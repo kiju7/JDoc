@@ -431,13 +431,21 @@ private:
         auto entries = storage_->entries("BinData");
         for (auto& name : entries) {
             std::string full_path = "BinData/" + name;
-            auto data = read_stream(*storage_, full_path);
-            if (!data.empty()) {
-                HWPEmbeddedImage img;
-                img.name = name;
-                img.data = std::move(data);
-                embedded_images_.push_back(std::move(img));
+            auto raw = read_stream(*storage_, full_path);
+            if (raw.empty()) continue;
+
+            std::vector<uint8_t> data;
+            if (compressed_) {
+                data = decompress(raw.data(), raw.size());
+                if (data.empty()) data = std::move(raw); // fallback: uncompressed
+            } else {
+                data = std::move(raw);
             }
+
+            HWPEmbeddedImage img;
+            img.name = name;
+            img.data = std::move(data);
+            embedded_images_.push_back(std::move(img));
         }
     }
 
@@ -623,6 +631,27 @@ private:
                         in_cell = false;
                         ctrl_state = NONE;
                         current_table = nullptr;
+                    }
+                }
+                break;
+            }
+
+            case hwp::SHAPE_COMPONENT: {
+                // Check if this is a picture shape (cip$ control type)
+                if (ctrl_state == IN_GSO && hdr.size >= 10) {
+                    // First 4 bytes are the control type name
+                    char sc_name[5] = {};
+                    memcpy(sc_name, data.data() + offset, 4);
+                    if (std::string(sc_name) == "cip$" || std::string(sc_name) == "$pic") {
+                        // ShapeComponent for picture
+                        // binDataId can be found at offset 18 (uint16)
+                        if (hdr.size >= 20) {
+                            uint16_t bin_id = util::read_u16_le(data.data() + offset + 18);
+                            if (bin_id > 0 && current) {
+                                current->image_bin_ids.push_back(bin_id);
+                                gso_bin_id = bin_id;
+                            }
+                        }
                     }
                 }
                 break;
