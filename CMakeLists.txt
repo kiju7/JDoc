@@ -67,6 +67,13 @@ add_library(jdoc_office STATIC
 target_include_directories(jdoc_office PUBLIC include PRIVATE src vendor)
 target_link_libraries(jdoc_office PUBLIC pugixml pole jdoc_zip jdoc_common)
 
+# ── Shared library with C API ─────────────────────────────────
+
+add_library(jdoc_shared SHARED src/jdoc_c_api.cpp)
+target_link_libraries(jdoc_shared PRIVATE jdoc_pdf jdoc_office jdoc_hwpx jdoc_hwp)
+target_include_directories(jdoc_shared PUBLIC include PRIVATE src)
+set_target_properties(jdoc_shared PROPERTIES OUTPUT_NAME "jdoc" SOVERSION 2)
+
 # ── Unified CLI ───────────────────────────────────────────────
 
 add_executable(jdoc src/main.cpp)
@@ -97,5 +104,5 @@ endif()
 # ── Install ───────────────────────────────────────────────────
 
 install(TARGETS jdoc DESTINATION bin)
-install(TARGETS jdoc_common jdoc_zip jdoc_pdf jdoc_hwpx jdoc_hwp jdoc_office DESTINATION lib)
+install(TARGETS jdoc_shared jdoc_common jdoc_zip jdoc_pdf jdoc_hwpx jdoc_hwp jdoc_office DESTINATION lib)
 install(DIRECTORY include/jdoc DESTINATION include)
