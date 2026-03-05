@@ -415,7 +415,10 @@ std::vector<PageChunk> XlsxParser::to_chunks(
     const ConvertOptions& opts) {
 
     std::vector<PageChunk> chunks;
-    auto all_images = extract_images(opts);
+    // Always enumerate images so we can reference them in text
+    ConvertOptions img_opts = opts;
+    img_opts.extract_images = true;
+    auto all_images = extract_images(img_opts);
 
     for (size_t i = 0; i < sheets_.size(); ++i) {
         int sheet_num = static_cast<int>(i) + 1;
@@ -477,13 +480,17 @@ std::vector<PageChunk> XlsxParser::to_chunks(
         }
 
         chunk.text = text.str();
-
-        // Attach images to first chunk
-        if (chunks.empty() && !all_images.empty()) {
-            chunk.images = std::move(all_images);
-        }
-
         chunks.push_back(std::move(chunk));
+    }
+
+    // Attach images and add references to text
+    if (!all_images.empty() && !chunks.empty()) {
+        for (auto& img : all_images) {
+            auto& target = chunks[0];
+            std::string ref = img.saved_path.empty() ? "embedded:" + img.name : img.saved_path;
+            target.text += "![" + img.name + "](" + ref + ")\n\n";
+            target.images.push_back(std::move(img));
+        }
     }
 
     return chunks;
