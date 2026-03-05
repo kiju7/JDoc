@@ -391,7 +391,10 @@ std::vector<PageChunk> PptxParser::to_chunks(
     const ConvertOptions& opts) {
 
     std::vector<PageChunk> chunks;
-    auto all_images = extract_images(opts);
+    // Always enumerate images so we can reference them in text
+    ConvertOptions img_opts = opts;
+    img_opts.extract_images = true;
+    auto all_images = extract_images(img_opts);
 
     for (size_t i = 0; i < slide_paths_.size(); ++i) {
         int slide_num = static_cast<int>(i) + 1;
@@ -428,13 +431,21 @@ std::vector<PageChunk> PptxParser::to_chunks(
         }
 
         chunk.text = text.str();
-
-        // Attach images to first chunk
-        if (chunks.empty() && !all_images.empty()) {
-            chunk.images = std::move(all_images);
-        }
-
         chunks.push_back(std::move(chunk));
+    }
+
+    // Distribute images to chunks (by slide relationship if available, else first chunk)
+    if (!all_images.empty() && !chunks.empty()) {
+        // Add image references to text and attach to appropriate chunks
+        for (auto& img : all_images) {
+            // Default: attach to first chunk
+            auto& target = chunks[0];
+            std::string ref = img.saved_path.empty() ? img.name : img.saved_path;
+            if (target.text.empty() || target.text.find("![") == std::string::npos) {
+                target.text += "![" + img.name + "](" + (img.saved_path.empty() ? "embedded:" + img.name : img.saved_path) + ")\n\n";
+            }
+            target.images.push_back(std::move(img));
+        }
     }
 
     return chunks;
