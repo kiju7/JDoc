@@ -678,9 +678,72 @@ std::string format_table(const TableData& table) {
     return md;
 }
 
+// ── BMP writer helper ────────────────────────────────────
+
+static std::vector<char> bitmap_to_bmp(FPDF_BITMAP bitmap) {
+    int w = FPDFBitmap_GetWidth(bitmap);
+    int h = FPDFBitmap_GetHeight(bitmap);
+    int stride = FPDFBitmap_GetStride(bitmap);
+    int fmt = FPDFBitmap_GetFormat(bitmap);
+    void* buf = FPDFBitmap_GetBuffer(bitmap);
+    if (!buf || w <= 0 || h <= 0) return {};
+
+    int bpp;
+    switch (fmt) {
+        case FPDFBitmap_Gray: bpp = 1; break;
+        case FPDFBitmap_BGR:  bpp = 3; break;
+        case FPDFBitmap_BGRx:
+        case FPDFBitmap_BGRA: bpp = 4; break;
+        default: return {};
+    }
+
+    // Write as 24-bit BMP (convert from BGRA/BGRx to BGR)
+    int out_stride = ((w * 3 + 3) / 4) * 4;
+    int pixel_data_size = out_stride * h;
+    int file_size = 14 + 40 + pixel_data_size;
+
+    std::vector<char> bmp(file_size);
+    auto write16 = [&](int off, uint16_t v) { memcpy(&bmp[off], &v, 2); };
+    auto write32 = [&](int off, uint32_t v) { memcpy(&bmp[off], &v, 4); };
+
+    // BMP file header
+    bmp[0] = 'B'; bmp[1] = 'M';
+    write32(2, file_size);
+    write32(10, 14 + 40); // pixel data offset
+
+    // DIB header (BITMAPINFOHEADER)
+    write32(14, 40);
+    write32(18, w);
+    write32(22, h);
+    write16(26, 1); // planes
+    write16(28, 24); // bpp
+    write32(34, pixel_data_size);
+
+    auto* src = static_cast<uint8_t*>(buf);
+    // BMP stores bottom-to-top, PDFium bitmap is top-to-bottom
+    for (int y = 0; y < h; y++) {
+        uint8_t* src_row = src + (h - 1 - y) * stride;
+        char* dst_row = &bmp[14 + 40 + y * out_stride];
+        for (int x = 0; x < w; x++) {
+            if (bpp >= 3) {
+                dst_row[x * 3 + 0] = src_row[x * bpp + 0]; // B
+                dst_row[x * 3 + 1] = src_row[x * bpp + 1]; // G
+                dst_row[x * 3 + 2] = src_row[x * bpp + 2]; // R
+            } else {
+                // Grayscale
+                dst_row[x * 3 + 0] = src_row[x];
+                dst_row[x * 3 + 1] = src_row[x];
+                dst_row[x * 3 + 2] = src_row[x];
+            }
+        }
+    }
+    return bmp;
+}
+
 // ── Image extraction ─────────────────────────────────────
 
-std::vector<ImageData> extract_images(FPDF_PAGE page, int page_num,
+std::vector<ImageData> extract_images(FPDF_DOCUMENT doc, FPDF_PAGE page,
+                                       int page_num,
                                        const std::string& output_dir) {
     std::vector<ImageData> images;
     int obj_count = FPDFPage_CountObjects(page);
@@ -699,31 +762,50 @@ std::vector<ImageData> extract_images(FPDF_PAGE page, int page_num,
         img.width = w;
         img.height = h;
 
-        img.format = "raw";
+        // Determine the image filter to decide extraction method
+        std::string filter;
         int filter_count = FPDFImageObj_GetImageFilterCount(obj);
         if (filter_count > 0) {
             char fbuf[64];
             unsigned long flen = FPDFImageObj_GetImageFilter(obj, 0, fbuf, sizeof(fbuf));
-            if (flen > 0) {
-                std::string filter(fbuf, flen - 1);
-                if (filter == "DCTDecode") img.format = "jpeg";
-                else if (filter == "FlateDecode") img.format = "png";
-                else if (filter == "JPXDecode") img.format = "jp2";
-                else img.format = filter;
-            }
+            if (flen > 0) filter = std::string(fbuf, flen - 1);
         }
 
-        unsigned long raw_size = FPDFImageObj_GetImageDataRaw(obj, nullptr, 0);
-        if (raw_size > 0) {
-            img.data.resize(raw_size);
-            FPDFImageObj_GetImageDataRaw(obj,
-                reinterpret_cast<unsigned char*>(img.data.data()), raw_size);
+        if (filter == "DCTDecode") {
+            // JPEG: raw stream is a valid JPEG file
+            img.format = "jpeg";
+            unsigned long raw_size = FPDFImageObj_GetImageDataRaw(obj, nullptr, 0);
+            if (raw_size > 0) {
+                img.data.resize(raw_size);
+                FPDFImageObj_GetImageDataRaw(obj,
+                    reinterpret_cast<unsigned char*>(img.data.data()), raw_size);
+            }
+        } else if (filter == "JPXDecode") {
+            // JPEG2000: raw stream is a valid JP2 file
+            img.format = "jp2";
+            unsigned long raw_size = FPDFImageObj_GetImageDataRaw(obj, nullptr, 0);
+            if (raw_size > 0) {
+                img.data.resize(raw_size);
+                FPDFImageObj_GetImageDataRaw(obj,
+                    reinterpret_cast<unsigned char*>(img.data.data()), raw_size);
+            }
+        } else {
+            // FlateDecode or other: render to bitmap and save as BMP
+            img.format = "bmp";
+            FPDF_BITMAP bitmap = FPDFImageObj_GetRenderedBitmap(doc, page, obj);
+            if (bitmap) {
+                auto bmp_data = bitmap_to_bmp(bitmap);
+                img.data.assign(bmp_data.begin(), bmp_data.end());
+                img.width = FPDFBitmap_GetWidth(bitmap);
+                img.height = FPDFBitmap_GetHeight(bitmap);
+                FPDFBitmap_Destroy(bitmap);
+            }
         }
 
         if (!output_dir.empty() && !img.data.empty()) {
             std::string ext = (img.format == "jpeg") ? ".jpg" :
-                              (img.format == "png") ? ".png" :
-                              (img.format == "jp2") ? ".jp2" : ".bin";
+                              (img.format == "jp2") ? ".jp2" :
+                              (img.format == "bmp") ? ".bmp" : ".bin";
             std::string path = output_dir + "/" + img.name + ext;
 
             std::ofstream ofs(path, std::ios::binary);
@@ -930,7 +1012,7 @@ ExtractResult extract_pdf(const std::string& pdf_path, const ConvertOptions& opt
         }
 
         if (opts.extract_images) {
-            result.all_images[p] = extract_images(page, p, image_dir);
+            result.all_images[p] = extract_images(doc, page, p, image_dir);
         }
         FPDF_ClosePage(page);
     }
