@@ -1,0 +1,10 @@
+build/
+*.so
+!vendor/pdfium/lib/libpdfium.so
+*.o
+*.a
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+.eggs/
