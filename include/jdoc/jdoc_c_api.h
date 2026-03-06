@@ -27,6 +27,14 @@ typedef struct {
 int jdoc_extract_images(const char* file_path, JDocImage** out_images,
                         char* err_buf, int err_buf_size);
 
+/* Extract text and images in a single parse pass.
+ * Returns malloc'd text (caller must call jdoc_free_string).
+ * Images are written to *out_images, count to *out_image_count.
+ * Returns NULL on error. */
+char* jdoc_extract_all(const char* file_path,
+                       JDocImage** out_images, int* out_image_count,
+                       char* err_buf, int err_buf_size);
+
 void jdoc_free_string(char* str);
 void jdoc_free_images(JDocImage* images, int count);
 
