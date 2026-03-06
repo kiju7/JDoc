@@ -1,5 +1,5 @@
-// pdf2md.cpp — PDF→Markdown using PDFium (BSD-3 license)
-// Features: text, headings, bold/italic, images, table detection (path + text clustering)
+// pdf.cpp — PDF→Markdown using PDFium
+// Features: text, headings, bold/italic, images, table detection (line-based + text-based)
 
 #include "jdoc/pdf.h"
 #include "common/string_utils.h"
@@ -9,7 +9,6 @@
 #include <fpdf_text.h>
 #include <fpdf_edit.h>
 
-#include <iostream>
 #include <fstream>
 #include <map>
 #include <algorithm>
@@ -224,6 +223,25 @@ std::vector<PdfLineSegment> extract_line_segments(FPDF_PAGE page) {
 }
 
 // ── Table detection helpers ──────────────────────────────
+
+// Merge sorted (left, right) ranges into spans where inter-span gap >= merge_gap
+std::vector<std::pair<double,double>> merge_char_ranges(
+        std::vector<std::pair<double,double>>& ranges, double merge_gap = 8.0) {
+    std::vector<std::pair<double,double>> spans;
+    if (ranges.empty()) return spans;
+    std::sort(ranges.begin(), ranges.end());
+    auto cur = ranges[0];
+    for (size_t i = 1; i < ranges.size(); i++) {
+        if (ranges[i].first - cur.second < merge_gap) {
+            cur.second = std::max(cur.second, ranges[i].second);
+        } else {
+            spans.push_back(cur);
+            cur = ranges[i];
+        }
+    }
+    spans.push_back(cur);
+    return spans;
+}
 
 std::vector<double> cluster_values(std::vector<double>& vals, double tol) {
     if (vals.empty()) return {};
@@ -493,6 +511,11 @@ void trim_table(TableData& table) {
     }
 }
 
+// Forward declaration for text-based column inference
+std::vector<double> infer_columns_from_text(FPDF_TEXTPAGE text_page,
+                                             double left, double right,
+                                             const std::vector<double>& row_ys);
+
 TableData build_table(const std::vector<double>& row_ys,
                        const std::vector<PdfLineSegment>& h_lines,
                        const std::vector<PdfLineSegment>& v_lines,
@@ -516,6 +539,26 @@ TableData build_table(const std::vector<double>& row_ys,
 
     auto col_xs = find_column_boundaries(v_lines, table_left, table_right,
                                           table_bot, table_top);
+
+    // Count vertical lines within the table region (not just edge lines)
+    int internal_vline_count = 0;
+    for (auto& vl : v_lines) {
+        double vx = (vl.x0 + vl.x1) / 2.0;
+        if (vx > table_left + 10 && vx < table_right - 10) {
+            double vy_lo = std::min((double)vl.y0, (double)vl.y1);
+            double vy_hi = std::max((double)vl.y0, (double)vl.y1);
+            if (vy_hi > table_bot - 5 && vy_lo < table_top + 5)
+                internal_vline_count++;
+        }
+    }
+
+    // Fallback: use text-based column inference only when there are
+    // no internal vertical lines (horizontal-line-only tables).
+    // If internal v-lines exist but don't form columns, it's likely
+    // a complex graphic (chart, diagram) rather than a table.
+    if (col_xs.size() < 3 && internal_vline_count == 0) {
+        col_xs = infer_columns_from_text(text_page, table_left, table_right, row_ys);
+    }
 
     if (col_xs.size() < 3) {
         table.rows.clear();
@@ -563,12 +606,178 @@ TableData build_table(const std::vector<double>& row_ys,
     std::reverse(table.rows.begin(), table.rows.end());
     trim_table(table);
 
-    int non_empty = 0;
-    for (auto& row : table.rows)
-        for (auto& cell : row) if (!cell.empty()) non_empty++;
-    if (non_empty < 3) table.rows.clear();
+    // Validate: need at least 2 rows where 2+ columns have content
+    int meaningful_rows = 0;
+    for (auto& row : table.rows) {
+        int filled_cols = 0;
+        for (auto& cell : row) if (!cell.empty()) filled_cols++;
+        if (filled_cols >= 2) meaningful_rows++;
+    }
+    if (meaningful_rows < 2) table.rows.clear();
 
     return table;
+}
+
+// Compute total h-line coverage at a given Y level
+// (sum of non-overlapping line lengths at that Y)
+double h_line_coverage_at_y(const std::vector<PdfLineSegment>& h_lines,
+                             double y, double tol) {
+    std::vector<std::pair<double,double>> intervals;
+    for (auto& hl : h_lines) {
+        double hy = (hl.y0 + hl.y1) / 2.0;
+        if (std::abs(hy - y) > tol) continue;
+        double lx = std::min((double)hl.x0, (double)hl.x1);
+        double rx = std::max((double)hl.x0, (double)hl.x1);
+        intervals.push_back({lx, rx});
+    }
+    if (intervals.empty()) return 0;
+    std::sort(intervals.begin(), intervals.end());
+    double total = 0, cur_l = intervals[0].first, cur_r = intervals[0].second;
+    for (size_t i = 1; i < intervals.size(); i++) {
+        if (intervals[i].first <= cur_r + 2.0)
+            cur_r = std::max(cur_r, intervals[i].second);
+        else { total += cur_r - cur_l; cur_l = intervals[i].first; cur_r = intervals[i].second; }
+    }
+    total += cur_r - cur_l;
+    return total;
+}
+
+// Check if two row-level horizontal lines span a similar table-width region
+bool h_lines_share_full_span(const std::vector<PdfLineSegment>& h_lines,
+                              double y1, double y2, double tol) {
+    double min1 = 1e9, max1 = 0, min2 = 1e9, max2 = 0;
+    for (auto& hl : h_lines) {
+        double hy = (hl.y0 + hl.y1) / 2.0;
+        double lx = std::min((double)hl.x0, (double)hl.x1);
+        double rx = std::max((double)hl.x0, (double)hl.x1);
+        if (std::abs(hy - y1) < tol) { if (lx < min1) min1 = lx; if (rx > max1) max1 = rx; }
+        if (std::abs(hy - y2) < tol) { if (lx < min2) min2 = lx; if (rx > max2) max2 = rx; }
+    }
+    if (max1 == 0 || max2 == 0) return false;
+
+    double extent1 = max1 - min1;
+    double extent2 = max2 - min2;
+    if (extent1 < 50 || extent2 < 50) return false;
+
+    // Check total coverage (sum of h-line lengths) vs extent
+    double cov1 = h_line_coverage_at_y(h_lines, y1, tol);
+    double cov2 = h_line_coverage_at_y(h_lines, y2, tol);
+    // At least 40% coverage of the extent (allows for gaps between cells)
+    if (cov1 < extent1 * 0.4 || cov2 < extent2 * 0.4) return false;
+
+    // Must share significant X overlap with similar extent
+    double overlap_l = std::max(min1, min2);
+    double overlap_r = std::min(max1, max2);
+    if (overlap_r <= overlap_l) return false;
+    double overlap = overlap_r - overlap_l;
+    double extent = std::max(extent1, extent2);
+    double ratio = std::min(extent1, extent2) / extent;
+    return overlap >= extent * 0.7 && ratio >= 0.5;
+}
+
+// Infer column boundaries from text x-positions when vertical lines are absent
+std::vector<double> infer_columns_from_text(FPDF_TEXTPAGE text_page,
+                                             double left, double right,
+                                             const std::vector<double>& row_ys) {
+    int n_rows = (int)row_ys.size() - 1;
+    if (n_rows < 1) return {};
+
+    int total_chars = FPDFText_CountChars(text_page);
+
+    // Collect text spans per row
+    std::vector<std::vector<std::pair<double,double>>> per_row(n_rows);
+
+    for (int r = 0; r < n_rows; r++) {
+        double bot = std::min(row_ys[r], row_ys[r+1]);
+        double top = std::max(row_ys[r], row_ys[r+1]);
+
+        std::vector<std::pair<double,double>> char_xs;
+        for (int ci = 0; ci < total_chars; ci++) {
+            unsigned int u = FPDFText_GetUnicode(text_page, ci);
+            if (u == 0 || u == '\r' || u == '\n' || u == 0xFFFD || u == ' ' || u == 0xA0)
+                continue;
+            double cl, cr, cb, ct;
+            if (!FPDFText_GetCharBox(text_page, ci, &cl, &cr, &cb, &ct)) continue;
+            double cx = (cl + cr) / 2.0;
+            double cy = (ct + cb) / 2.0;
+            if (cx < left - 5 || cx > right + 5) continue;
+            if (cy >= bot + 1 && cy <= top - 1)
+                char_xs.push_back({cl, cr});
+        }
+        per_row[r] = merge_char_ranges(char_xs);
+    }
+
+    // Find consistent gap positions across rows
+    // A gap is a region where most rows have no text
+    double width = right - left;
+    int n_bins = std::max(20, (int)(width / 5.0));
+    double bin_w = width / n_bins;
+    std::vector<int> gap_counts(n_bins, 0);
+
+    for (int r = 0; r < n_rows; r++) {
+        if (per_row[r].empty()) continue;
+        for (int b = 0; b < n_bins; b++) {
+            double bx = left + b * bin_w + bin_w / 2.0;
+            bool in_text = false;
+            for (auto& sp : per_row[r]) {
+                if (bx >= sp.first - 2 && bx <= sp.second + 2) {
+                    in_text = true;
+                    break;
+                }
+            }
+            if (!in_text) gap_counts[b]++;
+        }
+    }
+
+    // Threshold: gap must appear in at least 40% of non-empty rows
+    int non_empty_rows = 0;
+    for (int r = 0; r < n_rows; r++)
+        if (!per_row[r].empty()) non_empty_rows++;
+    int threshold = std::max(1, (int)(non_empty_rows * 0.4));
+
+    // Find gap regions (consecutive bins above threshold)
+    std::vector<double> boundaries;
+    boundaries.push_back(left);
+    bool in_gap = false;
+    double gap_start = 0;
+    for (int b = 0; b < n_bins; b++) {
+        double bx = left + b * bin_w + bin_w / 2.0;
+        if (gap_counts[b] >= threshold) {
+            if (!in_gap) { gap_start = bx; in_gap = true; }
+        } else {
+            if (in_gap) {
+                double gap_center = (gap_start + bx) / 2.0;
+                // Only add if gap is not too close to edges
+                if (gap_center > left + 15 && gap_center < right - 15)
+                    boundaries.push_back(gap_center);
+                in_gap = false;
+            }
+        }
+    }
+    boundaries.push_back(right);
+
+    if (boundaries.size() < 3) return {}; // need at least 2 columns
+
+    // Validate: check that most non-empty rows have text in multiple columns
+    int n_cols_inferred = (int)boundaries.size() - 1;
+    int rows_with_multi_cols = 0;
+    for (int r = 0; r < n_rows; r++) {
+        if (per_row[r].empty()) continue;
+        int cols_hit = 0;
+        for (int c = 0; c < n_cols_inferred; c++) {
+            double col_l = boundaries[c];
+            double col_r = boundaries[c + 1];
+            for (auto& sp : per_row[r]) {
+                double sp_mid = (sp.first + sp.second) / 2.0;
+                if (sp_mid >= col_l && sp_mid <= col_r) { cols_hit++; break; }
+            }
+        }
+        if (cols_hit >= 2) rows_with_multi_cols++;
+    }
+    // At least 50% of non-empty rows must use 2+ columns
+    if (rows_with_multi_cols < non_empty_rows * 0.5) return {};
+
+    return boundaries;
 }
 
 std::vector<TableData> detect_tables(const std::vector<PdfLineSegment>& lines,
@@ -602,6 +811,8 @@ std::vector<TableData> detect_tables(const std::vector<PdfLineSegment>& lines,
     if (row_ys.size() < 3) return {};
 
     int n_levels = (int)row_ys.size();
+
+    // Check vertical line connectivity between adjacent row levels
     std::vector<bool> connected(n_levels - 1, false);
     for (int i = 0; i < n_levels - 1; i++) {
         double y_lo = row_ys[i];
@@ -616,11 +827,22 @@ std::vector<TableData> detect_tables(const std::vector<PdfLineSegment>& lines,
         }
     }
 
+    // Also check if rows share similar X extent (heuristic for tables
+    // with only horizontal lines or partial vertical lines)
+    std::vector<bool> x_overlap(n_levels - 1, false);
+    for (int i = 0; i < n_levels - 1; i++) {
+        x_overlap[i] = h_lines_share_full_span(h_lines, row_ys[i], row_ys[i+1], 3.0);
+    }
+
+    // Group rows: connected by vertical lines OR by shared X extent
+    // with reasonable vertical gap (not too far apart)
     std::vector<std::vector<double>> table_groups;
     std::vector<double> current_group;
     current_group.push_back(row_ys[0]);
     for (int i = 0; i < n_levels - 1; i++) {
-        if (connected[i]) {
+        double gap = row_ys[i + 1] - row_ys[i];
+        bool close_enough = gap < 200.0; // max gap between rows in a table
+        if (connected[i] || (x_overlap[i] && close_enough)) {
             current_group.push_back(row_ys[i + 1]);
         } else {
             if (current_group.size() >= 3)
@@ -637,28 +859,372 @@ std::vector<TableData> detect_tables(const std::vector<PdfLineSegment>& lines,
     std::vector<TableData> result;
     for (auto& group : table_groups) {
         TableData t = build_table(group, h_lines, v_lines, text_page);
-        if (!t.rows.empty())
+        if (!t.rows.empty()) {
             result.push_back(std::move(t));
+        }
     }
+    return result;
+}
+
+// ── Pure text-based table detection (no lines required) ──────────
+// Detects tables by analyzing text position patterns:
+// 1. Cluster all chars by Y into text rows
+// 2. Find consistent column gaps across multiple rows
+// 3. Build table from rows that share the same column structure
+
+std::vector<TableData> detect_text_tables(FPDF_TEXTPAGE text_page,
+                                           const std::vector<TableData>& existing_tables,
+                                           double page_width, double page_height) {
+    int total_chars = FPDFText_CountChars(text_page);
+    if (total_chars < 10) return {};
+
+    // Collect all non-space chars with positions
+    struct CharInfo { double x, y, left, right, top, bot; };
+    std::vector<CharInfo> chars;
+    for (int ci = 0; ci < total_chars; ci++) {
+        unsigned int u = FPDFText_GetUnicode(text_page, ci);
+        if (u == 0 || u == '\r' || u == '\n' || u == 0xFFFD || u == ' ' || u == '\t' || u == 0xA0)
+            continue;
+        double l, r, b, t;
+        if (!FPDFText_GetCharBox(text_page, ci, &l, &r, &b, &t)) continue;
+        double cx = (l + r) / 2.0;
+        double cy = (t + b) / 2.0;
+        if (cx < 0 || cx > page_width || cy < 0 || cy > page_height) continue;
+        chars.push_back({cx, cy, l, r, t, b});
+    }
+    if (chars.empty()) return {};
+
+    // Cluster chars by Y into text rows (tolerance ~3pt for same line)
+    std::sort(chars.begin(), chars.end(), [](const CharInfo& a, const CharInfo& b) {
+        return a.y > b.y; // top to bottom (PDF coords: higher Y = higher on page)
+    });
+
+    struct TextRow {
+        double y_center;
+        double y_top, y_bot;
+        std::vector<std::pair<double,double>> char_ranges; // (left, right) of each char
+    };
+    std::vector<TextRow> text_rows;
+    {
+        TextRow cur;
+        cur.y_center = chars[0].y;
+        cur.y_top = chars[0].top;
+        cur.y_bot = chars[0].bot;
+        cur.char_ranges.push_back({chars[0].left, chars[0].right});
+
+        for (size_t i = 1; i < chars.size(); i++) {
+            if (std::abs(chars[i].y - cur.y_center) < 3.0) {
+                cur.char_ranges.push_back({chars[i].left, chars[i].right});
+                cur.y_top = std::max(cur.y_top, chars[i].top);
+                cur.y_bot = std::min(cur.y_bot, chars[i].bot);
+                // Update running average
+                cur.y_center = (cur.y_center * (cur.char_ranges.size() - 1) + chars[i].y)
+                               / cur.char_ranges.size();
+            } else {
+                if (!cur.char_ranges.empty()) text_rows.push_back(cur);
+                cur = TextRow();
+                cur.y_center = chars[i].y;
+                cur.y_top = chars[i].top;
+                cur.y_bot = chars[i].bot;
+                cur.char_ranges.push_back({chars[i].left, chars[i].right});
+            }
+        }
+        if (!cur.char_ranges.empty()) text_rows.push_back(cur);
+    }
+
+    if (text_rows.size() < 3) return {};
+
+    // Skip rows already covered by existing tables
+    auto row_in_existing_table = [&](const TextRow& row) -> bool {
+        for (auto& t : existing_tables) {
+            double t_bottom = std::min(t.y0, t.y1) - 5.0;
+            double t_top = std::max(t.y0, t.y1) + 5.0;
+            if (row.y_center >= t_bottom && row.y_center <= t_top)
+                return true;
+        }
+        return false;
+    };
+
+    // For each text row, merge chars into spans and compute the X extent
+    struct RowSpans {
+        double y_center, y_top, y_bot;
+        double x_min, x_max;
+        std::vector<std::pair<double,double>> spans; // merged text spans
+    };
+
+    std::vector<RowSpans> row_spans;
+    for (size_t ri = 0; ri < text_rows.size(); ri++) {
+        auto& tr = text_rows[ri];
+        if (row_in_existing_table(tr)) continue;
+
+        RowSpans rs;
+        rs.y_center = tr.y_center;
+        rs.y_top = tr.y_top;
+        rs.y_bot = tr.y_bot;
+
+        // Merge chars into text spans (gap < 8pt = same word/phrase)
+        auto ranges = tr.char_ranges;
+        rs.spans = merge_char_ranges(ranges);
+
+        rs.x_min = rs.spans.front().first;
+        rs.x_max = rs.spans.back().second;
+        row_spans.push_back(rs);
+    }
+
+    if (row_spans.size() < 3) return {};
+
+    // Now find groups of consecutive rows that look tabular:
+    // - Similar X extent (overlap > 70%)
+    // - Multiple text spans (columns) with consistent gap positions
+    // - At least 3 rows
+
+    // For each row, note gap positions (between spans)
+    // A "gap" is the midpoint between consecutive spans
+    auto get_gaps = [](const RowSpans& rs) -> std::vector<double> {
+        std::vector<double> gaps;
+        for (size_t i = 1; i < rs.spans.size(); i++) {
+            double gap_mid = (rs.spans[i-1].second + rs.spans[i].first) / 2.0;
+            gaps.push_back(gap_mid);
+        }
+        return gaps;
+    };
+
+    // Try to find tabular groups
+    std::vector<TableData> result;
+
+    size_t start = 0;
+    while (start < row_spans.size()) {
+        // Skip rows with only 1 span (single column text)
+        if (row_spans[start].spans.size() < 2) { start++; continue; }
+
+        // Try to extend a group from 'start'
+        std::vector<size_t> group_indices;
+        group_indices.push_back(start);
+
+        auto ref_gaps = get_gaps(row_spans[start]);
+        double ref_xmin = row_spans[start].x_min;
+        double ref_xmax = row_spans[start].x_max;
+
+        for (size_t j = start + 1; j < row_spans.size(); j++) {
+            auto& rs = row_spans[j];
+
+            // Check Y proximity: rows should be close (< 40pt gap)
+            double y_gap = std::abs(row_spans[group_indices.back()].y_center - rs.y_center);
+            if (y_gap > 40.0) break;
+
+            // Single-span row: continuation line or merged cell
+            // Check this BEFORE X extent overlap (which would fail for narrow continuations)
+            if (rs.spans.size() == 1) {
+                double sp_mid = (rs.spans[0].first + rs.spans[0].second) / 2.0;
+                // Allow if the span falls within the reference table X extent
+                if (sp_mid >= ref_xmin - 5 && sp_mid <= ref_xmax + 5) {
+                    group_indices.push_back(j);
+                    continue;
+                }
+                break;
+            }
+
+            // Check X extent overlap (only for multi-span rows)
+            double overlap_l = std::max(ref_xmin, rs.x_min);
+            double overlap_r = std::min(ref_xmax, rs.x_max);
+            double extent = std::max(ref_xmax - ref_xmin, rs.x_max - rs.x_min);
+            if (extent < 50) break;
+            if (overlap_r - overlap_l < extent * 0.5) break;
+
+            // Check gap alignment: at least some gaps should match
+            auto cur_gaps = get_gaps(rs);
+            if (cur_gaps.size() > 0) {
+                int matching = 0;
+                for (auto& cg : cur_gaps) {
+                    for (auto& rg : ref_gaps) {
+                        if (std::abs(cg - rg) < 15.0) { matching++; break; }
+                    }
+                }
+                // At least half the gaps should align
+                int min_gaps = (int)std::min(cur_gaps.size(), ref_gaps.size());
+                if (min_gaps > 0 && matching >= (min_gaps + 1) / 2) {
+                    group_indices.push_back(j);
+                    // Update reference extent
+                    ref_xmin = std::min(ref_xmin, rs.x_min);
+                    ref_xmax = std::max(ref_xmax, rs.x_max);
+                    continue;
+                }
+            }
+
+            break;
+        }
+
+        if (group_indices.size() < 3) {
+            start++;
+            continue;
+        }
+
+        // Build the table from this group
+        // Collect gap positions only from multi-span rows
+        // Also track the actual gap width to filter narrow false gaps
+        std::vector<double> all_gaps;
+        int multi_span_rows = 0;
+        for (auto idx : group_indices) {
+            auto& rs = row_spans[idx];
+            if (rs.spans.size() < 2) continue;
+            multi_span_rows++;
+            for (size_t s = 1; s < rs.spans.size(); s++) {
+                double gap_width = rs.spans[s].first - rs.spans[s-1].second;
+                if (gap_width >= 10.0) { // minimum gap width to be a column separator
+                    double gap_mid = (rs.spans[s-1].second + rs.spans[s].first) / 2.0;
+                    all_gaps.push_back(gap_mid);
+                }
+            }
+        }
+
+        if (all_gaps.empty() || multi_span_rows < 2) {
+            start = group_indices.back() + 1; continue;
+        }
+
+        // Cluster gaps by position
+        std::sort(all_gaps.begin(), all_gaps.end());
+        std::vector<double> col_boundaries;
+        col_boundaries.push_back(ref_xmin);
+
+        double cluster_sum = all_gaps[0];
+        int cluster_count = 1;
+        for (size_t i = 1; i < all_gaps.size(); i++) {
+            if (all_gaps[i] - (cluster_sum / cluster_count) < 15.0) {
+                cluster_sum += all_gaps[i];
+                cluster_count++;
+            } else {
+                // Gap must appear in majority of multi-span rows
+                if (cluster_count >= std::max(2, (int)(multi_span_rows * 0.5))) {
+                    col_boundaries.push_back(cluster_sum / cluster_count);
+                }
+                cluster_sum = all_gaps[i];
+                cluster_count = 1;
+            }
+        }
+        if (cluster_count >= std::max(2, (int)(multi_span_rows * 0.5))) {
+            col_boundaries.push_back(cluster_sum / cluster_count);
+        }
+        col_boundaries.push_back(ref_xmax);
+
+        int n_cols = (int)col_boundaries.size() - 1;
+        if (n_cols < 2) { start = group_indices.back() + 1; continue; }
+
+        // Build TableData
+        TableData table;
+        table.y0 = row_spans[group_indices.back()].y_bot;
+        table.y1 = row_spans[group_indices.front()].y_top;
+        table.x0 = ref_xmin;
+        table.x1 = ref_xmax;
+
+        for (auto idx : group_indices) {
+            auto& rs = row_spans[idx];
+            std::vector<std::string> row(n_cols);
+
+            // Assign each span to a column
+            for (auto& sp : rs.spans) {
+                double sp_mid = (sp.first + sp.second) / 2.0;
+                int best_col = 0;
+                for (int c = 0; c < n_cols; c++) {
+                    if (sp_mid >= col_boundaries[c] && sp_mid <= col_boundaries[c+1]) {
+                        best_col = c;
+                        break;
+                    }
+                }
+
+                // Extract text for this span from text_page
+                std::string cell_text;
+                for (int ci = 0; ci < total_chars; ci++) {
+                    double l, r, b, t;
+                    if (!FPDFText_GetCharBox(text_page, ci, &l, &r, &b, &t)) continue;
+                    double cx = (l + r) / 2.0;
+                    double cy = (t + b) / 2.0;
+                    if (std::abs(cy - rs.y_center) > 3.0) continue;
+                    if (cx >= sp.first - 2 && cx <= sp.second + 2) {
+                        unsigned int u = FPDFText_GetUnicode(text_page, ci);
+                        if (u == 0 || u == '\r' || u == '\n' || u == 0xFFFD) continue;
+                        util::append_utf8(cell_text, u);
+                    }
+                }
+
+                // Trim
+                size_t s = cell_text.find_first_not_of(" \t");
+                size_t e = cell_text.find_last_not_of(" \t");
+                if (s != std::string::npos)
+                    cell_text = cell_text.substr(s, e - s + 1);
+                else
+                    cell_text.clear();
+
+                if (!cell_text.empty()) {
+                    if (!row[best_col].empty()) row[best_col] += " ";
+                    row[best_col] += cell_text;
+                }
+            }
+            table.rows.push_back(std::move(row));
+        }
+
+        // Merge continuation rows (single-cell rows) into previous row
+        for (size_t r = 1; r < table.rows.size(); r++) {
+            int filled = 0;
+            int filled_col = -1;
+            for (int c = 0; c < n_cols; c++) {
+                if (!table.rows[r][c].empty()) { filled++; filled_col = c; }
+            }
+            if (filled == 1 && filled_col >= 0 && r > 0) {
+                // Merge into previous row's same column
+                if (!table.rows[r-1][filled_col].empty())
+                    table.rows[r-1][filled_col] += " ";
+                table.rows[r-1][filled_col] += table.rows[r][filled_col];
+                table.rows.erase(table.rows.begin() + r);
+                r--;
+            }
+        }
+
+        // Validate: at least 2 rows with 2+ filled columns
+        int meaningful_rows = 0;
+        for (auto& row : table.rows) {
+            int filled = 0;
+            for (auto& c : row) if (!c.empty()) filled++;
+            if (filled >= 2) meaningful_rows++;
+        }
+
+        if (meaningful_rows >= 2) {
+            trim_table(table);
+            result.push_back(std::move(table));
+        }
+
+        start = group_indices.back() + 1;
+    }
+
     return result;
 }
 
 std::string format_table(const TableData& table) {
     if (table.rows.empty()) return "";
 
-    int n_cols = table.rows[0].size();
+    // Filter out all-empty rows (except header)
+    std::vector<std::vector<std::string>> filtered;
+    for (size_t r = 0; r < table.rows.size(); r++) {
+        bool all_empty = true;
+        for (auto& cell : table.rows[r])
+            if (!cell.empty()) { all_empty = false; break; }
+        if (!all_empty || r == 0) // keep header even if empty
+            filtered.push_back(table.rows[r]);
+    }
+    if (filtered.empty()) return "";
+
+    int n_cols = filtered[0].size();
     if (n_cols == 0) return "";
 
     std::vector<size_t> widths(n_cols, 3);
-    for (auto& row : table.rows)
+    for (auto& row : filtered)
         for (int c = 0; c < n_cols && c < (int)row.size(); c++)
             widths[c] = std::max(widths[c], row[c].size());
 
     std::string md;
-    for (size_t r = 0; r < table.rows.size(); r++) {
+    for (size_t r = 0; r < filtered.size(); r++) {
         md += "|";
         for (int c = 0; c < n_cols; c++) {
-            std::string cell = (c < (int)table.rows[r].size()) ? table.rows[r][c] : "";
+            std::string cell = (c < (int)filtered[r].size()) ? filtered[r][c] : "";
             md += " " + cell;
             for (size_t p = cell.size(); p < widths[c]; p++) md += ' ';
             md += " |";
@@ -771,18 +1337,9 @@ std::vector<ImageData> extract_images(FPDF_DOCUMENT doc, FPDF_PAGE page,
             if (flen > 0) filter = std::string(fbuf, flen - 1);
         }
 
-        if (filter == "DCTDecode") {
-            // JPEG: raw stream is a valid JPEG file
-            img.format = "jpeg";
-            unsigned long raw_size = FPDFImageObj_GetImageDataRaw(obj, nullptr, 0);
-            if (raw_size > 0) {
-                img.data.resize(raw_size);
-                FPDFImageObj_GetImageDataRaw(obj,
-                    reinterpret_cast<unsigned char*>(img.data.data()), raw_size);
-            }
-        } else if (filter == "JPXDecode") {
-            // JPEG2000: raw stream is a valid JP2 file
-            img.format = "jp2";
+        if (filter == "DCTDecode" || filter == "JPXDecode") {
+            // JPEG/JPEG2000: raw stream is a valid image file
+            img.format = (filter == "DCTDecode") ? "jpeg" : "jp2";
             unsigned long raw_size = FPDFImageObj_GetImageDataRaw(obj, nullptr, 0);
             if (raw_size > 0) {
                 img.data.resize(raw_size);
@@ -827,9 +1384,25 @@ bool line_in_table(const TextLine& line, const std::vector<TableData>& tables) {
     for (auto& t : tables) {
         double t_bottom = std::min(t.y0, t.y1) - 10.0;
         double t_top = std::max(t.y0, t.y1) + 5.0;
-        if (line.y_center >= t_bottom && line.y_center <= t_top &&
-            line.x_left >= t.x0 - 10.0 && line.x_right <= t.x1 + 10.0) {
-            return true;
+        double t_left = std::min(t.x0, t.x1) - 15.0;
+        double t_right = std::max(t.x0, t.x1) + 15.0;
+        // Check if line's Y center is within table Y range
+        if (line.y_center >= t_bottom && line.y_center <= t_top) {
+            // Either the line is fully within the table X range,
+            // or it significantly overlaps with the table X range
+            if (line.x_left >= t_left && line.x_right <= t_right) {
+                return true;
+            }
+            // Partial overlap: if most of the line is within table bounds
+            double overlap_l = std::max(line.x_left, t_left);
+            double overlap_r = std::min(line.x_right, t_right);
+            if (overlap_r > overlap_l) {
+                double overlap = overlap_r - overlap_l;
+                double line_width = line.x_right - line.x_left;
+                if (line_width > 0 && overlap >= line_width * 0.6) {
+                    return true;
+                }
+            }
         }
     }
     return false;
@@ -869,7 +1442,14 @@ std::vector<TextLine> merge_colinear_lines(const std::vector<TextLine>& lines) {
             m.is_bold = lines[group[0]].is_bold;
             m.is_italic = lines[group[0]].is_italic;
             for (size_t k = 0; k < group.size(); k++) {
-                if (k > 0) m.text += " | ";
+                if (k > 0) {
+                    // Use gap between segments to decide separator
+                    double gap = lines[group[k]].x_left - lines[group[k-1]].x_right;
+                    if (gap > 100.0)
+                        m.text += "\n";  // Large gap = separate lines
+                    else
+                        m.text += "  ";  // Small gap = same line with spacing
+                }
                 m.text += lines[group[k]].text;
                 if (lines[group[k]].x_right > m.x_right)
                     m.x_right = lines[group[k]].x_right;
@@ -915,6 +1495,19 @@ std::string page_to_markdown(const std::vector<TextLine>& raw_lines,
         }
 
         if (line_in_table(l, tables)) continue;
+
+        // Skip lines that are only whitespace/pipe characters
+        // (artifact from PDF text extraction in table-like regions)
+        {
+            bool only_filler = true;
+            for (char ch : l.text) {
+                if (ch != '|' && ch != ' ' && ch != '\t' && ch != '\n') {
+                    only_filler = false;
+                    break;
+                }
+            }
+            if (only_filler) continue;
+        }
 
         int hlevel = stats.heading_level(l.font_size);
 
@@ -1007,6 +1600,12 @@ ExtractResult extract_pdf(const std::string& pdf_path, const ConvertOptions& opt
                 auto segments = extract_line_segments(page);
                 result.all_tables[p] = detect_tables(segments, text_page,
                     result.page_widths[p], result.page_heights[p]);
+                // Second pass: detect tables from text alignment alone
+                auto text_tables = detect_text_tables(text_page,
+                    result.all_tables[p],
+                    result.page_widths[p], result.page_heights[p]);
+                for (auto& tt : text_tables)
+                    result.all_tables[p].push_back(std::move(tt));
             }
             FPDFText_ClosePage(text_page);
         }
