@@ -8,7 +8,7 @@ C++17 document converter with Python bindings. Converts PDF, Office (DOCX/XLSX/P
 - **Output options** — Markdown (with headings, bold, tables) or plain text (with page separators)
 - **Heading detection** — font size ratio analysis (H1–H4)
 - **Bold / Italic** — font name pattern matching + inline formatting
-- **Table extraction** — line segment grid detection, pipe-delimited markdown output
+- **Table extraction** — line-based grid detection + text-based borderless table detection
 - **Image extraction** — returns image bytes in Python (no file save required)
 - **Page chunking** — per-page output for RAG pipelines
 - **Python bindings** — pybind11 module, returns text/data directly (no file I/O needed)
@@ -187,6 +187,37 @@ for (auto& chunk : chunks) {
 }
 ```
 
+### C API (Shared Library)
+
+```c
+#include <jdoc/jdoc_c_api.h>
+
+char err[256];
+
+// Extract text only
+char* text = jdoc_extract_text("input.pdf", err, sizeof(err));
+// use text...
+jdoc_free_string(text);
+
+// Extract images only
+JDocImage* images = NULL;
+int count = jdoc_extract_images("input.pdf", &images, err, sizeof(err));
+for (int i = 0; i < count; i++) {
+    // images[i].name, .data, .data_size, .format, .width, .height
+}
+jdoc_free_images(images, count);
+
+// Extract text + images in a single pass
+JDocImage* imgs = NULL;
+int img_count = 0;
+char* md = jdoc_extract_all("input.pdf", &imgs, &img_count, err, sizeof(err));
+// use md and imgs...
+jdoc_free_string(md);
+jdoc_free_images(imgs, img_count);
+```
+
+Link with `-ljdoc` (builds as `libjdoc.so`).
+
 ### CMake Integration
 
 ```cmake
@@ -253,10 +284,10 @@ Document file (PDF/Office/HTML/HWP/HWPX)
       │ Formatter        │
       └──────────────────┘
                 │
-      ┌────────┴────────┐
-      ▼                 ▼
-  Python API        CLI / C++ API
-(return string)   (stdout / file)
+      ┌────────┼────────┐
+      ▼        ▼        ▼
+  Python    CLI /    C API
+   API     C++ API  (libjdoc.so)
 ```
 
 ## License
