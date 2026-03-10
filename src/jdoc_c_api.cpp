@@ -13,8 +13,17 @@
 #include <string>
 #include <vector>
 #include <algorithm>
+#include <mutex>
+
+// ---------------------------------------------------------------------------
+// Internal helpers
+// ---------------------------------------------------------------------------
 
 enum class FileFormat { PDF, OFFICE, HWP, HWPX, UNKNOWN };
+
+// pdfium is NOT thread-safe even with separate document handles.
+// Only PDF operations need serialization; OOXML/HWP/HWPX parsers are safe.
+static std::mutex g_pdf_mutex;
 
 static std::string get_ext(const std::string& path) {
     auto dot = path.rfind('.');
@@ -68,24 +77,105 @@ static FileFormat detect_format(const std::string& path) {
     return FileFormat::UNKNOWN;
 }
 
-static void set_error(char* err_buf, int err_buf_size, const char* msg) {
-    if (err_buf && err_buf_size > 0) {
-        strncpy(err_buf, msg, err_buf_size - 1);
-        err_buf[err_buf_size - 1] = '\0';
+static void set_error(char* buf, int buf_size, const char* msg) {
+    if (buf && buf_size > 0) {
+        strncpy(buf, msg, buf_size - 1);
+        buf[buf_size - 1] = '\0';
     }
 }
 
 static char* strdup_cpp(const std::string& s) {
     char* p = (char*)malloc(s.size() + 1);
-    if (p) {
-        memcpy(p, s.c_str(), s.size() + 1);
+    if (!p) {
+        p = (char*)malloc(1);
+        if (p) p[0] = '\0';
+        return p;
     }
+    memcpy(p, s.c_str(), s.size() + 1);
     return p;
 }
+
+// Parse document into chunks (shared by all extract functions).
+// PDF calls are serialized via g_pdf_mutex; other formats run concurrently.
+static std::vector<jdoc::PageChunk> parse_chunks(const std::string& path,
+                                                   FileFormat fmt,
+                                                   const jdoc::ConvertOptions& opts) {
+    if (fmt == FileFormat::PDF) {
+        std::lock_guard<std::mutex> lock(g_pdf_mutex);
+        return jdoc::pdf_to_markdown_chunks(path, opts);
+    }
+    switch (fmt) {
+        case FileFormat::HWPX:  return jdoc::hwpx_to_markdown_chunks(path, opts);
+        case FileFormat::HWP:   return jdoc::hwp_to_markdown_chunks(path, opts);
+        case FileFormat::OFFICE: return jdoc::office_to_markdown_chunks(path, opts);
+        default:                 return {};
+    }
+}
+
+// Concatenate chunk texts with pre-reserved buffer
+static std::string concat_text(const std::vector<jdoc::PageChunk>& chunks) {
+    size_t total = 0;
+    for (auto& c : chunks) total += c.text.size() + 1;
+
+    std::string text;
+    text.reserve(total);
+    for (auto& c : chunks) {
+        if (!text.empty() && !c.text.empty()) text += '\n';
+        text += c.text;
+    }
+    return text;
+}
+
+// Build C image array from chunks. Returns count, -1 on alloc failure.
+static int build_images(const std::vector<jdoc::PageChunk>& chunks,
+                        JDocImage** out, char* err_buf, int err_buf_size) {
+    size_t n = 0;
+    for (auto& c : chunks) n += c.images.size();
+
+    if (n == 0) {
+        *out = nullptr;
+        return 0;
+    }
+
+    JDocImage* arr = (JDocImage*)calloc(n, sizeof(JDocImage));
+    if (!arr) {
+        set_error(err_buf, err_buf_size, "memory allocation failed");
+        return -1;
+    }
+
+    size_t idx = 0;
+    for (auto& c : chunks) {
+        for (auto& src : c.images) {
+            arr[idx].page_number = src.page_number;
+            arr[idx].name = strdup_cpp(src.name);
+            arr[idx].width = src.width;
+            arr[idx].height = src.height;
+            arr[idx].format = strdup_cpp(src.format);
+            arr[idx].data_size = (int)src.data.size();
+            if (!src.data.empty()) {
+                arr[idx].data = (char*)malloc(src.data.size());
+                if (arr[idx].data)
+                    memcpy(arr[idx].data, src.data.data(), src.data.size());
+            }
+            idx++;
+        }
+    }
+
+    *out = arr;
+    return (int)n;
+}
+
+// ---------------------------------------------------------------------------
+// Public C API
+// ---------------------------------------------------------------------------
 
 extern "C" {
 
 char* jdoc_extract_text(const char* file_path, char* err_buf, int err_buf_size) {
+    if (!file_path) {
+        set_error(err_buf, err_buf_size, "file_path is NULL");
+        return nullptr;
+    }
     try {
         std::string path(file_path);
         auto fmt = detect_format(path);
@@ -99,12 +189,16 @@ char* jdoc_extract_text(const char* file_path, char* err_buf, int err_buf_size) 
         opts.extract_tables = true;
 
         std::string text;
-        switch (fmt) {
-            case FileFormat::PDF:    text = jdoc::pdf_to_markdown(path, opts); break;
-            case FileFormat::HWPX:   text = jdoc::hwpx_to_markdown(path, opts); break;
-            case FileFormat::HWP:    text = jdoc::hwp_to_markdown(path, opts); break;
-            case FileFormat::OFFICE: text = jdoc::office_to_markdown(path, opts); break;
-            default: break;
+        if (fmt == FileFormat::PDF) {
+            std::lock_guard<std::mutex> lock(g_pdf_mutex);
+            text = jdoc::pdf_to_markdown(path, opts);
+        } else {
+            switch (fmt) {
+                case FileFormat::HWPX:   text = jdoc::hwpx_to_markdown(path, opts); break;
+                case FileFormat::HWP:    text = jdoc::hwp_to_markdown(path, opts); break;
+                case FileFormat::OFFICE: text = jdoc::office_to_markdown(path, opts); break;
+                default: break;
+            }
         }
         return strdup_cpp(text);
     } catch (const std::exception& e) {
@@ -118,6 +212,14 @@ char* jdoc_extract_text(const char* file_path, char* err_buf, int err_buf_size) 
 
 int jdoc_extract_images(const char* file_path, JDocImage** out_images,
                         char* err_buf, int err_buf_size) {
+    if (!file_path) {
+        set_error(err_buf, err_buf_size, "file_path is NULL");
+        return -1;
+    }
+    if (!out_images) {
+        set_error(err_buf, err_buf_size, "out_images is NULL");
+        return -1;
+    }
     try {
         std::string path(file_path);
         auto fmt = detect_format(path);
@@ -130,52 +232,10 @@ int jdoc_extract_images(const char* file_path, JDocImage** out_images,
         opts.extract_images = true;
         opts.page_chunks = true;
 
-        std::vector<jdoc::PageChunk> chunks;
-        switch (fmt) {
-            case FileFormat::PDF:    chunks = jdoc::pdf_to_markdown_chunks(path, opts); break;
-            case FileFormat::HWPX:   chunks = jdoc::hwpx_to_markdown_chunks(path, opts); break;
-            case FileFormat::HWP:    chunks = jdoc::hwp_to_markdown_chunks(path, opts); break;
-            case FileFormat::OFFICE: chunks = jdoc::office_to_markdown_chunks(path, opts); break;
-            default: break;
-        }
 
-        // Collect all images
-        std::vector<jdoc::ImageData> all_images;
-        for (auto& chunk : chunks) {
-            for (auto& img : chunk.images) {
-                all_images.push_back(std::move(img));
-            }
-        }
+        auto chunks = parse_chunks(path, fmt, opts);
 
-        if (all_images.empty()) {
-            *out_images = nullptr;
-            return 0;
-        }
-
-        JDocImage* images = (JDocImage*)calloc(all_images.size(), sizeof(JDocImage));
-        if (!images) {
-            set_error(err_buf, err_buf_size, "memory allocation failed");
-            return -1;
-        }
-
-        for (size_t i = 0; i < all_images.size(); i++) {
-            auto& src = all_images[i];
-            images[i].page_number = src.page_number;
-            images[i].name = strdup_cpp(src.name);
-            images[i].width = src.width;
-            images[i].height = src.height;
-            images[i].format = strdup_cpp(src.format);
-            images[i].data_size = (int)src.data.size();
-            if (!src.data.empty()) {
-                images[i].data = (char*)malloc(src.data.size());
-                if (images[i].data) {
-                    memcpy(images[i].data, src.data.data(), src.data.size());
-                }
-            }
-        }
-
-        *out_images = images;
-        return (int)all_images.size();
+        return build_images(chunks, out_images, err_buf, err_buf_size);
     } catch (const std::exception& e) {
         set_error(err_buf, err_buf_size, e.what());
         return -1;
@@ -188,6 +248,14 @@ int jdoc_extract_images(const char* file_path, JDocImage** out_images,
 char* jdoc_extract_all(const char* file_path,
                        JDocImage** out_images, int* out_image_count,
                        char* err_buf, int err_buf_size) {
+    if (!file_path) {
+        set_error(err_buf, err_buf_size, "file_path is NULL");
+        return nullptr;
+    }
+    if (!out_images || !out_image_count) {
+        set_error(err_buf, err_buf_size, "output pointer is NULL");
+        return nullptr;
+    }
     try {
         std::string path(file_path);
         auto fmt = detect_format(path);
@@ -196,66 +264,19 @@ char* jdoc_extract_all(const char* file_path,
             return nullptr;
         }
 
-        // Single parse: extract both text and images via chunks API
         jdoc::ConvertOptions opts;
         opts.extract_images = true;
         opts.extract_tables = true;
         opts.page_chunks = true;
 
-        std::vector<jdoc::PageChunk> chunks;
-        switch (fmt) {
-            case FileFormat::PDF:    chunks = jdoc::pdf_to_markdown_chunks(path, opts); break;
-            case FileFormat::HWPX:   chunks = jdoc::hwpx_to_markdown_chunks(path, opts); break;
-            case FileFormat::HWP:    chunks = jdoc::hwp_to_markdown_chunks(path, opts); break;
-            case FileFormat::OFFICE: chunks = jdoc::office_to_markdown_chunks(path, opts); break;
-            default: break;
-        }
 
-        // Concatenate text from all chunks
-        std::string text;
-        for (auto& chunk : chunks) {
-            if (!text.empty() && !chunk.text.empty()) {
-                text += '\n';
-            }
-            text += chunk.text;
-        }
+        auto chunks = parse_chunks(path, fmt, opts);
 
-        // Collect images
-        std::vector<jdoc::ImageData> all_images;
-        for (auto& chunk : chunks) {
-            for (auto& img : chunk.images) {
-                all_images.push_back(std::move(img));
-            }
-        }
+        std::string text = concat_text(chunks);
 
-        // Build image output
-        if (all_images.empty()) {
-            *out_images = nullptr;
-            *out_image_count = 0;
-        } else {
-            JDocImage* images = (JDocImage*)calloc(all_images.size(), sizeof(JDocImage));
-            if (!images) {
-                set_error(err_buf, err_buf_size, "memory allocation failed");
-                return nullptr;
-            }
-            for (size_t i = 0; i < all_images.size(); i++) {
-                auto& src = all_images[i];
-                images[i].page_number = src.page_number;
-                images[i].name = strdup_cpp(src.name);
-                images[i].width = src.width;
-                images[i].height = src.height;
-                images[i].format = strdup_cpp(src.format);
-                images[i].data_size = (int)src.data.size();
-                if (!src.data.empty()) {
-                    images[i].data = (char*)malloc(src.data.size());
-                    if (images[i].data) {
-                        memcpy(images[i].data, src.data.data(), src.data.size());
-                    }
-                }
-            }
-            *out_images = images;
-            *out_image_count = (int)all_images.size();
-        }
+        int img_count = build_images(chunks, out_images, err_buf, err_buf_size);
+        if (img_count < 0) return nullptr;
+        *out_image_count = img_count;
 
         return strdup_cpp(text);
     } catch (const std::exception& e) {
@@ -267,9 +288,81 @@ char* jdoc_extract_all(const char* file_path,
     }
 }
 
-void jdoc_free_string(char* str) {
-    free(str);
+char* jdoc_extract_all_paged(const char* file_path,
+                              JDocImage** out_images, int* out_image_count,
+                              JDocPageText** out_pages, int* out_page_count,
+                              char* err_buf, int err_buf_size) {
+    if (!file_path) {
+        set_error(err_buf, err_buf_size, "file_path is NULL");
+        return nullptr;
+    }
+    if (!out_images || !out_image_count || !out_pages || !out_page_count) {
+        set_error(err_buf, err_buf_size, "output pointer is NULL");
+        return nullptr;
+    }
+    try {
+        std::string path(file_path);
+        auto fmt = detect_format(path);
+        if (fmt == FileFormat::UNKNOWN) {
+            set_error(err_buf, err_buf_size, "unsupported file format");
+            return nullptr;
+        }
+
+        jdoc::ConvertOptions opts;
+        opts.extract_images = true;
+        opts.extract_tables = true;
+        opts.page_chunks = true;
+
+
+        auto chunks = parse_chunks(path, fmt, opts);
+
+        std::string text = concat_text(chunks);
+
+        // Build per-page text
+        if (chunks.empty()) {
+            *out_pages = nullptr;
+            *out_page_count = 0;
+        } else {
+            JDocPageText* pages = (JDocPageText*)calloc(chunks.size(), sizeof(JDocPageText));
+            if (!pages) {
+                set_error(err_buf, err_buf_size, "memory allocation failed");
+                return nullptr;
+            }
+            for (size_t i = 0; i < chunks.size(); i++) {
+                pages[i].page_number = chunks[i].page_number;
+                pages[i].text = strdup_cpp(chunks[i].text);
+            }
+            *out_pages = pages;
+            *out_page_count = (int)chunks.size();
+        }
+
+        // Build images
+        int img_count = build_images(chunks, out_images, err_buf, err_buf_size);
+        if (img_count < 0) {
+            jdoc_free_page_texts(*out_pages, *out_page_count);
+            *out_pages = nullptr;
+            *out_page_count = 0;
+            return nullptr;
+        }
+        *out_image_count = img_count;
+
+        return strdup_cpp(text);
+    } catch (const std::exception& e) {
+        set_error(err_buf, err_buf_size, e.what());
+        return nullptr;
+    } catch (...) {
+        set_error(err_buf, err_buf_size, "unknown error");
+        return nullptr;
+    }
 }
+
+void jdoc_free_page_texts(JDocPageText* pages, int count) {
+    if (!pages) return;
+    for (int i = 0; i < count; i++) free(pages[i].text);
+    free(pages);
+}
+
+void jdoc_free_string(char* str) { free(str); }
 
 void jdoc_free_images(JDocImage* images, int count) {
     if (!images) return;
