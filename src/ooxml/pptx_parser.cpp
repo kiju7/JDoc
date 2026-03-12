@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <regex>
+#include <set>
 #include <sys/stat.h>
 #include <sstream>
 
@@ -305,6 +306,68 @@ PptxParser::SlideContent PptxParser::parse_slide(
     return content;
 }
 
+// ── Slide relationship parsing ──────────────────────────
+
+std::map<std::string, std::string> PptxParser::parse_slide_rels(
+    const std::string& slide_path) {
+
+    std::map<std::string, std::string> rels;
+    // e.g. "ppt/slides/slide1.xml" -> "ppt/slides/_rels/slide1.xml.rels"
+    auto slash = slide_path.rfind('/');
+    if (slash == std::string::npos) return rels;
+    std::string dir = slide_path.substr(0, slash);
+    std::string base = slide_path.substr(slash + 1);
+    std::string rels_path = dir + "/_rels/" + base + ".rels";
+
+    if (!zip_.has_entry(rels_path)) return rels;
+
+    auto data = zip_.read_entry(rels_path);
+    pugi::xml_document doc;
+    if (!doc.load_buffer(data.data(), data.size())) return rels;
+
+    std::vector<pugi::xml_node> rel_nodes;
+    xml_find_all(doc, "Relationship", rel_nodes);
+
+    for (auto& rel : rel_nodes) {
+        const char* id = xml_attr(rel, "Id");
+        const char* target = xml_attr(rel, "Target");
+        if (id[0] && target[0]) {
+            std::string full_target = target;
+            if (full_target.find("../") == 0) {
+                // Relative to slide dir -> resolve to ppt/ level
+                full_target = "ppt/" + full_target.substr(3);
+            } else if (full_target.find("ppt/") != 0 &&
+                       full_target.find("http") != 0 &&
+                       full_target[0] != '/') {
+                full_target = dir + "/" + full_target;
+            }
+            rels[id] = full_target;
+        }
+    }
+    return rels;
+}
+
+// ── Collect image rIds from shape tree ──────────────────
+
+void PptxParser::collect_image_rids(const pugi::xml_node& node,
+                                     std::vector<std::string>& rids) {
+    // Look for <a:blip r:embed="rIdX"/> anywhere in the tree
+    const char* name = node.name();
+    const char* colon = strchr(name, ':');
+    const char* local = colon ? colon + 1 : name;
+
+    if (strcmp(local, "blip") == 0) {
+        const char* embed = xml_attr(node, "embed");
+        if (embed[0]) rids.push_back(embed);
+        const char* link = xml_attr(node, "link");
+        if (link[0]) rids.push_back(link);
+    }
+
+    for (auto child = node.first_child(); child; child = child.next_sibling()) {
+        collect_image_rids(child, rids);
+    }
+}
+
 // ── Image extraction ────────────────────────────────────
 
 std::vector<ImageData> PptxParser::extract_images(
@@ -313,8 +376,61 @@ std::vector<ImageData> PptxParser::extract_images(
     std::vector<ImageData> images;
     if (!opts.extract_images) return images;
 
+    // Track already-extracted media paths to avoid duplicates
+    std::set<std::string> extracted;
+
+    // Per-slide image extraction via relationships
+    for (size_t i = 0; i < slide_paths_.size(); ++i) {
+        int slide_num = static_cast<int>(i) + 1;
+        auto rels = parse_slide_rels(slide_paths_[i]);
+
+        // Parse slide XML to find image references
+        auto slide_data = zip_.read_entry(slide_paths_[i]);
+        pugi::xml_document doc;
+        if (!doc.load_buffer(slide_data.data(), slide_data.size())) continue;
+
+        std::vector<std::string> rids;
+        collect_image_rids(doc, rids);
+
+        for (auto& rid : rids) {
+            auto it = rels.find(rid);
+            if (it == rels.end()) continue;
+            const std::string& media_path = it->second;
+            if (!zip_.has_entry(media_path) || extracted.count(media_path)) continue;
+            extracted.insert(media_path);
+
+            std::string ext = util::get_extension(media_path);
+            std::string fmt = util::image_format_from_ext(ext);
+
+            ImageData img;
+            img.page_number = slide_num;
+            img.name = util::get_filename(media_path);
+            img.format = fmt;
+
+            if (!opts.image_output_dir.empty()) {
+                mkdir(opts.image_output_dir.c_str(), 0755);
+                std::string out_path = opts.image_output_dir + "/" + img.name;
+                const ZipReader::Entry* entry_ptr = nullptr;
+                for (auto& e : zip_.entries()) {
+                    if (e.name == media_path) { entry_ptr = &e; break; }
+                }
+                if (entry_ptr && zip_.extract_entry_to_file(*entry_ptr, out_path)) {
+                    img.saved_path = out_path;
+                }
+            } else {
+                img.data = zip_.read_entry(media_path);
+            }
+
+            images.push_back(std::move(img));
+        }
+    }
+
+    // Fallback: pick up any remaining files in ppt/media/ not yet extracted
     auto entries = zip_.entries_with_prefix("ppt/media/");
     for (auto* entry : entries) {
+        if (extracted.count(entry->name)) continue;
+        extracted.insert(entry->name);
+
         std::string ext = util::get_extension(entry->name);
         std::string fmt = util::image_format_from_ext(ext);
 
@@ -325,8 +441,7 @@ std::vector<ImageData> PptxParser::extract_images(
 
         if (!opts.image_output_dir.empty()) {
             mkdir(opts.image_output_dir.c_str(), 0755);
-            std::string out_path =
-                opts.image_output_dir + "/" + img.name;
+            std::string out_path = opts.image_output_dir + "/" + img.name;
             if (zip_.extract_entry_to_file(*entry, out_path)) {
                 img.saved_path = out_path;
             }
@@ -382,6 +497,14 @@ std::string PptxParser::to_markdown(const ConvertOptions& opts) {
         }
     }
 
+    // Extract and reference images
+    auto images = extract_images(opts);
+    if (!images.empty()) {
+        for (auto& img : images) {
+            out << "![" << img.name << "](" << img.name << ")\n\n";
+        }
+    }
+
     return out.str();
 }
 
@@ -434,17 +557,17 @@ std::vector<PageChunk> PptxParser::to_chunks(
         chunks.push_back(std::move(chunk));
     }
 
-    // Distribute images to chunks (by slide relationship if available, else first chunk)
+    // Distribute images to their corresponding slide chunks
     if (!all_images.empty() && !chunks.empty()) {
-        // Add image references to text and attach to appropriate chunks
         for (auto& img : all_images) {
-            // Default: attach to first chunk
-            auto& target = chunks[0];
-            std::string ref = img.saved_path.empty() ? img.name : img.saved_path;
-            if (target.text.empty() || target.text.find("![") == std::string::npos) {
-                target.text += "![" + img.name + "](" + (img.saved_path.empty() ? "embedded:" + img.name : img.saved_path) + ")\n\n";
+            // Find the chunk matching this image's page_number
+            PageChunk* target = &chunks[0];
+            for (auto& c : chunks) {
+                if (c.page_number == img.page_number) { target = &c; break; }
             }
-            target.images.push_back(std::move(img));
+            std::string ref = img.saved_path.empty() ? "embedded:" + img.name : img.saved_path;
+            target->text += "![" + img.name + "](" + ref + ")\n\n";
+            target->images.push_back(std::move(img));
         }
     }
 
