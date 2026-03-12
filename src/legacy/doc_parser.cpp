@@ -23,7 +23,6 @@ std::string DocParser::extract_text() {
     if (word_doc.size() < 0x60) return "";
 
     // Parse FIB header.
-    // fWhichTblStm is bit 9 of the uint16_t at offset 0x000A.
     uint16_t flags = util::read_u16_le(word_doc.data() + 0x0A);
     bool use_1table = (flags >> 9) & 1;
     std::string table_name = use_1table ? "1Table" : "0Table";
@@ -31,46 +30,58 @@ std::string DocParser::extract_text() {
     std::vector<char> table_stream = ole_.read_stream(table_name);
     if (table_stream.empty()) return "";
 
-    // Locate fcClx and lcbClx in FIB.
-    // FibRgFcLcb97 structure: the position depends on the FIB version.
-    // For Word 97-2003, FibRgFcLcb97 starts at offset 0x01A2 from the beginning of FIB.
-    // fcClx is at an offset within FibRgFcLcb97. It's the 66th pair (0-indexed: 65),
-    // so at FibRgFcLcb97 + 65*8 = FibRgFcLcb97 + 520.
-    // But the actual offset from the FIB start is complicated. Let's use the known
-    // absolute offset: fcClx is at 0x01A2 in the FIB. Let me use the more reliable
-    // approach of scanning from FibRgW97 / FibRgLw97.
-    //
-    // FIB layout:
-    //   0x0000: FibBase (32 bytes)
-    //   0x0020: uint16_t csw (count of shorts in FibRgW)
-    //   0x0022: FibRgW97 (csw * 2 bytes)
-    //   After FibRgW: uint16_t cslw (count of longs in FibRgLw)
-    //   After that: FibRgLw97 (cslw * 4 bytes)
-    //   After that: uint16_t cbRgFcLcb (count of FC/LCB pairs)
-    //   After that: FibRgFcLcb (cbRgFcLcb * 8 bytes)
-    //   fcClx is the 66th FC/LCB pair (index 65, 0-based) = pair at offset 65*8=520 within FibRgFcLcb.
+    // Locate fcClx/lcbClx — the Clx (piece table) position in the table stream.
+    // We try multiple methods because the FIB layout varies across Word versions.
+    uint32_t fcClx = 0, lcbClx = 0;
 
-    if (word_doc.size() < 0x22) return "";
-    uint16_t csw = util::read_u16_le(word_doc.data() + 0x20);
-    size_t pos = 0x22 + csw * 2;
+    // Helper: validate a candidate fcClx/lcbClx pair.
+    // The Clx structure begins with optional Prc (0x01) entries followed by Pcdt (0x02).
+    auto valid_clx = [&](uint32_t fc, uint32_t lcb) -> bool {
+        if (fc == 0 || lcb == 0) return false;
+        if (static_cast<size_t>(fc) + lcb > table_stream.size()) return false;
+        // Walk past any Prc (0x01) entries, then expect Pcdt (0x02).
+        size_t base = fc;
+        size_t p = 0;
+        while (p < lcb && base + p < table_stream.size() &&
+               static_cast<uint8_t>(table_stream[base + p]) == 0x01) {
+            if (p + 3 > lcb || base + p + 3 > table_stream.size()) return false;
+            uint16_t prc_len = util::read_u16_le(table_stream.data() + base + p + 1);
+            p += 3 + prc_len;
+        }
+        return p < lcb && base + p < table_stream.size() &&
+               static_cast<uint8_t>(table_stream[base + p]) == 0x02;
+    };
 
-    if (pos + 2 > word_doc.size()) return "";
-    uint16_t cslw = util::read_u16_le(word_doc.data() + pos);
-    pos += 2 + cslw * 4;
+    // Method 1: absolute FIB offset 0x01A2 (MS-DOC §2.5.6, Word 97–2007+).
+    if (0x01A2 + 8 <= word_doc.size()) {
+        uint32_t fc  = util::read_u32_le(word_doc.data() + 0x01A2);
+        uint32_t lcb = util::read_u32_le(word_doc.data() + 0x01A2 + 4);
+        if (valid_clx(fc, lcb)) { fcClx = fc; lcbClx = lcb; }
+    }
 
-    if (pos + 2 > word_doc.size()) return "";
-    uint16_t cbRgFcLcb = util::read_u16_le(word_doc.data() + pos);
-    pos += 2;
-
-    // fcClx is the 66th pair (index 65) in the FC/LCB table.
-    size_t fc_clx_offset = pos + 65 * 8;
-    if (fc_clx_offset + 8 > word_doc.size()) return "";
-
-    uint32_t fcClx  = util::read_u32_le(word_doc.data() + fc_clx_offset);
-    uint32_t lcbClx = util::read_u32_le(word_doc.data() + fc_clx_offset + 4);
+    // Method 2: navigate FIB variable-length sections (non-standard layouts).
+    if (fcClx == 0 && word_doc.size() >= 0x22) {
+        uint16_t csw = util::read_u16_le(word_doc.data() + 0x20);
+        size_t pos = 0x22 + csw * 2;
+        if (pos + 2 <= word_doc.size()) {
+            uint16_t cslw = util::read_u16_le(word_doc.data() + pos);
+            pos += 2 + cslw * 4;
+        }
+        if (pos + 2 <= word_doc.size()) {
+            uint16_t cbRgFcLcb = util::read_u16_le(word_doc.data() + pos);
+            pos += 2;
+            // Try index 65 and 66 (common positions for fcClx).
+            for (int idx : {65, 66}) {
+                size_t off = pos + idx * 8;
+                if (off + 8 > word_doc.size() || idx >= cbRgFcLcb) continue;
+                uint32_t fc  = util::read_u32_le(word_doc.data() + off);
+                uint32_t lcb = util::read_u32_le(word_doc.data() + off + 4);
+                if (valid_clx(fc, lcb)) { fcClx = fc; lcbClx = lcb; break; }
+            }
+        }
+    }
 
     if (fcClx == 0 || lcbClx == 0) return "";
-    if (fcClx + lcbClx > table_stream.size()) return "";
 
     // Parse Clx structure.
     const char* clx = table_stream.data() + fcClx;
@@ -126,7 +137,7 @@ std::string DocParser::extract_text() {
         if (compressed) {
             // CP1252 encoded, 1 byte per character.
             byte_offset /= 2;
-            if (byte_offset + char_count > word_doc.size()) continue;
+            if (static_cast<size_t>(byte_offset) + char_count > word_doc.size()) continue;
             for (uint32_t j = 0; j < char_count; ++j) {
                 uint8_t ch = static_cast<uint8_t>(word_doc[byte_offset + j]);
                 if (ch == 0x0D) {
@@ -141,7 +152,7 @@ std::string DocParser::extract_text() {
         } else {
             // UTF-16LE, 2 bytes per character.
             size_t byte_len = static_cast<size_t>(char_count) * 2;
-            if (byte_offset + byte_len > word_doc.size()) continue;
+            if (static_cast<size_t>(byte_offset) + byte_len > word_doc.size()) continue;
             const char* src = word_doc.data() + byte_offset;
             for (uint32_t j = 0; j < char_count; ++j) {
                 uint16_t ch = util::read_u16_le(src + j * 2);
