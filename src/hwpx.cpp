@@ -608,7 +608,7 @@ private:
 
         auto walk = [&](pugi::xml_node node, auto& self) -> void {
             std::string name = node.name();
-            if (name == "hc:img" || name.find(":img") != std::string::npos) {
+            if (name == "hc:img") {
                 bin_ref = node.attribute("binaryItemIDRef").as_string();
             }
             if (name == "hp:orgSz" || name.find("orgSz") != std::string::npos) {
