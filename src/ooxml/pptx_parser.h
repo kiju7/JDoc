@@ -5,6 +5,7 @@
 #include "zip_reader.h"
 #include "xml_utils.h"
 #include "jdoc/types.h"
+#include <map>
 #include <string>
 #include <vector>
 
@@ -44,6 +45,13 @@ private:
 
     std::vector<ImageData> extract_images(
         const ConvertOptions& opts);
+
+    // Parse slide relationships to map rId -> media target
+    std::map<std::string, std::string> parse_slide_rels(const std::string& slide_path);
+
+    // Collect image rIds referenced in a slide's shape tree
+    void collect_image_rids(const pugi::xml_node& node,
+                            std::vector<std::string>& rids);
 
     std::string format_table(
         const std::vector<std::vector<std::string>>& rows);
