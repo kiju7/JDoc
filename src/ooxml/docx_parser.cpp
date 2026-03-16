@@ -128,8 +128,10 @@ void DocxParser::parse_relationships() {
         if (id[0] && target[0]) {
             // Targets are relative to word/ directory
             std::string full_target = target;
-            if (full_target.find('/') == std::string::npos &&
-                full_target.find("word/") != 0) {
+            if (full_target.find("word/") != 0 &&
+                full_target.find("http://") != 0 &&
+                full_target.find("https://") != 0 &&
+                full_target[0] != '/') {
                 full_target = "word/" + full_target;
             }
             rel_targets_[id] = full_target;
@@ -228,6 +230,23 @@ static std::string find_image_rid(const pugi::xml_node& para) {
         const char* link = xml_attr(blip, "link");
         if (link[0]) return link;
     }
+
+    // Also check VML: <w:pict> -> <v:shape> -> <v:imagedata r:id="rIdX">
+    std::vector<pugi::xml_node> imagedata_nodes;
+    xml_find_all(para, "imagedata", imagedata_nodes);
+    for (auto& imgdata : imagedata_nodes) {
+        const char* rid = xml_attr(imgdata, "id");
+        if (rid[0]) return rid;
+        // Check namespaced r:id attribute
+        for (auto attr = imgdata.first_attribute(); attr; attr = attr.next_attribute()) {
+            std::string aname = attr.name();
+            if (aname == "r:id" || aname.find(":id") != std::string::npos) {
+                std::string val = attr.value();
+                if (val.find("rId") == 0) return val;
+            }
+        }
+    }
+
     return "";
 }
 
@@ -492,11 +511,15 @@ std::string DocxParser::to_markdown(const ConvertOptions& opts) {
         }
 
         // Image reference
-        if (!elem.image_rid.empty() && opts.extract_images) {
+        if (!elem.image_rid.empty()) {
             auto it = rel_targets_.find(elem.image_rid);
             if (it != rel_targets_.end()) {
                 std::string img_name = util::get_filename(it->second);
-                out << "![" << img_name << "](" << img_name << ")\n\n";
+                if (opts.extract_images) {
+                    out << "![" << img_name << "](" << img_name << ")\n\n";
+                } else {
+                    out << "![" << img_name << "](embedded:" << img_name << ")\n\n";
+                }
             }
         }
 
@@ -578,7 +601,7 @@ std::vector<PageChunk> DocxParser::to_chunks(
 
     auto flush_chunk = [&]() {
         current.text = text.str();
-        if (!current.text.empty() || !current.tables.empty()) {
+        if (!current.text.empty() || !current.tables.empty() || !current.images.empty()) {
             chunks.push_back(std::move(current));
         }
         current = PageChunk{};
@@ -606,6 +629,19 @@ std::vector<PageChunk> DocxParser::to_chunks(
         }
 
         // PARAGRAPH
+        // Handle image references even when text is empty
+        if (!elem.image_rid.empty()) {
+            auto it = rel_targets_.find(elem.image_rid);
+            if (it != rel_targets_.end()) {
+                std::string img_name = util::get_filename(it->second);
+                if (opts.extract_images) {
+                    text << "![" << img_name << "](" << img_name << ")\n\n";
+                } else {
+                    text << "![" << img_name << "](embedded:" << img_name << ")\n\n";
+                }
+            }
+        }
+
         if (elem.text.empty()) {
             if (in_ordered_list) {
                 in_ordered_list = false;
@@ -642,8 +678,13 @@ std::vector<PageChunk> DocxParser::to_chunks(
 
     flush_chunk();
 
-    // Attach images to first chunk
-    if (!chunks.empty() && !all_images.empty()) {
+    // Attach images to first chunk (create one if needed)
+    if (!all_images.empty()) {
+        if (chunks.empty()) {
+            PageChunk c;
+            c.page_number = 1;
+            chunks.push_back(std::move(c));
+        }
         chunks[0].images = std::move(all_images);
     }
 

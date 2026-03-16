@@ -8,6 +8,8 @@
 #include <cctype>
 #include <cstring>
 #include <cstdlib>
+#include <map>
+#include <set>
 #include <sstream>
 #include <sys/stat.h>
 
@@ -345,27 +347,133 @@ std::vector<ImageData> XlsxParser::extract_images(
     std::vector<ImageData> images;
     if (!opts.extract_images) return images;
 
+    std::set<std::string> extracted;
+
+    // Per-sheet image extraction via drawing relationships
+    for (size_t i = 0; i < sheets_.size(); ++i) {
+        int sheet_num = static_cast<int>(i) + 1;
+        const auto& info = sheets_[i];
+        if (info.file_path.empty()) continue;
+
+        // Parse sheet rels to find drawing reference
+        auto slash = info.file_path.rfind('/');
+        if (slash == std::string::npos) continue;
+        std::string dir = info.file_path.substr(0, slash);
+        std::string base = info.file_path.substr(slash + 1);
+        std::string sheet_rels = dir + "/_rels/" + base + ".rels";
+
+        if (!zip_.has_entry(sheet_rels)) continue;
+        auto rels_data = zip_.read_entry(sheet_rels);
+        pugi::xml_document rels_doc;
+        if (!rels_doc.load_buffer(rels_data.data(), rels_data.size())) continue;
+
+        // Find drawing targets (type ends with /drawing)
+        std::vector<pugi::xml_node> rel_nodes;
+        xml_find_all(rels_doc, "Relationship", rel_nodes);
+
+        for (auto& rel : rel_nodes) {
+            const char* type = xml_attr(rel, "Type");
+            const char* target = xml_attr(rel, "Target");
+            if (!target[0]) continue;
+
+            std::string type_str = type;
+            if (type_str.find("/drawing") == std::string::npos) continue;
+
+            // Resolve drawing path
+            std::string drawing_path = target;
+            if (drawing_path.find("../") == 0) {
+                drawing_path = "xl/" + drawing_path.substr(3);
+            } else if (drawing_path.find("xl/") != 0) {
+                drawing_path = dir + "/" + drawing_path;
+            }
+
+            if (!zip_.has_entry(drawing_path)) continue;
+
+            // Parse drawing rels for image targets
+            auto draw_slash = drawing_path.rfind('/');
+            if (draw_slash == std::string::npos) continue;
+            std::string draw_dir = drawing_path.substr(0, draw_slash);
+            std::string draw_base = drawing_path.substr(draw_slash + 1);
+            std::string draw_rels = draw_dir + "/_rels/" + draw_base + ".rels";
+
+            if (!zip_.has_entry(draw_rels)) continue;
+            auto draw_rels_data = zip_.read_entry(draw_rels);
+            pugi::xml_document draw_rels_doc;
+            if (!draw_rels_doc.load_buffer(draw_rels_data.data(), draw_rels_data.size())) continue;
+
+            std::map<std::string, std::string> draw_rel_map;
+            std::vector<pugi::xml_node> draw_rel_nodes;
+            xml_find_all(draw_rels_doc, "Relationship", draw_rel_nodes);
+            for (auto& dr : draw_rel_nodes) {
+                const char* id = xml_attr(dr, "Id");
+                const char* tgt = xml_attr(dr, "Target");
+                if (id[0] && tgt[0]) {
+                    std::string full = tgt;
+                    if (full.find("../") == 0) full = "xl/" + full.substr(3);
+                    else if (full.find("xl/") != 0) full = draw_dir + "/" + full;
+                    draw_rel_map[id] = full;
+                }
+            }
+
+            // Parse drawing XML to find blip references
+            auto draw_data = zip_.read_entry(drawing_path);
+            pugi::xml_document draw_doc;
+            if (!draw_doc.load_buffer(draw_data.data(), draw_data.size())) continue;
+
+            std::vector<pugi::xml_node> blips;
+            xml_find_all(draw_doc, "blip", blips);
+            for (auto& blip : blips) {
+                const char* embed = xml_attr(blip, "embed");
+                if (!embed[0]) continue;
+                auto mit = draw_rel_map.find(embed);
+                if (mit == draw_rel_map.end()) continue;
+                const std::string& media_path = mit->second;
+                if (!zip_.has_entry(media_path) || extracted.count(media_path)) continue;
+                extracted.insert(media_path);
+
+                ImageData img;
+                img.page_number = sheet_num;
+                img.name = util::get_filename(media_path);
+                img.format = util::image_format_from_ext(util::get_extension(media_path));
+
+                if (!opts.image_output_dir.empty()) {
+                    mkdir(opts.image_output_dir.c_str(), 0755);
+                    std::string out_path = opts.image_output_dir + "/" + img.name;
+                    for (auto& e : zip_.entries()) {
+                        if (e.name == media_path) {
+                            if (zip_.extract_entry_to_file(e, out_path))
+                                img.saved_path = out_path;
+                            break;
+                        }
+                    }
+                } else {
+                    img.data = zip_.read_entry(media_path);
+                }
+                images.push_back(std::move(img));
+            }
+        }
+    }
+
+    // Fallback: pick up any remaining files in xl/media/ not yet extracted
     auto entries = zip_.entries_with_prefix("xl/media/");
     for (auto* entry : entries) {
-        std::string ext = util::get_extension(entry->name);
-        std::string fmt = util::image_format_from_ext(ext);
+        if (extracted.count(entry->name)) continue;
+        extracted.insert(entry->name);
 
         ImageData img;
         img.page_number = 1;
         img.name = util::get_filename(entry->name);
-        img.format = fmt;
+        img.format = util::image_format_from_ext(util::get_extension(entry->name));
 
         if (!opts.image_output_dir.empty()) {
             mkdir(opts.image_output_dir.c_str(), 0755);
-            std::string out_path =
-                opts.image_output_dir + "/" + img.name;
+            std::string out_path = opts.image_output_dir + "/" + img.name;
             if (zip_.extract_entry_to_file(*entry, out_path)) {
                 img.saved_path = out_path;
             }
         } else {
             img.data = zip_.read_entry(*entry);
         }
-
         images.push_back(std::move(img));
     }
     return images;
@@ -406,6 +514,14 @@ std::string XlsxParser::to_markdown(const ConvertOptions& opts) {
         out << format_sheet_as_table(sheet) << "\n";
     }
 
+    // Extract and reference images
+    auto images = extract_images(opts);
+    if (!images.empty()) {
+        for (auto& img : images) {
+            out << "![" << img.name << "](" << img.name << ")\n\n";
+        }
+    }
+
     return out.str();
 }
 
@@ -415,7 +531,10 @@ std::vector<PageChunk> XlsxParser::to_chunks(
     const ConvertOptions& opts) {
 
     std::vector<PageChunk> chunks;
-    auto all_images = extract_images(opts);
+    // Always enumerate images so we can reference them in text
+    ConvertOptions img_opts = opts;
+    img_opts.extract_images = true;
+    auto all_images = extract_images(img_opts);
 
     for (size_t i = 0; i < sheets_.size(); ++i) {
         int sheet_num = static_cast<int>(i) + 1;
@@ -477,13 +596,20 @@ std::vector<PageChunk> XlsxParser::to_chunks(
         }
 
         chunk.text = text.str();
-
-        // Attach images to first chunk
-        if (chunks.empty() && !all_images.empty()) {
-            chunk.images = std::move(all_images);
-        }
-
         chunks.push_back(std::move(chunk));
+    }
+
+    // Distribute images to their corresponding sheet chunks
+    if (!all_images.empty() && !chunks.empty()) {
+        for (auto& img : all_images) {
+            PageChunk* target = &chunks[0];
+            for (auto& c : chunks) {
+                if (c.page_number == img.page_number) { target = &c; break; }
+            }
+            std::string ref = img.saved_path.empty() ? "embedded:" + img.name : img.saved_path;
+            target->text += "![" + img.name + "](" + ref + ")\n\n";
+            target->images.push_back(std::move(img));
+        }
     }
 
     return chunks;

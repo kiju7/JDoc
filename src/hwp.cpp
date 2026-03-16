@@ -48,6 +48,7 @@ static std::vector<uint8_t> decompress(const uint8_t* data, size_t len) {
     } while (ret != Z_STREAM_END);
 
     output.resize(strm.total_out);
+    output.shrink_to_fit();
     inflateEnd(&strm);
     return output;
 }
@@ -119,6 +120,7 @@ struct HWPParagraph {
 struct HWPEmbeddedImage {
     std::string name;           // e.g. "BIN0001.jpg"
     std::vector<uint8_t> data;
+    std::string name_lower;     // lowercase for case-insensitive lookup
 };
 
 // ── HWP Parser ──────────────────────────────────────────────
@@ -164,6 +166,12 @@ public:
             throw std::runtime_error("No BodyText sections found in HWP file");
         }
 
+        // Release POLE storage - all data has been read into memory
+        storage_.reset();
+        // Release file data - POLE no longer needs it
+        file_data_.clear();
+        file_data_.shrink_to_fit();
+
         return true;
     }
 
@@ -202,7 +210,10 @@ private:
 
     HWPDocInfo doc_info_;
     std::vector<std::vector<uint8_t>> section_data_;
-    std::vector<HWPEmbeddedImage> embedded_images_;
+    // Keyed by lowercase name for O(1) case-insensitive lookup
+    std::map<std::string, HWPEmbeddedImage> embedded_images_;
+    // Ordered list of image names for index-based fallback
+    std::vector<std::string> embedded_image_keys_;
 
     // ── FileHeader parsing ──────────────────────────────────
     void parse_file_header() {
@@ -431,13 +442,28 @@ private:
         auto entries = storage_->entries("BinData");
         for (auto& name : entries) {
             std::string full_path = "BinData/" + name;
-            auto data = read_stream(*storage_, full_path);
-            if (!data.empty()) {
-                HWPEmbeddedImage img;
-                img.name = name;
-                img.data = std::move(data);
-                embedded_images_.push_back(std::move(img));
+            auto raw = read_stream(*storage_, full_path);
+            if (raw.empty()) continue;
+
+            std::vector<uint8_t> data;
+            if (compressed_) {
+                data = decompress(raw.data(), raw.size());
+                // raw is no longer needed after decompress
+                if (data.empty()) data = std::move(raw);
+            } else {
+                data = std::move(raw);
             }
+
+            HWPEmbeddedImage img;
+            img.name = name;
+            // Build lowercase key for case-insensitive lookup
+            std::string key = name;
+            for (auto& c : key) c = std::tolower(c);
+            img.name_lower = key;
+            img.data = std::move(data);
+
+            embedded_image_keys_.push_back(key);
+            embedded_images_.emplace(std::move(key), std::move(img));
         }
     }
 
@@ -448,9 +474,15 @@ private:
         std::vector<uint8_t> data;
         if (compressed_) {
             data = decompress(raw.data(), raw.size());
-            if (data.empty()) data = raw;  // fallback
+            if (data.empty()) {
+                data = std::move(raw);  // fallback: use raw directly
+            } else {
+                // Release raw data - no longer needed after decompress
+                raw.clear();
+                raw.shrink_to_fit();
+            }
         } else {
-            data = raw;
+            data = std::move(raw);  // move instead of copy
         }
 
         // Parse paragraphs from record stream
@@ -628,7 +660,41 @@ private:
                 break;
             }
 
+            case hwp::SHAPE_COMPONENT: {
+                // Check if this is a picture shape (cip$ control type)
+                if (ctrl_state == IN_GSO && hdr.size >= 10) {
+                    // First 4 bytes are the control type name
+                    char sc_name[5] = {};
+                    memcpy(sc_name, data.data() + offset, 4);
+                    if (std::string(sc_name) == "cip$" || std::string(sc_name) == "$pic") {
+                        // ShapeComponent for picture
+                        // binDataId can be found at offset 18 (uint16)
+                        if (hdr.size >= 20) {
+                            uint16_t bin_id = util::read_u16_le(data.data() + offset + 18);
+                            if (bin_id > 0 && current) {
+                                current->image_bin_ids.push_back(bin_id);
+                                gso_bin_id = bin_id;
+                            }
+                        }
+                    }
+                }
+                break;
+            }
+
             case hwp::SHAPE_COMPONENT_PICTURE: {
+                if (ctrl_state == IN_GSO && hdr.size >= 15) {
+                    uint16_t bin_id = util::read_u16_le(data.data() + offset + 13);
+                    if (bin_id > 0 && current) {
+                        current->image_bin_ids.push_back(bin_id);
+                        gso_bin_id = bin_id;
+                    }
+                    ctrl_state = NONE;
+                }
+                break;
+            }
+
+            case hwp::SHAPE_COMPONENT_OLE: {
+                // OLE objects may contain embedded images; extract binDataId
                 if (ctrl_state == IN_GSO && hdr.size >= 15) {
                     uint16_t bin_id = util::read_u16_le(data.data() + offset + 13);
                     if (bin_id > 0 && current) {
@@ -760,43 +826,31 @@ private:
         std::string ext = ref.extension;
         if (ext.empty()) ext = "jpg";
 
-        // Find the embedded image data
+        // Find the embedded image data using map lookup (O(log n))
         // BinData storage name is typically BIN{hex(bin_data_id)}.{ext}
-        // or BIN{decimal_id}.{ext}
         std::string img_name;
         std::vector<uint8_t>* img_data = nullptr;
 
-        // Try to match by binDataId
         char hex_name[32];
-        snprintf(hex_name, sizeof(hex_name), "BIN%04X.%s",
+        snprintf(hex_name, sizeof(hex_name), "bin%04x.%s",
                  ref.bin_data_id, ext.c_str());
-        for (auto& emb : embedded_images_) {
-            if (emb.name == hex_name) {
-                img_name = emb.name;
-                img_data = &emb.data;
-                break;
-            }
+        std::string lookup_key = hex_name;
+        // lowercase for case-insensitive map lookup
+        for (auto& c : lookup_key) c = std::tolower(c);
+
+        auto it = embedded_images_.find(lookup_key);
+        if (it != embedded_images_.end()) {
+            img_name = it->second.name;
+            img_data = &it->second.data;
         }
 
-        // Fallback: try case-insensitive match or any BIN with matching extension
-        if (!img_data) {
-            std::string lower_hex = hex_name;
-            for (auto& c : lower_hex) c = std::tolower(c);
-            for (auto& emb : embedded_images_) {
-                std::string lower_name = emb.name;
-                for (auto& c : lower_name) c = std::tolower(c);
-                if (lower_name == lower_hex) {
-                    img_name = emb.name;
-                    img_data = &emb.data;
-                    break;
-                }
+        // Fallback: try matching by index in insertion order
+        if (!img_data && bin_id <= (int)embedded_image_keys_.size()) {
+            auto fit = embedded_images_.find(embedded_image_keys_[bin_id - 1]);
+            if (fit != embedded_images_.end()) {
+                img_name = fit->second.name;
+                img_data = &fit->second.data;
             }
-        }
-
-        // Still not found? Try matching by index
-        if (!img_data && bin_id <= (int)embedded_images_.size()) {
-            img_name = embedded_images_[bin_id - 1].name;
-            img_data = &embedded_images_[bin_id - 1].data;
         }
 
         if (!img_data || img_data->empty()) return "";
@@ -817,7 +871,12 @@ private:
         idata.page_number = chunk.page_number;
         idata.name = img_name;
         idata.format = ext;
-        idata.data.assign(img_data->begin(), img_data->end());
+        // Reinterpret uint8_t data as char via move of underlying memory
+        idata.data.resize(img_data->size());
+        memcpy(idata.data.data(), img_data->data(), img_data->size());
+        // Release source to free memory immediately
+        img_data->clear();
+        img_data->shrink_to_fit();
         idata.saved_path = saved_path;
         chunk.images.push_back(std::move(idata));
 
