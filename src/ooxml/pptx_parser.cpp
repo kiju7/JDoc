@@ -265,7 +265,7 @@ PptxParser::SlideContent PptxParser::parse_slide(
     SlideContent content;
     auto data = zip_.read_entry(slide_path);
     pugi::xml_document doc;
-    if (!doc.load_buffer(data.data(), data.size())) return content;
+    if (!doc.load_buffer(data.data(), data.size(), pugi::parse_default | pugi::parse_ws_pcdata)) return content;
 
     // Find the shape tree: <p:cSld><p:spTree>
     auto cSld = xml_child(doc.first_child(), "cSld");
@@ -323,7 +323,7 @@ std::map<std::string, std::string> PptxParser::parse_slide_rels(
 
     auto data = zip_.read_entry(rels_path);
     pugi::xml_document doc;
-    if (!doc.load_buffer(data.data(), data.size())) return rels;
+    if (!doc.load_buffer(data.data(), data.size(), pugi::parse_default | pugi::parse_ws_pcdata)) return rels;
 
     std::vector<pugi::xml_node> rel_nodes;
     xml_find_all(doc, "Relationship", rel_nodes);
@@ -387,7 +387,7 @@ std::vector<ImageData> PptxParser::extract_images(
         // Parse slide XML to find image references
         auto slide_data = zip_.read_entry(slide_paths_[i]);
         pugi::xml_document doc;
-        if (!doc.load_buffer(slide_data.data(), slide_data.size())) continue;
+        if (!doc.load_buffer(slide_data.data(), slide_data.size(), pugi::parse_default | pugi::parse_ws_pcdata)) continue;
 
         std::vector<std::string> rids;
         collect_image_rids(doc, rids);
