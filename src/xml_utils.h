@@ -9,27 +9,34 @@
 
 namespace jdoc {
 
-// Collect all text content from a node and its descendants recursively
+// Collect all text content from a node and its descendants recursively.
+// Skips mc:Fallback branches to avoid duplicate text.
 inline std::string xml_text_content(const pugi::xml_node& node) {
     std::string result;
     for (auto child = node.first_child(); child; child = child.next_sibling()) {
         if (child.type() == pugi::node_pcdata || child.type() == pugi::node_cdata) {
             result += child.value();
         } else {
+            const char* name = child.name();
+            const char* colon = strchr(name, ':');
+            const char* local = colon ? colon + 1 : name;
+            if (strcmp(local, "Fallback") == 0) continue;
             result += xml_text_content(child);
         }
     }
     return result;
 }
 
-// Find all descendant nodes with a given name (ignoring namespace prefixes)
+// Find all descendant nodes with a given name (ignoring namespace prefixes).
+// Skips mc:Fallback branches inside mc:AlternateContent to avoid duplicates.
 inline void xml_find_all(const pugi::xml_node& node, const char* local_name,
                           std::vector<pugi::xml_node>& results) {
     for (auto child = node.first_child(); child; child = child.next_sibling()) {
         const char* name = child.name();
-        // Match after namespace prefix (e.g. "w:t" matches "t")
         const char* colon = strchr(name, ':');
         const char* local = colon ? colon + 1 : name;
+        // Skip mc:Fallback — mc:Choice content is preferred
+        if (strcmp(local, "Fallback") == 0) continue;
         if (strcmp(local, local_name) == 0) {
             results.push_back(child);
         }
