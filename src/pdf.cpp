@@ -17,6 +17,7 @@
 #include <cstring>
 #include <stdexcept>
 #include <sys/stat.h>
+#include <zlib.h>
 
 namespace jdoc {
 namespace {
@@ -1432,6 +1433,91 @@ static std::vector<char> bitmap_to_bmp(FPDF_BITMAP bitmap) {
     return bmp;
 }
 
+// ── PNG writer (zlib-based, no external dependency) ──────
+
+static void png_put32(std::vector<char>& v, uint32_t val) {
+    char b[4] = {static_cast<char>((val >> 24) & 0xFF),
+                 static_cast<char>((val >> 16) & 0xFF),
+                 static_cast<char>((val >> 8) & 0xFF),
+                 static_cast<char>(val & 0xFF)};
+    v.insert(v.end(), b, b + 4);
+}
+
+static void png_write_chunk(std::vector<char>& out, const char type[4],
+                             const uint8_t* data, uint32_t len) {
+    png_put32(out, len);
+    size_t type_pos = out.size();
+    out.insert(out.end(), type, type + 4);
+    if (data && len > 0)
+        out.insert(out.end(), reinterpret_cast<const char*>(data),
+                   reinterpret_cast<const char*>(data) + len);
+    uint32_t crc = crc32(0, reinterpret_cast<const Bytef*>(&out[type_pos]),
+                         4 + len);
+    png_put32(out, crc);
+}
+
+// Encode a PDFium bitmap as PNG (RGB, 8-bit, lossless).
+static std::vector<char> bitmap_to_png(FPDF_BITMAP bitmap) {
+    int w = FPDFBitmap_GetWidth(bitmap);
+    int h = FPDFBitmap_GetHeight(bitmap);
+    int stride = FPDFBitmap_GetStride(bitmap);
+    int fmt = FPDFBitmap_GetFormat(bitmap);
+    auto* src = static_cast<uint8_t*>(FPDFBitmap_GetBuffer(bitmap));
+    if (!src || w <= 0 || h <= 0) return {};
+
+    int bpp;
+    switch (fmt) {
+        case FPDFBitmap_Gray: bpp = 1; break;
+        case FPDFBitmap_BGR:  bpp = 3; break;
+        case FPDFBitmap_BGRx:
+        case FPDFBitmap_BGRA: bpp = 4; break;
+        default: return {};
+    }
+
+    // Raw scanlines: filter byte (0x00) + RGB triplets per row
+    size_t row_bytes = 1 + static_cast<size_t>(w) * 3;
+    std::vector<uint8_t> raw(row_bytes * h);
+    for (int y = 0; y < h; y++) {
+        uint8_t* sr = src + y * stride;
+        uint8_t* dr = raw.data() + y * row_bytes;
+        dr[0] = 0; // filter: none
+        for (int x = 0; x < w; x++) {
+            if (bpp >= 3) {
+                dr[1 + x*3]     = sr[x*bpp + 2]; // R (BGR→RGB)
+                dr[1 + x*3 + 1] = sr[x*bpp + 1]; // G
+                dr[1 + x*3 + 2] = sr[x*bpp];     // B
+            } else { // grayscale
+                dr[1 + x*3] = dr[1 + x*3 + 1] = dr[1 + x*3 + 2] = sr[x];
+            }
+        }
+    }
+
+    // Deflate
+    uLong bound = compressBound(static_cast<uLong>(raw.size()));
+    std::vector<uint8_t> deflated(bound);
+    uLong deflated_size = bound;
+    if (compress2(deflated.data(), &deflated_size, raw.data(),
+                  static_cast<uLong>(raw.size()), Z_DEFAULT_COMPRESSION) != Z_OK)
+        return {};
+
+    // Assemble PNG
+    std::vector<char> png;
+    png.reserve(8 + 25 + deflated_size + 24);
+
+    const uint8_t sig[] = {0x89,'P','N','G',0x0D,0x0A,0x1A,0x0A};
+    png.insert(png.end(), sig, sig + 8);
+
+    uint8_t ihdr[13] = {};
+    ihdr[0] = (w >> 24); ihdr[1] = (w >> 16); ihdr[2] = (w >> 8); ihdr[3] = w;
+    ihdr[4] = (h >> 24); ihdr[5] = (h >> 16); ihdr[6] = (h >> 8); ihdr[7] = h;
+    ihdr[8] = 8; ihdr[9] = 2; // 8-bit RGB
+    png_write_chunk(png, "IHDR", ihdr, 13);
+    png_write_chunk(png, "IDAT", deflated.data(), static_cast<uint32_t>(deflated_size));
+    png_write_chunk(png, "IEND", nullptr, 0);
+
+    return png;
+}
+
 // Build a BMP from raw decoded pixel data at original resolution
 static std::vector<char> decoded_pixels_to_bmp(const std::vector<unsigned char>& decoded,
                                                 unsigned int w, unsigned int h,
@@ -1633,6 +1719,40 @@ std::vector<ImageData> extract_images(FPDF_DOCUMENT doc, FPDF_PAGE page,
         img_idx++;
     }
     return images;
+}
+
+// Render a full page as a 150-DPI PNG (fallback for scanned/vector-only pages).
+static ImageData render_page_as_png(FPDF_DOCUMENT doc, FPDF_PAGE page,
+                                     int page_num, const std::string& output_dir) {
+    constexpr double kDPI = 150.0;
+    constexpr double kBase = 72.0;
+    int rw = static_cast<int>(FPDF_GetPageWidth(page) * kDPI / kBase);
+    int rh = static_cast<int>(FPDF_GetPageHeight(page) * kDPI / kBase);
+    if (rw <= 0 || rh <= 0) return {};
+
+    FPDF_BITMAP bm = FPDFBitmap_Create(rw, rh, 0);
+    if (!bm) return {};
+    FPDFBitmap_FillRect(bm, 0, 0, rw, rh, 0xFFFFFFFF);
+    FPDF_RenderPageBitmap(bm, page, 0, 0, rw, rh, 0, FPDF_PRINTING);
+
+    auto png = bitmap_to_png(bm);
+    FPDFBitmap_Destroy(bm);
+    if (png.empty()) return {};
+
+    ImageData img;
+    img.page_number = page_num;
+    img.name = "page" + std::to_string(page_num + 1) + "_render";
+    img.format = "png";
+    img.width = rw;
+    img.height = rh;
+    img.data = std::move(png);
+
+    if (!output_dir.empty()) {
+        std::string path = output_dir + "/" + img.name + ".png";
+        std::ofstream f(path, std::ios::binary);
+        if (f) f.write(img.data.data(), static_cast<std::streamsize>(img.data.size()));
+    }
+    return img;
 }
 
 // ── Markdown formatting ──────────────────────────────────
@@ -1923,6 +2043,13 @@ ExtractResult extract_pdf(const std::string& pdf_path, const ConvertOptions& opt
 
         if (opts.extract_images) {
             result.all_images[p] = extract_images(doc, page, p, image_dir);
+
+            // Fallback: render page as PNG for scanned/vector-only pages
+            if (result.all_images[p].empty() && result.all_lines[p].empty()) {
+                auto rendered = render_page_as_png(doc, page, p, image_dir);
+                if (!rendered.data.empty())
+                    result.all_images[p].push_back(std::move(rendered));
+            }
         }
         FPDF_ClosePage(page);
     }
