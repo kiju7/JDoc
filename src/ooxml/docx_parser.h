@@ -31,12 +31,22 @@ private:
     // abstractNumId -> ilvl -> numFmt ("decimal", "bullet", etc.)
     std::map<int, std::map<int, std::string>> abstract_num_formats_;
 
-    // Relationship ID -> target path (for images)
+    // Relationship ID -> target path (for images and hyperlinks)
     std::map<std::string, std::string> rel_targets_;
+
+    // External hyperlink targets (rId -> URL)
+    std::map<std::string, std::string> hyperlink_targets_;
 
     void parse_styles();
     void parse_numbering();
     void parse_relationships();
+
+    // Extract text from header/footer XML parts.
+    std::string extract_headers_footers();
+
+    // Extract text from footnotes/endnotes XML parts.
+    std::string extract_footnotes();
+    std::string extract_endnotes();
 
     struct ParagraphInfo {
         std::string text;

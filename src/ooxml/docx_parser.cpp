@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <map>
+#include <set>
 #include <sys/stat.h>
 #include <sstream>
 
@@ -27,7 +28,7 @@ void DocxParser::parse_styles() {
 
     auto data = zip_.read_entry("word/styles.xml");
     pugi::xml_document doc;
-    if (!doc.load_buffer(data.data(), data.size())) return;
+    if (!doc.load_buffer(data.data(), data.size(), pugi::parse_default | pugi::parse_ws_pcdata)) return;
 
     // Find all <w:style> elements
     std::vector<pugi::xml_node> styles;
@@ -64,7 +65,7 @@ void DocxParser::parse_numbering() {
 
     auto data = zip_.read_entry("word/numbering.xml");
     pugi::xml_document doc;
-    if (!doc.load_buffer(data.data(), data.size())) return;
+    if (!doc.load_buffer(data.data(), data.size(), pugi::parse_default | pugi::parse_ws_pcdata)) return;
 
     // Parse abstractNum definitions
     std::vector<pugi::xml_node> abstract_nums;
@@ -117,7 +118,7 @@ void DocxParser::parse_relationships() {
 
     auto data = zip_.read_entry(rels_path);
     pugi::xml_document doc;
-    if (!doc.load_buffer(data.data(), data.size())) return;
+    if (!doc.load_buffer(data.data(), data.size(), pugi::parse_default | pugi::parse_ws_pcdata)) return;
 
     std::vector<pugi::xml_node> rels;
     xml_find_all(doc, "Relationship", rels);
@@ -125,18 +126,131 @@ void DocxParser::parse_relationships() {
     for (auto& rel : rels) {
         const char* id = xml_attr(rel, "Id");
         const char* target = xml_attr(rel, "Target");
-        if (id[0] && target[0]) {
-            // Targets are relative to word/ directory
-            std::string full_target = target;
-            if (full_target.find("word/") != 0 &&
-                full_target.find("http://") != 0 &&
-                full_target.find("https://") != 0 &&
-                full_target[0] != '/') {
-                full_target = "word/" + full_target;
-            }
-            rel_targets_[id] = full_target;
+        const char* type = xml_attr(rel, "Type");
+        const char* mode = xml_attr(rel, "TargetMode");
+        if (!id[0] || !target[0]) continue;
+
+        // External hyperlinks
+        std::string type_str(type);
+        if (type_str.find("hyperlink") != std::string::npos &&
+            std::string(mode) == "External") {
+            hyperlink_targets_[id] = target;
+            continue;
         }
+
+        // Internal targets (images, etc.) — relative to word/ directory
+        std::string full_target = target;
+        if (full_target.find("word/") != 0 &&
+            full_target.find("http://") != 0 &&
+            full_target.find("https://") != 0 &&
+            full_target[0] != '/') {
+            full_target = "word/" + full_target;
+        }
+        rel_targets_[id] = full_target;
     }
+}
+
+// ── Header/Footer extraction ────────────────────────────
+
+std::string DocxParser::extract_headers_footers() {
+    std::string result;
+    // Collect unique header/footer texts to avoid duplicating per-section defs
+    std::set<std::string> seen;
+
+    auto extract_part = [&](const std::string& path) {
+        if (!zip_.has_entry(path)) return;
+        auto data = zip_.read_entry(path);
+        pugi::xml_document doc;
+        if (!doc.load_buffer(data.data(), data.size())) return;
+
+        std::string text;
+        std::vector<pugi::xml_node> paras;
+        xml_find_all(doc, "p", paras);
+        for (auto& p : paras) {
+            std::vector<pugi::xml_node> t_nodes;
+            xml_find_all(p, "t", t_nodes);
+            std::string line;
+            for (auto& t : t_nodes) line += xml_text_content(t);
+            line = util::trim(line);
+            if (!line.empty()) {
+                if (!text.empty()) text += "\n";
+                text += line;
+            }
+        }
+        if (!text.empty() && seen.insert(text).second) {
+            result += text + "\n";
+        }
+    };
+
+    // Check for header/footer parts (typical: header1-3, footer1-3)
+    for (int i = 1; i <= 3; ++i) {
+        extract_part("word/header" + std::to_string(i) + ".xml");
+    }
+    for (int i = 1; i <= 3; ++i) {
+        extract_part("word/footer" + std::to_string(i) + ".xml");
+    }
+    return result;
+}
+
+// ── Footnote/Endnote extraction ─────────────────────────
+
+std::string DocxParser::extract_footnotes() {
+    if (!zip_.has_entry("word/footnotes.xml")) return "";
+
+    auto data = zip_.read_entry("word/footnotes.xml");
+    pugi::xml_document doc;
+    if (!doc.load_buffer(data.data(), data.size())) return "";
+
+    std::string result;
+    std::vector<pugi::xml_node> footnotes;
+    xml_find_all(doc, "footnote", footnotes);
+
+    int idx = 0;
+    for (auto& fn : footnotes) {
+        // Skip separator/continuation footnotes (type="separator" or type="continuationSeparator")
+        const char* type = xml_attr(fn, "type");
+        if (type[0]) continue;
+
+        std::string text;
+        std::vector<pugi::xml_node> t_nodes;
+        xml_find_all(fn, "t", t_nodes);
+        for (auto& t : t_nodes) text += xml_text_content(t);
+        text = util::trim(text);
+        if (text.empty()) continue;
+
+        ++idx;
+        result += "[^" + std::to_string(idx) + "]: " + text + "\n";
+    }
+    return result;
+}
+
+std::string DocxParser::extract_endnotes() {
+    if (!zip_.has_entry("word/endnotes.xml")) return "";
+
+    auto data = zip_.read_entry("word/endnotes.xml");
+    pugi::xml_document doc;
+    if (!doc.load_buffer(data.data(), data.size())) return "";
+
+    std::string result;
+    std::vector<pugi::xml_node> endnotes;
+    xml_find_all(doc, "endnote", endnotes);
+
+    int idx = 0;
+    for (auto& en : endnotes) {
+        const char* type = xml_attr(en, "type");
+        if (type[0]) continue;
+
+        std::string text;
+        std::vector<pugi::xml_node> t_nodes;
+        xml_find_all(en, "t", t_nodes);
+        for (auto& t : t_nodes) text += xml_text_content(t);
+        text = util::trim(text);
+        if (text.empty()) continue;
+
+        ++idx;
+        result += "[^e" + std::to_string(idx) + "]: " + text + "\n";
+    }
+    return result;
 }
 
 // ── Image extraction ────────────────────────────────────
@@ -327,7 +441,8 @@ static std::vector<DocxElement> parse_body(
     const pugi::xml_node& body,
     const std::map<std::string, int>& style_heading_map,
     const std::map<int, int>& num_to_abstract,
-    const std::map<int, std::map<int, std::string>>& abstract_num_formats) {
+    const std::map<int, std::map<int, std::string>>& abstract_num_formats,
+    const std::map<std::string, std::string>& hyperlink_targets = {}) {
 
     std::vector<DocxElement> elements;
 
@@ -402,42 +517,61 @@ static std::vector<DocxElement> parse_body(
                 }
             }
 
-            // Extract runs with formatting
-            std::ostringstream para_text;
-            std::vector<pugi::xml_node> runs;
-            xml_find_all(child, "r", runs);
-
-            for (auto& run : runs) {
+            // Helper: extract formatted text from a run node
+            auto extract_run_text = [&](const pugi::xml_node& run, bool in_heading) -> std::string {
                 auto rPr = xml_child(run, "rPr");
                 bool bold = false, italic = false;
                 if (rPr) {
                     bold = xml_child(rPr, "b") ? true : false;
                     italic = xml_child(rPr, "i") ? true : false;
                 }
-
-                // Collect text from <w:t> nodes in this run
                 std::string run_text;
                 std::vector<pugi::xml_node> t_nodes;
                 xml_find_all(run, "t", t_nodes);
-                for (auto& t : t_nodes) {
-                    run_text += xml_text_content(t);
+                for (auto& t : t_nodes) run_text += xml_text_content(t);
+                if (run_text.empty()) return "";
+                if (!in_heading) {
+                    if (bold && italic) return "***" + run_text + "***";
+                    if (bold) return "**" + run_text + "**";
+                    if (italic) return "*" + run_text + "*";
                 }
+                return run_text;
+            };
 
-                if (run_text.empty()) continue;
+            // Extract runs and hyperlinks from direct children of paragraph
+            std::ostringstream para_text;
+            bool is_heading = (elem.heading_level > 0);
 
-                // Apply formatting only for non-heading paragraphs
-                if (elem.heading_level == 0) {
-                    if (bold && italic) {
-                        para_text << "***" << run_text << "***";
-                    } else if (bold) {
-                        para_text << "**" << run_text << "**";
-                    } else if (italic) {
-                        para_text << "*" << run_text << "*";
-                    } else {
-                        para_text << run_text;
+            for (auto pchild = child.first_child(); pchild; pchild = pchild.next_sibling()) {
+                const char* pname = pchild.name();
+                const char* pcolon = strchr(pname, ':');
+                const char* plocal = pcolon ? pcolon + 1 : pname;
+
+                if (strcmp(plocal, "r") == 0) {
+                    para_text << extract_run_text(pchild, is_heading);
+                } else if (strcmp(plocal, "hyperlink") == 0) {
+                    // Collect link text from child runs
+                    std::string link_text;
+                    for (auto hr = pchild.first_child(); hr; hr = hr.next_sibling()) {
+                        const char* hrn = hr.name();
+                        const char* hrc = strchr(hrn, ':');
+                        const char* hrl = hrc ? hrc + 1 : hrn;
+                        if (strcmp(hrl, "r") == 0) {
+                            link_text += extract_run_text(hr, is_heading);
+                        }
                     }
-                } else {
-                    para_text << run_text;
+                    // Resolve hyperlink URL from r:id
+                    const char* rid = xml_attr(pchild, "id");
+                    if (rid[0] && !link_text.empty()) {
+                        auto hit = hyperlink_targets.find(rid);
+                        if (hit != hyperlink_targets.end()) {
+                            para_text << "[" << link_text << "](" << hit->second << ")";
+                        } else {
+                            para_text << link_text;
+                        }
+                    } else {
+                        para_text << link_text;
+                    }
                 }
             }
 
@@ -453,6 +587,18 @@ static std::vector<DocxElement> parse_body(
             elem.type = DocxElement::TABLE;
             elem.table_rows = parse_table_node(child);
             elements.push_back(std::move(elem));
+
+        } else if (strcmp(local, "AlternateContent") == 0) {
+            // Process mc:Choice only, skip mc:Fallback
+            auto choice = xml_child(child, "Choice");
+            if (choice) {
+                auto inner = parse_body(choice, style_heading_map,
+                                         num_to_abstract, abstract_num_formats,
+                                         hyperlink_targets);
+                elements.insert(elements.end(),
+                    std::make_move_iterator(inner.begin()),
+                    std::make_move_iterator(inner.end()));
+            }
         }
     }
 
@@ -466,7 +612,7 @@ std::string DocxParser::to_markdown(const ConvertOptions& opts) {
 
     auto data = zip_.read_entry("word/document.xml");
     pugi::xml_document doc;
-    if (!doc.load_buffer(data.data(), data.size())) return "";
+    if (!doc.load_buffer(data.data(), data.size(), pugi::parse_default | pugi::parse_ws_pcdata)) return "";
 
     auto body = xml_child(doc, "body");
     if (!body) {
@@ -479,17 +625,31 @@ std::string DocxParser::to_markdown(const ConvertOptions& opts) {
     if (!body) return "";
 
     auto elements = parse_body(body, style_heading_map_,
-                               num_to_abstract_, abstract_num_formats_);
+                               num_to_abstract_, abstract_num_formats_,
+                               hyperlink_targets_);
+
+    // Extract supplementary content
+    std::string header_footer = extract_headers_footers();
+    std::string footnotes = extract_footnotes();
+    std::string endnotes = extract_endnotes();
 
     std::ostringstream out;
+
+    // Prepend header/footer content if present
+    if (!header_footer.empty()) {
+        out << header_footer << "\n";
+    }
+
     int ordered_counter = 0;
     bool in_ordered_list = false;
+    int page_num = 1;
 
     for (size_t i = 0; i < elements.size(); ++i) {
         auto& elem = elements[i];
 
         if (elem.type == DocxElement::PAGE_BREAK) {
-            out << "\n---\n\n";
+            ++page_num;
+            out << "\n## Page " << page_num << "\n\n";
             continue;
         }
 
@@ -502,7 +662,6 @@ std::string DocxParser::to_markdown(const ConvertOptions& opts) {
 
         // PARAGRAPH
         if (elem.text.empty() && elem.image_rid.empty()) {
-            // Reset list state on empty paragraph
             if (in_ordered_list) {
                 in_ordered_list = false;
                 ordered_counter = 0;
@@ -558,7 +717,14 @@ std::string DocxParser::to_markdown(const ConvertOptions& opts) {
         out << elem.text << "\n\n";
     }
 
-    // Append image references if extracted
+    // Append footnotes and endnotes
+    if (!footnotes.empty()) {
+        out << "\n" << footnotes;
+    }
+    if (!endnotes.empty()) {
+        out << "\n" << endnotes;
+    }
+
     auto images = extract_images(opts);
     if (!images.empty() && opts.extract_images) {
         // Images already referenced inline where possible
@@ -576,7 +742,7 @@ std::vector<PageChunk> DocxParser::to_chunks(
 
     auto data = zip_.read_entry("word/document.xml");
     pugi::xml_document doc;
-    if (!doc.load_buffer(data.data(), data.size())) return {};
+    if (!doc.load_buffer(data.data(), data.size(), pugi::parse_default | pugi::parse_ws_pcdata)) return {};
 
     auto body = xml_child(doc, "body");
     if (!body) {
@@ -588,7 +754,8 @@ std::vector<PageChunk> DocxParser::to_chunks(
     if (!body) return {};
 
     auto elements = parse_body(body, style_heading_map_,
-                               num_to_abstract_, abstract_num_formats_);
+                               num_to_abstract_, abstract_num_formats_,
+                               hyperlink_targets_);
 
     auto all_images = extract_images(opts);
 
