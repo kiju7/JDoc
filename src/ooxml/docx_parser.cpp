@@ -759,12 +759,22 @@ std::vector<PageChunk> DocxParser::to_chunks(
 
     auto all_images = extract_images(opts);
 
+    // Extract supplementary content
+    std::string header_footer = extract_headers_footers();
+    std::string footnotes = extract_footnotes();
+    std::string endnotes = extract_endnotes();
+
     std::vector<PageChunk> chunks;
     PageChunk current;
     current.page_number = 1;
     std::ostringstream text;
     int ordered_counter = 0;
     bool in_ordered_list = false;
+
+    // Prepend header/footer content to first chunk
+    if (!header_footer.empty()) {
+        text << header_footer << "\n";
+    }
 
     auto flush_chunk = [&]() {
         current.text = text.str();
@@ -841,6 +851,12 @@ std::vector<PageChunk> DocxParser::to_chunks(
             ordered_counter = 0;
             text << elem.text << "\n\n";
         }
+    }
+
+    // Append footnotes/endnotes to last chunk
+    if (!footnotes.empty() || !endnotes.empty()) {
+        if (!footnotes.empty()) text << "\n" << footnotes;
+        if (!endnotes.empty()) text << "\n" << endnotes;
     }
 
     flush_chunk();
