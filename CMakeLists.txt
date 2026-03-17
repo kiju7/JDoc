@@ -13,10 +13,6 @@ find_package(ZLIB REQUIRED)
 add_library(pugixml STATIC vendor/pugixml/pugixml.cpp)
 target_include_directories(pugixml PUBLIC vendor/pugixml)
 
-# POLE (OLE2/CFB container reader for HWP/legacy Office)
-add_library(pole STATIC vendor/pole/pole.cpp)
-target_include_directories(pole PUBLIC vendor/pole)
-
 # PDFium (PDF backend)
 set(PDFium_DIR "${CMAKE_SOURCE_DIR}/vendor/pdfium" CACHE PATH "PDFium SDK location")
 find_package(PDFium REQUIRED)
@@ -66,7 +62,7 @@ add_library(jdoc_office STATIC
     src/html/html_parser.cpp
 )
 target_include_directories(jdoc_office PUBLIC include PRIVATE src vendor)
-target_link_libraries(jdoc_office PUBLIC pugixml pole jdoc_zip jdoc_common)
+target_link_libraries(jdoc_office PUBLIC pugixml jdoc_zip jdoc_common)
 
 # ── Shared library with C API ─────────────────────────────────
 

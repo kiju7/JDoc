@@ -19,7 +19,6 @@ C++17 document converter with Python bindings. Converts PDF, Office (DOCX/XLSX/X
 |---------|---------|------|
 | PDFium | BSD-3 | PDF backend |
 | pugixml | MIT | XML parsing (HWPX/OOXML) |
-| POLE | BSD | OLE2 container (HWP/legacy Office) |
 | ZLIB | zlib | ZIP decompression |
 | pybind11 | BSD | Python bindings (optional) |
 | CMake ≥ 3.16 | BSD | Build system |
