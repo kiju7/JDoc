@@ -11,7 +11,10 @@ namespace jdoc {
 
 class OleReader {
 public:
+    // Open from file path.
     explicit OleReader(const std::string& path);
+    // Open from memory buffer (data must outlive the reader).
+    OleReader(const uint8_t* data, size_t size);
     ~OleReader();
 
     OleReader(const OleReader&) = delete;
@@ -22,7 +25,11 @@ public:
     // List all stream names in the directory tree.
     std::vector<std::string> list_streams() const;
 
-    // Read a stream's full contents by name. Returns empty if not found.
+    // List stream names under a storage directory (e.g., "BinData").
+    std::vector<std::string> entries(const std::string& storage_name) const;
+
+    // Read a stream's full contents by name (e.g., "BinData/BIN0001.png").
+    // Supports "/" separator for nested paths.
     std::vector<char> read_stream(const std::string& name) const;
 
     // Check if a stream with the given name exists.
@@ -40,6 +47,8 @@ private:
     };
 
     FILE* fp_ = nullptr;
+    const uint8_t* mem_data_ = nullptr;
+    size_t mem_size_ = 0;
     bool valid_ = false;
     uint16_t major_version_ = 0;
     uint32_t sector_size_ = 512;
@@ -69,7 +78,13 @@ private:
     void traverse_dir(int id, std::vector<std::string>& names) const;
 
     // Find directory entry index by name, or -1.
+    // Supports "/" separated paths (e.g., "BinData/BIN0001.png").
     int find_entry(const std::string& name) const;
+
+    // Find a storage entry index by name, or -1.
+    int find_storage(const std::string& name) const;
+
+    void init_from_source();
 };
 
 } // namespace jdoc

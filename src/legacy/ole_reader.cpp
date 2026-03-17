@@ -27,7 +27,16 @@ static const uint8_t kOleMagic[8] = {
 OleReader::OleReader(const std::string& path) {
     fp_ = std::fopen(path.c_str(), "rb");
     if (!fp_) return;
+    init_from_source();
+}
 
+OleReader::OleReader(const uint8_t* data, size_t size)
+    : mem_data_(data), mem_size_(size) {
+    if (!data || size < 512) return;
+    init_from_source();
+}
+
+void OleReader::init_from_source() {
     try {
         parse_header();
         parse_fat();
@@ -44,15 +53,21 @@ OleReader::~OleReader() {
 }
 
 bool OleReader::is_open() const {
-    return fp_ != nullptr && valid_;
+    return (fp_ != nullptr || mem_data_ != nullptr) && valid_;
 }
 
 // ---------- header -----------------------------------------------------------
 
 void OleReader::parse_header() {
     uint8_t hdr[512];
-    if (std::fread(hdr, 1, 512, fp_) != 512)
-        throw std::runtime_error("Failed to read OLE header");
+    if (mem_data_) {
+        if (mem_size_ < 512)
+            throw std::runtime_error("Failed to read OLE header");
+        std::memcpy(hdr, mem_data_, 512);
+    } else {
+        if (std::fread(hdr, 1, 512, fp_) != 512)
+            throw std::runtime_error("Failed to read OLE header");
+    }
 
     // Validate magic.
     if (std::memcmp(hdr, kOleMagic, 8) != 0)
@@ -139,9 +154,17 @@ void OleReader::parse_header() {
 // ---------- read_sector ------------------------------------------------------
 
 void OleReader::read_sector(uint32_t sector, void* buf) const {
-    // Physical offset: header is at 0, sectors start at sector_size_.
-    // Sector 0 is at offset sector_size_, sector 1 at 2*sector_size_, etc.
     uint64_t offset = static_cast<uint64_t>(sector + 1) * sector_size_;
+
+    if (mem_data_) {
+        if (offset + sector_size_ <= mem_size_) {
+            std::memcpy(buf, mem_data_ + offset, sector_size_);
+        } else {
+            std::memset(buf, 0, sector_size_);
+        }
+        return;
+    }
+
 #ifdef _WIN32
     _fseeki64(fp_, offset, SEEK_SET);
 #else
@@ -207,8 +230,12 @@ void OleReader::parse_directories() {
 void OleReader::parse_mini_fat() {
     // Re-read the header to get first mini-FAT sector and count.
     uint8_t hdr[512];
-    std::fseek(fp_, 0, SEEK_SET);
-    if (std::fread(hdr, 1, 512, fp_) != 512) return;
+    if (mem_data_) {
+        std::memcpy(hdr, mem_data_, 512);
+    } else {
+        std::fseek(fp_, 0, SEEK_SET);
+        if (std::fread(hdr, 1, 512, fp_) != 512) return;
+    }
 
     uint32_t first_mini_fat_sector = util::read_u32_le(hdr + 0x3C);
     uint32_t num_mini_fat_sectors  = util::read_u32_le(hdr + 0x40);
@@ -231,22 +258,34 @@ void OleReader::parse_mini_fat() {
 // ---------- read_chain -------------------------------------------------------
 
 std::vector<char> OleReader::read_chain(uint32_t start, uint64_t size) const {
-    std::vector<char> result;
-    result.reserve(static_cast<size_t>(size));
+    std::vector<char> result(static_cast<size_t>(size));
 
     uint32_t sec = start;
-    uint64_t remaining = size;
-    std::vector<char> sbuf(sector_size_);
+    uint64_t written = 0;
 
-    while (sec != ENDOFCHAIN && sec != FREESECT && sec < fat_.size() && remaining > 0) {
-        read_sector(sec, sbuf.data());
-        uint64_t to_copy = std::min(static_cast<uint64_t>(sector_size_), remaining);
-        result.insert(result.end(), sbuf.begin(), sbuf.begin() + to_copy);
-        remaining -= to_copy;
-        sec = fat_[sec];
+    if (mem_data_) {
+        // Memory-based: direct copy from mapped buffer, no intermediate buffer
+        while (sec != ENDOFCHAIN && sec != FREESECT && sec < fat_.size() && written < size) {
+            uint64_t offset = static_cast<uint64_t>(sec + 1) * sector_size_;
+            uint64_t to_copy = std::min(static_cast<uint64_t>(sector_size_), size - written);
+            if (offset + to_copy <= mem_size_) {
+                std::memcpy(result.data() + written, mem_data_ + offset, static_cast<size_t>(to_copy));
+            }
+            written += to_copy;
+            sec = fat_[sec];
+        }
+    } else {
+        // File-based: sector-at-a-time
+        std::vector<char> sbuf(sector_size_);
+        while (sec != ENDOFCHAIN && sec != FREESECT && sec < fat_.size() && written < size) {
+            read_sector(sec, sbuf.data());
+            uint64_t to_copy = std::min(static_cast<uint64_t>(sector_size_), size - written);
+            std::memcpy(result.data() + written, sbuf.data(), static_cast<size_t>(to_copy));
+            written += to_copy;
+            sec = fat_[sec];
+        }
     }
 
-    result.resize(static_cast<size_t>(size)); // truncate to exact size
     return result;
 }
 
@@ -307,8 +346,33 @@ void OleReader::traverse_dir(int id, std::vector<std::string>& names) const {
 // ---------- find_entry -------------------------------------------------------
 
 int OleReader::find_entry(const std::string& name) const {
+    // Support "/" separated paths like "BinData/BIN0001.png"
+    auto slash = name.find('/');
+    if (slash != std::string::npos) {
+        std::string parent = name.substr(0, slash);
+        std::string child = name.substr(slash + 1);
+        int storage_id = find_storage(parent);
+        if (storage_id < 0) return -1;
+        // Search among children of this storage
+        int child_id = dirs_[storage_id].child_id;
+        if (child_id < 0) return -1;
+        // BFS/linear search in the subtree for the child stream
+        for (size_t i = 0; i < dirs_.size(); ++i) {
+            if (dirs_[i].name == child && dirs_[i].type == 2)
+                return static_cast<int>(i);
+        }
+        return -1;
+    }
     for (size_t i = 0; i < dirs_.size(); ++i) {
         if (dirs_[i].name == name && dirs_[i].type == 2)
+            return static_cast<int>(i);
+    }
+    return -1;
+}
+
+int OleReader::find_storage(const std::string& name) const {
+    for (size_t i = 0; i < dirs_.size(); ++i) {
+        if (dirs_[i].name == name && (dirs_[i].type == 1 || dirs_[i].type == 5))
             return static_cast<int>(i);
     }
     return -1;
@@ -325,6 +389,28 @@ std::vector<std::string> OleReader::list_streams() const {
 
 bool OleReader::has_stream(const std::string& name) const {
     return find_entry(name) >= 0;
+}
+
+std::vector<std::string> OleReader::entries(const std::string& storage_name) const {
+    std::vector<std::string> result;
+    if (!valid_) return result;
+
+    int sid = find_storage(storage_name);
+    if (sid < 0) return result;
+
+    int child = dirs_[sid].child_id;
+    if (child < 0) return result;
+
+    // Traverse the red-black tree under this storage
+    std::vector<std::string> all;
+    traverse_dir(child, all);
+
+    // Filter to just stream names (traverse_dir appends "/" for storages)
+    for (auto& name : all) {
+        if (!name.empty() && name.back() != '/')
+            result.push_back(name);
+    }
+    return result;
 }
 
 std::vector<char> OleReader::read_stream(const std::string& name) const {
