@@ -5,9 +5,9 @@
 
 #include "jdoc/hwp.h"
 #include "jdoc/hwp_types.h"
+#include "legacy/ole_reader.h"
 #include "common/file_utils.h"
 #include "common/string_utils.h"
-#include <pole.h>
 #include <zlib.h>
 #include <algorithm>
 #include <map>
@@ -53,19 +53,16 @@ static std::vector<uint8_t> decompress(const uint8_t* data, size_t len) {
     return output;
 }
 
-// ── POLE stream reading helper ──────────────────────────────
+// ── OLE stream reading helper ──────────────────────────────
 
-static std::vector<uint8_t> read_stream(POLE::Storage& storage,
-                                          const std::string& path) {
-    POLE::Stream stream(&storage, path);
-    if (stream.fail()) return {};
-
-    unsigned long sz = stream.size();
-    std::vector<uint8_t> data(sz);
-    if (sz > 0) {
-        stream.read(data.data(), sz);
-    }
-    return data;
+static std::vector<uint8_t> read_ole_stream(OleReader& ole,
+                                              const std::string& path) {
+    auto data = ole.read_stream(path);
+    if (data.empty()) return {};
+    // Convert vector<char> to vector<uint8_t>
+    return std::vector<uint8_t>(
+        reinterpret_cast<const uint8_t*>(data.data()),
+        reinterpret_cast<const uint8_t*>(data.data()) + data.size());
 }
 
 // ── HWP Document structures ────────────────────────────────
@@ -129,7 +126,7 @@ class HWPParser {
 public:
     HWPParser(const std::string& path, ConvertOptions opts)
         : opts_(std::move(opts)) {
-        // Read entire file into memory for POLE
+        // Read entire file into memory for OleReader
         std::ifstream f(path, std::ios::binary);
         if (!f) throw std::runtime_error("Cannot open HWP file: " + path);
         f.seekg(0, std::ios::end);
@@ -139,9 +136,8 @@ public:
     }
 
     bool parse() {
-        storage_ = std::make_unique<POLE::Storage>(
-            reinterpret_cast<char*>(file_data_.data()), file_data_.size());
-        if (!storage_->open()) {
+        ole_ = std::make_unique<OleReader>(file_data_.data(), file_data_.size());
+        if (!ole_->is_open()) {
             throw std::runtime_error("Not a valid HWP file (OLE2 open failed)");
         }
 
@@ -151,13 +147,13 @@ public:
         // 2. Read DocInfo
         parse_doc_info();
 
-        // 3. Read BinData entries (images)
-        read_bin_data_storage();
+        // 3. Index BinData entries (lazy — actual data loaded on demand)
+        index_bin_data_storage();
 
         // 4. Discover sections
         for (int i = 0; ; i++) {
             std::string section_path = "BodyText/Section" + std::to_string(i);
-            auto data = read_stream(*storage_, section_path);
+            auto data = read_ole_stream(*ole_, section_path);
             if (data.empty()) break;
             section_data_.push_back(std::move(data));
         }
@@ -166,11 +162,8 @@ public:
             throw std::runtime_error("No BodyText sections found in HWP file");
         }
 
-        // Release POLE storage - all data has been read into memory
-        storage_.reset();
-        // Release file data - POLE no longer needs it
-        file_data_.clear();
-        file_data_.shrink_to_fit();
+        // Keep ole_ and file_data_ alive for lazy BinData loading.
+        // They are released in release_storage() after convert_chunks().
 
         return true;
     }
@@ -197,13 +190,20 @@ public:
             chunks.push_back(std::move(chunk));
         }
 
+        release_storage();
         return chunks;
+    }
+
+    void release_storage() {
+        ole_.reset();
+        file_data_.clear();
+        file_data_.shrink_to_fit();
     }
 
 private:
     ConvertOptions opts_;
     std::vector<uint8_t> file_data_;
-    std::unique_ptr<POLE::Storage> storage_;
+    std::unique_ptr<OleReader> ole_;
 
     bool compressed_ = true;
     uint32_t version_ = 0;
@@ -217,7 +217,7 @@ private:
 
     // ── FileHeader parsing ──────────────────────────────────
     void parse_file_header() {
-        auto data = read_stream(*storage_, "FileHeader");
+        auto data = read_ole_stream(*ole_, "FileHeader");
         if (data.size() < 36) {
             throw std::runtime_error("Invalid HWP FileHeader");
         }
@@ -244,7 +244,7 @@ private:
 
     // ── DocInfo parsing ─────────────────────────────────────
     void parse_doc_info() {
-        auto raw = read_stream(*storage_, "DocInfo");
+        auto raw = read_ole_stream(*ole_, "DocInfo");
         if (raw.empty()) return;
 
         std::vector<uint8_t> data;
@@ -436,37 +436,32 @@ private:
         doc_info_.bin_data_refs.push_back(ref);
     }
 
-    // ── BinData storage reading ─────────────────────────────
-    void read_bin_data_storage() {
-        // List entries under /BinData/
-        auto entries = storage_->entries("BinData");
+    // ── BinData storage indexing (lazy — no data read here) ──
+    void index_bin_data_storage() {
+        auto entries = ole_->entries("BinData");
         for (auto& name : entries) {
-            std::string full_path = "BinData/" + name;
-            auto raw = read_stream(*storage_, full_path);
-            if (raw.empty()) continue;
-
-            std::vector<uint8_t> data;
-            if (compressed_) {
-                data = decompress(raw.data(), raw.size());
-                // raw is no longer needed after decompress
-                if (data.empty()) data = std::move(raw);
-            } else {
-                data = std::move(raw);
-            }
+            std::string key = name;
+            for (auto& c : key) c = std::tolower(c);
 
             HWPEmbeddedImage img;
             img.name = name;
-            // Build lowercase key for case-insensitive lookup
-            std::string key = name;
-            for (auto& c : key) c = std::tolower(c);
             img.name_lower = key;
-            img.data = std::move(data);
+            // img.data left empty — loaded on demand in load_bin_data()
 
             embedded_image_keys_.push_back(key);
             embedded_images_.emplace(std::move(key), std::move(img));
         }
     }
 
+    // Load BinData on demand from OLE storage.
+    // BinData streams contain raw image data (PNG/JPEG/etc.) and are NOT
+    // deflate-compressed, even when the HWP compressed flag is set.
+    // The compressed flag only applies to DocInfo and BodyText sections.
+    std::vector<uint8_t> load_bin_data(const std::string& name) {
+        if (!ole_) return {};
+        std::string full_path = "BinData/" + name;
+        return read_ole_stream(*ole_, full_path);
+    }
     // ── Section parsing ─────────────────────────────────────
     void parse_section(int section_idx, PageChunk& chunk) {
         auto& raw = section_data_[section_idx];
@@ -540,7 +535,26 @@ private:
 
             switch (hdr.tag_id) {
             case hwp::PARA_HEADER: {
-                // If we're in a table cell, this is an inner paragraph
+                // Level 0 = top-level paragraph. If we're still in a table
+                // but hit a level-0 record, the table subtree has ended.
+                if (in_cell && hdr.level == 0) {
+                    // Flush the last cell
+                    if (current_table) {
+                        HWPTableCell cell;
+                        cell.text = util::trim(current_cell_text);
+                        cell.col_addr = cur_cell_col;
+                        cell.row_addr = cur_cell_row;
+                        cell.col_span = cur_cell_colspan;
+                        cell.row_span = cur_cell_rowspan;
+                        current_table->cells.push_back(std::move(cell));
+                    }
+                    current_cell_text.clear();
+                    in_cell = false;
+                    ctrl_state = NONE;
+                    current_table = nullptr;
+                }
+
+                // If we're inside a table cell (level > 0), skip
                 if (in_cell) break;
 
                 // Start new top-level paragraph
@@ -581,6 +595,24 @@ private:
 
             case hwp::CTRL_HEADER: {
                 if (hdr.size < 4) break;
+
+                // Level-0 CTRL_HEADER while in table => table subtree ended
+                if (in_cell && hdr.level == 0) {
+                    if (current_table) {
+                        HWPTableCell cell;
+                        cell.text = util::trim(current_cell_text);
+                        cell.col_addr = cur_cell_col;
+                        cell.row_addr = cur_cell_row;
+                        cell.col_span = cur_cell_colspan;
+                        cell.row_span = cur_cell_rowspan;
+                        current_table->cells.push_back(std::move(cell));
+                    }
+                    current_cell_text.clear();
+                    in_cell = false;
+                    ctrl_state = NONE;
+                    current_table = nullptr;
+                }
+
                 uint32_t ctrl_id = util::read_u32_le(data.data() + offset);
                 char c0 = (ctrl_id >> 24) & 0xFF;
                 char c1 = (ctrl_id >> 16) & 0xFF;
@@ -818,72 +850,80 @@ private:
     }
 
     // ── Image handling ─────────────────────────────────────────
-    std::string format_image(int bin_id, PageChunk& chunk, int& image_idx) {
-        // bin_id is 1-based index into doc_info_.bin_data_refs
-        if (bin_id <= 0 || bin_id > (int)doc_info_.bin_data_refs.size()) return "";
-
+    // Resolve the BinData entry name for a given bin_id.
+    HWPEmbeddedImage* find_image_entry(int bin_id) {
+        if (bin_id <= 0 || bin_id > (int)doc_info_.bin_data_refs.size()) return nullptr;
         auto& ref = doc_info_.bin_data_refs[bin_id - 1];
         std::string ext = ref.extension;
         if (ext.empty()) ext = "jpg";
-
-        // Find the embedded image data using map lookup (O(log n))
-        // BinData storage name is typically BIN{hex(bin_data_id)}.{ext}
-        std::string img_name;
-        std::vector<uint8_t>* img_data = nullptr;
 
         char hex_name[32];
         snprintf(hex_name, sizeof(hex_name), "bin%04x.%s",
                  ref.bin_data_id, ext.c_str());
         std::string lookup_key = hex_name;
-        // lowercase for case-insensitive map lookup
         for (auto& c : lookup_key) c = std::tolower(c);
 
         auto it = embedded_images_.find(lookup_key);
-        if (it != embedded_images_.end()) {
-            img_name = it->second.name;
-            img_data = &it->second.data;
-        }
+        if (it != embedded_images_.end()) return &it->second;
 
-        // Fallback: try matching by index in insertion order
-        if (!img_data && bin_id <= (int)embedded_image_keys_.size()) {
+        // Fallback: match by index in insertion order
+        if (bin_id <= (int)embedded_image_keys_.size()) {
             auto fit = embedded_images_.find(embedded_image_keys_[bin_id - 1]);
-            if (fit != embedded_images_.end()) {
-                img_name = fit->second.name;
-                img_data = &fit->second.data;
-            }
+            if (fit != embedded_images_.end()) return &fit->second;
+        }
+        return nullptr;
+    }
+
+    std::string format_image(int bin_id, PageChunk& chunk, int& image_idx) {
+        if (bin_id <= 0 || bin_id > (int)doc_info_.bin_data_refs.size()) return "";
+
+        auto* entry = find_image_entry(bin_id);
+        if (!entry) return "";
+
+        auto& ref = doc_info_.bin_data_refs[bin_id - 1];
+        std::string ext = ref.extension;
+        if (ext.empty()) ext = "jpg";
+
+        // When images not requested, emit markdown reference without loading data
+        if (!opts_.extract_images) {
+            image_idx++;
+            return "![" + entry->name + "](" + entry->name + ")\n\n";
         }
 
-        if (!img_data || img_data->empty()) return "";
+        // Lazy load from OLE storage
+        if (entry->data.empty()) {
+            entry->data = load_bin_data(entry->name);
+            if (entry->data.empty()) return "";
+        }
 
         std::string saved_path;
-        if (opts_.extract_images && !opts_.image_output_dir.empty()) {
+        if (!opts_.image_output_dir.empty()) {
             util::ensure_dir(opts_.image_output_dir);
             std::string filename = "page" + std::to_string(chunk.page_number)
                                  + "_img" + std::to_string(image_idx) + "." + ext;
             saved_path = opts_.image_output_dir + "/" + filename;
             std::ofstream out(saved_path, std::ios::binary);
             if (out) {
-                out.write(reinterpret_cast<const char*>(img_data->data()), img_data->size());
+                out.write(reinterpret_cast<const char*>(entry->data.data()), entry->data.size());
             }
         }
 
         ImageData idata;
         idata.page_number = chunk.page_number;
-        idata.name = img_name;
+        idata.name = entry->name;
         idata.format = ext;
-        // Reinterpret uint8_t data as char via move of underlying memory
-        idata.data.resize(img_data->size());
-        memcpy(idata.data.data(), img_data->data(), img_data->size());
-        // Release source to free memory immediately
-        img_data->clear();
-        img_data->shrink_to_fit();
+        // Move data instead of copying — halves peak memory for large images
+        idata.data.assign(reinterpret_cast<const char*>(entry->data.data()),
+                          reinterpret_cast<const char*>(entry->data.data()) + entry->data.size());
+        entry->data.clear();
+        entry->data.shrink_to_fit();
         idata.saved_path = saved_path;
         chunk.images.push_back(std::move(idata));
 
         image_idx++;
 
-        std::string ref_path = saved_path.empty() ? img_name : saved_path;
-        return "![" + img_name + "](" + ref_path + ")\n\n";
+        std::string ref_path = saved_path.empty() ? entry->name : saved_path;
+        return "![" + entry->name + "](" + ref_path + ")\n\n";
     }
 
     // ── Paragraph to Markdown ───────────────────────────────
@@ -1024,13 +1064,16 @@ std::string hwp_to_markdown(const std::string& hwp_path, ConvertOptions opts) {
 
     std::string result;
     for (size_t i = 0; i < chunks.size(); i++) {
-        if (plaintext) {
-            if (i > 0)
-                result += "\n--- Page " + std::to_string(chunks[i].page_number + 1) + " ---\n\n";
-            result += util::strip_markdown(chunks[i].text);
-        } else {
-            result += chunks[i].text;
+        if (i > 0) {
+            if (plaintext)
+                result += "\n--- Page " + std::to_string(chunks[i].page_number) + " ---\n\n";
+            else
+                result += "\n## Page " + std::to_string(chunks[i].page_number) + "\n\n";
         }
+        if (plaintext)
+            result += util::strip_markdown(chunks[i].text);
+        else
+            result += chunks[i].text;
     }
     return result;
 }
