@@ -106,14 +106,21 @@ inline std::string strip_markdown(const std::string& md) {
                 }
             }
         }
-        // Image: ![alt](path) -> skip entirely
+        // Image: ![alt](path) -> [image: alt]
         if (md[i] == '!' && i + 1 < len && md[i + 1] == '[') {
             size_t j = i + 2;
             while (j < len && md[j] != ']') j++;
             if (j < len && j + 1 < len && md[j + 1] == '(') {
                 size_t k = j + 2;
                 while (k < len && md[k] != ')') k++;
-                if (k < len) { i = k + 1; continue; }
+                if (k < len) {
+                    std::string alt = md.substr(i + 2, j - i - 2);
+                    if (!alt.empty()) {
+                        result += "[image: " + alt + "]";
+                    }
+                    i = k + 1;
+                    continue;
+                }
             }
         }
         // Bold/italic: strip *** ** *
