@@ -1,10 +1,10 @@
 # JDoc — Universal Document to Markdown/Text Converter
 
-C++17 document converter with Python bindings. Converts PDF, Office (DOCX/XLSX/PPTX/DOC/XLS/PPT/RTF), HTML, and Korean HWP/HWPX formats to Markdown or plain text.
+C++17 document converter with Python bindings. Converts PDF, Office (DOCX/XLSX/XLSB/PPTX/DOC/XLS/PPT/RTF), HTML, and Korean HWP/HWPX formats to Markdown or plain text.
 
 ## Features
 
-- **Multi-format** — PDF, DOCX, XLSX, PPTX, DOC, XLS, PPT, RTF, HTML, HWP, HWPX
+- **Multi-format** — PDF, DOCX, XLSX, XLSB, PPTX, DOC, XLS, PPT, RTF, HTML, HWP, HWPX
 - **Output options** — Markdown (with headings, bold, tables) or plain text (with page separators)
 - **Heading detection** — font size ratio analysis (H1–H4)
 - **Bold / Italic** — font name pattern matching + inline formatting
@@ -77,6 +77,7 @@ make -j$(nproc)
 # All formats supported
 ./jdoc document.docx
 ./jdoc spreadsheet.xlsx
+./jdoc spreadsheet.xlsb
 ./jdoc presentation.pptx
 ./jdoc page.html
 ./jdoc document.hwp
@@ -124,6 +125,7 @@ pages = jdoc.convert_pages("document.pdf",
 # All formats work the same way
 md = jdoc.convert("report.docx")
 md = jdoc.convert("spreadsheet.xlsx")
+md = jdoc.convert("spreadsheet.xlsb")
 md = jdoc.convert("presentation.pptx")
 md = jdoc.convert("page.html")
 md = jdoc.convert("document.hwp")
