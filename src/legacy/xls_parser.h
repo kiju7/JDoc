@@ -44,6 +44,12 @@ private:
     // Parsed sheets.
     std::vector<Sheet> sheets_;
 
+    // Number formatting: FORMAT record (numFmtId → formatCode).
+    std::map<int, std::string> custom_num_fmts_;
+
+    // Number formatting: XF record (xfIndex → numFmtId).
+    std::vector<int> xf_num_fmt_ids_;
+
     // Parse the Workbook (or Book) stream.
     void parse_workbook();
 
@@ -59,8 +65,16 @@ private:
     // Decode an RK value to a double.
     static double decode_rk(uint32_t rk);
 
-    // Format a double as a string (strip trailing zeros).
+    // Format a numeric value using XF style index.
+    std::string format_cell_number(double val, int xf_index) const;
+
+    // Format a double as a plain string (strip trailing zeros).
     static std::string format_number(double val);
+
+    // Date/time helpers.
+    static bool is_date_format(int fmt_id, const std::string& fmt_code);
+    static std::string serial_to_date(double serial);
+    static std::string serial_to_time(double serial);
 
     // Build a markdown table from sheet cells.
     static std::string sheet_to_markdown(const Sheet& sheet);

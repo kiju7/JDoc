@@ -6,8 +6,10 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <sstream>
+#include <stdexcept>
 
 namespace jdoc {
 
@@ -18,9 +20,16 @@ static constexpr uint16_t RT_BOUNDSHEET = 0x0085;
 static constexpr uint16_t RT_SST        = 0x00FC;
 static constexpr uint16_t RT_CONTINUE   = 0x003C;
 static constexpr uint16_t RT_LABELSST   = 0x00FD;
+static constexpr uint16_t RT_LABEL      = 0x0204;
 static constexpr uint16_t RT_NUMBER     = 0x0203;
 static constexpr uint16_t RT_RK         = 0x027E;
 static constexpr uint16_t RT_MULRK      = 0x00BD;
+static constexpr uint16_t RT_FORMULA    = 0x0006;
+static constexpr uint16_t RT_STRING     = 0x0207;
+static constexpr uint16_t RT_BOOLERR   = 0x0205;
+static constexpr uint16_t RT_FORMAT     = 0x041E;
+static constexpr uint16_t RT_XF         = 0x00E0;
+static constexpr uint16_t RT_FILEPASS   = 0x002F;
 static constexpr uint16_t RT_MSODRAWING = 0x00EC;
 
 // ---------- helpers ----------------------------------------------------------
@@ -55,11 +64,9 @@ double XlsParser::decode_rk(uint32_t rk) {
     bool div100 = (rk & 0x01) != 0;
 
     if (is_int) {
-        // Signed 30-bit integer (arithmetic shift right by 2).
         int32_t ival = static_cast<int32_t>(rk) >> 2;
         val = static_cast<double>(ival);
     } else {
-        // IEEE 754 double with lower 32 bits masked.
         uint64_t bits = static_cast<uint64_t>(rk & 0xFFFFFFFC) << 32;
         std::memcpy(&val, &bits, 8);
     }
@@ -68,8 +75,9 @@ double XlsParser::decode_rk(uint32_t rk) {
     return val;
 }
 
+// ---------- Number formatting ------------------------------------------------
+
 std::string XlsParser::format_number(double val) {
-    // Check if it's effectively an integer.
     if (std::abs(val - std::round(val)) < 1e-9 && std::abs(val) < 1e15) {
         long long ival = static_cast<long long>(std::round(val));
         return std::to_string(ival);
@@ -77,6 +85,182 @@ std::string XlsParser::format_number(double val) {
     std::ostringstream oss;
     oss << val;
     return oss.str();
+}
+
+bool XlsParser::is_date_format(int fmt_id, const std::string& fmt_code) {
+    // Built-in date/time format IDs
+    if ((fmt_id >= 14 && fmt_id <= 22) ||
+        (fmt_id >= 27 && fmt_id <= 36) ||
+        (fmt_id >= 45 && fmt_id <= 47) ||
+        (fmt_id >= 50 && fmt_id <= 58)) {
+        return true;
+    }
+
+    if (fmt_code.empty()) return false;
+    std::string lower;
+    for (char c : fmt_code) lower += std::tolower(static_cast<unsigned char>(c));
+
+    bool in_quote = false;
+    for (size_t i = 0; i < lower.size(); i++) {
+        if (lower[i] == '"') { in_quote = !in_quote; continue; }
+        if (in_quote) continue;
+        if (lower[i] == '\\') { i++; continue; }
+        char ch = lower[i];
+        if (ch == 'y' || ch == 'd' || ch == 'h') return true;
+        if (ch == 's' && i > 0) return true;
+    }
+    return false;
+}
+
+std::string XlsParser::serial_to_date(double serial) {
+    int days = static_cast<int>(serial);
+    if (days < 1) return "0000-00-00";
+
+    // Lotus 1-2-3 bug: day 60 = fake Feb 29, 1900. Correct for days > 60.
+    if (days > 60) days--;
+
+    days--; // make 0-based from 1900-01-01
+
+    int y = 1900;
+    while (true) {
+        bool leap = (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0);
+        int year_days = leap ? 366 : 365;
+        if (days < year_days) break;
+        days -= year_days;
+        y++;
+    }
+
+    bool leap = (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0);
+    static const int month_days[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+    int m = 0;
+    for (m = 0; m < 12; m++) {
+        int md = month_days[m] + (m == 1 && leap ? 1 : 0);
+        if (days < md) break;
+        days -= md;
+    }
+
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%04d-%02d-%02d", y, m + 1, days + 1);
+    return buf;
+}
+
+std::string XlsParser::serial_to_time(double serial) {
+    double frac = serial - static_cast<int>(serial);
+    int total_secs = static_cast<int>(frac * 86400 + 0.5);
+    int h = total_secs / 3600;
+    int m = (total_secs % 3600) / 60;
+    int s = total_secs % 60;
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%02d:%02d:%02d", h, m, s);
+    return buf;
+}
+
+std::string XlsParser::format_cell_number(double val, int xf_index) const {
+    if (xf_index < 0 || xf_index >= static_cast<int>(xf_num_fmt_ids_.size()))
+        return format_number(val);
+
+    int fmt_id = xf_num_fmt_ids_[xf_index];
+    if (fmt_id == 0) return format_number(val); // General
+
+    // Look up custom format code
+    std::string fmt_code;
+    auto it = custom_num_fmts_.find(fmt_id);
+    if (it != custom_num_fmts_.end()) {
+        fmt_code = it->second;
+    }
+
+    // Date/time formats
+    if (is_date_format(fmt_id, fmt_code)) {
+        bool is_time_only = (fmt_id >= 18 && fmt_id <= 21) ||
+                            (fmt_id >= 45 && fmt_id <= 47);
+        if (is_time_only) return serial_to_time(val);
+
+        std::string result = serial_to_date(val);
+        double frac = val - static_cast<int>(val);
+        if (frac > 0.0001 && (fmt_id == 22 ||
+            fmt_code.find('h') != std::string::npos ||
+            fmt_code.find('H') != std::string::npos)) {
+            result += " " + serial_to_time(val);
+        }
+        return result;
+    }
+
+    // Percentage formats (built-in IDs 9-10)
+    if (fmt_id == 9) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "%.0f%%", val * 100.0);
+        return buf;
+    }
+    if (fmt_id == 10) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "%.2f%%", val * 100.0);
+        return buf;
+    }
+
+    // Custom percentage
+    if (!fmt_code.empty() && fmt_code.find('%') != std::string::npos) {
+        int decimals = 0;
+        bool after_dot = false;
+        for (char c : fmt_code) {
+            if (c == '.') after_dot = true;
+            else if (after_dot && c == '0') decimals++;
+            else if (c == '%') break;
+        }
+        char buf[64];
+        snprintf(buf, sizeof(buf), "%.*f%%", decimals, val * 100.0);
+        return buf;
+    }
+
+    // Comma-grouped integers (IDs 3, 37, 38)
+    if (fmt_id == 3 || fmt_id == 37 || fmt_id == 38) {
+        long long ival = static_cast<long long>(val + (val >= 0 ? 0.5 : -0.5));
+        char buf[64];
+        snprintf(buf, sizeof(buf), "%lld", ival);
+        std::string s = buf;
+        int start = (s[0] == '-') ? 1 : 0;
+        int len = static_cast<int>(s.size()) - start;
+        if (len > 3) {
+            for (int i = len - 3; i > 0; i -= 3)
+                s.insert(start + i, 1, ',');
+        }
+        return s;
+    }
+
+    // Comma-grouped decimals (IDs 4, 39, 40)
+    if (fmt_id == 4 || fmt_id == 39 || fmt_id == 40) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "%.2f", val);
+        std::string s = buf;
+        auto dot = s.find('.');
+        int start = (s[0] == '-') ? 1 : 0;
+        int int_len = static_cast<int>(dot) - start;
+        if (int_len > 3) {
+            for (int i = int_len - 3; i > 0; i -= 3)
+                s.insert(start + i, 1, ',');
+        }
+        return s;
+    }
+
+    // Scientific notation (ID 11)
+    if (fmt_id == 11) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "%.2E", val);
+        return buf;
+    }
+
+    // Fixed decimal (IDs 1-2)
+    if (fmt_id == 1) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "%.0f", val);
+        return buf;
+    }
+    if (fmt_id == 2) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "%.2f", val);
+        return buf;
+    }
+
+    return format_number(val);
 }
 
 // ---------- XL Unicode string parsing ----------------------------------------
@@ -139,11 +323,9 @@ void XlsParser::parse_sst(const char* data, size_t len,
                            const std::vector<std::vector<char>>& continues) {
     if (len < 8) return;
 
-    // uint32_t total_strings = rd32(data);     // not needed
-    uint32_t unique_count  = rd32(data + 4);
+    uint32_t unique_count = rd32(data + 4);
 
     // Concatenate the SST record data with all CONTINUE records to form one buffer.
-    // This simplifies string parsing that may span record boundaries.
     std::vector<char> buf(data + 8, data + len);
     for (const auto& cont : continues) {
         buf.insert(buf.end(), cont.begin(), cont.end());
@@ -167,18 +349,15 @@ void XlsParser::parse_workbook() {
     }
     if (wb.empty()) return;
 
-    // First pass: collect BoundSheet names, SST, etc.
+    // First pass: collect BoundSheet names, SST, FORMAT, XF records.
     std::vector<std::string> sheet_names;
     int bof_count = 0;
     bool in_globals = false;
-    int current_sheet = -1;
 
     size_t pos = 0;
-    uint16_t prev_type = 0;
     std::vector<std::vector<char>> continue_blocks;
 
-    // We need two passes: first for globals (SST, BoundSheet), then for sheet data.
-    // Pass 1: globals
+    // Pass 1: globals (SST, BoundSheet, FORMAT, XF, FILEPASS)
     while (pos + 4 <= wb.size()) {
         uint16_t rec_type = rd16(wb.data() + pos);
         uint16_t rec_size = rd16(wb.data() + pos + 2);
@@ -194,17 +373,19 @@ void XlsParser::parse_workbook() {
         }
 
         if (in_globals) {
+            // Encryption detection: FILEPASS record means file is encrypted.
+            if (rec_type == RT_FILEPASS) {
+                throw std::runtime_error("XLS file is encrypted");
+            }
+
             if (rec_type == RT_BOUNDSHEET && rec_size >= 8) {
-                // offset 6: 1 byte name length, offset 7: 1 byte flags (0=compressed, 1=UTF-16LE)
                 uint8_t name_len = static_cast<uint8_t>(rec_data[6]);
                 uint8_t name_flags = static_cast<uint8_t>(rec_data[7]);
                 std::string sname;
                 if (name_flags & 0x01) {
-                    // UTF-16LE
                     size_t byte_len = std::min(size_t(name_len) * 2, size_t(rec_size - 8));
                     sname = util::utf16le_to_utf8(rec_data + 8, byte_len);
                 } else {
-                    // Compressed (CP1252)
                     size_t byte_len = std::min(size_t(name_len), size_t(rec_size - 8));
                     for (size_t i = 0; i < byte_len; ++i) {
                         sname += util::cp1252_to_utf8(static_cast<uint8_t>(rec_data[8 + i]));
@@ -213,8 +394,37 @@ void XlsParser::parse_workbook() {
                 sheet_names.push_back(sname);
             }
 
+            // FORMAT record: numFmtId (2 bytes) + formatCode string
+            if (rec_type == RT_FORMAT && rec_size >= 5) {
+                uint16_t fmt_id = rd16(rec_data);
+                // Format string is an XLUnicodeString starting at offset 2
+                uint16_t cch = rd16(rec_data + 2);
+                uint8_t flags = static_cast<uint8_t>(rec_data[4]);
+                bool high_byte = (flags & 0x01) != 0;
+
+                size_t str_start = 5;
+                size_t bytes_needed = high_byte ? (size_t(cch) * 2) : size_t(cch);
+                if (str_start + bytes_needed <= rec_size) {
+                    std::string code;
+                    if (high_byte) {
+                        code = util::utf16le_to_utf8(rec_data + str_start, bytes_needed);
+                    } else {
+                        for (size_t i = 0; i < bytes_needed; ++i) {
+                            code += util::cp1252_to_utf8(
+                                static_cast<uint8_t>(rec_data[str_start + i]));
+                        }
+                    }
+                    custom_num_fmts_[fmt_id] = code;
+                }
+            }
+
+            // XF record: offset 2-3 = numFmtId (2 bytes)
+            if (rec_type == RT_XF && rec_size >= 4) {
+                uint16_t fmt_id = rd16(rec_data + 2);
+                xf_num_fmt_ids_.push_back(static_cast<int>(fmt_id));
+            }
+
             if (rec_type == RT_SST) {
-                // Collect CONTINUE records that follow.
                 continue_blocks.clear();
                 size_t look = pos + rec_size;
                 while (look + 4 <= wb.size()) {
@@ -239,10 +449,13 @@ void XlsParser::parse_workbook() {
         sheets_[i].name = sheet_names[i];
     }
 
-    // Pass 2: sheet cell data.
+    // Pass 2: sheet cell data (LABELSST, LABEL, NUMBER, RK, MULRK, FORMULA).
     pos = 0;
     bof_count = 0;
-    current_sheet = -1;
+    int current_sheet = -1;
+    bool expect_string = false;  // true after FORMULA with string result
+    uint16_t formula_row = 0, formula_col = 0;
+    int formula_sheet = -1;
 
     while (pos + 4 <= wb.size()) {
         uint16_t rec_type = rd16(wb.data() + pos);
@@ -256,10 +469,34 @@ void XlsParser::parse_workbook() {
             if (bof_count > 1) {
                 current_sheet = bof_count - 2;
             }
-        } else if (rec_type == RT_EOF) {
-            if (current_sheet >= 0) {
-                // Sheet ended.
+        }
+
+        // STRING record follows FORMULA when result is a string.
+        if (expect_string && rec_type == RT_STRING && rec_size >= 3) {
+            expect_string = false;
+            if (formula_sheet >= 0 && formula_sheet < static_cast<int>(sheets_.size())) {
+                uint16_t cch = rd16(rec_data);
+                uint8_t flags = static_cast<uint8_t>(rec_data[2]);
+                bool high_byte = (flags & 0x01) != 0;
+                size_t str_start = 3;
+                size_t bytes_needed = high_byte ? (size_t(cch) * 2) : size_t(cch);
+                std::string val;
+                if (str_start + bytes_needed <= rec_size) {
+                    if (high_byte) {
+                        val = util::utf16le_to_utf8(rec_data + str_start, bytes_needed);
+                    } else {
+                        for (size_t i = 0; i < bytes_needed; ++i) {
+                            val += util::cp1252_to_utf8(
+                                static_cast<uint8_t>(rec_data[str_start + i]));
+                        }
+                    }
+                }
+                if (!val.empty()) {
+                    sheets_[formula_sheet].cells.push_back({formula_row, formula_col, val});
+                }
             }
+        } else if (rec_type != RT_CONTINUE) {
+            expect_string = false;
         }
 
         if (current_sheet >= 0 && current_sheet < static_cast<int>(sheets_.size())) {
@@ -268,35 +505,125 @@ void XlsParser::parse_workbook() {
             if (rec_type == RT_LABELSST && rec_size >= 10) {
                 uint16_t row = rd16(rec_data);
                 uint16_t col = rd16(rec_data + 2);
-                // XF index at offset 4 (skip).
                 uint32_t sst_idx = rd32(rec_data + 6);
                 if (sst_idx < sst_.size()) {
                     sheet.cells.push_back({row, col, sst_[sst_idx]});
                 }
+            } else if (rec_type == RT_BOOLERR && rec_size >= 8) {
+                // BOOLERR record: boolean or error cell
+                uint16_t row = rd16(rec_data);
+                uint16_t col = rd16(rec_data + 2);
+                // XF index at offset 4 (2 bytes) — skip
+                uint8_t val = static_cast<uint8_t>(rec_data[6]);
+                uint8_t is_error = static_cast<uint8_t>(rec_data[7]);
+                std::string cell_val;
+                if (is_error) {
+                    switch (val) {
+                        case 0x00: cell_val = "#NULL!"; break;
+                        case 0x07: cell_val = "#DIV/0!"; break;
+                        case 0x0F: cell_val = "#VALUE!"; break;
+                        case 0x17: cell_val = "#REF!"; break;
+                        case 0x1D: cell_val = "#NAME?"; break;
+                        case 0x24: cell_val = "#NUM!"; break;
+                        case 0x2A: cell_val = "#N/A"; break;
+                        default:   cell_val = "#ERR"; break;
+                    }
+                } else {
+                    cell_val = val ? "TRUE" : "FALSE";
+                }
+                sheet.cells.push_back({row, col, cell_val});
+            } else if (rec_type == RT_LABEL && rec_size >= 9) {
+                // LABEL record: inline string cell (BIFF8)
+                uint16_t row = rd16(rec_data);
+                uint16_t col = rd16(rec_data + 2);
+                // XF index at offset 4 (2 bytes) — skip
+                uint16_t cch = rd16(rec_data + 6);
+                uint8_t flags = static_cast<uint8_t>(rec_data[8]);
+                bool high_byte = (flags & 0x01) != 0;
+                size_t str_start = 9;
+                size_t bytes_needed = high_byte ? (size_t(cch) * 2) : size_t(cch);
+                std::string val;
+                if (str_start + bytes_needed <= rec_size) {
+                    if (high_byte) {
+                        val = util::utf16le_to_utf8(rec_data + str_start, bytes_needed);
+                    } else {
+                        for (size_t i = 0; i < bytes_needed; ++i) {
+                            val += util::cp1252_to_utf8(
+                                static_cast<uint8_t>(rec_data[str_start + i]));
+                        }
+                    }
+                }
+                if (!val.empty()) {
+                    sheet.cells.push_back({row, col, val});
+                }
             } else if (rec_type == RT_NUMBER && rec_size >= 14) {
                 uint16_t row = rd16(rec_data);
                 uint16_t col = rd16(rec_data + 2);
+                uint16_t xf_idx = rd16(rec_data + 4);
                 double val = rd_double(rec_data + 6);
-                sheet.cells.push_back({row, col, format_number(val)});
+                sheet.cells.push_back({row, col, format_cell_number(val, xf_idx)});
             } else if (rec_type == RT_RK && rec_size >= 10) {
                 uint16_t row = rd16(rec_data);
                 uint16_t col = rd16(rec_data + 2);
+                uint16_t xf_idx = rd16(rec_data + 4);
                 uint32_t rk = rd32(rec_data + 6);
                 double val = decode_rk(rk);
-                sheet.cells.push_back({row, col, format_number(val)});
+                sheet.cells.push_back({row, col, format_cell_number(val, xf_idx)});
             } else if (rec_type == RT_MULRK && rec_size >= 6) {
                 uint16_t row = rd16(rec_data);
                 uint16_t first_col = rd16(rec_data + 2);
-                // Last col is at the end of the record (2 bytes).
                 uint16_t last_col = rd16(rec_data + rec_size - 2);
-                // Between: (XF index (2 bytes) + RK value (4 bytes)) pairs.
                 size_t pair_offset = 4;
                 for (uint16_t c = first_col; c <= last_col && pair_offset + 6 <= rec_size - 2u; ++c) {
-                    // XF index at pair_offset (2 bytes) -- skip.
+                    uint16_t xf_idx = rd16(rec_data + pair_offset);
                     uint32_t rk = rd32(rec_data + pair_offset + 2);
                     double val = decode_rk(rk);
-                    sheet.cells.push_back({row, c, format_number(val)});
+                    sheet.cells.push_back({row, c, format_cell_number(val, xf_idx)});
                     pair_offset += 6;
+                }
+            } else if (rec_type == RT_FORMULA && rec_size >= 20) {
+                // FORMULA record: row(2) + col(2) + xf(2) + result(8) + options(2) + reserved(4)
+                uint16_t row = rd16(rec_data);
+                uint16_t col = rd16(rec_data + 2);
+                uint16_t xf_idx = rd16(rec_data + 4);
+
+                // Result value is 8 bytes at offset 6.
+                // Check if it's a special type: bytes 6-7 = 0xFFFF means not a number.
+                uint16_t marker = rd16(rec_data + 12);
+                if (marker == 0xFFFF) {
+                    // Special value: byte at offset 6 indicates type.
+                    uint8_t result_type = static_cast<uint8_t>(rec_data[6]);
+                    if (result_type == 0) {
+                        // String result: follows in a STRING record.
+                        expect_string = true;
+                        formula_row = row;
+                        formula_col = col;
+                        formula_sheet = current_sheet;
+                    } else if (result_type == 1) {
+                        // Boolean: byte at offset 8
+                        bool bval = (rec_data[8] != 0);
+                        sheet.cells.push_back({row, col, bval ? "TRUE" : "FALSE"});
+                    } else if (result_type == 2) {
+                        // Error: byte at offset 8
+                        uint8_t err = static_cast<uint8_t>(rec_data[8]);
+                        std::string err_str;
+                        switch (err) {
+                            case 0x00: err_str = "#NULL!"; break;
+                            case 0x07: err_str = "#DIV/0!"; break;
+                            case 0x0F: err_str = "#VALUE!"; break;
+                            case 0x17: err_str = "#REF!"; break;
+                            case 0x1D: err_str = "#NAME?"; break;
+                            case 0x24: err_str = "#NUM!"; break;
+                            case 0x2A: err_str = "#N/A"; break;
+                            default:   err_str = "#ERR"; break;
+                        }
+                        sheet.cells.push_back({row, col, err_str});
+                    }
+                    // result_type == 3: empty cell, skip
+                } else {
+                    // Numeric result (IEEE 754 double).
+                    double val = rd_double(rec_data + 6);
+                    sheet.cells.push_back({row, col, format_cell_number(val, xf_idx)});
                 }
             }
         }
@@ -344,12 +671,12 @@ std::string XlsParser::sheet_to_markdown(const Sheet& sheet) {
 
     // Render markdown table.
     std::ostringstream out;
-    out << "### " << sheet.name << "\n\n";
+    std::string display_name = sheet.name.empty() ? "Sheet" : sheet.name;
+    out << "## " << display_name << "\n\n";
 
     for (int r = 0; r < used_rows; ++r) {
         out << "|";
         for (int c = 0; c < used_cols; ++c) {
-            // Escape pipe characters in cell values.
             std::string val = grid[r][c];
             for (size_t i = 0; i < val.size(); ++i) {
                 if (val[i] == '|') val.replace(i, 1, "\\|");
@@ -397,7 +724,6 @@ std::vector<ImageData> XlsParser::extract_images() {
 
         if (rec_type == RT_MSODRAWING) {
             drawing_data.insert(drawing_data.end(), wb.data() + pos, wb.data() + pos + rec_size);
-            // Append CONTINUE records.
             size_t look = pos + rec_size;
             while (look + 4 <= wb.size()) {
                 uint16_t ct = rd16(wb.data() + look);
@@ -426,31 +752,28 @@ std::vector<ImageData> XlsParser::extract_images() {
         uint8_t ver = ver_inst & 0x0F;
 
         if (ver == 0x0F) {
-            // Container: recurse into it (just advance past header).
             pos += 8;
             continue;
         }
 
         if (rec_type >= 0xF01A && rec_type <= 0xF029 && rec_len > 0) {
-            // BLIP record.
             size_t blip_start = pos + 8;
             size_t blip_end = blip_start + rec_len;
             if (blip_end > drawing_data.size()) break;
 
-            size_t header_skip = 17; // default: 1 byte + 16 bytes UID
+            size_t header_skip = 17;
             std::string fmt;
 
             switch (rec_type) {
                 case 0xF01A: fmt = "emf"; header_skip = 50; break;
                 case 0xF01B: fmt = "wmf"; header_skip = 50; break;
-                case 0xF01C: header_skip = 50; break; // PICT
+                case 0xF01C: header_skip = 50; break;
                 case 0xF01D: fmt = "jpeg"; header_skip = 17; break;
                 case 0xF01E: fmt = "png"; header_skip = 17; break;
                 case 0xF01F: fmt = "bmp"; header_skip = 17; break;
                 case 0xF029: fmt = "tiff"; header_skip = 17; break;
             }
 
-            // Check for 2 UIDs.
             uint16_t inst = ver_inst >> 4;
             if (rec_type == 0xF01D && (inst == 0x46B || inst == 0x6E3)) header_skip = 33;
             if (rec_type == 0xF01E && (inst == 0x6E1 || inst == 0x6E5)) header_skip = 33;
@@ -471,7 +794,6 @@ std::vector<ImageData> XlsParser::extract_images() {
 
             pos = blip_end;
         } else {
-            // Non-BLIP atom: skip.
             pos += 8 + rec_len;
         }
     }
@@ -511,7 +833,6 @@ std::vector<PageChunk> XlsParser::to_chunks(const ConvertOptions& opts) {
         chunk.page_height = 792.0;
         chunk.body_font_size = 10.0;
 
-        // Build the tables data structure.
         if (opts.extract_tables && !sheets_[i].cells.empty()) {
             uint16_t max_row = 0, max_col = 0;
             for (const auto& c : sheets_[i].cells) {
@@ -528,7 +849,6 @@ std::vector<PageChunk> XlsParser::to_chunks(const ConvertOptions& opts) {
                     grid[c.row][c.col] = c.value;
             }
 
-            // Trim empty rows/cols.
             int used_rows = 0, used_cols = 0;
             for (int r = 0; r <= max_row; ++r)
                 for (int c = 0; c <= max_col; ++c)
@@ -546,7 +866,6 @@ std::vector<PageChunk> XlsParser::to_chunks(const ConvertOptions& opts) {
             }
         }
 
-        // Distribute images to chunks (best-effort).
         if (opts.extract_images && img_per_sheet > 0) {
             int start = static_cast<int>(i) * img_per_sheet;
             int end = std::min(start + img_per_sheet, static_cast<int>(images.size()));
