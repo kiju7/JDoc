@@ -46,17 +46,18 @@ target_link_libraries(jdoc_hwpx PUBLIC pugixml jdoc_zip jdoc_common)
 
 # ── HWP (binary format) ──────────────────────────────────────
 
-add_library(jdoc_hwp STATIC src/hwp.cpp)
+add_library(jdoc_hwp STATIC src/hwp.cpp src/legacy/ole_reader.cpp)
 target_include_directories(jdoc_hwp PUBLIC include PRIVATE src)
-target_link_libraries(jdoc_hwp PUBLIC pole ZLIB::ZLIB jdoc_common)
+target_link_libraries(jdoc_hwp PUBLIC ZLIB::ZLIB jdoc_common)
 
-# ── Office (DOCX/XLSX/PPTX/DOC/XLS/PPT/RTF/HTML) ─────────────
+# ── Office (DOCX/XLSX/XLSB/PPTX/DOC/XLS/PPT/RTF/HTML) ────────
 
 add_library(jdoc_office STATIC
     src/office.cpp
     src/ooxml/docx_parser.cpp
     src/ooxml/pptx_parser.cpp
     src/ooxml/xlsx_parser.cpp
+    src/ooxml/xlsb_parser.cpp
     src/legacy/ole_reader.cpp
     src/legacy/doc_parser.cpp
     src/legacy/xls_parser.cpp

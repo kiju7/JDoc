@@ -7,6 +7,7 @@
 #include "ooxml/docx_parser.h"
 #include "ooxml/pptx_parser.h"
 #include "ooxml/xlsx_parser.h"
+#include "ooxml/xlsb_parser.h"
 #include "legacy/ole_reader.h"
 #include "legacy/doc_parser.h"
 #include "legacy/xls_parser.h"
@@ -49,6 +50,7 @@ DocFormat detect_office_format(const std::string& file_path) {
         // OOXML — determine specific type from extension or internal content
         if (ext == ".docx") return DocFormat::DOCX;
         if (ext == ".xlsx") return DocFormat::XLSX;
+        if (ext == ".xlsb") return DocFormat::XLSB;
         if (ext == ".pptx") return DocFormat::PPTX;
 
         // Fallback: inspect [Content_Types].xml
@@ -59,8 +61,13 @@ DocFormat detect_office_format(const std::string& file_path) {
                 std::string content(ct.begin(), ct.end());
                 if (content.find("wordprocessingml") != std::string::npos)
                     return DocFormat::DOCX;
-                if (content.find("spreadsheetml") != std::string::npos)
+                if (content.find("spreadsheetml") != std::string::npos) {
+                    // Check if XLSB by looking for .bin worksheets
+                    if (content.find("binaryFormat") != std::string::npos ||
+                        zip.has_entry("xl/workbook.bin"))
+                        return DocFormat::XLSB;
                     return DocFormat::XLSX;
+                }
                 if (content.find("presentationml") != std::string::npos)
                     return DocFormat::PPTX;
             }
@@ -71,7 +78,7 @@ DocFormat detect_office_format(const std::string& file_path) {
     // OLE magic: D0 CF 11 E0 A1 B1 1A E1
     static const unsigned char OLE_MAGIC[] = {0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1};
     if (memcmp(magic, OLE_MAGIC, 8) == 0) {
-        // Determine type from extension first
+        // Determine type from extension first (skip .hwp — handled by main)
         if (ext == ".doc") return DocFormat::DOC;
         if (ext == ".xls") return DocFormat::XLS;
         if (ext == ".ppt") return DocFormat::PPT;
@@ -79,6 +86,8 @@ DocFormat detect_office_format(const std::string& file_path) {
         // Fallback: inspect internal streams
         OleReader ole(file_path);
         if (ole.is_open()) {
+            // HWP check: skip it here, let the main dispatcher handle HWP
+            if (ole.has_stream("FileHeader")) return DocFormat::UNKNOWN;
             if (ole.has_stream("WordDocument")) return DocFormat::DOC;
             if (ole.has_stream("Workbook") || ole.has_stream("Book"))
                 return DocFormat::XLS;
@@ -117,6 +126,7 @@ DocFormat detect_office_format(const std::string& file_path) {
     // Extension-only fallback
     if (ext == ".docx") return DocFormat::DOCX;
     if (ext == ".xlsx") return DocFormat::XLSX;
+    if (ext == ".xlsb") return DocFormat::XLSB;
     if (ext == ".pptx") return DocFormat::PPTX;
     if (ext == ".doc")  return DocFormat::DOC;
     if (ext == ".xls")  return DocFormat::XLS;
@@ -130,6 +140,7 @@ const char* format_name(DocFormat fmt) {
     switch (fmt) {
         case DocFormat::DOCX: return "DOCX";
         case DocFormat::XLSX: return "XLSX";
+        case DocFormat::XLSB: return "XLSB";
         case DocFormat::PPTX: return "PPTX";
         case DocFormat::DOC:  return "DOC";
         case DocFormat::XLS:  return "XLS";
@@ -142,10 +153,33 @@ const char* format_name(DocFormat fmt) {
 
 // ── Public API ──────────────────────────────────────────
 
+// Section separator label for each format
+static const char* section_label(DocFormat fmt) {
+    switch (fmt) {
+    case DocFormat::PPTX: case DocFormat::PPT: return "Slide";
+    case DocFormat::XLSX: case DocFormat::XLS: case DocFormat::XLSB: return "Sheet";
+    default: return "Page";
+    }
+}
+
 std::string office_to_markdown(const std::string& file_path, ConvertOptions opts) {
     auto format = detect_office_format(file_path);
-    std::string md;
 
+    if (opts.output_format == OutputFormat::PLAINTEXT) {
+        auto chunks = office_to_markdown_chunks(file_path, opts);
+        if (chunks.size() <= 1 && !chunks.empty())
+            return chunks[0].text;
+        const char* label = section_label(format);
+        std::string result;
+        for (size_t i = 0; i < chunks.size(); ++i) {
+            if (i > 0)
+                result += "\n--- " + std::string(label) + " " + std::to_string(chunks[i].page_number) + " ---\n\n";
+            result += chunks[i].text;
+        }
+        return result;
+    }
+
+    std::string md;
     switch (format) {
     case DocFormat::DOCX: {
         ZipReader zip(file_path);
@@ -165,6 +199,13 @@ std::string office_to_markdown(const std::string& file_path, ConvertOptions opts
         ZipReader zip(file_path);
         if (!zip.is_open()) throw std::runtime_error("Cannot open XLSX file: " + file_path);
         XlsxParser parser(zip);
+        md = parser.to_markdown(opts);
+        break;
+    }
+    case DocFormat::XLSB: {
+        ZipReader zip(file_path);
+        if (!zip.is_open()) throw std::runtime_error("Cannot open XLSB file: " + file_path);
+        XlsbParser parser(zip);
         md = parser.to_markdown(opts);
         break;
     }
@@ -202,9 +243,6 @@ std::string office_to_markdown(const std::string& file_path, ConvertOptions opts
     default:
         throw std::runtime_error("Unsupported document format: " + file_path);
     }
-
-    if (opts.output_format == OutputFormat::PLAINTEXT)
-        return util::strip_markdown(md);
     return md;
 }
 
@@ -232,6 +270,13 @@ std::vector<PageChunk> office_to_markdown_chunks(const std::string& file_path,
         ZipReader zip(file_path);
         if (!zip.is_open()) throw std::runtime_error("Cannot open XLSX file: " + file_path);
         XlsxParser parser(zip);
+        chunks = parser.to_chunks(opts);
+        break;
+    }
+    case DocFormat::XLSB: {
+        ZipReader zip(file_path);
+        if (!zip.is_open()) throw std::runtime_error("Cannot open XLSB file: " + file_path);
+        XlsbParser parser(zip);
         chunks = parser.to_chunks(opts);
         break;
     }

@@ -1,6 +1,6 @@
 #pragma once
 // jdoc - Office document to Markdown converter
-// Supports: DOCX, XLSX, PPTX, DOC, XLS, PPT, RTF, HTML
+// Supports: DOCX, XLSX, XLSB, PPTX, DOC, XLS, PPT, RTF, HTML
 // License: MIT
 
 #include "jdoc/types.h"
@@ -10,7 +10,7 @@
 namespace jdoc {
 
 enum class DocFormat {
-    UNKNOWN, DOCX, XLSX, PPTX, DOC, XLS, PPT, RTF, HTML
+    UNKNOWN, DOCX, XLSX, XLSB, PPTX, DOC, XLS, PPT, RTF, HTML
 };
 
 DocFormat detect_office_format(const std::string& file_path);
