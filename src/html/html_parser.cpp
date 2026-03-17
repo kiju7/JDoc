@@ -286,6 +286,8 @@ std::string HtmlParser::convert(const ConvertOptions& opts,
 
     // State tracking
     bool in_head = false;
+    bool in_title = false;
+    std::string title_text;
     bool in_script = false;
     bool in_style = false;
     bool in_pre = false;
@@ -316,7 +318,11 @@ std::string HtmlParser::convert(const ConvertOptions& opts,
         // Try to read text first
         if (raw_html_[pos] != '<') {
             std::string text = read_text(pos);
-            if (in_head || in_script || in_style) continue;
+            if (in_script || in_style) continue;
+            if (in_head) {
+                if (in_title) title_text += text;
+                continue;
+            }
 
             text = decode_entities(text);
 
@@ -380,9 +386,12 @@ std::string HtmlParser::convert(const ConvertOptions& opts,
             continue;
         }
 
-        // Head section
+        // Head section — extract <title> content
         if (tag.name == "head") { in_head = !tag.is_closing; continue; }
-        if (in_head) continue;
+        if (in_head) {
+            if (tag.name == "title") in_title = !tag.is_closing;
+            continue;
+        }
 
         // ── Headings ─────────────────────────────────
         if (tag.name.size() == 2 && tag.name[0] == 'h' &&
@@ -728,6 +737,17 @@ std::string HtmlParser::convert(const ConvertOptions& opts,
         }
     }
 
+    // Prepend page title if extracted from <title> tag
+    if (!title_text.empty()) {
+        // Trim whitespace
+        size_t s = title_text.find_first_not_of(" \t\r\n");
+        size_t e = title_text.find_last_not_of(" \t\r\n");
+        if (s != std::string::npos) {
+            std::string title = decode_entities(title_text.substr(s, e - s + 1));
+            result = "# " + title + "\n\n" + result;
+        }
+    }
+
     return result;
 }
 
@@ -754,7 +774,7 @@ std::vector<PageChunk> HtmlParser::to_chunks(const ConvertOptions& opts) {
     std::string md = convert(opts, images);
 
     PageChunk chunk;
-    chunk.page_number = 0;
+    chunk.page_number = 1;
     chunk.text = md;
     chunk.page_width = 0;
     chunk.page_height = 0;
