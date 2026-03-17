@@ -6,8 +6,10 @@
 #include "common/file_utils.h"
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <cstring>
 #include <cstdlib>
+#include <cstdio>
 #include <map>
 #include <set>
 #include <sstream>
@@ -21,6 +23,7 @@ XlsxParser::XlsxParser(ZipReader& zip) : zip_(zip) {
     parse_shared_strings();
     parse_workbook();
     parse_workbook_rels();
+    parse_styles();
 }
 
 // ── Shared strings (xl/sharedStrings.xml) ───────────────
@@ -30,7 +33,7 @@ void XlsxParser::parse_shared_strings() {
 
     auto data = zip_.read_entry("xl/sharedStrings.xml");
     pugi::xml_document doc;
-    if (!doc.load_buffer(data.data(), data.size())) return;
+    if (!doc.load_buffer(data.data(), data.size(), pugi::parse_default | pugi::parse_ws_pcdata)) return;
 
     // Each <si> element contains one shared string
     // Text can be in <t> directly or in <r><t> runs
@@ -65,7 +68,7 @@ void XlsxParser::parse_workbook() {
 
     auto data = zip_.read_entry("xl/workbook.xml");
     pugi::xml_document doc;
-    if (!doc.load_buffer(data.data(), data.size())) return;
+    if (!doc.load_buffer(data.data(), data.size(), pugi::parse_default | pugi::parse_ws_pcdata)) return;
 
     // Find <sheets><sheet> elements
     std::vector<pugi::xml_node> sheet_nodes;
@@ -103,7 +106,7 @@ void XlsxParser::parse_workbook_rels() {
 
     auto data = zip_.read_entry(rels_path);
     pugi::xml_document doc;
-    if (!doc.load_buffer(data.data(), data.size())) return;
+    if (!doc.load_buffer(data.data(), data.size(), pugi::parse_default | pugi::parse_ws_pcdata)) return;
 
     // Build rId -> target map
     std::map<std::string, std::string> id_to_target;
@@ -135,6 +138,287 @@ void XlsxParser::parse_workbook_rels() {
     }
 }
 
+// ── Styles (xl/styles.xml) — number format parsing ──────
+
+void XlsxParser::parse_styles() {
+    if (!zip_.has_entry("xl/styles.xml")) return;
+
+    auto data = zip_.read_entry("xl/styles.xml");
+    pugi::xml_document doc;
+    if (!doc.load_buffer(data.data(), data.size(), pugi::parse_default | pugi::parse_ws_pcdata)) return;
+
+    // Parse custom number formats: <numFmts><numFmt numFmtId="..." formatCode="..."/>
+    std::vector<pugi::xml_node> fmt_nodes;
+    xml_find_all(doc, "numFmt", fmt_nodes);
+    for (auto& node : fmt_nodes) {
+        const char* id_str = xml_attr(node, "numFmtId");
+        const char* code = xml_attr(node, "formatCode");
+        if (id_str[0] && code[0]) {
+            custom_num_fmts_[std::atoi(id_str)] = code;
+        }
+    }
+
+    // Parse cell formats: <cellXfs><xf numFmtId="..."/>
+    std::vector<pugi::xml_node> xf_nodes;
+    xml_find_all(doc, "xf", xf_nodes);
+
+    // cellXfs entries come after cellStyleXfs entries.
+    // Find the <cellXfs> parent to get the right set.
+    std::vector<pugi::xml_node> cell_xfs_nodes;
+    xml_find_all(doc, "cellXfs", cell_xfs_nodes);
+
+    if (!cell_xfs_nodes.empty()) {
+        auto cellXfs = cell_xfs_nodes[0];
+        for (auto xf = cellXfs.first_child(); xf; xf = xf.next_sibling()) {
+            const char* name = xf.name();
+            const char* colon = strchr(name, ':');
+            const char* local = colon ? colon + 1 : name;
+            if (strcmp(local, "xf") != 0) continue;
+
+            const char* fmt_id = xml_attr(xf, "numFmtId");
+            xf_num_fmt_ids_.push_back(fmt_id[0] ? std::atoi(fmt_id) : 0);
+        }
+    }
+}
+
+// ── Number formatting ───────────────────────────────────
+
+bool XlsxParser::is_date_format(int fmt_id, const std::string& fmt_code) {
+    // Built-in date/time format IDs
+    if ((fmt_id >= 14 && fmt_id <= 22) ||
+        (fmt_id >= 27 && fmt_id <= 36) ||
+        (fmt_id >= 45 && fmt_id <= 47) ||
+        (fmt_id >= 50 && fmt_id <= 58)) {
+        return true;
+    }
+
+    // Check custom format code for date/time patterns
+    if (fmt_code.empty()) return false;
+    std::string lower;
+    for (char c : fmt_code) lower += std::tolower(static_cast<unsigned char>(c));
+
+    // Skip escaped chars and quoted strings
+    bool in_quote = false;
+    for (size_t i = 0; i < lower.size(); i++) {
+        if (lower[i] == '"') { in_quote = !in_quote; continue; }
+        if (in_quote) continue;
+        if (lower[i] == '\\') { i++; continue; }
+        char ch = lower[i];
+        if (ch == 'y' || ch == 'd') return true;
+        // 'm' is date only if not preceded by 'h' or followed by 's'
+        if (ch == 'h') return true;
+        if (ch == 's' && i > 0) return true;
+    }
+    return false;
+}
+
+std::string XlsxParser::serial_to_date(double serial) {
+    // Excel epoch: day 1 = 1900-01-01, with Lotus 1-2-3 bug (day 60 = Feb 29, 1900)
+    int days = static_cast<int>(serial);
+    if (days < 1) return "0000-00-00";
+
+    // Lotus bug: Excel treats 1900 as a leap year.
+    // Day 60 = "Feb 29, 1900" which doesn't exist.
+    // For days > 60, subtract 1 to correct. For days <= 60, keep as-is.
+    if (days > 60) days--;
+
+    // days is now 1-based from 1900-01-01
+    days--; // make 0-based
+
+    int y = 1900;
+    while (true) {
+        bool leap = (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0);
+        int year_days = leap ? 366 : 365;
+        if (days < year_days) break;
+        days -= year_days;
+        y++;
+    }
+
+    bool leap = (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0);
+    static const int month_days[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+    int m = 0;
+    for (m = 0; m < 12; m++) {
+        int md = month_days[m] + (m == 1 && leap ? 1 : 0);
+        if (days < md) break;
+        days -= md;
+    }
+
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%04d-%02d-%02d", y, m + 1, days + 1);
+    return buf;
+}
+
+std::string XlsxParser::serial_to_time(double serial) {
+    double frac = serial - static_cast<int>(serial);
+    int total_secs = static_cast<int>(frac * 86400 + 0.5);
+    int h = total_secs / 3600;
+    int m = (total_secs % 3600) / 60;
+    int s = total_secs % 60;
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%02d:%02d:%02d", h, m, s);
+    return buf;
+}
+
+std::string XlsxParser::format_number(const std::string& raw_value,
+                                       int style_idx) const {
+    if (style_idx < 0 || style_idx >= static_cast<int>(xf_num_fmt_ids_.size()))
+        return raw_value;
+
+    int fmt_id = xf_num_fmt_ids_[style_idx];
+    if (fmt_id == 0) return raw_value; // General
+
+    // Look up format code
+    std::string fmt_code;
+    auto it = custom_num_fmts_.find(fmt_id);
+    if (it != custom_num_fmts_.end()) {
+        fmt_code = it->second;
+    }
+
+    double val = std::atof(raw_value.c_str());
+
+    // Date/time formats
+    if (is_date_format(fmt_id, fmt_code)) {
+        // Pure time formats (IDs 18-21, 45-47)
+        bool is_time_only = (fmt_id >= 18 && fmt_id <= 21) ||
+                            (fmt_id >= 45 && fmt_id <= 47);
+        if (is_time_only) {
+            return serial_to_time(val);
+        }
+        // Date (possibly with time)
+        std::string result = serial_to_date(val);
+        double frac = val - static_cast<int>(val);
+        if (frac > 0.0001 && (fmt_id == 22 ||
+            fmt_code.find('h') != std::string::npos ||
+            fmt_code.find('H') != std::string::npos)) {
+            result += " " + serial_to_time(val);
+        }
+        return result;
+    }
+
+    // Percentage formats (IDs 9-10)
+    if (fmt_id == 9) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "%.0f%%", val * 100.0);
+        return buf;
+    }
+    if (fmt_id == 10) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "%.2f%%", val * 100.0);
+        return buf;
+    }
+
+    // Check custom format for percentage
+    if (!fmt_code.empty() && fmt_code.find('%') != std::string::npos) {
+        // Count decimal places after '0' before '%'
+        int decimals = 0;
+        bool after_dot = false;
+        for (char c : fmt_code) {
+            if (c == '.') after_dot = true;
+            else if (after_dot && c == '0') decimals++;
+            else if (c == '%') break;
+        }
+        char buf[64];
+        snprintf(buf, sizeof(buf), "%.*f%%", decimals, val * 100.0);
+        return buf;
+    }
+
+    // Number with comma grouping (IDs 3-4, 37-40)
+    if (fmt_id == 3 || fmt_id == 37 || fmt_id == 38) {
+        // #,##0
+        long long ival = static_cast<long long>(val + (val >= 0 ? 0.5 : -0.5));
+        char buf[64];
+        snprintf(buf, sizeof(buf), "%lld", ival);
+        std::string s = buf;
+        // Insert commas
+        int start = (s[0] == '-') ? 1 : 0;
+        int len = static_cast<int>(s.size()) - start;
+        if (len > 3) {
+            for (int i = len - 3; i > 0; i -= 3) {
+                s.insert(start + i, 1, ',');
+            }
+        }
+        return s;
+    }
+    if (fmt_id == 4 || fmt_id == 39 || fmt_id == 40) {
+        // #,##0.00
+        char buf[64];
+        snprintf(buf, sizeof(buf), "%.2f", val);
+        std::string s = buf;
+        auto dot = s.find('.');
+        int start = (s[0] == '-') ? 1 : 0;
+        int int_len = static_cast<int>(dot) - start;
+        if (int_len > 3) {
+            for (int i = int_len - 3; i > 0; i -= 3) {
+                s.insert(start + i, 1, ',');
+            }
+        }
+        return s;
+    }
+
+    // Scientific notation (ID 11)
+    if (fmt_id == 11) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "%.2E", val);
+        return buf;
+    }
+
+    // Fraction formats (IDs 12-13) — just show decimal
+    if (fmt_id == 12 || fmt_id == 13) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "%.4g", val);
+        return buf;
+    }
+
+    // Fixed decimal formats (IDs 1-2)
+    if (fmt_id == 1) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "%.0f", val);
+        return buf;
+    }
+    if (fmt_id == 2) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "%.2f", val);
+        return buf;
+    }
+
+    // Currency formats (IDs 5-8)
+    if (fmt_id >= 5 && fmt_id <= 8) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "%.2f", val);
+        std::string s = buf;
+        auto dot = s.find('.');
+        int start = (s[0] == '-') ? 1 : 0;
+        int int_len = static_cast<int>(dot) - start;
+        if (int_len > 3) {
+            for (int i = int_len - 3; i > 0; i -= 3) {
+                s.insert(start + i, 1, ',');
+            }
+        }
+        return s;
+    }
+
+    // For unknown custom formats, try to detect date pattern
+    if (!fmt_code.empty()) {
+        std::string lower;
+        for (char c : fmt_code) lower += std::tolower(static_cast<unsigned char>(c));
+        if (lower.find('#') != std::string::npos ||
+            lower.find('0') != std::string::npos) {
+            // Numeric format — just clean up trailing zeros
+            char buf[64];
+            int decimals = 0;
+            bool after_dot = false;
+            for (char c : fmt_code) {
+                if (c == '.') after_dot = true;
+                else if (after_dot && (c == '0' || c == '#')) decimals++;
+            }
+            snprintf(buf, sizeof(buf), "%.*f", decimals, val);
+            return buf;
+        }
+    }
+
+    return raw_value;
+}
+
 // ── Cell reference parsing ──────────────────────────────
 
 int XlsxParser::column_to_index(const std::string& col) {
@@ -164,6 +448,79 @@ std::pair<int, int> XlsxParser::parse_cell_ref(const std::string& ref) {
     return {col, row};
 }
 
+// ── Comments parsing ────────────────────────────────────
+
+std::map<std::string, std::string> XlsxParser::parse_comments(
+    const SheetInfo& info) {
+
+    std::map<std::string, std::string> comments;
+    if (info.file_path.empty()) return comments;
+
+    // Find sheet rels to locate comments file
+    auto slash = info.file_path.rfind('/');
+    if (slash == std::string::npos) return comments;
+    std::string dir = info.file_path.substr(0, slash);
+    std::string base = info.file_path.substr(slash + 1);
+    std::string rels_path = dir + "/_rels/" + base + ".rels";
+
+    if (!zip_.has_entry(rels_path)) return comments;
+    auto rels_data = zip_.read_entry(rels_path);
+    pugi::xml_document rels_doc;
+    if (!rels_doc.load_buffer(rels_data.data(), rels_data.size())) return comments;
+
+    // Find comments target
+    std::string comments_path;
+    std::vector<pugi::xml_node> rel_nodes;
+    xml_find_all(rels_doc, "Relationship", rel_nodes);
+    for (auto& rel : rel_nodes) {
+        const char* type = xml_attr(rel, "Type");
+        const char* target = xml_attr(rel, "Target");
+        if (!target[0]) continue;
+        std::string type_str = type;
+        if (type_str.find("/comments") != std::string::npos) {
+            comments_path = target;
+            if (comments_path.find("../") == 0)
+                comments_path = "xl/" + comments_path.substr(3);
+            else if (comments_path.find("xl/") != 0)
+                comments_path = dir + "/" + comments_path;
+            break;
+        }
+    }
+
+    if (comments_path.empty() || !zip_.has_entry(comments_path))
+        return comments;
+
+    auto data = zip_.read_entry(comments_path);
+    pugi::xml_document doc;
+    if (!doc.load_buffer(data.data(), data.size(), pugi::parse_default | pugi::parse_ws_pcdata)) return comments;
+
+    // Parse <commentList><comment ref="A1"><text><t>...</t></text></comment>
+    std::vector<pugi::xml_node> comment_nodes;
+    xml_find_all(doc, "comment", comment_nodes);
+
+    for (auto& node : comment_nodes) {
+        const char* ref = xml_attr(node, "ref");
+        if (!ref[0]) continue;
+
+        // Get text from <text> child -> <t> or <r><t> runs
+        std::string text;
+        auto text_node = xml_child(node, "text");
+        if (text_node) {
+            std::vector<pugi::xml_node> t_nodes;
+            xml_find_all(text_node, "t", t_nodes);
+            for (auto& t : t_nodes) {
+                text += xml_text_content(t);
+            }
+        }
+
+        if (!text.empty()) {
+            comments[ref] = text;
+        }
+    }
+
+    return comments;
+}
+
 // ── Sheet parsing ───────────────────────────────────────
 
 XlsxParser::SheetData XlsxParser::parse_sheet(const SheetInfo& info) {
@@ -176,7 +533,10 @@ XlsxParser::SheetData XlsxParser::parse_sheet(const SheetInfo& info) {
 
     auto data = zip_.read_entry(info.file_path);
     pugi::xml_document doc;
-    if (!doc.load_buffer(data.data(), data.size())) return sheet;
+    if (!doc.load_buffer(data.data(), data.size(), pugi::parse_default | pugi::parse_ws_pcdata)) return sheet;
+
+    // Parse comments for this sheet
+    auto comments = parse_comments(info);
 
     // Find <sheetData> element
     std::vector<pugi::xml_node> sheet_data_nodes;
@@ -211,6 +571,8 @@ XlsxParser::SheetData XlsxParser::parse_sheet(const SheetInfo& info) {
 
             // Determine cell value based on type
             const char* cell_type = xml_attr(cell, "t");
+            const char* style_str = xml_attr(cell, "s");
+            int style_idx = style_str[0] ? std::atoi(style_str) : -1;
             std::string value;
 
             if (std::string(cell_type) == "s") {
@@ -256,11 +618,19 @@ XlsxParser::SheetData XlsxParser::parse_sheet(const SheetInfo& info) {
                     value = xml_text_content(v_node);
                 }
             } else {
-                // Numeric or formula result
+                // Numeric or formula result — apply number formatting
                 auto v_node = xml_child(cell, "v");
                 if (v_node) {
-                    value = xml_text_content(v_node);
+                    std::string raw = xml_text_content(v_node);
+                    value = format_number(raw, style_idx);
                 }
+            }
+
+            // Append comment if exists for this cell
+            auto cit = comments.find(ref);
+            if (cit != comments.end()) {
+                if (!value.empty()) value += " ";
+                value += "[" + cit->second + "]";
             }
 
             if (!value.empty()) {
