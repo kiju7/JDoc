@@ -8,6 +8,7 @@
 #include <fpdfview.h>
 #include <fpdf_text.h>
 #include <fpdf_edit.h>
+#include <fpdf_doc.h>
 
 #include <fstream>
 #include <map>
@@ -80,7 +81,6 @@ struct FontStats {
         if (r >= 1.8) return 1;
         if (r >= 1.5) return 2;
         if (r >= 1.3) return 3;
-        if (r >= 1.15) return 4;
         return 0;
     }
 };
@@ -614,6 +614,85 @@ TableData build_table(const std::vector<double>& row_ys,
         if (filled_cols >= 2) meaningful_rows++;
     }
     if (meaningful_rows < 2) table.rows.clear();
+
+    // Reject tables where the column count does not match the visible
+    // cell structure. When many internal vertical lines create more columns
+    // than content fills (>50% cells empty), it's a bordered text block.
+    if (!table.rows.empty()) {
+        int n_cols_t = (int)table.rows[0].size();
+        if (n_cols_t >= 4) {
+            int total_cells = 0;
+            int empty_cells = 0;
+            for (auto& row : table.rows) {
+                for (int c = 0; c < n_cols_t && c < (int)row.size(); c++) {
+                    total_cells++;
+                    if (row[c].empty()) empty_cells++;
+                }
+            }
+            if (total_cells > 0 && empty_cells > total_cells * 0.5) {
+                table.rows.clear();
+                return table;
+            }
+        }
+    }
+
+    // Reject tables that look like numbered/bulleted lists.
+    // Patterns detected:
+    // 1. 2-column: short label (가., 1)) + long content
+    // 2. Any column count: first row starts with a list marker (N) or N.)
+    //    AND the same pattern repeats in subsequent rows
+    if (!table.rows.empty() && (int)table.rows[0].size() >= 2) {
+        int n_cols_t = (int)table.rows[0].size();
+        int rows_with_list_marker = 0;
+        int valid_rows_t = 0;
+        for (auto& row : table.rows) {
+            bool has_content = false;
+            for (auto& c : row) if (!c.empty()) { has_content = true; break; }
+            if (!has_content) continue;
+            valid_rows_t++;
+            // Find the first non-empty cell
+            std::string first_cell;
+            for (auto& c : row) if (!c.empty()) { first_cell = c; break; }
+            if (first_cell.empty()) continue;
+            // Check for numbered list markers: "N)" pattern only
+            // (not "N." which could be a table cell like "3.5")
+            bool is_marker = false;
+            if (first_cell[0] >= '0' && first_cell[0] <= '9') {
+                for (size_t k = 1; k < first_cell.size() && k < 4; k++) {
+                    if (first_cell[k] == ')') {
+                        is_marker = true; break;
+                    }
+                    if (first_cell[k] < '0' || first_cell[k] > '9') break;
+                }
+            }
+            if (is_marker) rows_with_list_marker++;
+        }
+        // If >60% of rows start with list markers, reject as a list
+        if (valid_rows_t >= 2 &&
+            rows_with_list_marker >= valid_rows_t * 0.6) {
+            table.rows.clear();
+            return table;
+        }
+    }
+
+    // Additional check for 2-column tables:
+    // Short label (가., 나., 1), 2) etc.) + long content
+    if (!table.rows.empty() && (int)table.rows[0].size() == 2) {
+        int short_label_rows = 0;
+        int long_content_rows = 0;
+        for (auto& row : table.rows) {
+            if (row.size() >= 2 && row[0].size() <= 6 && !row[0].empty())
+                short_label_rows++;
+            if (row.size() >= 2 && row[1].size() > 15)
+                long_content_rows++;
+        }
+        int valid_rows = (int)table.rows.size();
+        if (valid_rows >= 2 &&
+            short_label_rows >= valid_rows * 0.5 &&
+            long_content_rows >= valid_rows * 0.5) {
+            table.rows.clear();
+        }
+    }
 
     return table;
 }
@@ -1188,8 +1267,55 @@ std::vector<TableData> detect_text_tables(FPDF_TEXTPAGE text_page,
         }
 
         if (meaningful_rows >= 2) {
-            trim_table(table);
-            result.push_back(std::move(table));
+            // Reject tables that look like numbered/bulleted lists.
+            bool looks_like_list = false;
+
+            // Check for N) pattern in first cell of each row (any column count)
+            {
+                int marker_rows = 0;
+                int content_rows = 0;
+                for (auto& row : table.rows) {
+                    bool has_content = false;
+                    for (auto& c : row) if (!c.empty()) { has_content = true; break; }
+                    if (!has_content) continue;
+                    content_rows++;
+                    std::string first;
+                    for (auto& c : row) if (!c.empty()) { first = c; break; }
+                    if (!first.empty() && first[0] >= '0' && first[0] <= '9') {
+                        for (size_t k = 1; k < first.size() && k < 4; k++) {
+                            if (first[k] == ')') { marker_rows++; break; }
+                            if (first[k] < '0' || first[k] > '9') break;
+                        }
+                    }
+                }
+                if (content_rows >= 2 && marker_rows >= content_rows * 0.6)
+                    looks_like_list = true;
+            }
+
+            // Additional 2-column check: short labels + long content
+            if (!looks_like_list && n_cols == 2) {
+                int short_label_rows = 0;
+                int long_content_rows = 0;
+                for (auto& row : table.rows) {
+                    // Column 0 is a short label (bullet, number, letter+period)
+                    if (row.size() >= 2 && row[0].size() <= 6 && !row[0].empty())
+                        short_label_rows++;
+                    // Column 1 has substantial content
+                    if (row.size() >= 2 && row[1].size() > 15)
+                        long_content_rows++;
+                }
+                int valid_rows = (int)table.rows.size();
+                if (valid_rows >= 2 &&
+                    short_label_rows >= valid_rows * 0.5 &&
+                    long_content_rows >= valid_rows * 0.5) {
+                    looks_like_list = true;
+                }
+            }
+
+            if (!looks_like_list) {
+                trim_table(table);
+                result.push_back(std::move(table));
+            }
         }
 
         start = group_indices.back() + 1;
@@ -1244,7 +1370,7 @@ std::string format_table(const TableData& table) {
     return md;
 }
 
-// ── BMP writer helper ────────────────────────────────────
+// ── BMP writer helpers ───────────────────────────────────
 
 static std::vector<char> bitmap_to_bmp(FPDF_BITMAP bitmap) {
     int w = FPDFBitmap_GetWidth(bitmap);
@@ -1306,6 +1432,111 @@ static std::vector<char> bitmap_to_bmp(FPDF_BITMAP bitmap) {
     return bmp;
 }
 
+// Build a BMP from raw decoded pixel data at original resolution
+static std::vector<char> decoded_pixels_to_bmp(const std::vector<unsigned char>& decoded,
+                                                unsigned int w, unsigned int h,
+                                                int colorspace, unsigned int bpp) {
+    if (decoded.empty() || w == 0 || h == 0) return {};
+
+    // Determine source bytes per pixel from colorspace and bpp
+    int src_components;
+    switch (colorspace) {
+        case FPDF_COLORSPACE_DEVICEGRAY:
+        case FPDF_COLORSPACE_CALGRAY:
+            src_components = 1;
+            break;
+        case FPDF_COLORSPACE_DEVICERGB:
+        case FPDF_COLORSPACE_CALRGB:
+        case FPDF_COLORSPACE_LAB:
+        case FPDF_COLORSPACE_ICCBASED:
+            src_components = (bpp >= 24) ? (bpp / 8) : 3;
+            break;
+        case FPDF_COLORSPACE_DEVICECMYK:
+            src_components = 4;
+            break;
+        default:
+            src_components = bpp / 8;
+            if (src_components == 0) src_components = 3;
+            break;
+    }
+
+    size_t expected_size = (size_t)w * h * src_components;
+    // If decoded size doesn't match, try to infer components from data size
+    if (decoded.size() != expected_size) {
+        size_t total_pixels = (size_t)w * h;
+        if (total_pixels > 0) {
+            int inferred = (int)(decoded.size() / total_pixels);
+            if (inferred >= 1 && inferred <= 4 && decoded.size() == total_pixels * inferred) {
+                src_components = inferred;
+            } else {
+                return {};  // Can't determine pixel layout
+            }
+        } else {
+            return {};
+        }
+    }
+
+    // Write as 24-bit BMP
+    int out_stride = (((int)w * 3 + 3) / 4) * 4;
+    int pixel_data_size = out_stride * (int)h;
+    int file_size = 14 + 40 + pixel_data_size;
+
+    std::vector<char> bmp(file_size, 0);
+    auto write16 = [&](int off, uint16_t v) { memcpy(&bmp[off], &v, 2); };
+    auto write32 = [&](int off, uint32_t v) { memcpy(&bmp[off], &v, 4); };
+
+    bmp[0] = 'B'; bmp[1] = 'M';
+    write32(2, (uint32_t)file_size);
+    write32(10, 14 + 40);
+    write32(14, 40);
+    write32(18, (uint32_t)w);
+    write32(22, (uint32_t)h);
+    write16(26, 1);
+    write16(28, 24);
+    write32(34, (uint32_t)pixel_data_size);
+
+    int src_stride = (int)w * src_components;
+
+    for (int y = 0; y < (int)h; y++) {
+        // BMP is bottom-to-top, PDF image data is top-to-bottom
+        const unsigned char* src_row = decoded.data() + ((int)h - 1 - y) * src_stride;
+        char* dst_row = &bmp[14 + 40 + y * out_stride];
+        for (int x = 0; x < (int)w; x++) {
+            uint8_t r, g, b;
+            if (src_components == 1) {
+                r = g = b = src_row[x];
+            } else if (src_components == 3) {
+                r = src_row[x * 3 + 0];
+                g = src_row[x * 3 + 1];
+                b = src_row[x * 3 + 2];
+            } else if (src_components == 4) {
+                if (colorspace == FPDF_COLORSPACE_DEVICECMYK) {
+                    // CMYK to RGB conversion
+                    int c = src_row[x * 4 + 0];
+                    int m = src_row[x * 4 + 1];
+                    int yy = src_row[x * 4 + 2];
+                    int k = src_row[x * 4 + 3];
+                    r = (uint8_t)(255 - std::min(255, c + k));
+                    g = (uint8_t)(255 - std::min(255, m + k));
+                    b = (uint8_t)(255 - std::min(255, yy + k));
+                } else {
+                    // RGBA - drop alpha
+                    r = src_row[x * 4 + 0];
+                    g = src_row[x * 4 + 1];
+                    b = src_row[x * 4 + 2];
+                }
+            } else {
+                r = g = b = src_row[x * src_components];
+            }
+            // BMP stores as BGR
+            dst_row[x * 3 + 0] = (char)b;
+            dst_row[x * 3 + 1] = (char)g;
+            dst_row[x * 3 + 2] = (char)r;
+        }
+    }
+    return bmp;
+}
+
 // ── Image extraction ─────────────────────────────────────
 
 std::vector<ImageData> extract_images(FPDF_DOCUMENT doc, FPDF_PAGE page,
@@ -1347,15 +1578,41 @@ std::vector<ImageData> extract_images(FPDF_DOCUMENT doc, FPDF_PAGE page,
                     reinterpret_cast<unsigned char*>(img.data.data()), raw_size);
             }
         } else {
-            // FlateDecode or other: render to bitmap and save as BMP
+            // FlateDecode or other: extract decoded pixel data at original resolution
             img.format = "bmp";
-            FPDF_BITMAP bitmap = FPDFImageObj_GetRenderedBitmap(doc, page, obj);
-            if (bitmap) {
-                auto bmp_data = bitmap_to_bmp(bitmap);
-                img.data.assign(bmp_data.begin(), bmp_data.end());
-                img.width = FPDFBitmap_GetWidth(bitmap);
-                img.height = FPDFBitmap_GetHeight(bitmap);
-                FPDFBitmap_Destroy(bitmap);
+            unsigned long decoded_size = FPDFImageObj_GetImageDataDecoded(obj, nullptr, 0);
+            if (decoded_size > 0 && w > 0 && h > 0) {
+                std::vector<unsigned char> decoded(decoded_size);
+                FPDFImageObj_GetImageDataDecoded(obj, decoded.data(), decoded_size);
+
+                FPDF_IMAGEOBJ_METADATA meta = {};
+                FPDFImageObj_GetImageMetadata(obj, page, &meta);
+
+                auto bmp_data = decoded_pixels_to_bmp(decoded, w, h,
+                                                       meta.colorspace, meta.bits_per_pixel);
+                if (!bmp_data.empty()) {
+                    img.data.assign(bmp_data.begin(), bmp_data.end());
+                } else {
+                    // Fallback: render via PDFium bitmap
+                    FPDF_BITMAP bitmap = FPDFImageObj_GetRenderedBitmap(doc, page, obj);
+                    if (bitmap) {
+                        bmp_data = bitmap_to_bmp(bitmap);
+                        img.data.assign(bmp_data.begin(), bmp_data.end());
+                        img.width = FPDFBitmap_GetWidth(bitmap);
+                        img.height = FPDFBitmap_GetHeight(bitmap);
+                        FPDFBitmap_Destroy(bitmap);
+                    }
+                }
+            } else {
+                // No decoded data available, fallback to rendered bitmap
+                FPDF_BITMAP bitmap = FPDFImageObj_GetRenderedBitmap(doc, page, obj);
+                if (bitmap) {
+                    auto bmp_data = bitmap_to_bmp(bitmap);
+                    img.data.assign(bmp_data.begin(), bmp_data.end());
+                    img.width = FPDFBitmap_GetWidth(bitmap);
+                    img.height = FPDFBitmap_GetHeight(bitmap);
+                    FPDFBitmap_Destroy(bitmap);
+                }
             }
         }
 
@@ -1511,6 +1768,11 @@ std::string page_to_markdown(const std::vector<TextLine>& raw_lines,
 
         int hlevel = stats.heading_level(l.font_size);
 
+        // Suppress headings for long lines (likely body text with slightly larger font)
+        // and for lines that are not bold (weaker heading signal at lower levels)
+        if (hlevel >= 3 && !l.is_bold && l.text.size() > 60)
+            hlevel = 0;
+
         if (hlevel > 0) {
             if (i > 0) md += '\n';
             for (int h = 0; h < hlevel; h++) md += '#';
@@ -1545,12 +1807,57 @@ std::string page_to_markdown(const std::vector<TextLine>& raw_lines,
 
 // ── Core extraction logic ────────────────────────────────
 
+struct BookmarkEntry {
+    std::string title;
+    int page = -1;   // 0-based page index, -1 if no destination
+    int level = 0;    // nesting depth (0 = top-level)
+};
+
+void collect_bookmarks(FPDF_DOCUMENT doc, FPDF_BOOKMARK parent,
+                       int depth, std::vector<BookmarkEntry>& out) {
+    FPDF_BOOKMARK child = FPDFBookmark_GetFirstChild(doc, parent);
+    while (child) {
+        BookmarkEntry entry;
+        entry.level = depth;
+
+        // Get title (UTF-16LE from PDFium)
+        unsigned long len = FPDFBookmark_GetTitle(child, nullptr, 0);
+        if (len > 2) {
+            std::vector<char16_t> buf(len / 2);
+            FPDFBookmark_GetTitle(child, buf.data(), len);
+            // Convert UTF-16LE to UTF-8
+            for (size_t i = 0; i < buf.size() && buf[i]; i++) {
+                util::append_utf8(entry.title, static_cast<char32_t>(buf[i]));
+            }
+        }
+
+        // Get destination page
+        FPDF_DEST dest = FPDFBookmark_GetDest(doc, child);
+        if (!dest) {
+            FPDF_ACTION action = FPDFBookmark_GetAction(child);
+            if (action && FPDFAction_GetType(action) == PDFACTION_GOTO)
+                dest = FPDFAction_GetDest(doc, action);
+        }
+        if (dest) {
+            entry.page = FPDFDest_GetDestPageIndex(doc, dest);
+        }
+
+        out.push_back(std::move(entry));
+
+        // Recurse into children
+        collect_bookmarks(doc, child, depth + 1, out);
+
+        child = FPDFBookmark_GetNextSibling(doc, child);
+    }
+}
+
 struct ExtractResult {
     std::vector<std::vector<TextLine>> all_lines;
     std::vector<std::vector<ImageData>> all_images;
     std::vector<std::vector<TableData>> all_tables;
     std::vector<double> page_widths;
     std::vector<double> page_heights;
+    std::vector<BookmarkEntry> bookmarks;
     FontStats stats;
     int total_pages = 0;
 };
@@ -1559,8 +1866,12 @@ ExtractResult extract_pdf(const std::string& pdf_path, const ConvertOptions& opt
     ensure_pdfium_initialized();
 
     FPDF_DOCUMENT doc = FPDF_LoadDocument(pdf_path.c_str(), nullptr);
-    if (!doc)
+    if (!doc) {
+        unsigned long err = FPDF_GetLastError();
+        if (err == FPDF_ERR_PASSWORD)
+            throw std::runtime_error("Encrypted PDF files are not supported: " + pdf_path);
         throw std::runtime_error("Cannot open PDF: " + pdf_path);
+    }
 
     ExtractResult result;
     result.total_pages = FPDF_GetPageCount(doc);
@@ -1616,6 +1927,9 @@ ExtractResult extract_pdf(const std::string& pdf_path, const ConvertOptions& opt
         FPDF_ClosePage(page);
     }
 
+    // Extract bookmarks/outline for TOC
+    collect_bookmarks(doc, nullptr, 0, result.bookmarks);
+
     FPDF_CloseDocument(doc);
 
     result.stats.compute(result.all_lines);
@@ -1625,6 +1939,29 @@ ExtractResult extract_pdf(const std::string& pdf_path, const ConvertOptions& opt
 } // anonymous namespace
 
 // ── Public API ───────────────────────────────────────────
+
+static std::string format_bookmarks(const std::vector<BookmarkEntry>& bookmarks,
+                                     bool plaintext) {
+    if (bookmarks.empty()) return "";
+    std::string out;
+    for (auto& bm : bookmarks) {
+        if (bm.title.empty()) continue;
+        if (plaintext) {
+            for (int i = 0; i < bm.level; i++) out += "  ";
+            out += bm.title;
+            if (bm.page >= 0)
+                out += " (p." + std::to_string(bm.page + 1) + ")";
+            out += "\n";
+        } else {
+            for (int i = 0; i < bm.level; i++) out += "  ";
+            out += "- " + bm.title;
+            if (bm.page >= 0)
+                out += " *(p." + std::to_string(bm.page + 1) + ")*";
+            out += "\n";
+        }
+    }
+    return out;
+}
 
 std::string pdf_to_markdown(const std::string& pdf_path, ConvertOptions opts) {
     auto r = extract_pdf(pdf_path, opts);
@@ -1640,6 +1977,14 @@ std::string pdf_to_markdown(const std::string& pdf_path, ConvertOptions opts) {
 
     std::string full_md;
     full_md.reserve(64 * 1024);
+
+    // Insert bookmark TOC if available
+    if (!r.bookmarks.empty()) {
+        if (!plaintext) full_md += "## Table of Contents\n\n";
+        full_md += format_bookmarks(r.bookmarks, plaintext);
+        full_md += "\n";
+    }
+
     bool first = true;
     for (int p : page_indices) {
         if (p < 0 || p >= r.total_pages) continue;
@@ -1647,7 +1992,7 @@ std::string pdf_to_markdown(const std::string& pdf_path, ConvertOptions opts) {
             if (plaintext)
                 full_md += "\n--- Page " + std::to_string(p + 1) + " ---\n\n";
             else
-                full_md += "\n---\n\n";
+                full_md += "\n## Page " + std::to_string(p + 1) + "\n\n";
         }
         first = false;
         std::string page_md = page_to_markdown(r.all_lines[p], r.stats,
@@ -1677,7 +2022,7 @@ std::vector<PageChunk> pdf_to_markdown_chunks(const std::string& pdf_path,
     for (int p : page_indices) {
         if (p < 0 || p >= r.total_pages) continue;
         PageChunk chunk;
-        chunk.page_number = p;
+        chunk.page_number = p + 1;
         chunk.page_width = r.page_widths[p];
         chunk.page_height = r.page_heights[p];
         chunk.body_font_size = r.stats.body_size;
