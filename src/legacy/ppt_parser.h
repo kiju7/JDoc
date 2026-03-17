@@ -29,6 +29,7 @@ private:
         int number = 0;
         std::string title;
         std::string body;
+        std::string notes;
     };
 
     std::vector<Slide> slides_;

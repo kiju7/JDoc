@@ -44,15 +44,31 @@ void PptParser::parse_document() {
     if (stream.empty()) return;
 
     // Linear scan through all records.
-    // We track whether we're inside a SlideListWithTextContainer, and collect
-    // text atoms associated with each slide.
+    // Track SlideListWithText containers: first = slides, second = notes.
+    // Collect text atoms associated with each slide/note.
 
+    int slide_list_count = 0;  // 0=not yet, 1=in slides list, 2=in notes list
     bool in_slide_list = false;
-    int slide_list_depth = 0;  // Nesting depth when entering SlideListWithText.
-    int current_depth = 0;
+    bool in_notes_list = false;
 
     int slide_idx = -1;
+    int note_idx = -1;
     uint32_t text_type = 0xFF; // From TextHeaderAtom: 0=title, 1=body, etc.
+
+    // Helper to decode text from TextCharsAtom or TextBytesAtom
+    auto decode_text_chars = [](const char* data, size_t len) -> std::string {
+        return util::utf16le_to_utf8(data, len);
+    };
+    auto decode_text_bytes = [](const char* data, size_t len) -> std::string {
+        std::string text;
+        for (size_t i = 0; i < len; ++i) {
+            uint8_t ch = static_cast<uint8_t>(data[i]);
+            if (ch == 0x0D) text.push_back('\n');
+            else if (ch >= 0x20 || ch == '\t' || ch == '\n')
+                text += util::cp1252_to_utf8(ch);
+        }
+        return text;
+    };
 
     size_t pos = 0;
     while (pos + 8 <= stream.size()) {
@@ -61,30 +77,31 @@ void PptParser::parse_document() {
         uint32_t rec_len  = rd32(stream.data() + pos + 4);
 
         uint8_t ver = ver_inst & 0x0F;
-        // uint16_t inst = ver_inst >> 4;
-
         bool is_container = (ver == 0x0F);
 
         if (is_container) {
-            // Container record: enter it (children follow immediately after header).
             if (rec_type == RT_SLIDE_LIST_WITH_TEXT) {
-                in_slide_list = true;
-                slide_list_depth = current_depth;
+                ++slide_list_count;
+                if (slide_list_count == 1) {
+                    in_slide_list = true;
+                    in_notes_list = false;
+                } else if (slide_list_count == 2) {
+                    in_slide_list = false;
+                    in_notes_list = true;
+                    note_idx = -1;
+                }
             }
-            current_depth++;
-            pos += 8; // Just skip the header; children are inline.
+            pos += 8;
             continue;
         }
 
         // Atom record.
         size_t atom_end = pos + 8 + rec_len;
         if (atom_end > stream.size()) break;
-
         const char* atom_data = stream.data() + pos + 8;
 
         if (in_slide_list) {
             if (rec_type == RT_SLIDE_PERSIST_ATOM) {
-                // New slide.
                 slides_.emplace_back();
                 slide_idx = static_cast<int>(slides_.size()) - 1;
                 slides_[slide_idx].number = slide_idx + 1;
@@ -92,31 +109,19 @@ void PptParser::parse_document() {
             } else if (rec_type == RT_TEXT_HEADER_ATOM && rec_len >= 4) {
                 text_type = rd32(atom_data);
             } else if (rec_type == RT_TEXT_CHARS_ATOM && slide_idx >= 0) {
-                // UTF-16LE text.
-                std::string text = util::utf16le_to_utf8(atom_data, rec_len);
+                std::string text = decode_text_chars(atom_data, rec_len);
                 if (text_type == 0) {
-                    // Title text.
                     if (!slides_[slide_idx].title.empty())
                         slides_[slide_idx].title += " ";
                     slides_[slide_idx].title += text;
                 } else {
-                    // Body text.
                     if (!slides_[slide_idx].body.empty())
                         slides_[slide_idx].body += "\n";
                     slides_[slide_idx].body += text;
                 }
-                text_type = 0xFF; // Reset.
+                text_type = 0xFF;
             } else if (rec_type == RT_TEXT_BYTES_ATOM && slide_idx >= 0) {
-                // Single-byte (CP1252) text.
-                std::string text;
-                for (size_t i = 0; i < rec_len; ++i) {
-                    uint8_t ch = static_cast<uint8_t>(atom_data[i]);
-                    if (ch == 0x0D) {
-                        text.push_back('\n');
-                    } else if (ch >= 0x20 || ch == '\t' || ch == '\n') {
-                        text += util::cp1252_to_utf8(ch);
-                    }
-                }
+                std::string text = decode_text_bytes(atom_data, rec_len);
                 if (text_type == 0) {
                     if (!slides_[slide_idx].title.empty())
                         slides_[slide_idx].title += " ";
@@ -125,6 +130,25 @@ void PptParser::parse_document() {
                     if (!slides_[slide_idx].body.empty())
                         slides_[slide_idx].body += "\n";
                     slides_[slide_idx].body += text;
+                }
+                text_type = 0xFF;
+            }
+        } else if (in_notes_list) {
+            if (rec_type == RT_SLIDE_PERSIST_ATOM) {
+                ++note_idx;
+                text_type = 0xFF;
+            } else if (rec_type == RT_TEXT_HEADER_ATOM && rec_len >= 4) {
+                text_type = rd32(atom_data);
+            } else if ((rec_type == RT_TEXT_CHARS_ATOM || rec_type == RT_TEXT_BYTES_ATOM) &&
+                       note_idx >= 0 && note_idx < static_cast<int>(slides_.size())) {
+                std::string text = (rec_type == RT_TEXT_CHARS_ATOM)
+                    ? decode_text_chars(atom_data, rec_len)
+                    : decode_text_bytes(atom_data, rec_len);
+                // Skip title placeholders in notes (slide number text)
+                if (text_type != 0 && !text.empty()) {
+                    if (!slides_[note_idx].notes.empty())
+                        slides_[note_idx].notes += "\n";
+                    slides_[note_idx].notes += text;
                 }
                 text_type = 0xFF;
             }
@@ -207,8 +231,8 @@ void PptParser::parse_document() {
 std::string PptParser::slide_to_markdown(const Slide& slide) {
     std::ostringstream out;
 
-    // Slide number as context.
-    out << "---\n\n";
+    // Slide header
+    out << "## Slide " << slide.number << "\n\n";
 
     if (!slide.title.empty()) {
         out << "# " << slide.title << "\n\n";
@@ -250,6 +274,18 @@ std::string PptParser::slide_to_markdown(const Slide& slide) {
                     out << line << "\n";
                 }
             }
+        }
+    }
+
+    // Append notes if present
+    if (!slide.notes.empty()) {
+        out << "\n**Notes:**\n";
+        std::istringstream niss(slide.notes);
+        std::string nline;
+        while (std::getline(niss, nline)) {
+            while (!nline.empty() && (nline.back() == '\r' || nline.back() == ' '))
+                nline.pop_back();
+            if (!nline.empty()) out << nline << "\n";
         }
     }
 
