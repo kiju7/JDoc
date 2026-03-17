@@ -32,7 +32,7 @@ target_link_libraries(jdoc_zip PUBLIC ZLIB::ZLIB jdoc_common)
 
 add_library(jdoc_pdf STATIC src/pdf.cpp)
 target_include_directories(jdoc_pdf PUBLIC include PRIVATE src)
-target_link_libraries(jdoc_pdf PUBLIC pdfium jdoc_common)
+target_link_libraries(jdoc_pdf PUBLIC pdfium jdoc_common ZLIB::ZLIB)
 
 # ── HWPX (ZIP+XML format) ────────────────────────────────────
 
