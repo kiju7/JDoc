@@ -691,13 +691,16 @@ std::string hwpx_to_markdown(const std::string& hwpx_path, ConvertOptions opts) 
 
     std::string result;
     for (size_t i = 0; i < chunks.size(); i++) {
-        if (plaintext) {
-            if (i > 0)
-                result += "\n--- Page " + std::to_string(chunks[i].page_number + 1) + " ---\n\n";
-            result += util::strip_markdown(chunks[i].text);
-        } else {
-            result += chunks[i].text;
+        if (i > 0) {
+            if (plaintext)
+                result += "\n--- Page " + std::to_string(chunks[i].page_number) + " ---\n\n";
+            else
+                result += "\n## Page " + std::to_string(chunks[i].page_number) + "\n\n";
         }
+        if (plaintext)
+            result += util::strip_markdown(chunks[i].text);
+        else
+            result += chunks[i].text;
     }
     return result;
 }
