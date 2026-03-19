@@ -591,19 +591,21 @@ TableData build_table(const std::vector<double>& row_ys,
         return table;
     }
 
-    // Detect and correct Y offset between table lines and text.
-    // Some PDFs draw table grid lines at different Y coordinates than text.
-    // If text doesn't fall within the line-based grid, shift the entire grid
-    // by a constant offset (preserving the line structure and row count).
-    std::vector<double> actual_ys = row_ys;
+    // Build row boundaries from actual text positions instead of line Y coords.
+    // Lines give us column structure (X) reliably, but line Y and text Y can
+    // be in different coordinate spaces. We cluster text by Y, keep only rows
+    // that span multiple columns (= table rows, not titles), and build
+    // boundaries between them.
+    std::vector<double> actual_ys;
     {
         double tl = col_xs.front(), tr = col_xs.back();
-        double tb = row_ys.front(), tt = row_ys.back();
-        double row_h = (row_ys.size() >= 2) ? (row_ys[1] - row_ys[0]) : 0;
-
+        double row_h = (row_ys.size() >= 2) ? (row_ys[1] - row_ys[0]) : 18.0;
+        int n_cols_found = (int)col_xs.size() - 1;
         int total_chars = FPDFText_CountChars(text_page);
 
-        std::vector<double> text_ys;
+        // Collect (x, y) for each non-whitespace char in column range
+        struct CharPos { double x, y; };
+        std::vector<CharPos> chars;
         for (int ci = 0; ci < total_chars; ci++) {
             unsigned int u = FPDFText_GetUnicode(text_page, ci);
             if (u == 0 || u == '\r' || u == '\n' || u == ' ' || u == 0xA0) continue;
@@ -611,53 +613,60 @@ TableData build_table(const std::vector<double>& row_ys,
             if (!FPDFText_GetCharBox(text_page, ci, &cl, &cr, &cb, &ct)) continue;
             double cx = (cl + cr) / 2.0, cy = (ct + cb) / 2.0;
             if (cx < tl - 5 || cx > tr + 5) continue;
-            text_ys.push_back(cy);
+            chars.push_back({cx, cy});
         }
 
-        // Count how many text row clusters fall within the grid
+        // Cluster chars by Y to find text rows
+        std::vector<double> cy_vals;
+        for (auto& cp : chars) cy_vals.push_back(cp.y);
+        auto text_row_ys = cluster_values(cy_vals, row_h * 0.4);
+
+        // Assign each char to its column for efficient row filtering
+        std::vector<std::vector<double>> col_char_ys(n_cols_found);
+        for (auto& cp : chars) {
+            for (int c = 0; c < n_cols_found; c++) {
+                if (cp.x >= col_xs[c] && cp.x <= col_xs[c + 1]) {
+                    col_char_ys[c].push_back(cp.y);
+                    break;
+                }
+            }
+        }
+
+        // Keep only rows that have text in 2+ columns (table rows, not titles)
+        std::vector<double> table_row_centers;
+        double tol = row_h * 0.4;
+        for (double ry : text_row_ys) {
+            int cols_hit = 0;
+            for (int c = 0; c < n_cols_found; c++) {
+                for (double cy : col_char_ys[c]) {
+                    if (std::abs(cy - ry) < tol) { cols_hit++; break; }
+                }
+            }
+            if (cols_hit >= 2)
+                table_row_centers.push_back(ry);
+        }
+
+        // Check if line-based Y works (most text rows inside grid)
+        double tb = row_ys.front(), tt = row_ys.back();
+        int rows_in_grid = 0;
+        for (double tc : table_row_centers)
+            if (tc >= tb - row_h * 0.5 && tc <= tt + row_h * 0.5)
+                rows_in_grid++;
+
         int n_rows_expected = (int)row_ys.size() - 1;
-        int rows_inside = 0;
-        if (!text_ys.empty() && row_h > 1.0) {
-            auto text_clusters = cluster_values(text_ys, row_h * 0.4);
-            for (double tc : text_clusters)
-                if (tc >= tb - row_h * 0.5 && tc <= tt + row_h * 0.5)
-                    rows_inside++;
-        }
+        bool use_text_rows = (rows_in_grid < n_rows_expected * 0.9) &&
+                             ((int)table_row_centers.size() >= n_rows_expected * 0.8);
 
-        bool misaligned = (rows_inside < n_rows_expected * 0.8) &&
-                          (!text_ys.empty()) && (row_h > 1.0);
-        if (misaligned) {
-            // Text and lines are misaligned. Find offset that maximizes
-            // the number of text chars falling within the shifted grid.
-            // Use text row centers as candidate alignment targets.
-            auto text_clusters = cluster_values(text_ys, row_h * 0.4);
-            double best_offset = 0;
-            int best_count = rows_inside;
-
-            for (double tc : text_clusters) {
-                double grid_center = (row_ys[0] + row_ys[1]) / 2.0;
-                double n_from_bot = std::round((tc - grid_center) / row_h);
-                double aligned_center = grid_center + n_from_bot * row_h;
-                double candidate_offset = tc - aligned_center;
-
-                // Count text row clusters inside shifted grid
-                int count = 0;
-                double shifted_bot = tb + candidate_offset;
-                double shifted_top = tt + candidate_offset;
-                for (double tc2 : text_clusters) {
-                    if (tc2 >= shifted_bot - row_h * 0.5 && tc2 <= shifted_top + row_h * 0.5)
-                        count++;
-                }
-                if (count > best_count) {
-                    best_count = count;
-                    best_offset = candidate_offset;
-                }
-            }
-
-            if (std::abs(best_offset) > row_h * 0.3 && best_count > rows_inside) {
-                for (auto& y : actual_ys)
-                    y += best_offset;
-            }
+        if (use_text_rows && !table_row_centers.empty()) {
+            // Build boundaries between text row centers
+            std::sort(table_row_centers.begin(), table_row_centers.end());
+            double half = row_h / 2.0;
+            actual_ys.push_back(table_row_centers.front() - half);
+            for (size_t i = 0; i < table_row_centers.size() - 1; i++)
+                actual_ys.push_back((table_row_centers[i] + table_row_centers[i + 1]) / 2.0);
+            actual_ys.push_back(table_row_centers.back() + half);
+        } else {
+            actual_ys = row_ys; // lines and text are aligned, use as-is
         }
     }
 
