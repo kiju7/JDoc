@@ -33,6 +33,31 @@ void ensure_pdfium_initialized() {
     static PdfiumLibrary instance;
 }
 
+// RAII guards for PDFium handles — prevent leaks on exception (e.g. bad_alloc)
+struct DocGuard {
+    FPDF_DOCUMENT h;
+    explicit DocGuard(FPDF_DOCUMENT d) : h(d) {}
+    ~DocGuard() { if (h) FPDF_CloseDocument(h); }
+    DocGuard(const DocGuard&) = delete;
+    DocGuard& operator=(const DocGuard&) = delete;
+};
+
+struct PageGuard {
+    FPDF_PAGE h;
+    explicit PageGuard(FPDF_PAGE p) : h(p) {}
+    ~PageGuard() { if (h) FPDF_ClosePage(h); }
+    PageGuard(const PageGuard&) = delete;
+    PageGuard& operator=(const PageGuard&) = delete;
+};
+
+struct TextPageGuard {
+    FPDF_TEXTPAGE h;
+    explicit TextPageGuard(FPDF_TEXTPAGE t) : h(t) {}
+    ~TextPageGuard() { if (h) FPDFText_ClosePage(h); }
+    TextPageGuard(const TextPageGuard&) = delete;
+    TextPageGuard& operator=(const TextPageGuard&) = delete;
+};
+
 // ── PDF-specific types (only used in this file) ─────────
 
 struct TableData {
@@ -1457,7 +1482,7 @@ static void png_write_chunk(std::vector<char>& out, const char type[4],
 }
 
 // Encode a PDFium bitmap as PNG (RGB, 8-bit, lossless).
-static std::vector<char> bitmap_to_png(FPDF_BITMAP bitmap) {
+static std::vector<char> bitmap_to_png(FPDF_BITMAP bitmap, int level) {
     int w = FPDFBitmap_GetWidth(bitmap);
     int h = FPDFBitmap_GetHeight(bitmap);
     int stride = FPDFBitmap_GetStride(bitmap);
@@ -1497,8 +1522,11 @@ static std::vector<char> bitmap_to_png(FPDF_BITMAP bitmap) {
     std::vector<uint8_t> deflated(bound);
     uLong deflated_size = bound;
     if (compress2(deflated.data(), &deflated_size, raw.data(),
-                  static_cast<uLong>(raw.size()), Z_DEFAULT_COMPRESSION) != Z_OK)
+                  static_cast<uLong>(raw.size()), level) != Z_OK)
         return {};
+
+    raw.clear();
+    raw.shrink_to_fit();
 
     // Assemble PNG
     std::vector<char> png;
@@ -1623,107 +1651,11 @@ static std::vector<char> decoded_pixels_to_bmp(const std::vector<unsigned char>&
     return bmp;
 }
 
-// ── Image extraction ─────────────────────────────────────
+// ── Page rendering ───────────────────────────────────────
 
-std::vector<ImageData> extract_images(FPDF_DOCUMENT doc, FPDF_PAGE page,
-                                       int page_num,
-                                       const std::string& output_dir) {
-    std::vector<ImageData> images;
-    int obj_count = FPDFPage_CountObjects(page);
-    int img_idx = 0;
-
-    for (int i = 0; i < obj_count; i++) {
-        FPDF_PAGEOBJECT obj = FPDFPage_GetObject(page, i);
-        if (FPDFPageObj_GetType(obj) != FPDF_PAGEOBJ_IMAGE) continue;
-
-        ImageData img;
-        img.page_number = page_num;
-        img.name = "page" + std::to_string(page_num + 1) + "_img" + std::to_string(img_idx);
-
-        unsigned int w = 0, h = 0;
-        FPDFImageObj_GetImagePixelSize(obj, &w, &h);
-        img.width = w;
-        img.height = h;
-
-        // Determine the image filter to decide extraction method
-        std::string filter;
-        int filter_count = FPDFImageObj_GetImageFilterCount(obj);
-        if (filter_count > 0) {
-            char fbuf[64];
-            unsigned long flen = FPDFImageObj_GetImageFilter(obj, 0, fbuf, sizeof(fbuf));
-            if (flen > 0) filter = std::string(fbuf, flen - 1);
-        }
-
-        if (filter == "DCTDecode" || filter == "JPXDecode") {
-            // JPEG/JPEG2000: raw stream is a valid image file
-            img.format = (filter == "DCTDecode") ? "jpeg" : "jp2";
-            unsigned long raw_size = FPDFImageObj_GetImageDataRaw(obj, nullptr, 0);
-            if (raw_size > 0) {
-                img.data.resize(raw_size);
-                FPDFImageObj_GetImageDataRaw(obj,
-                    reinterpret_cast<unsigned char*>(img.data.data()), raw_size);
-            }
-        } else {
-            // FlateDecode or other: extract decoded pixel data at original resolution
-            img.format = "bmp";
-            unsigned long decoded_size = FPDFImageObj_GetImageDataDecoded(obj, nullptr, 0);
-            if (decoded_size > 0 && w > 0 && h > 0) {
-                std::vector<unsigned char> decoded(decoded_size);
-                FPDFImageObj_GetImageDataDecoded(obj, decoded.data(), decoded_size);
-
-                FPDF_IMAGEOBJ_METADATA meta = {};
-                FPDFImageObj_GetImageMetadata(obj, page, &meta);
-
-                auto bmp_data = decoded_pixels_to_bmp(decoded, w, h,
-                                                       meta.colorspace, meta.bits_per_pixel);
-                if (!bmp_data.empty()) {
-                    img.data.assign(bmp_data.begin(), bmp_data.end());
-                } else {
-                    // Fallback: render via PDFium bitmap
-                    FPDF_BITMAP bitmap = FPDFImageObj_GetRenderedBitmap(doc, page, obj);
-                    if (bitmap) {
-                        bmp_data = bitmap_to_bmp(bitmap);
-                        img.data.assign(bmp_data.begin(), bmp_data.end());
-                        img.width = FPDFBitmap_GetWidth(bitmap);
-                        img.height = FPDFBitmap_GetHeight(bitmap);
-                        FPDFBitmap_Destroy(bitmap);
-                    }
-                }
-            } else {
-                // No decoded data available, fallback to rendered bitmap
-                FPDF_BITMAP bitmap = FPDFImageObj_GetRenderedBitmap(doc, page, obj);
-                if (bitmap) {
-                    auto bmp_data = bitmap_to_bmp(bitmap);
-                    img.data.assign(bmp_data.begin(), bmp_data.end());
-                    img.width = FPDFBitmap_GetWidth(bitmap);
-                    img.height = FPDFBitmap_GetHeight(bitmap);
-                    FPDFBitmap_Destroy(bitmap);
-                }
-            }
-        }
-
-        if (!output_dir.empty() && !img.data.empty()) {
-            std::string ext = (img.format == "jpeg") ? ".jpg" :
-                              (img.format == "jp2") ? ".jp2" :
-                              (img.format == "bmp") ? ".bmp" : ".bin";
-            std::string path = output_dir + "/" + img.name + ext;
-
-            std::ofstream ofs(path, std::ios::binary);
-            if (ofs) {
-                ofs.write(img.data.data(), img.data.size());
-                img.saved_path = path;
-            }
-        }
-
-        images.push_back(std::move(img));
-        img_idx++;
-    }
-    return images;
-}
-
-// Render a full page as a 150-DPI PNG (fallback for scanned/vector-only pages).
-static ImageData render_page_as_png(FPDF_DOCUMENT doc, FPDF_PAGE page,
-                                     int page_num, const std::string& output_dir) {
+// Render a full page as a 150-DPI PNG with Z_BEST_SPEED compression.
+static ImageData render_page_as_image(FPDF_DOCUMENT doc, FPDF_PAGE page,
+                                       int page_num, const std::string& output_dir) {
     constexpr double kDPI = 150.0;
     constexpr double kBase = 72.0;
     int rw = static_cast<int>(FPDF_GetPageWidth(page) * kDPI / kBase);
@@ -1735,7 +1667,7 @@ static ImageData render_page_as_png(FPDF_DOCUMENT doc, FPDF_PAGE page,
     FPDFBitmap_FillRect(bm, 0, 0, rw, rh, 0xFFFFFFFF);
     FPDF_RenderPageBitmap(bm, page, 0, 0, rw, rh, 0, FPDF_PRINTING);
 
-    auto png = bitmap_to_png(bm);
+    auto png = bitmap_to_png(bm, Z_BEST_SPEED);
     FPDFBitmap_Destroy(bm);
     if (png.empty()) return {};
 
@@ -1750,9 +1682,172 @@ static ImageData render_page_as_png(FPDF_DOCUMENT doc, FPDF_PAGE page,
     if (!output_dir.empty()) {
         std::string path = output_dir + "/" + img.name + ".png";
         std::ofstream f(path, std::ios::binary);
-        if (f) f.write(img.data.data(), static_cast<std::streamsize>(img.data.size()));
+        if (f) {
+            f.write(img.data.data(), static_cast<std::streamsize>(img.data.size()));
+            img.saved_path = path;
+        }
     }
     return img;
+}
+
+// ── Image extraction ─────────────────────────────────────
+
+ImageData extract_single_image(FPDF_DOCUMENT doc, FPDF_PAGE page,
+                                FPDF_PAGEOBJECT obj, int page_num, int img_idx,
+                                const std::string& output_dir) {
+    ImageData img;
+    img.page_number = page_num;
+    img.name = "page" + std::to_string(page_num + 1) + "_img" + std::to_string(img_idx);
+
+    unsigned int w = 0, h = 0;
+    FPDFImageObj_GetImagePixelSize(obj, &w, &h);
+    img.width = w;
+    img.height = h;
+
+    // Check all filters in the chain (e.g. [/FlateDecode /DCTDecode]).
+    std::string jpeg_filter;
+    int filter_count = FPDFImageObj_GetImageFilterCount(obj);
+    for (int fi = 0; fi < filter_count; fi++) {
+        char fbuf[64];
+        unsigned long flen = FPDFImageObj_GetImageFilter(obj, fi, fbuf, sizeof(fbuf));
+        if (flen > 0) {
+            std::string f(fbuf, flen - 1);
+            if (f == "DCTDecode" || f == "JPXDecode") {
+                jpeg_filter = f;
+                break;
+            }
+        }
+    }
+
+    if (!jpeg_filter.empty()) {
+        // JPEG/JPEG2000: try decoded data first, then fall back to raw stream.
+        img.format = (jpeg_filter == "DCTDecode") ? "jpeg" : "jp2";
+        bool extracted = false;
+
+        if (filter_count > 1) {
+            unsigned long dec_size = FPDFImageObj_GetImageDataDecoded(obj, nullptr, 0);
+            if (dec_size > 2) {
+                img.data.resize(dec_size);
+                FPDFImageObj_GetImageDataDecoded(obj,
+                    reinterpret_cast<unsigned char*>(img.data.data()), dec_size);
+                auto* p = reinterpret_cast<unsigned char*>(img.data.data());
+                bool valid = (img.format == "jpeg" && p[0] == 0xFF && p[1] == 0xD8) ||
+                             (img.format == "jp2" && dec_size >= 12 &&
+                              p[0] == 0x00 && p[1] == 0x00 && p[2] == 0x00 && p[3] == 0x0C);
+                if (valid)
+                    extracted = true;
+                else
+                    img.data.clear(); // not valid, fall through
+            }
+        }
+
+        if (!extracted) {
+            unsigned long raw_size = FPDFImageObj_GetImageDataRaw(obj, nullptr, 0);
+            if (raw_size > 0) {
+                img.data.resize(raw_size);
+                FPDFImageObj_GetImageDataRaw(obj,
+                    reinterpret_cast<unsigned char*>(img.data.data()), raw_size);
+            }
+        }
+    } else {
+        // FlateDecode or other: extract decoded pixel data at original resolution
+        img.format = "bmp";
+        unsigned long decoded_size = FPDFImageObj_GetImageDataDecoded(obj, nullptr, 0);
+        if (decoded_size > 0 && w > 0 && h > 0) {
+            std::vector<unsigned char> decoded(decoded_size);
+            FPDFImageObj_GetImageDataDecoded(obj, decoded.data(), decoded_size);
+
+            FPDF_IMAGEOBJ_METADATA meta = {};
+            FPDFImageObj_GetImageMetadata(obj, page, &meta);
+
+            auto bmp_data = decoded_pixels_to_bmp(decoded, w, h,
+                                                   meta.colorspace, meta.bits_per_pixel);
+            decoded.clear();
+            decoded.shrink_to_fit();
+
+            if (!bmp_data.empty()) {
+                img.data = std::move(bmp_data);
+            } else {
+                FPDF_BITMAP bitmap = FPDFImageObj_GetRenderedBitmap(doc, page, obj);
+                if (bitmap) {
+                    img.data = bitmap_to_bmp(bitmap);
+                    img.width = FPDFBitmap_GetWidth(bitmap);
+                    img.height = FPDFBitmap_GetHeight(bitmap);
+                    FPDFBitmap_Destroy(bitmap);
+                }
+            }
+        } else {
+            FPDF_BITMAP bitmap = FPDFImageObj_GetRenderedBitmap(doc, page, obj);
+            if (bitmap) {
+                img.data = bitmap_to_bmp(bitmap);
+                img.width = FPDFBitmap_GetWidth(bitmap);
+                img.height = FPDFBitmap_GetHeight(bitmap);
+                FPDFBitmap_Destroy(bitmap);
+            }
+        }
+    }
+
+    if (!output_dir.empty() && !img.data.empty()) {
+        std::string ext = (img.format == "jpeg") ? ".jpg" :
+                          (img.format == "jp2") ? ".jp2" :
+                          (img.format == "bmp") ? ".bmp" : ".bin";
+        std::string path = output_dir + "/" + img.name + ext;
+
+        std::ofstream ofs(path, std::ios::binary);
+        if (ofs) {
+            ofs.write(img.data.data(), img.data.size());
+            img.saved_path = path;
+        }
+    }
+
+    return img;
+}
+
+std::vector<ImageData> extract_images(FPDF_DOCUMENT doc, FPDF_PAGE page,
+                                       int page_num,
+                                       const std::string& output_dir) {
+    // Classify image objects: detect layered structure in single pass.
+    int obj_count = FPDFPage_CountObjects(page);
+    bool has_regular = false;
+    bool has_mask = false;
+
+    for (int i = 0; i < obj_count; i++) {
+        FPDF_PAGEOBJECT obj = FPDFPage_GetObject(page, i);
+        if (FPDFPageObj_GetType(obj) != FPDF_PAGEOBJ_IMAGE) continue;
+
+        FPDF_IMAGEOBJ_METADATA meta = {};
+        if (FPDFImageObj_GetImageMetadata(obj, page, &meta) && meta.bits_per_pixel == 1)
+            has_mask = true;
+        else
+            has_regular = true;
+
+        if (has_regular && has_mask) break; // early exit
+    }
+
+    // Layered page (background + ImageMask overlays): render as single composite.
+    if (has_regular && has_mask) {
+        std::vector<ImageData> images;
+        auto rendered = render_page_as_image(doc, page, page_num, output_dir);
+        if (!rendered.data.empty())
+            images.push_back(std::move(rendered));
+        return images;
+    }
+
+    // Normal: extract each image individually.
+    std::vector<ImageData> images;
+    int img_idx = 0;
+
+    for (int i = 0; i < obj_count; i++) {
+        FPDF_PAGEOBJECT obj = FPDFPage_GetObject(page, i);
+        if (FPDFPageObj_GetType(obj) != FPDF_PAGEOBJ_IMAGE) continue;
+
+        auto img = extract_single_image(doc, page, obj, page_num, img_idx, output_dir);
+        if (!img.data.empty()) {
+            images.push_back(std::move(img));
+            img_idx++;
+        }
+    }
+    return images;
 }
 
 // ── Markdown formatting ──────────────────────────────────
@@ -1992,6 +2087,7 @@ ExtractResult extract_pdf(const std::string& pdf_path, const ConvertOptions& opt
             throw std::runtime_error("Encrypted PDF files are not supported: " + pdf_path);
         throw std::runtime_error("Cannot open PDF: " + pdf_path);
     }
+    DocGuard doc_guard(doc);
 
     ExtractResult result;
     result.total_pages = FPDF_GetPageCount(doc);
@@ -2020,25 +2116,25 @@ ExtractResult extract_pdf(const std::string& pdf_path, const ConvertOptions& opt
         if (p < 0 || p >= tp) continue;
         FPDF_PAGE page = FPDF_LoadPage(doc, p);
         if (!page) continue;
+        PageGuard page_guard(page);
 
         result.page_widths[p] = FPDF_GetPageWidth(page);
         result.page_heights[p] = FPDF_GetPageHeight(page);
 
         FPDF_TEXTPAGE text_page = FPDFText_LoadPage(page);
         if (text_page) {
+            TextPageGuard tp_guard(text_page);
             result.all_lines[p] = extract_lines(text_page);
             if (opts.extract_tables) {
                 auto segments = extract_line_segments(page);
                 result.all_tables[p] = detect_tables(segments, text_page,
                     result.page_widths[p], result.page_heights[p]);
-                // Second pass: detect tables from text alignment alone
                 auto text_tables = detect_text_tables(text_page,
                     result.all_tables[p],
                     result.page_widths[p], result.page_heights[p]);
                 for (auto& tt : text_tables)
                     result.all_tables[p].push_back(std::move(tt));
             }
-            FPDFText_ClosePage(text_page);
         }
 
         if (opts.extract_images) {
@@ -2046,18 +2142,25 @@ ExtractResult extract_pdf(const std::string& pdf_path, const ConvertOptions& opt
 
             // Fallback: render page as PNG for scanned/vector-only pages
             if (result.all_images[p].empty() && result.all_lines[p].empty()) {
-                auto rendered = render_page_as_png(doc, page, p, image_dir);
+                auto rendered = render_page_as_image(doc, page, p, image_dir);
                 if (!rendered.data.empty())
                     result.all_images[p].push_back(std::move(rendered));
             }
+
+            // Release pixel data after writing to disk
+            if (!image_dir.empty()) {
+                for (auto& img : result.all_images[p]) {
+                    if (!img.saved_path.empty()) {
+                        img.data.clear();
+                        img.data.shrink_to_fit();
+                    }
+                }
+            }
         }
-        FPDF_ClosePage(page);
     }
 
     // Extract bookmarks/outline for TOC
     collect_bookmarks(doc, nullptr, 0, result.bookmarks);
-
-    FPDF_CloseDocument(doc);
 
     result.stats.compute(result.all_lines);
     return result;
