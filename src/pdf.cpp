@@ -591,17 +591,87 @@ TableData build_table(const std::vector<double>& row_ys,
         return table;
     }
 
-    int n_rows = (int)row_ys.size() - 1;
+    // Detect and correct Y offset between table lines and text.
+    // Some PDFs draw table grid lines at different Y coordinates than text.
+    // If text doesn't fall within the line-based grid, shift the entire grid
+    // by a constant offset (preserving the line structure and row count).
+    std::vector<double> actual_ys = row_ys;
+    {
+        double tl = col_xs.front(), tr = col_xs.back();
+        double tb = row_ys.front(), tt = row_ys.back();
+        double row_h = (row_ys.size() >= 2) ? (row_ys[1] - row_ys[0]) : 0;
+
+        int total_chars = FPDFText_CountChars(text_page);
+
+        std::vector<double> text_ys;
+        for (int ci = 0; ci < total_chars; ci++) {
+            unsigned int u = FPDFText_GetUnicode(text_page, ci);
+            if (u == 0 || u == '\r' || u == '\n' || u == ' ' || u == 0xA0) continue;
+            double cl, cr, cb, ct;
+            if (!FPDFText_GetCharBox(text_page, ci, &cl, &cr, &cb, &ct)) continue;
+            double cx = (cl + cr) / 2.0, cy = (ct + cb) / 2.0;
+            if (cx < tl - 5 || cx > tr + 5) continue;
+            text_ys.push_back(cy);
+        }
+
+        // Count how many text row clusters fall within the grid
+        int n_rows_expected = (int)row_ys.size() - 1;
+        int rows_inside = 0;
+        if (!text_ys.empty() && row_h > 1.0) {
+            auto text_clusters = cluster_values(text_ys, row_h * 0.4);
+            for (double tc : text_clusters)
+                if (tc >= tb - row_h * 0.5 && tc <= tt + row_h * 0.5)
+                    rows_inside++;
+        }
+
+        bool misaligned = (rows_inside < n_rows_expected * 0.8) &&
+                          (!text_ys.empty()) && (row_h > 1.0);
+        if (misaligned) {
+            // Text and lines are misaligned. Find offset that maximizes
+            // the number of text chars falling within the shifted grid.
+            // Use text row centers as candidate alignment targets.
+            auto text_clusters = cluster_values(text_ys, row_h * 0.4);
+            double best_offset = 0;
+            int best_count = rows_inside;
+
+            for (double tc : text_clusters) {
+                double grid_center = (row_ys[0] + row_ys[1]) / 2.0;
+                double n_from_bot = std::round((tc - grid_center) / row_h);
+                double aligned_center = grid_center + n_from_bot * row_h;
+                double candidate_offset = tc - aligned_center;
+
+                // Count text row clusters inside shifted grid
+                int count = 0;
+                double shifted_bot = tb + candidate_offset;
+                double shifted_top = tt + candidate_offset;
+                for (double tc2 : text_clusters) {
+                    if (tc2 >= shifted_bot - row_h * 0.5 && tc2 <= shifted_top + row_h * 0.5)
+                        count++;
+                }
+                if (count > best_count) {
+                    best_count = count;
+                    best_offset = candidate_offset;
+                }
+            }
+
+            if (std::abs(best_offset) > row_h * 0.3 && best_count > rows_inside) {
+                for (auto& y : actual_ys)
+                    y += best_offset;
+            }
+        }
+    }
+
+    int n_rows = (int)actual_ys.size() - 1;
     int n_cols = (int)col_xs.size() - 1;
 
     table.x0 = col_xs.front();
-    table.y0 = row_ys.front();
+    table.y0 = actual_ys.front();
     table.x1 = col_xs.back();
-    table.y1 = row_ys.back();
+    table.y1 = actual_ys.back();
 
     int last_col_idx = n_cols - 1;
     auto sub_boundaries = detect_response_boundaries(text_page,
-        col_xs[last_col_idx], col_xs[last_col_idx + 1], row_ys);
+        col_xs[last_col_idx], col_xs[last_col_idx + 1], actual_ys);
     int n_sub = sub_boundaries.empty() ? 0 : (int)sub_boundaries.size() - 1;
     int total_cols = (n_sub > 1) ? (n_cols - 1 + n_sub) : n_cols;
 
@@ -611,8 +681,8 @@ TableData build_table(const std::vector<double>& row_ys,
         for (int c = 0; c < n_cols; c++) {
             double left   = col_xs[c];
             double right  = col_xs[c + 1];
-            double bottom = row_ys[r];
-            double top    = row_ys[r + 1];
+            double bottom = actual_ys[r];
+            double top    = actual_ys[r + 1];
 
             if (c == last_col_idx && n_sub > 1) {
                 if (is_scale_row(text_page, left, right, bottom, top, sub_boundaries)) {
@@ -946,7 +1016,7 @@ std::vector<TableData> detect_tables(const std::vector<PdfLineSegment>& lines,
     current_group.push_back(row_ys[0]);
     for (int i = 0; i < n_levels - 1; i++) {
         double gap = row_ys[i + 1] - row_ys[i];
-        bool close_enough = gap < 200.0; // max gap between rows in a table
+        bool close_enough = gap < 200.0;
         if (connected[i] || (x_overlap[i] && close_enough)) {
             current_group.push_back(row_ys[i + 1]);
         } else {
