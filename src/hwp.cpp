@@ -16,7 +16,6 @@
 #include <iostream>
 #include <cstring>
 #include <memory>
-#include <sys/stat.h>
 
 namespace jdoc {
 

@@ -16,7 +16,6 @@
 #include <cmath>
 #include <cstring>
 #include <stdexcept>
-#include <sys/stat.h>
 #include <zlib.h>
 
 namespace jdoc {
@@ -2188,7 +2187,7 @@ ExtractResult extract_pdf(const std::string& pdf_path, const ConvertOptions& opt
     std::string image_dir;
     if (opts.extract_images && !opts.image_output_dir.empty()) {
         image_dir = opts.image_output_dir;
-        mkdir(image_dir.c_str(), 0755);
+        util::ensure_dir(image_dir);
     }
 
     for (int p : page_indices) {

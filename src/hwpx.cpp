@@ -14,7 +14,6 @@
 #include <set>
 #include <sstream>
 #include <iostream>
-#include <sys/stat.h>
 
 namespace jdoc {
 

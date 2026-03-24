@@ -13,7 +13,6 @@
 #include <map>
 #include <set>
 #include <sstream>
-#include <sys/stat.h>
 
 namespace jdoc {
 
@@ -807,7 +806,7 @@ std::vector<ImageData> XlsxParser::extract_images(
                 img.format = util::image_format_from_ext(util::get_extension(media_path));
 
                 if (!opts.image_output_dir.empty()) {
-                    mkdir(opts.image_output_dir.c_str(), 0755);
+                    util::ensure_dir(opts.image_output_dir);
                     std::string out_path = opts.image_output_dir + "/" + img.name;
                     for (auto& e : zip_.entries()) {
                         if (e.name == media_path) {
@@ -836,7 +835,7 @@ std::vector<ImageData> XlsxParser::extract_images(
         img.format = util::image_format_from_ext(util::get_extension(entry->name));
 
         if (!opts.image_output_dir.empty()) {
-            mkdir(opts.image_output_dir.c_str(), 0755);
+            util::ensure_dir(opts.image_output_dir);
             std::string out_path = opts.image_output_dir + "/" + img.name;
             if (zip_.extract_entry_to_file(*entry, out_path)) {
                 img.saved_path = out_path;

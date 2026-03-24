@@ -1,6 +1,15 @@
 build/
 *.so
-!vendor/pdfium/lib/libpdfium.so
+*.dylib
+*.dll
+*.dll.lib
+
+# Keep PDFium prebuilt binaries for all platforms
+!vendor/pdfium/lib/**/*.so
+!vendor/pdfium/lib/**/*.dylib
+!vendor/pdfium/lib/**/*.dll.lib
+!vendor/pdfium/bin/**/*.dll
+
 *.o
 *.a
 __pycache__/

@@ -24,27 +24,63 @@ C++17 document converter with Python bindings. Converts PDF, Office (DOCX/XLSX/X
 | CMake ≥ 3.16 | BSD | Build system |
 | C++17 compiler | — | GCC 8+ / Clang 7+ / MSVC 2019+ |
 
+## Supported Platforms
+
+| Platform | Architecture | Status |
+|----------|-------------|--------|
+| Linux | x86-64 | Supported |
+| macOS | arm64 (Apple Silicon) | Supported |
+| macOS | x86-64 (Intel) | Supported |
+| Windows | x86-64 | Supported |
+
+## Prerequisites
+
+Install CMake and a C++17 compiler before building:
+
+```bash
+# macOS (Homebrew)
+brew install cmake
+
+# Ubuntu / Debian
+sudo apt install cmake build-essential zlib1g-dev
+
+# Windows (winget)
+winget install Kitware.CMake
+
+# Windows (chocolatey)
+choco install cmake --installargs 'ADD_CMAKE_TO_PATH=System'
+
+# Windows (manual)
+# Download installer from https://cmake.org/download/
+```
+
 ## Build
 
 ### C++ CLI only
 
 ```bash
+# Linux / macOS
 mkdir build && cd build
 cmake ..
-make -j$(nproc)
+cmake --build . --parallel
+
+# Windows (Visual Studio)
+mkdir build && cd build
+cmake ..
+cmake --build . --config Release --parallel
 ```
 
 ### With Python bindings
 
 ```bash
-# Option 1: pip install (recommended)
+# Option 1: pip install (recommended, all platforms)
 pip install pybind11
 pip install .
 
-# Option 2: CMake direct
+# Option 2: CMake direct (Linux / macOS)
 mkdir build && cd build
 cmake .. -DBUILD_PYTHON=ON
-make -j$(nproc)
+cmake --build . --parallel
 ```
 
 ## Usage
@@ -217,7 +253,7 @@ jdoc_free_string(md);
 jdoc_free_images(imgs, img_count);
 ```
 
-Link with `-ljdoc` (builds as `libjdoc.so`).
+Link with `-ljdoc` (builds as `libjdoc.so` on Linux, `libjdoc.dylib` on macOS, `jdoc.dll` on Windows).
 
 ### CMake Integration
 
@@ -288,7 +324,7 @@ Document file (PDF/Office/HTML/HWP/HWPX)
       ┌────────┼────────┐
       ▼        ▼        ▼
   Python    CLI /    C API
-   API     C++ API  (libjdoc.so)
+   API     C++ API  (libjdoc.so/.dylib/.dll)
 ```
 
 ## License

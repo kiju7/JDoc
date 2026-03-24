@@ -168,7 +168,7 @@ void OleReader::read_sector(uint32_t sector, void* buf) const {
 #ifdef _WIN32
     _fseeki64(fp_, offset, SEEK_SET);
 #else
-    std::fseek(fp_, static_cast<long>(offset), SEEK_SET);
+    fseeko(fp_, static_cast<off_t>(offset), SEEK_SET);
 #endif
     std::fread(buf, 1, sector_size_, fp_);
 }

@@ -17,6 +17,14 @@ target_include_directories(pugixml PUBLIC vendor/pugixml)
 set(PDFium_DIR "${CMAKE_SOURCE_DIR}/vendor/pdfium" CACHE PATH "PDFium SDK location")
 find_package(PDFium REQUIRED)
 
+# Copy PDFium shared library to build directory for runtime
+if(WIN32)
+    set(PDFIUM_RUNTIME_LIB "${PDFium_LIBRARY}")  # pdfium.dll
+else()
+    set(PDFIUM_RUNTIME_LIB "${PDFium_LIBRARY}")  # .so or .dylib
+endif()
+file(COPY "${PDFIUM_RUNTIME_LIB}" DESTINATION "${CMAKE_BINARY_DIR}")
+
 # ── Common utilities (compiled once) ──────────────────────────
 
 add_library(jdoc_common STATIC src/common/string_utils.cpp)
@@ -69,13 +77,37 @@ target_link_libraries(jdoc_office PUBLIC pugixml jdoc_zip jdoc_common)
 add_library(jdoc_shared SHARED src/jdoc_c_api.cpp)
 target_link_libraries(jdoc_shared PRIVATE jdoc_pdf jdoc_office jdoc_hwpx jdoc_hwp)
 target_include_directories(jdoc_shared PUBLIC include PRIVATE src)
-set_target_properties(jdoc_shared PROPERTIES OUTPUT_NAME "jdoc" SOVERSION 2)
+set_target_properties(jdoc_shared PROPERTIES
+    OUTPUT_NAME "jdoc"
+    VERSION ${PROJECT_VERSION}
+    SOVERSION 2
+)
+
+# macOS: set rpath so the executable finds dylibs next to it
+if(APPLE)
+    set_target_properties(jdoc_shared PROPERTIES
+        INSTALL_RPATH "@loader_path"
+        BUILD_RPATH "@loader_path"
+    )
+endif()
+
+# Windows: export all symbols from shared library
+if(WIN32)
+    set_target_properties(jdoc_shared PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
+endif()
 
 # ── Unified CLI ───────────────────────────────────────────────
 
 add_executable(jdoc src/main.cpp)
 target_link_libraries(jdoc PRIVATE jdoc_pdf jdoc_office jdoc_hwpx jdoc_hwp)
 target_include_directories(jdoc PRIVATE include src)
+
+if(APPLE)
+    set_target_properties(jdoc PROPERTIES
+        INSTALL_RPATH "@executable_path/../lib"
+        BUILD_RPATH "${CMAKE_BINARY_DIR}"
+    )
+endif()
 
 # ── Tests ─────────────────────────────────────────────────────
 

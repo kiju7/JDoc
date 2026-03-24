@@ -8,7 +8,6 @@
 #include <cstdlib>
 #include <regex>
 #include <set>
-#include <sys/stat.h>
 #include <sstream>
 
 namespace jdoc {
@@ -408,7 +407,7 @@ std::vector<ImageData> PptxParser::extract_images(
             img.format = fmt;
 
             if (!opts.image_output_dir.empty()) {
-                mkdir(opts.image_output_dir.c_str(), 0755);
+                util::ensure_dir(opts.image_output_dir);
                 std::string out_path = opts.image_output_dir + "/" + img.name;
                 const ZipReader::Entry* entry_ptr = nullptr;
                 for (auto& e : zip_.entries()) {
@@ -440,7 +439,7 @@ std::vector<ImageData> PptxParser::extract_images(
         img.format = fmt;
 
         if (!opts.image_output_dir.empty()) {
-            mkdir(opts.image_output_dir.c_str(), 0755);
+            util::ensure_dir(opts.image_output_dir);
             std::string out_path = opts.image_output_dir + "/" + img.name;
             if (zip_.extract_entry_to_file(*entry, out_path)) {
                 img.saved_path = out_path;

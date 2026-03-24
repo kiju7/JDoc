@@ -5,7 +5,14 @@
 #include <algorithm>
 #include <cctype>
 #include <string>
-#include <sys/stat.h>
+
+#ifdef _WIN32
+  #include <direct.h>
+  #define jdoc_mkdir(path) _mkdir(path)
+#else
+  #include <sys/stat.h>
+  #define jdoc_mkdir(path) mkdir(path, 0755)
+#endif
 
 namespace jdoc { namespace util {
 
@@ -64,7 +71,7 @@ inline std::string escape_cell(const std::string& text) {
 
 // Create a directory (no error on existing).
 inline void ensure_dir(const std::string& dir) {
-    if (!dir.empty()) mkdir(dir.c_str(), 0755);
+    if (!dir.empty()) jdoc_mkdir(dir.c_str());
 }
 
 // Strip markdown formatting from text, returning plain text.
