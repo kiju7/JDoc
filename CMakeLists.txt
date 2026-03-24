@@ -83,11 +83,16 @@ set_target_properties(jdoc_shared PROPERTIES
     SOVERSION 2
 )
 
-# macOS: set rpath so the executable finds dylibs next to it
+# Set rpath so the library finds pdfium next to it
 if(APPLE)
     set_target_properties(jdoc_shared PROPERTIES
         INSTALL_RPATH "@loader_path"
         BUILD_RPATH "@loader_path"
+    )
+elseif(UNIX)
+    set_target_properties(jdoc_shared PROPERTIES
+        INSTALL_RPATH "$ORIGIN"
+        BUILD_RPATH "$ORIGIN"
     )
 endif()
 
@@ -104,7 +109,12 @@ target_include_directories(jdoc PRIVATE include src)
 
 if(APPLE)
     set_target_properties(jdoc PROPERTIES
-        INSTALL_RPATH "@executable_path/../lib"
+        INSTALL_RPATH "@executable_path"
+        BUILD_RPATH "${CMAKE_BINARY_DIR}"
+    )
+elseif(UNIX)
+    set_target_properties(jdoc PROPERTIES
+        INSTALL_RPATH "$ORIGIN"
         BUILD_RPATH "${CMAKE_BINARY_DIR}"
     )
 endif()
@@ -128,6 +138,17 @@ if(BUILD_PYTHON)
     pybind11_add_module(_jdoc src/python_bindings.cpp)
     target_link_libraries(_jdoc PRIVATE jdoc_pdf jdoc_office jdoc_hwpx jdoc_hwp)
     target_include_directories(_jdoc PRIVATE include src)
+    if(APPLE)
+        set_target_properties(_jdoc PROPERTIES
+            INSTALL_RPATH "@loader_path"
+            BUILD_RPATH "@loader_path"
+        )
+    elseif(UNIX)
+        set_target_properties(_jdoc PROPERTIES
+            INSTALL_RPATH "$ORIGIN"
+            BUILD_RPATH "$ORIGIN"
+        )
+    endif()
 endif()
 
 # ── Install ───────────────────────────────────────────────────
