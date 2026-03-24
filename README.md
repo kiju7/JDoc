@@ -44,6 +44,12 @@ brew install cmake
 # Ubuntu / Debian
 sudo apt install cmake build-essential zlib1g-dev
 
+# RHEL / CentOS / Rocky Linux
+sudo yum install cmake gcc-c++ zlib-devel
+
+# Fedora
+sudo dnf install cmake gcc-c++ zlib-devel
+
 # Windows (winget)
 winget install Kitware.CMake
 
