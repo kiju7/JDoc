@@ -1948,7 +1948,7 @@ struct PageCharCache {
     std::string get_text_in_rect(double left, double top, double right, double bottom) const {
         double rect_top = std::max(top, bottom);
         double rect_bot = std::min(top, bottom);
-        double y_lo = rect_bot + 1, y_hi = rect_top - 1;
+        double y_lo = rect_bot + 0.5, y_hi = rect_top - 0.5;
         auto lo_it = std::lower_bound(y_sorted.begin(), y_sorted.end(), y_lo,
             [this](size_t idx, double val) { return chars[idx].y < val; });
         auto hi_it = std::upper_bound(lo_it, y_sorted.end(), y_hi,
@@ -1956,7 +1956,7 @@ struct PageCharCache {
         std::vector<size_t> matches;
         for (auto it = lo_it; it != hi_it; ++it) {
             auto& ch = chars[*it];
-            if (ch.x >= left + 1 && ch.x <= right - 1)
+            if (ch.x >= left + 0.5 && ch.x <= right - 0.5)
                 matches.push_back(*it);
         }
         std::sort(matches.begin(), matches.end());

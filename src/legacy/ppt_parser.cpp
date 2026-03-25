@@ -157,8 +157,14 @@ void PptParser::parse_document() {
         pos = atom_end;
     }
 
-    // If no SlideListWithText was found, try a more aggressive scan for text atoms.
-    if (slides_.empty()) {
+    // If no text was found in SlideListWithText, do a full scan.
+    // This handles PPTs where text is in individual Slide containers, not in SLT.
+    bool has_any_text = false;
+    for (auto& s : slides_) {
+        if (!s.title.empty() || !s.body.empty()) { has_any_text = true; break; }
+    }
+    if (!has_any_text) {
+        slides_.clear();
         pos = 0;
         Slide current_slide;
         current_slide.number = 1;
