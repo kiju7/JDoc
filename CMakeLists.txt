@@ -6,24 +6,13 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 find_package(ZLIB REQUIRED)
+find_package(JPEG REQUIRED)
 
 # ── Vendor libraries ────────────────────────────────────────
 
 # pugixml (XML parser for HWPX/OOXML)
 add_library(pugixml STATIC vendor/pugixml/pugixml.cpp)
 target_include_directories(pugixml PUBLIC vendor/pugixml)
-
-# PDFium (PDF backend)
-set(PDFium_DIR "${CMAKE_SOURCE_DIR}/vendor/pdfium" CACHE PATH "PDFium SDK location")
-find_package(PDFium REQUIRED)
-
-# Copy PDFium shared library to build directory for runtime
-if(WIN32)
-    set(PDFIUM_RUNTIME_LIB "${PDFium_LIBRARY}")
-else()
-    set(PDFIUM_RUNTIME_LIB "${PDFium_LIBRARY}")
-endif()
-file(COPY "${PDFIUM_RUNTIME_LIB}" DESTINATION "${CMAKE_BINARY_DIR}")
 
 # ── Common utilities (compiled once) ──────────────────────────
 
@@ -40,7 +29,7 @@ target_link_libraries(jdoc_zip PUBLIC ZLIB::ZLIB jdoc_common)
 
 add_library(jdoc_pdf STATIC src/pdf.cpp)
 target_include_directories(jdoc_pdf PUBLIC include PRIVATE src)
-target_link_libraries(jdoc_pdf PUBLIC pdfium jdoc_common ZLIB::ZLIB)
+target_link_libraries(jdoc_pdf PUBLIC jdoc_common ZLIB::ZLIB JPEG::JPEG)
 
 # ── HWPX (ZIP+XML format) ────────────────────────────────────
 
@@ -83,18 +72,6 @@ set_target_properties(jdoc_shared PROPERTIES
     SOVERSION 2
 )
 
-# Set rpath so the library finds pdfium next to it
-if(APPLE)
-    set_target_properties(jdoc_shared PROPERTIES
-        INSTALL_RPATH "@loader_path"
-        BUILD_RPATH "@loader_path"
-    )
-elseif(UNIX)
-    set_target_properties(jdoc_shared PROPERTIES
-        INSTALL_RPATH "$ORIGIN"
-        BUILD_RPATH "$ORIGIN"
-    )
-endif()
 
 # Windows: export all symbols from shared library
 if(WIN32)
@@ -107,17 +84,6 @@ add_executable(jdoc src/main.cpp)
 target_link_libraries(jdoc PRIVATE jdoc_pdf jdoc_office jdoc_hwpx jdoc_hwp)
 target_include_directories(jdoc PRIVATE include src)
 
-if(APPLE)
-    set_target_properties(jdoc PROPERTIES
-        INSTALL_RPATH "@executable_path"
-        BUILD_RPATH "${CMAKE_BINARY_DIR}"
-    )
-elseif(UNIX)
-    set_target_properties(jdoc PROPERTIES
-        INSTALL_RPATH "$ORIGIN"
-        BUILD_RPATH "${CMAKE_BINARY_DIR}"
-    )
-endif()
 
 # ── Tests ─────────────────────────────────────────────────────
 

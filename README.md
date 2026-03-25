@@ -5,9 +5,10 @@ C++17 document converter with Python bindings. Converts PDF, Office (DOCX/XLSX/P
 ## Features
 
 - **Multi-format** — PDF, DOCX, XLSX, XLSB, PPTX, DOC, XLS, PPT, RTF, HTML, HWP, HWPX
+- **Thread-safe PDF** — custom parser, no global state, fully reentrant
 - **Heading detection** — font size ratio analysis (H1–H4)
 - **Table extraction** — line-based grid + borderless table detection
-- **Image extraction** — embedded images with metadata
+- **Image extraction** — JPEG passthrough, vector rendering (200 DPI), CCITTFax G3/G4
 - **Page chunking** — per-page output for RAG pipelines
 - **Python bindings** — pybind11 module
 
@@ -19,22 +20,22 @@ Linux (x64), macOS (arm64/x64), Windows (x64)
 
 | Library | License | Role |
 |---------|---------|------|
-| PDFium | BSD-3 | PDF backend (auto-downloaded) |
+| zlib | zlib | Compression (FlateDecode, PNG) |
+| libjpeg-turbo | IJG/BSD | JPEG decode for PDF images |
 | pugixml | MIT | XML parsing (bundled) |
-| zlib | zlib | ZIP decompression |
 | pybind11 | BSD-3 | Python bindings (optional) |
 
 ## Install
 
 ```bash
-# macOS
-brew install cmake
-
 # Ubuntu/Debian
-sudo apt install cmake build-essential zlib1g-dev
+sudo apt install cmake build-essential zlib1g-dev libjpeg-dev
+
+# macOS
+brew install cmake libjpeg-turbo
 
 # RHEL/Fedora
-sudo dnf install cmake gcc-c++ zlib-devel
+sudo dnf install cmake gcc-c++ zlib-devel libjpeg-turbo-devel
 
 # Windows
 winget install Kitware.CMake
@@ -44,7 +45,7 @@ winget install Kitware.CMake
 
 ```bash
 mkdir build && cd build
-cmake ..
+cmake .. -DCMAKE_BUILD_TYPE=Release
 cmake --build . --parallel
 ```
 
@@ -76,7 +77,9 @@ pages = jdoc.convert_pages("document.pdf", extract_images=True)
 for page in pages:
     print(page.text)
     for img in page.images:
-        raw_bytes = img.data
+        # img.pixels: raw RGB bytes (zero-copy, width * height * components)
+        # img.data: JPEG original bytes (passthrough, no re-encoding)
+        pass
 ```
 
 ## C++
@@ -99,6 +102,10 @@ std::string md = jdoc::pdf_to_markdown("input.pdf", opts);
 auto chunks = jdoc::pdf_to_markdown_chunks("input.pdf");
 for (auto& chunk : chunks) {
     std::cout << chunk.text << "\n";
+    for (auto& img : chunk.images) {
+        // img.pixels: raw RGB/gray (width * height * components)
+        // img.data: JPEG/JP2 original bytes
+    }
 }
 ```
 

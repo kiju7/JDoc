@@ -1,6 +1,6 @@
 #pragma once
 // jdoc - PDF to Markdown converter
-// Backend: PDFium
+// Backend: Custom parser (thread-safe, no PDFium dependency)
 // License: MIT
 
 #include "jdoc/types.h"
