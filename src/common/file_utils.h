@@ -151,7 +151,7 @@ inline std::string strip_markdown(const std::string& md) {
                 size_t pipe = line.find('|', ci);
                 if (pipe == std::string::npos || pipe >= e) pipe = e;
                 std::string cell = trim(line.substr(ci, pipe - ci));
-                if (!row.empty()) row += '\t';
+                if (!row.empty()) row += "  ";
                 row += cell;
                 ci = pipe + 1;
             }

@@ -154,12 +154,8 @@ const char* format_name(DocFormat fmt) {
 // ── Public API ──────────────────────────────────────────
 
 // Section separator label for each format
-static const char* section_label(DocFormat fmt) {
-    switch (fmt) {
-    case DocFormat::PPTX: case DocFormat::PPT: return "Slide";
-    case DocFormat::XLSX: case DocFormat::XLS: case DocFormat::XLSB: return "Sheet";
-    default: return "Page";
-    }
+static const char* section_label(DocFormat /*fmt*/) {
+    return "Page";
 }
 
 std::string office_to_markdown(const std::string& file_path, ConvertOptions opts) {

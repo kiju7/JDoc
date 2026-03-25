@@ -634,7 +634,7 @@ void XlsParser::parse_workbook() {
 
 // ---------- sheet to markdown ------------------------------------------------
 
-std::string XlsParser::sheet_to_markdown(const Sheet& sheet) {
+std::string XlsParser::sheet_to_markdown(const Sheet& sheet, int sheet_num) {
     if (sheet.cells.empty()) return "";
 
     // Determine grid dimensions.
@@ -671,8 +671,7 @@ std::string XlsParser::sheet_to_markdown(const Sheet& sheet) {
 
     // Render markdown table.
     std::ostringstream out;
-    std::string display_name = sheet.name.empty() ? "Sheet" : sheet.name;
-    out << "## " << display_name << "\n\n";
+    out << "--- Page " << sheet_num << " ---\n\n";
 
     for (int r = 0; r < used_rows; ++r) {
         out << "|";
@@ -805,8 +804,8 @@ std::vector<ImageData> XlsParser::extract_images() {
 
 std::string XlsParser::to_markdown(const ConvertOptions& opts) {
     std::string md;
-    for (const auto& sheet : sheets_) {
-        md += sheet_to_markdown(sheet);
+    for (size_t i = 0; i < sheets_.size(); i++) {
+        md += sheet_to_markdown(sheets_[i], static_cast<int>(i) + 1);
     }
 
     if (opts.extract_images) {
@@ -828,7 +827,7 @@ std::vector<PageChunk> XlsParser::to_chunks(const ConvertOptions& opts) {
     for (size_t i = 0; i < sheets_.size(); ++i) {
         PageChunk chunk;
         chunk.page_number = static_cast<int>(i + 1);
-        chunk.text = sheet_to_markdown(sheets_[i]);
+        chunk.text = sheet_to_markdown(sheets_[i], static_cast<int>(i) + 1);
         chunk.page_width = 612.0;
         chunk.page_height = 792.0;
         chunk.body_font_size = 10.0;

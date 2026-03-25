@@ -83,6 +83,74 @@ struct PdfLineSegment {
     bool is_vertical()   const { return std::abs(x1 - x0) < 2.0f; }
 };
 
+struct PageChar {
+    double x, y;
+    double left, right, top, bot;
+    unsigned int unicode;
+};
+
+struct PageCharCache {
+    std::vector<PageChar> chars;
+    std::vector<size_t> y_sorted;
+
+    void build(FPDF_TEXTPAGE text_page) {
+        int total = FPDFText_CountChars(text_page);
+        chars.reserve(total);
+        for (int ci = 0; ci < total; ci++) {
+            unsigned int u = FPDFText_GetUnicode(text_page, ci);
+            if (u == 0 || u == '\r' || u == '\n' || u == 0xFFFD) continue;
+            double l, r, b, t;
+            if (!FPDFText_GetCharBox(text_page, ci, &l, &r, &b, &t)) continue;
+            chars.push_back({(l+r)/2.0, (t+b)/2.0, l, r, t, b, u});
+        }
+        y_sorted.resize(chars.size());
+        for (size_t i = 0; i < chars.size(); i++) y_sorted[i] = i;
+        std::stable_sort(y_sorted.begin(), y_sorted.end(),
+            [this](size_t a, size_t b) { return chars[a].y < chars[b].y; });
+    }
+
+    std::string get_text_in_rect(double left, double top, double right, double bottom) const {
+        double rect_top = std::max(top, bottom);
+        double rect_bot = std::min(top, bottom);
+        double y_lo = rect_bot + 1, y_hi = rect_top - 1;
+        auto lo_it = std::lower_bound(y_sorted.begin(), y_sorted.end(), y_lo,
+            [this](size_t idx, double val) { return chars[idx].y < val; });
+        auto hi_it = std::upper_bound(lo_it, y_sorted.end(), y_hi,
+            [this](double val, size_t idx) { return val < chars[idx].y; });
+        std::vector<size_t> matches;
+        for (auto it = lo_it; it != hi_it; ++it) {
+            auto& ch = chars[*it];
+            if (ch.x >= left + 1 && ch.x <= right - 1)
+                matches.push_back(*it);
+        }
+        std::sort(matches.begin(), matches.end());
+        std::string text;
+        for (size_t idx : matches) {
+            auto& ch = chars[idx];
+            if (ch.unicode == ' ' || ch.unicode == 0xA0)
+                text += ' ';
+            else
+                util::append_utf8(text, ch.unicode);
+        }
+        size_t s = text.find_first_not_of(" ");
+        size_t e = text.find_last_not_of(" ");
+        if (s != std::string::npos) return text.substr(s, e - s + 1);
+        return "";
+    }
+
+    std::vector<std::pair<double,double>> get_char_ranges_in_row(
+            double y_center, double y_tol, double x_min, double x_max) const {
+        std::vector<std::pair<double,double>> ranges;
+        for (auto& ch : chars) {
+            if (ch.unicode == ' ' || ch.unicode == '\t' || ch.unicode == 0xA0) continue;
+            if (std::abs(ch.y - y_center) > y_tol) continue;
+            if (ch.x < x_min - 5 || ch.x > x_max + 5) continue;
+            ranges.push_back({ch.left, ch.right});
+        }
+        return ranges;
+    }
+};
+
 struct FontStats {
     double body_size = 12.0;
 
@@ -131,7 +199,8 @@ bool check_italic(const std::string& name, int flags) {
 
 // ── Extract text lines ───────────────────────────────────
 
-std::vector<TextLine> extract_lines(FPDF_TEXTPAGE text_page) {
+std::vector<TextLine> extract_lines(FPDF_TEXTPAGE text_page,
+                                     bool skip_font_analysis = false) {
     int count = FPDFText_CountChars(text_page);
     if (count <= 0) return {};
 
@@ -165,7 +234,8 @@ std::vector<TextLine> extract_lines(FPDF_TEXTPAGE text_page) {
             }
         }
 
-        if (first_text_char >= 0) {
+        // Skip font name analysis for plaintext (no heading/bold/italic needed)
+        if (!skip_font_analysis && first_text_char >= 0) {
             char buf[256];
             int flags = 0;
             unsigned long len = FPDFText_GetFontInfo(text_page, first_text_char,
@@ -221,8 +291,40 @@ std::vector<PdfLineSegment> extract_line_segments(FPDF_PAGE page) {
         FPDF_PAGEOBJECT obj = FPDFPage_GetObject(page, i);
         if (FPDFPageObj_GetType(obj) != FPDF_PAGEOBJ_PATH) continue;
 
+        // Skip invisible paths (white/transparent stroke = layout grid, not table border)
+        {
+            unsigned int r = 255, g = 255, b = 255, a = 255;
+            if (FPDFPageObj_GetStrokeColor(obj, &r, &g, &b, &a)) {
+                if (a == 0) continue;
+                if (r >= 240 && g >= 240 && b >= 240) continue;
+            }
+        }
+
         int seg_count = FPDFPath_CountSegments(obj);
         if (seg_count < 2) continue;
+
+        // Skip small closed rectangles that are text highlights/backgrounds.
+        // These are 4-5 segment closed paths with height ≤ 15pt (single text line).
+        // Real table cell borders are taller or part of larger grids.
+        if (seg_count >= 4 && seg_count <= 5) {
+            FPDF_PATHSEGMENT first = FPDFPath_GetPathSegment(obj, 0);
+            FPDF_PATHSEGMENT last = FPDFPath_GetPathSegment(obj, seg_count - 1);
+            float fx, fy, lx, ly;
+            FPDFPathSegment_GetPoint(first, &fx, &fy);
+            FPDFPathSegment_GetPoint(last, &lx, &ly);
+            if (std::abs(fx - lx) < 2.0f && std::abs(fy - ly) < 2.0f) {
+                // Closed shape — measure bounding box height
+                float min_y = fy, max_y = fy;
+                for (int s = 0; s < seg_count; s++) {
+                    float sx, sy;
+                    FPDFPathSegment_GetPoint(FPDFPath_GetPathSegment(obj, s), &sx, &sy);
+                    if (sy < min_y) min_y = sy;
+                    if (sy > max_y) max_y = sy;
+                }
+                if (max_y - min_y < 20.0f)
+                    continue; // text highlight/background box — skip
+            }
+        }
 
         float prev_x = 0, prev_y = 0;
         for (int s = 0; s < seg_count; s++) {
@@ -305,6 +407,7 @@ std::string get_bounded_text(FPDF_TEXTPAGE text_page,
 }
 
 std::vector<double> detect_response_boundaries(FPDF_TEXTPAGE text_page,
+                                                const PageCharCache& cache,
                                                 double left, double right,
                                                 const std::vector<double>& row_ys) {
     double width = right - left;
@@ -313,28 +416,18 @@ std::vector<double> detect_response_boundaries(FPDF_TEXTPAGE text_page,
     int n_rows = (int)row_ys.size() - 1;
     if (n_rows < 2) return {};
 
-    int total_chars = FPDFText_CountChars(text_page);
-
     struct RowChars { std::vector<double> xs; };
     std::vector<RowChars> per_row(n_rows);
 
-    for (int ci = 0; ci < total_chars; ci++) {
-        unsigned int u = FPDFText_GetUnicode(text_page, ci);
-        if (u == 0 || u == '\r' || u == '\n' || u == 0xFFFD || u == ' ' || u == 0xA0)
-            continue;
-
-        double cl, cr, cb, ct;
-        if (!FPDFText_GetCharBox(text_page, ci, &cl, &cr, &cb, &ct)) continue;
-        double cx = (cl + cr) / 2.0;
-        double cy = (ct + cb) / 2.0;
-
-        if (cx < left + 1 || cx > right - 1) continue;
+    for (auto& ch : cache.chars) {
+        if (ch.unicode == ' ' || ch.unicode == 0xA0 || ch.unicode == '\t') continue;
+        if (ch.x < left + 1 || ch.x > right - 1) continue;
 
         for (int r = 0; r < n_rows; r++) {
             double bot = std::min(row_ys[r], row_ys[r+1]);
             double top = std::max(row_ys[r], row_ys[r+1]);
-            if (cy >= bot + 1 && cy <= top - 1) {
-                per_row[r].xs.push_back(cx);
+            if (ch.y >= bot + 1 && ch.y <= top - 1) {
+                per_row[r].xs.push_back(ch.x);
                 break;
             }
         }
@@ -375,40 +468,50 @@ std::vector<double> detect_response_boundaries(FPDF_TEXTPAGE text_page,
     auto stable_xs = cluster_values(all_centers, 15.0);
 
     if ((int)stable_xs.size() > 7) {
-        double best_var = 1e9;
-        std::vector<double> best_set;
+        // Select 5 best-spaced columns: score by hit count then gap variance.
+        // Greedy: pick columns with highest support in all_centers.
         int n = (int)stable_xs.size();
+        std::vector<int> hits(n, 0);
+        for (int i = 0; i < n; i++)
+            for (double c : all_centers)
+                if (std::abs(c - stable_xs[i]) < 15.0) hits[i]++;
 
-        for (int a = 0; a < n-4; a++)
-        for (int b = a+1; b < n-3; b++)
-        for (int c = b+1; c < n-2; c++)
-        for (int d = c+1; d < n-1; d++)
-        for (int e = d+1; e < n; e++) {
-            double xs[5] = {stable_xs[a], stable_xs[b], stable_xs[c],
-                            stable_xs[d], stable_xs[e]};
-            double gaps[4];
-            double avg = 0;
-            for (int i = 0; i < 4; i++) { gaps[i] = xs[i+1] - xs[i]; avg += gaps[i]; }
-            avg /= 4;
-            double var = 0;
-            for (int i = 0; i < 4; i++) var += (gaps[i] - avg) * (gaps[i] - avg);
+        // Sort indices by hit count descending, pick top candidates
+        std::vector<int> order(n);
+        for (int i = 0; i < n; i++) order[i] = i;
+        std::sort(order.begin(), order.end(),
+                  [&](int a, int b) { return hits[a] > hits[b]; });
 
-            int min_hits = 999;
-            for (int i = 0; i < 5; i++) {
-                int hits = 0;
-                for (double c : all_centers)
-                    if (std::abs(c - xs[i]) < 15.0) hits++;
-                if (hits < min_hits) min_hits = hits;
+        // Take top candidates (up to 8), then pick best 5 by gap variance
+        int top = std::min(n, 8);
+        std::vector<double> cands;
+        for (int i = 0; i < top; i++) cands.push_back(stable_xs[order[i]]);
+        std::sort(cands.begin(), cands.end());
+
+        if ((int)cands.size() >= 5) {
+            // Pick 5 with most uniform spacing
+            double best_var = 1e9;
+            std::vector<double> best_set;
+            int cn = (int)cands.size();
+            for (int a = 0; a < cn-4; a++)
+            for (int b = a+1; b < cn-3; b++)
+            for (int c = b+1; c < cn-2; c++)
+            for (int d = c+1; d < cn-1; d++)
+            for (int e = d+1; e < cn; e++) {
+                double xs[5] = {cands[a], cands[b], cands[c], cands[d], cands[e]};
+                double avg = (xs[4] - xs[0]) / 4.0;
+                double var = 0;
+                for (int i = 0; i < 4; i++) {
+                    double g = xs[i+1] - xs[i] - avg;
+                    var += g * g;
+                }
+                if (var < best_var) { best_var = var; best_set = {xs[0], xs[1], xs[2], xs[3], xs[4]}; }
             }
-
-            if (min_hits >= 2 && var < best_var) {
-                best_var = var;
-                best_set = {xs[0], xs[1], xs[2], xs[3], xs[4]};
+            if (!best_set.empty() && best_var < 200.0) {
+                stable_xs = best_set;
+            } else {
+                return {};
             }
-        }
-
-        if (!best_set.empty() && best_var < 200.0) {
-            stable_xs = best_set;
         } else {
             return {};
         }
@@ -513,6 +616,17 @@ std::vector<double> find_column_boundaries(
         merged.push_back(col_xs.back());
         col_xs = std::move(merged);
     }
+
+    // Limit to max 8 columns — merge closest pairs when over limit
+    while (col_xs.size() > 9) { // 9 boundaries = 8 columns
+        double min_gap = 1e9;
+        size_t min_idx = 1;
+        for (size_t i = 1; i < col_xs.size() - 1; i++) {
+            double gap = col_xs[i + 1] - col_xs[i];
+            if (gap < min_gap) { min_gap = gap; min_idx = i; }
+        }
+        col_xs.erase(col_xs.begin() + min_idx);
+    }
     return col_xs;
 }
 
@@ -538,13 +652,15 @@ void trim_table(TableData& table) {
 
 // Forward declaration for text-based column inference
 std::vector<double> infer_columns_from_text(FPDF_TEXTPAGE text_page,
+                                             const PageCharCache& cache,
                                              double left, double right,
                                              const std::vector<double>& row_ys);
 
 TableData build_table(const std::vector<double>& row_ys,
                        const std::vector<PdfLineSegment>& h_lines,
                        const std::vector<PdfLineSegment>& v_lines,
-                       FPDF_TEXTPAGE text_page) {
+                       FPDF_TEXTPAGE text_page,
+                       const PageCharCache& cache) {
     TableData table;
     double table_top = row_ys.back();
     double table_bot = row_ys.front();
@@ -582,7 +698,7 @@ TableData build_table(const std::vector<double>& row_ys,
     // If internal v-lines exist but don't form columns, it's likely
     // a complex graphic (chart, diagram) rather than a table.
     if (col_xs.size() < 3 && internal_vline_count == 0) {
-        col_xs = infer_columns_from_text(text_page, table_left, table_right, row_ys);
+        col_xs = infer_columns_from_text(text_page, cache, table_left, table_right, row_ys);
     }
 
     if (col_xs.size() < 3) {
@@ -600,19 +716,14 @@ TableData build_table(const std::vector<double>& row_ys,
         double tl = col_xs.front(), tr = col_xs.back();
         double row_h = (row_ys.size() >= 2) ? (row_ys[1] - row_ys[0]) : 18.0;
         int n_cols_found = (int)col_xs.size() - 1;
-        int total_chars = FPDFText_CountChars(text_page);
 
-        // Collect (x, y) for each non-whitespace char in column range
+        // Use pre-built char cache instead of re-scanning text_page
         struct CharPos { double x, y; };
         std::vector<CharPos> chars;
-        for (int ci = 0; ci < total_chars; ci++) {
-            unsigned int u = FPDFText_GetUnicode(text_page, ci);
-            if (u == 0 || u == '\r' || u == '\n' || u == ' ' || u == 0xA0) continue;
-            double cl, cr, cb, ct;
-            if (!FPDFText_GetCharBox(text_page, ci, &cl, &cr, &cb, &ct)) continue;
-            double cx = (cl + cr) / 2.0, cy = (ct + cb) / 2.0;
-            if (cx < tl - 5 || cx > tr + 5) continue;
-            chars.push_back({cx, cy});
+        for (auto& ch : cache.chars) {
+            if (ch.unicode == ' ' || ch.unicode == 0xA0 || ch.unicode == '\t') continue;
+            if (ch.x < tl - 5 || ch.x > tr + 5) continue;
+            chars.push_back({ch.x, ch.y});
         }
 
         // Cluster chars by Y to find text rows
@@ -678,7 +789,7 @@ TableData build_table(const std::vector<double>& row_ys,
     table.y1 = actual_ys.back();
 
     int last_col_idx = n_cols - 1;
-    auto sub_boundaries = detect_response_boundaries(text_page,
+    auto sub_boundaries = detect_response_boundaries(text_page, cache,
         col_xs[last_col_idx], col_xs[last_col_idx + 1], actual_ys);
     int n_sub = sub_boundaries.empty() ? 0 : (int)sub_boundaries.size() - 1;
     int total_cols = (n_sub > 1) ? (n_cols - 1 + n_sub) : n_cols;
@@ -695,14 +806,14 @@ TableData build_table(const std::vector<double>& row_ys,
             if (c == last_col_idx && n_sub > 1) {
                 if (is_scale_row(text_page, left, right, bottom, top, sub_boundaries)) {
                     for (int sc = 0; sc < n_sub; sc++) {
-                        table.rows[r][n_cols - 1 + sc] = get_bounded_text(
-                            text_page, sub_boundaries[sc], top, sub_boundaries[sc+1], bottom);
+                        table.rows[r][n_cols - 1 + sc] = cache.get_text_in_rect(
+                            sub_boundaries[sc], top, sub_boundaries[sc+1], bottom);
                     }
                 } else {
-                    table.rows[r][n_cols - 1] = get_bounded_text(text_page, left, top, right, bottom);
+                    table.rows[r][n_cols - 1] = cache.get_text_in_rect(left, top, right, bottom);
                 }
             } else {
-                table.rows[r][c] = get_bounded_text(text_page, left, top, right, bottom);
+                table.rows[r][c] = cache.get_text_in_rect(left, top, right, bottom);
             }
         }
     }
@@ -717,26 +828,24 @@ TableData build_table(const std::vector<double>& row_ys,
         for (auto& cell : row) if (!cell.empty()) filled_cols++;
         if (filled_cols >= 2) meaningful_rows++;
     }
-    if (meaningful_rows < 2) table.rows.clear();
+    if (meaningful_rows < 3) table.rows.clear();
 
     // Reject tables where the column count does not match the visible
     // cell structure. When many internal vertical lines create more columns
     // than content fills (>50% cells empty), it's a bordered text block.
     if (!table.rows.empty()) {
         int n_cols_t = (int)table.rows[0].size();
-        if (n_cols_t >= 4) {
-            int total_cells = 0;
-            int empty_cells = 0;
-            for (auto& row : table.rows) {
-                for (int c = 0; c < n_cols_t && c < (int)row.size(); c++) {
-                    total_cells++;
-                    if (row[c].empty()) empty_cells++;
-                }
+        int total_cells = 0;
+        int empty_cells = 0;
+        for (auto& row : table.rows) {
+            for (int c = 0; c < n_cols_t && c < (int)row.size(); c++) {
+                total_cells++;
+                if (row[c].empty()) empty_cells++;
             }
-            if (total_cells > 0 && empty_cells > total_cells * 0.5) {
-                table.rows.clear();
-                return table;
-            }
+        }
+        if (total_cells > 0 && empty_cells > total_cells * 0.6) {
+            table.rows.clear();
+            return table;
         }
     }
 
@@ -860,34 +969,31 @@ bool h_lines_share_full_span(const std::vector<PdfLineSegment>& h_lines,
 
 // Infer column boundaries from text x-positions when vertical lines are absent
 std::vector<double> infer_columns_from_text(FPDF_TEXTPAGE text_page,
+                                             const PageCharCache& cache,
                                              double left, double right,
                                              const std::vector<double>& row_ys) {
     int n_rows = (int)row_ys.size() - 1;
     if (n_rows < 1) return {};
 
-    int total_chars = FPDFText_CountChars(text_page);
-
-    // Collect text spans per row
+    // Collect text spans per row using cache
     std::vector<std::vector<std::pair<double,double>>> per_row(n_rows);
 
-    for (int r = 0; r < n_rows; r++) {
-        double bot = std::min(row_ys[r], row_ys[r+1]);
-        double top = std::max(row_ys[r], row_ys[r+1]);
-
-        std::vector<std::pair<double,double>> char_xs;
-        for (int ci = 0; ci < total_chars; ci++) {
-            unsigned int u = FPDFText_GetUnicode(text_page, ci);
-            if (u == 0 || u == '\r' || u == '\n' || u == 0xFFFD || u == ' ' || u == 0xA0)
-                continue;
-            double cl, cr, cb, ct;
-            if (!FPDFText_GetCharBox(text_page, ci, &cl, &cr, &cb, &ct)) continue;
-            double cx = (cl + cr) / 2.0;
-            double cy = (ct + cb) / 2.0;
-            if (cx < left - 5 || cx > right + 5) continue;
-            if (cy >= bot + 1 && cy <= top - 1)
-                char_xs.push_back({cl, cr});
+    for (auto& ch : cache.chars) {
+        if (ch.unicode == ' ' || ch.unicode == 0xA0 || ch.unicode == '\t') continue;
+        double cx = ch.x;
+        double cy = ch.y;
+        if (cx < left - 5 || cx > right + 5) continue;
+        for (int r = 0; r < n_rows; r++) {
+            double bot = std::min(row_ys[r], row_ys[r+1]);
+            double top = std::max(row_ys[r], row_ys[r+1]);
+            if (cy >= bot + 1 && cy <= top - 1) {
+                per_row[r].push_back({ch.left, ch.right});
+                break;
+            }
         }
-        per_row[r] = merge_char_ranges(char_xs);
+    }
+    for (int r = 0; r < n_rows; r++) {
+        per_row[r] = merge_char_ranges(per_row[r]);
     }
 
     // Find consistent gap positions across rows
@@ -965,6 +1071,7 @@ std::vector<double> infer_columns_from_text(FPDF_TEXTPAGE text_page,
 
 std::vector<TableData> detect_tables(const std::vector<PdfLineSegment>& lines,
                                       FPDF_TEXTPAGE text_page,
+                                      const PageCharCache& cache,
                                       double page_width, double page_height) {
     if (lines.size() < 4) return {};
 
@@ -976,7 +1083,7 @@ std::vector<TableData> detect_tables(const std::vector<PdfLineSegment>& lines,
             double lx = std::min((double)l.x0, (double)l.x1);
             double rx = std::max((double)l.x0, (double)l.x1);
             if (lx < -10 || rx > page_width + 10) continue;
-            if (rx - lx < 15.0) continue;
+            if (rx - lx < 50.0) continue;
             h_lines.push_back(l);
         } else if (l.is_vertical()) {
             double x = (l.x0 + l.x1) / 2.0;
@@ -1021,27 +1128,34 @@ std::vector<TableData> detect_tables(const std::vector<PdfLineSegment>& lines,
     // with reasonable vertical gap (not too far apart)
     std::vector<std::vector<double>> table_groups;
     std::vector<double> current_group;
+    int group_vline_connections = 0;
     current_group.push_back(row_ys[0]);
     for (int i = 0; i < n_levels - 1; i++) {
         double gap = row_ys[i + 1] - row_ys[i];
         bool close_enough = gap < 200.0;
         if (connected[i] || (x_overlap[i] && close_enough)) {
             current_group.push_back(row_ys[i + 1]);
+            if (connected[i]) group_vline_connections++;
         } else {
-            if (current_group.size() >= 3)
+            // Only accept groups that have at least 1 vertical line connection,
+            // OR are large enough (5+ rows) with h-line overlap to be a real table
+            if (current_group.size() >= 3 &&
+                (group_vline_connections > 0 || current_group.size() >= 7))
                 table_groups.push_back(current_group);
             current_group.clear();
+            group_vline_connections = 0;
             current_group.push_back(row_ys[i + 1]);
         }
     }
-    if (current_group.size() >= 3)
+    if (current_group.size() >= 3 &&
+        (group_vline_connections > 0 || current_group.size() >= 7))
         table_groups.push_back(current_group);
 
     if (table_groups.empty()) return {};
 
     std::vector<TableData> result;
     for (auto& group : table_groups) {
-        TableData t = build_table(group, h_lines, v_lines, text_page);
+        TableData t = build_table(group, h_lines, v_lines, text_page, cache);
         if (!t.rows.empty()) {
             result.push_back(std::move(t));
         }
@@ -1056,24 +1170,20 @@ std::vector<TableData> detect_tables(const std::vector<PdfLineSegment>& lines,
 // 3. Build table from rows that share the same column structure
 
 std::vector<TableData> detect_text_tables(FPDF_TEXTPAGE text_page,
+                                           const PageCharCache& cache,
                                            const std::vector<TableData>& existing_tables,
                                            double page_width, double page_height) {
-    int total_chars = FPDFText_CountChars(text_page);
-    if (total_chars < 10) return {};
+    if (cache.chars.size() < 10) return {};
 
-    // Collect all non-space chars with positions
-    struct CharInfo { double x, y, left, right, top, bot; };
+    // Reuse pre-built char cache, filtering to page bounds
+    struct CharInfo { double x, y, left, right, top, bot; int idx; unsigned int unicode; };
     std::vector<CharInfo> chars;
-    for (int ci = 0; ci < total_chars; ci++) {
-        unsigned int u = FPDFText_GetUnicode(text_page, ci);
-        if (u == 0 || u == '\r' || u == '\n' || u == 0xFFFD || u == ' ' || u == '\t' || u == 0xA0)
-            continue;
-        double l, r, b, t;
-        if (!FPDFText_GetCharBox(text_page, ci, &l, &r, &b, &t)) continue;
-        double cx = (l + r) / 2.0;
-        double cy = (t + b) / 2.0;
-        if (cx < 0 || cx > page_width || cy < 0 || cy > page_height) continue;
-        chars.push_back({cx, cy, l, r, t, b});
+    chars.reserve(cache.chars.size());
+    for (size_t i = 0; i < cache.chars.size(); i++) {
+        auto& ch = cache.chars[i];
+        if (ch.unicode == ' ' || ch.unicode == '\t' || ch.unicode == 0xA0) continue;
+        if (ch.x < 0 || ch.x > page_width || ch.y < 0 || ch.y > page_height) continue;
+        chars.push_back({ch.x, ch.y, ch.left, ch.right, ch.top, ch.bot, (int)i, ch.unicode});
     }
     if (chars.empty()) return {};
 
@@ -1086,6 +1196,7 @@ std::vector<TableData> detect_text_tables(FPDF_TEXTPAGE text_page,
         double y_center;
         double y_top, y_bot;
         std::vector<std::pair<double,double>> char_ranges; // (left, right) of each char
+        std::vector<size_t> char_indices; // indices into chars[]
     };
     std::vector<TextRow> text_rows;
     {
@@ -1094,25 +1205,28 @@ std::vector<TableData> detect_text_tables(FPDF_TEXTPAGE text_page,
         cur.y_top = chars[0].top;
         cur.y_bot = chars[0].bot;
         cur.char_ranges.push_back({chars[0].left, chars[0].right});
+        cur.char_indices.push_back(0);
 
         for (size_t i = 1; i < chars.size(); i++) {
             if (std::abs(chars[i].y - cur.y_center) < 3.0) {
                 cur.char_ranges.push_back({chars[i].left, chars[i].right});
+                cur.char_indices.push_back(i);
                 cur.y_top = std::max(cur.y_top, chars[i].top);
                 cur.y_bot = std::min(cur.y_bot, chars[i].bot);
                 // Update running average
                 cur.y_center = (cur.y_center * (cur.char_ranges.size() - 1) + chars[i].y)
                                / cur.char_ranges.size();
             } else {
-                if (!cur.char_ranges.empty()) text_rows.push_back(cur);
+                if (!cur.char_ranges.empty()) text_rows.push_back(std::move(cur));
                 cur = TextRow();
                 cur.y_center = chars[i].y;
                 cur.y_top = chars[i].top;
                 cur.y_bot = chars[i].bot;
                 cur.char_ranges.push_back({chars[i].left, chars[i].right});
+                cur.char_indices.push_back(i);
             }
         }
-        if (!cur.char_ranges.empty()) text_rows.push_back(cur);
+        if (!cur.char_ranges.empty()) text_rows.push_back(std::move(cur));
     }
 
     if (text_rows.size() < 3) return {};
@@ -1133,6 +1247,7 @@ std::vector<TableData> detect_text_tables(FPDF_TEXTPAGE text_page,
         double y_center, y_top, y_bot;
         double x_min, x_max;
         std::vector<std::pair<double,double>> spans; // merged text spans
+        std::vector<size_t> char_indices; // indices into chars[]
     };
 
     std::vector<RowSpans> row_spans;
@@ -1144,6 +1259,7 @@ std::vector<TableData> detect_text_tables(FPDF_TEXTPAGE text_page,
         rs.y_center = tr.y_center;
         rs.y_top = tr.y_top;
         rs.y_bot = tr.y_bot;
+        rs.char_indices = std::move(tr.char_indices);
 
         // Merge chars into text spans (gap < 8pt = same word/phrase)
         auto ranges = tr.char_ranges;
@@ -1151,7 +1267,7 @@ std::vector<TableData> detect_text_tables(FPDF_TEXTPAGE text_page,
 
         rs.x_min = rs.spans.front().first;
         rs.x_max = rs.spans.back().second;
-        row_spans.push_back(rs);
+        row_spans.push_back(std::move(rs));
     }
 
     if (row_spans.size() < 3) return {};
@@ -1253,7 +1369,7 @@ std::vector<TableData> detect_text_tables(FPDF_TEXTPAGE text_page,
             multi_span_rows++;
             for (size_t s = 1; s < rs.spans.size(); s++) {
                 double gap_width = rs.spans[s].first - rs.spans[s-1].second;
-                if (gap_width >= 10.0) { // minimum gap width to be a column separator
+                if (gap_width >= 20.0) { // minimum gap width to be a column separator
                     double gap_mid = (rs.spans[s-1].second + rs.spans[s].first) / 2.0;
                     all_gaps.push_back(gap_mid);
                 }
@@ -1292,6 +1408,15 @@ std::vector<TableData> detect_text_tables(FPDF_TEXTPAGE text_page,
         int n_cols = (int)col_boundaries.size() - 1;
         if (n_cols < 2) { start = group_indices.back() + 1; continue; }
 
+        // 2-column tables need stronger gap consensus to avoid false positives
+        if (n_cols == 2 && multi_span_rows >= 3) {
+            // Re-check: the single gap cluster must appear in >= 70% of multi-span rows
+            // (col_boundaries has 3 entries: left, gap, right — the gap was the last accepted cluster)
+            if (cluster_count < (int)(multi_span_rows * 0.7)) {
+                start = group_indices.back() + 1; continue;
+            }
+        }
+
         // Build TableData
         TableData table;
         table.y0 = row_spans[group_indices.back()].y_bot;
@@ -1303,46 +1428,68 @@ std::vector<TableData> detect_text_tables(FPDF_TEXTPAGE text_page,
             auto& rs = row_spans[idx];
             std::vector<std::string> row(n_cols);
 
-            // Assign each span to a column
-            for (auto& sp : rs.spans) {
-                double sp_mid = (sp.first + sp.second) / 2.0;
-                int best_col = 0;
+            // Sort this row's chars by X for left-to-right text extraction
+            auto sorted_ci = rs.char_indices;
+            std::sort(sorted_ci.begin(), sorted_ci.end(), [&](size_t a, size_t b) {
+                return chars[a].x < chars[b].x;
+            });
+
+            // Assign each char directly to its column (O(chars_in_row × n_cols))
+            for (size_t ci : sorted_ci) {
+                auto& ch = chars[ci];
+                // Find which column this char belongs to
+                int col = -1;
                 for (int c = 0; c < n_cols; c++) {
-                    if (sp_mid >= col_boundaries[c] && sp_mid <= col_boundaries[c+1]) {
-                        best_col = c;
+                    if (ch.x >= col_boundaries[c] - 2 && ch.x <= col_boundaries[c+1] + 2) {
+                        col = c;
                         break;
                     }
                 }
+                if (col < 0) continue;
+                util::append_utf8(row[col], ch.unicode);
+            }
 
-                // Extract text for this span from text_page
-                std::string cell_text;
-                for (int ci = 0; ci < total_chars; ci++) {
-                    double l, r, b, t;
-                    if (!FPDFText_GetCharBox(text_page, ci, &l, &r, &b, &t)) continue;
-                    double cx = (l + r) / 2.0;
-                    double cy = (t + b) / 2.0;
-                    if (std::abs(cy - rs.y_center) > 3.0) continue;
-                    if (cx >= sp.first - 2 && cx <= sp.second + 2) {
-                        unsigned int u = FPDFText_GetUnicode(text_page, ci);
-                        if (u == 0 || u == '\r' || u == '\n' || u == 0xFFFD) continue;
-                        util::append_utf8(cell_text, u);
-                    }
-                }
-
-                // Trim
-                size_t s = cell_text.find_first_not_of(" \t");
-                size_t e = cell_text.find_last_not_of(" \t");
+            // Trim each cell
+            for (int c = 0; c < n_cols; c++) {
+                size_t s = row[c].find_first_not_of(" \t");
+                size_t e = row[c].find_last_not_of(" \t");
                 if (s != std::string::npos)
-                    cell_text = cell_text.substr(s, e - s + 1);
+                    row[c] = row[c].substr(s, e - s + 1);
                 else
-                    cell_text.clear();
-
-                if (!cell_text.empty()) {
-                    if (!row[best_col].empty()) row[best_col] += " ";
-                    row[best_col] += cell_text;
-                }
+                    row[c].clear();
             }
             table.rows.push_back(std::move(row));
+        }
+
+        // ── Early reject: check text continuity across columns ──
+        // Must run BEFORE merge to see the original cell splits.
+        // In split body text, adjacent cells continue the same sentence.
+        {
+            auto is_content_byte = [](unsigned char c) -> bool {
+                return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                       (c >= '0' && c <= '9') || c >= 0x80;
+            };
+            int continuation_rows = 0;
+            int checked_rows = 0;
+            for (auto& r : table.rows) {
+                if ((int)r.size() < n_cols) continue;
+                int pairs_checked = 0;
+                int pairs_continued = 0;
+                for (int c = 0; c + 1 < n_cols; c++) {
+                    if (r[c].empty() || r[c+1].empty()) continue;
+                    pairs_checked++;
+                    if (is_content_byte((unsigned char)r[c].back()) &&
+                        is_content_byte((unsigned char)r[c+1][0]))
+                        pairs_continued++;
+                }
+                checked_rows++;
+                if (pairs_checked > 0 && pairs_continued > pairs_checked / 2)
+                    continuation_rows++;
+            }
+            if (checked_rows >= 2 && continuation_rows >= checked_rows * 0.3) {
+                start = group_indices.back() + 1;
+                continue;
+            }
         }
 
         // Merge continuation rows (single-cell rows) into previous row
@@ -1370,7 +1517,8 @@ std::vector<TableData> detect_text_tables(FPDF_TEXTPAGE text_page,
             if (filled >= 2) meaningful_rows++;
         }
 
-        if (meaningful_rows >= 2) {
+        // Text-based tables need stronger validation than line-based
+        if (meaningful_rows >= 3 && n_cols <= 4) {
             // Reject tables that look like numbered/bulleted lists.
             bool looks_like_list = false;
 
@@ -1414,6 +1562,139 @@ std::vector<TableData> detect_text_tables(FPDF_TEXTPAGE text_page,
                     long_content_rows >= valid_rows * 0.5) {
                     looks_like_list = true;
                 }
+            }
+
+            // Korean label pattern: 한글 1음절 + "." in first column (가., 나., 다.)
+            if (!looks_like_list && n_cols == 2) {
+                int korean_label_rows = 0;
+                for (auto& row : table.rows) {
+                    if (row.size() < 2 || row[0].empty()) continue;
+                    if (row[0].size() <= 6) {
+                        unsigned char c0 = (unsigned char)row[0][0];
+                        bool is_hangul = (c0 >= 0xEA && c0 <= 0xED);
+                        bool ends_period = (row[0].back() == '.');
+                        if (is_hangul && ends_period) korean_label_rows++;
+                    }
+                }
+                int valid_rows = (int)table.rows.size();
+                if (valid_rows >= 2 && korean_label_rows >= valid_rows * 0.4)
+                    looks_like_list = true;
+            }
+
+            // Reject 2-column "tables" where many rows have empty first column
+            // (indicates body text continuation, not a real table)
+            if (!looks_like_list && n_cols == 2) {
+                int empty_first_col = 0;
+                for (auto& row : table.rows)
+                    if (row.size() >= 2 && row[0].empty() && !row[1].empty())
+                        empty_first_col++;
+                if ((int)table.rows.size() >= 3 &&
+                    empty_first_col >= (int)table.rows.size() * 0.4)
+                    looks_like_list = true;
+            }
+
+            // Reject tables whose first row is only punctuation/spaces
+            // (false positive from comma-separated values or headings)
+            if (!looks_like_list && !table.rows.empty()) {
+                bool header_only_punct = true;
+                for (auto& cell : table.rows[0]) {
+                    for (char c : cell) {
+                        if (c != '.' && c != ',' && c != ' ' && c != '\t' &&
+                            c != ';' && c != ':' && c != '-')
+                            { header_only_punct = false; break; }
+                    }
+                    if (!header_only_punct) break;
+                }
+                if (header_only_punct) looks_like_list = true;
+            }
+
+            // ── Fundamental check: reject split body text ──
+            // In a real table, cells contain independent data items.
+            // In split text, adjacent cells are continuations of one
+            // sentence — left cell ends mid-word/phrase and right cell
+            // continues it. Detect by checking text continuity across
+            // column boundaries.
+            if (!looks_like_list) {
+                auto is_content_char = [](unsigned char c) -> bool {
+                    // Korean UTF-8 lead bytes (0xEA-0xED), ASCII letters/digits
+                    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                           (c >= '0' && c <= '9') || c >= 0x80;
+                };
+                auto is_filler_only = [](const std::string& s) -> bool {
+                    for (char c : s)
+                        if (c != '.' && c != ',' && c != ' ' && c != '\t' &&
+                            c != ';' && c != ':' && c != '-')
+                            return false;
+                    return true;
+                };
+
+                int continuation_rows = 0;
+                int filler_cells = 0;
+                int total_cells = 0;
+                int checked_rows = 0;
+
+                for (auto& row : table.rows) {
+                    if ((int)row.size() < n_cols) continue;
+
+                    // Count filler cells
+                    for (auto& cell : row) {
+                        if (cell.empty()) continue;
+                        total_cells++;
+                        if (is_filler_only(cell)) filler_cells++;
+                    }
+
+                    // Check continuity between adjacent columns
+                    bool row_is_continuation = false;
+                    int pairs_checked = 0;
+                    int pairs_continued = 0;
+                    for (int c = 0; c + 1 < n_cols; c++) {
+                        if (row[c].empty() || row[c+1].empty()) continue;
+                        unsigned char left_last = (unsigned char)row[c].back();
+                        unsigned char right_first = (unsigned char)row[c+1][0];
+                        pairs_checked++;
+                        // If left ends with content char and right starts
+                        // with content char (no natural break between them),
+                        // this is a sentence continuation, not a table
+                        if (is_content_char(left_last) && is_content_char(right_first))
+                            pairs_continued++;
+                    }
+                    if (pairs_checked > 0 && pairs_continued > pairs_checked / 2)
+                        row_is_continuation = true;
+
+                    if (row_is_continuation) continuation_rows++;
+                    checked_rows++;
+                }
+
+                // If >30% of rows show text continuation across columns,
+                // this is body text split into fake columns
+                if (checked_rows >= 2 && continuation_rows >= checked_rows * 0.3)
+                    looks_like_list = true;
+
+                // Additional: check if cells span across columns to form
+                // natural sentences (cells are small fragments rather than
+                // independent data). In real tables, most cells are self-
+                // contained units. In split text, many cells are tiny
+                // fragments (< 5 chars, excluding filler).
+                if (!looks_like_list && n_cols >= 3) {
+                    int tiny_cells = 0;
+                    int non_empty_cells = 0;
+                    for (auto& row : table.rows) {
+                        for (auto& cell : row) {
+                            if (cell.empty()) continue;
+                            if (is_filler_only(cell)) continue;
+                            non_empty_cells++;
+                            if (cell.size() <= 6) tiny_cells++;
+                        }
+                    }
+                    // If >40% of meaningful cells are tiny fragments,
+                    // this is split body text
+                    if (non_empty_cells >= 4 && tiny_cells >= non_empty_cells * 0.4)
+                        looks_like_list = true;
+                }
+
+                // Also reject if >15% of cells are filler (dots, commas only)
+                if (total_cells > 0 && filler_cells >= total_cells * 0.15)
+                    looks_like_list = true;
             }
 
             if (!looks_like_list) {
@@ -1993,12 +2274,16 @@ std::vector<TextLine> merge_colinear_lines(const std::vector<TextLine>& lines) {
             m.is_italic = lines[group[0]].is_italic;
             for (size_t k = 0; k < group.size(); k++) {
                 if (k > 0) {
-                    // Use gap between segments to decide separator
+                    // Use font-size-relative gap to decide separator
                     double gap = lines[group[k]].x_left - lines[group[k-1]].x_right;
-                    if (gap > 100.0)
-                        m.text += "\n";  // Large gap = separate lines
-                    else
-                        m.text += "  ";  // Small gap = same line with spacing
+                    double avg_font = (lines[group[k]].font_size +
+                                       lines[group[k-1]].font_size) / 2.0;
+                    double col_gap = std::max(avg_font * 6.0, 60.0);
+                    double word_gap = std::max(avg_font * 0.5, 4.0);
+                    if (gap > col_gap)
+                        m.text += "\n";
+                    else if (gap > word_gap)
+                        m.text += " ";
                 }
                 m.text += lines[group[k]].text;
                 if (lines[group[k]].x_right > m.x_right)
@@ -2202,12 +2487,18 @@ ExtractResult extract_pdf(const std::string& pdf_path, const ConvertOptions& opt
         FPDF_TEXTPAGE text_page = FPDFText_LoadPage(page);
         if (text_page) {
             TextPageGuard tp_guard(text_page);
-            result.all_lines[p] = extract_lines(text_page);
-            if (opts.extract_tables) {
+            bool plaintext = (opts.output_format == OutputFormat::PLAINTEXT);
+            result.all_lines[p] = extract_lines(text_page, plaintext);
+            bool need_tables = opts.extract_tables && !plaintext;
+            if (need_tables) {
+                // Build char cache once per page — reused by all table detection
+                PageCharCache cache;
+                cache.build(text_page);
+
                 auto segments = extract_line_segments(page);
-                result.all_tables[p] = detect_tables(segments, text_page,
+                result.all_tables[p] = detect_tables(segments, text_page, cache,
                     result.page_widths[p], result.page_heights[p]);
-                auto text_tables = detect_text_tables(text_page,
+                auto text_tables = detect_text_tables(text_page, cache,
                     result.all_tables[p],
                     result.page_widths[p], result.page_heights[p]);
                 for (auto& tt : text_tables)
@@ -2296,12 +2587,8 @@ std::string pdf_to_markdown(const std::string& pdf_path, ConvertOptions opts) {
     bool first = true;
     for (int p : page_indices) {
         if (p < 0 || p >= r.total_pages) continue;
-        if (!first) {
-            if (plaintext)
-                full_md += "\n--- Page " + std::to_string(p + 1) + " ---\n\n";
-            else
-                full_md += "\n## Page " + std::to_string(p + 1) + "\n\n";
-        }
+        if (!first)
+            full_md += "\n--- Page " + std::to_string(p + 1) + " ---\n\n";
         first = false;
         std::string page_md = page_to_markdown(r.all_lines[p], r.stats,
                                                 r.all_images[p], r.all_tables[p]);

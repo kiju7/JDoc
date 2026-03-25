@@ -473,10 +473,9 @@ std::string PptxParser::to_markdown(const ConvertOptions& opts) {
 
         auto content = parse_slide(slide_paths_[i]);
 
-        if (i > 0) out << "\n---\n\n";
-
-        // Slide header
-        out << "## Slide " << slide_num << "\n\n";
+        if (i > 0) {
+            out << "\n--- Page " << slide_num << " ---\n\n";
+        }
 
         // Title
         if (!content.title.empty()) {

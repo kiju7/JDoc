@@ -19,9 +19,9 @@ find_package(PDFium REQUIRED)
 
 # Copy PDFium shared library to build directory for runtime
 if(WIN32)
-    set(PDFIUM_RUNTIME_LIB "${PDFium_LIBRARY}")  # pdfium.dll
+    set(PDFIUM_RUNTIME_LIB "${PDFium_LIBRARY}")
 else()
-    set(PDFIUM_RUNTIME_LIB "${PDFium_LIBRARY}")  # .so or .dylib
+    set(PDFIUM_RUNTIME_LIB "${PDFium_LIBRARY}")
 endif()
 file(COPY "${PDFIUM_RUNTIME_LIB}" DESTINATION "${CMAKE_BINARY_DIR}")
 

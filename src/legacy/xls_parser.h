@@ -77,7 +77,7 @@ private:
     static std::string serial_to_time(double serial);
 
     // Build a markdown table from sheet cells.
-    static std::string sheet_to_markdown(const Sheet& sheet);
+    static std::string sheet_to_markdown(const Sheet& sheet, int sheet_num);
 
     // Extract images from MSODRAWING records.
     std::vector<ImageData> extract_images();

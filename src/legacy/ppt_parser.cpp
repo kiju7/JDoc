@@ -231,8 +231,7 @@ void PptParser::parse_document() {
 std::string PptParser::slide_to_markdown(const Slide& slide) {
     std::ostringstream out;
 
-    // Slide header
-    out << "## Slide " << slide.number << "\n\n";
+    out << "--- Page " << slide.number << " ---\n\n";
 
     if (!slide.title.empty()) {
         out << "# " << slide.title << "\n\n";

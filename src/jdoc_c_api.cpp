@@ -21,8 +21,9 @@
 
 enum class FileFormat { PDF, OFFICE, HWP, HWPX, UNKNOWN };
 
-// pdfium is NOT thread-safe even with separate document handles.
-// Only PDF operations need serialization; OOXML/HWP/HWPX parsers are safe.
+// PDFium is NOT thread-safe — even separate document handles crash
+// under concurrent access. All PDF calls must be serialized.
+// Other formats (OOXML, HWP, HWPX) are safe for concurrent use.
 static std::mutex g_pdf_mutex;
 
 static std::string get_ext(const std::string& path) {
@@ -34,44 +35,51 @@ static std::string get_ext(const std::string& path) {
 }
 
 static FileFormat detect_format(const std::string& path) {
+    // Magic bytes first — reliable regardless of file extension
+    unsigned char magic[8] = {};
+    std::ifstream f(path, std::ios::binary);
+    if (f) {
+        f.read(reinterpret_cast<char*>(magic), 8);
+        f.close();
+
+        if (magic[0] == '%' && magic[1] == 'P' && magic[2] == 'D' && magic[3] == 'F')
+            return FileFormat::PDF;
+
+        if (magic[0] == 'P' && magic[1] == 'K' && magic[2] == 0x03 && magic[3] == 0x04) {
+            jdoc::ZipReader zip(path);
+            if (zip.is_open()) {
+                if (zip.has_entry("Contents/section0.xml") ||
+                    zip.has_entry("META-INF/container.xml"))
+                    return FileFormat::HWPX;
+            }
+            return FileFormat::OFFICE;
+        }
+
+        if (magic[0] == 0xD0 && magic[1] == 0xCF && magic[2] == 0x11 && magic[3] == 0xE0) {
+            jdoc::OleReader ole(path);
+            if (ole.is_open()) {
+                if (ole.has_stream("FileHeader") || ole.has_stream("BodyText/Section0"))
+                    return FileFormat::HWP;
+            }
+            return FileFormat::OFFICE;
+        }
+
+        if (magic[0] == '{' && magic[1] == '\\' && magic[2] == 'r' &&
+            magic[3] == 't' && magic[4] == 'f')
+            return FileFormat::OFFICE;
+
+        if (magic[0] == '<')
+            return FileFormat::OFFICE; // HTML
+    }
+
+    // Extension fallback
     std::string ext = get_ext(path);
     if (ext == ".pdf") return FileFormat::PDF;
     if (ext == ".hwpx") return FileFormat::HWPX;
     if (ext == ".hwp") return FileFormat::HWP;
     if (ext == ".docx" || ext == ".xlsx" || ext == ".pptx" ||
         ext == ".doc" || ext == ".xls" || ext == ".ppt" || ext == ".rtf" ||
-        ext == ".html" || ext == ".htm")
-        return FileFormat::OFFICE;
-
-    unsigned char magic[8] = {};
-    std::ifstream f(path, std::ios::binary);
-    if (!f) return FileFormat::UNKNOWN;
-    f.read(reinterpret_cast<char*>(magic), 8);
-
-    if (magic[0] == '%' && magic[1] == 'P' && magic[2] == 'D' && magic[3] == 'F')
-        return FileFormat::PDF;
-
-    if (magic[0] == 'P' && magic[1] == 'K' && magic[2] == 0x03 && magic[3] == 0x04) {
-        jdoc::ZipReader zip(path);
-        if (zip.is_open()) {
-            if (zip.has_entry("Contents/section0.xml") ||
-                zip.has_entry("META-INF/container.xml"))
-                return FileFormat::HWPX;
-        }
-        return FileFormat::OFFICE;
-    }
-
-    if (magic[0] == 0xD0 && magic[1] == 0xCF && magic[2] == 0x11 && magic[3] == 0xE0) {
-        jdoc::OleReader ole(path);
-        if (ole.is_open()) {
-            if (ole.has_stream("FileHeader") || ole.has_stream("BodyText/Section0"))
-                return FileFormat::HWP;
-        }
-        return FileFormat::OFFICE;
-    }
-
-    if (magic[0] == '{' && magic[1] == '\\' && magic[2] == 'r' &&
-        magic[3] == 't' && magic[4] == 'f')
+        ext == ".html" || ext == ".htm" || ext == ".xlsb")
         return FileFormat::OFFICE;
 
     return FileFormat::UNKNOWN;
@@ -95,8 +103,6 @@ static char* strdup_cpp(const std::string& s) {
     return p;
 }
 
-// Parse document into chunks (shared by all extract functions).
-// PDF calls are serialized via g_pdf_mutex; other formats run concurrently.
 static std::vector<jdoc::PageChunk> parse_chunks(const std::string& path,
                                                    FileFormat fmt,
                                                    const jdoc::ConvertOptions& opts) {
@@ -105,8 +111,8 @@ static std::vector<jdoc::PageChunk> parse_chunks(const std::string& path,
         return jdoc::pdf_to_markdown_chunks(path, opts);
     }
     switch (fmt) {
-        case FileFormat::HWPX:  return jdoc::hwpx_to_markdown_chunks(path, opts);
-        case FileFormat::HWP:   return jdoc::hwp_to_markdown_chunks(path, opts);
+        case FileFormat::HWPX:   return jdoc::hwpx_to_markdown_chunks(path, opts);
+        case FileFormat::HWP:    return jdoc::hwp_to_markdown_chunks(path, opts);
         case FileFormat::OFFICE: return jdoc::office_to_markdown_chunks(path, opts);
         default:                 return {};
     }

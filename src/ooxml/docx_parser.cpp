@@ -648,7 +648,7 @@ std::string DocxParser::to_markdown(const ConvertOptions& opts) {
 
         if (elem.type == DocxElement::PAGE_BREAK) {
             ++page_num;
-            out << "\n## Page " << page_num << "\n\n";
+            out << "\n--- Page " << page_num << " ---\n\n";
             continue;
         }
 
