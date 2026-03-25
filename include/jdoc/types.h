@@ -17,8 +17,10 @@ struct ImageData {
     std::string name;
     unsigned width = 0;
     unsigned height = 0;
-    std::vector<char> data;
-    std::string format;
+    int components = 3;             // 1=gray, 3=RGB, 4=CMYK
+    std::vector<char> data;         // encoded bytes (jpeg/png) or raw pixels
+    std::vector<uint8_t> pixels;    // raw pixel buffer (width * height * components)
+    std::string format;             // "jpeg", "png", "raw"
     std::string saved_path;
 };
 
