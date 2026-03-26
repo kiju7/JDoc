@@ -84,6 +84,11 @@ add_executable(jdoc src/main.cpp)
 target_link_libraries(jdoc PRIVATE jdoc_pdf jdoc_office jdoc_hwpx jdoc_hwp)
 target_include_directories(jdoc PRIVATE include src)
 
+# GCC 8 requires explicit linking for std::filesystem
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS 9)
+    target_link_libraries(jdoc PRIVATE stdc++fs)
+endif()
+
 
 # ── Tests ─────────────────────────────────────────────────────
 
