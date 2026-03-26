@@ -67,9 +67,14 @@ bool DocParser::process_char(uint32_t ch, std::string& result) {
         result.push_back('\n');
         return true;
     }
-    // Cell mark → tab.
+    // Cell mark (0x07): tab between cells, newline at row end.
+    // Two consecutive 0x07 = last cell mark + row end mark → emit \t then \n.
     if (ch == 0x07) {
-        result.push_back('\t');
+        if (!result.empty() && result.back() == '\t') {
+            result.back() = '\n';  // Replace previous cell tab with row-end newline
+        } else {
+            result.push_back('\t');
+        }
         return true;
     }
     // Tab.
@@ -438,13 +443,13 @@ std::string DocParser::text_to_markdown(const std::string& raw_text) {
         }
         consecutive_empty = 0;
 
-        // Table detection: 2+ tabs in consecutive lines
+        // Table detection: 1+ tab in consecutive lines
         int tabs = count_tabs(ln);
-        if (tabs >= 2) {
+        if (tabs >= 1) {
             // Collect all consecutive tab-separated rows
             size_t tbl_start = i;
             int max_cols = tabs + 1;
-            while (i < lines.size() && count_tabs(lines[i]) >= 2) {
+            while (i < lines.size() && count_tabs(lines[i]) >= 1) {
                 max_cols = std::max(max_cols, count_tabs(lines[i]) + 1);
                 i++;
             }
