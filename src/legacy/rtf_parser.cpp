@@ -401,13 +401,17 @@ std::string RtfParser::to_markdown(const ConvertOptions& opts) {
     std::vector<PictImage> pict_images;
     parse(text, pict_images);
 
-    if (opts.extract_images && !pict_images.empty()) {
+    if (!pict_images.empty()) {
         text += "\n\n---\n\n";
         for (size_t i = 0; i < pict_images.size(); ++i) {
             const auto& pi = pict_images[i];
             std::string name = "rtf_image_" + std::to_string(i + 1);
             std::string ext = pi.format.empty() ? "bin" : pi.format;
-            text += "![" + name + "](" + name + "." + ext + ")\n\n";
+            std::string filename = name + "." + ext;
+            if (opts.extract_images)
+                text += "![" + filename + "](" + opts.image_ref_prefix + filename + ")\n\n";
+            else
+                text += "![" + filename + "](embedded:" + filename + ")\n\n";
         }
     }
 

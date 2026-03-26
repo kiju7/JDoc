@@ -881,7 +881,10 @@ std::string XlsxParser::to_markdown(const ConvertOptions& opts) {
     auto images = extract_images(opts);
     if (!images.empty()) {
         for (auto& img : images) {
-            out << "![" << img.name << "](" << img.name << ")\n\n";
+            if (opts.extract_images)
+                out << "![" << img.name << "](" << opts.image_ref_prefix << img.name << ")\n\n";
+            else
+                out << "![" << img.name << "](embedded:" << img.name << ")\n\n";
         }
     }
 
@@ -969,7 +972,9 @@ std::vector<PageChunk> XlsxParser::to_chunks(
             for (auto& c : chunks) {
                 if (c.page_number == img.page_number) { target = &c; break; }
             }
-            std::string ref = img.saved_path.empty() ? "embedded:" + img.name : img.saved_path;
+            std::string ref = img.saved_path.empty()
+                ? "embedded:" + img.name
+                : opts.image_ref_prefix + img.name;
             target->text += "![" + img.name + "](" + ref + ")\n\n";
             target->images.push_back(std::move(img));
         }

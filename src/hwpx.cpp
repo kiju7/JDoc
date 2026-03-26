@@ -101,6 +101,7 @@ private:
     std::vector<hwp::ParaShapeInfo> para_shapes_;
     std::map<std::string, std::vector<hwp::FaceNameInfo>> font_faces_;  // lang -> fonts
     std::vector<std::string> section_paths_;
+    std::vector<std::string> footnotes_;
 
     // ── content.hpf parsing ─────────────────────────────────
     void parse_content_hpf() {
@@ -289,7 +290,15 @@ private:
         std::map<int, int> size_counts;
         int image_idx = 0;
 
+        footnotes_.clear();
         process_paragraphs(sec, md, chunk, size_counts, image_idx, 0);
+
+        // Append collected footnotes/endnotes
+        if (!footnotes_.empty()) {
+            md += "\n";
+            for (auto& fn : footnotes_) md += fn + "\n";
+            footnotes_.clear();
+        }
 
         // Determine body_font_size (most frequent)
         int max_count = 0;
@@ -418,14 +427,28 @@ private:
                         para_has_content = true;
                         // Add image reference in markdown
                         auto& saved = chunk.images.back();
-                        if (!saved.saved_path.empty()) {
-                            para_text += "![" + saved.name + "](" + saved.saved_path + ")";
-                        } else {
-                            para_text += "![image](" + saved.name + ")";
+                        if (!saved.saved_path.empty())
+                            para_text += "![" + saved.name + "](" + opts_.image_ref_prefix + saved.name + ")";
+                        else
+                            para_text += "![" + saved.name + "](embedded:" + saved.name + ")";
+                    }
+                }
+                else if (in == "hp:ctrl") {
+                    // Check for footnotes/endnotes inside ctrl
+                    for (auto ctrl_child : item.children()) {
+                        std::string cn = ctrl_child.name();
+                        if (cn == "hp:footNote" || cn == "hp:endNote") {
+                            int num = ctrl_child.attribute("number").as_int(0);
+                            std::string note_text;
+                            collect_note_text(ctrl_child, note_text);
+                            note_text = util::trim(note_text);
+                            if (!note_text.empty()) {
+                                para_text += "[^" + std::to_string(num) + "]";
+                                footnotes_.push_back("[^" + std::to_string(num) + "]: " + note_text);
+                            }
                         }
                     }
                 }
-                // Skip other controls (secPr, ctrl, rect, ellipse, etc.)
             }
         }
 
@@ -504,6 +527,18 @@ private:
         }
 
         return result;
+    }
+
+    // Recursively collect text from footnote/endnote subtree
+    void collect_note_text(pugi::xml_node node, std::string& out) {
+        for (auto child : node.children()) {
+            std::string cn = child.name();
+            if (cn == "hp:t") {
+                out += extract_text(child);
+            } else {
+                collect_note_text(child, out);
+            }
+        }
     }
 
     // ── Table processing ────────────────────────────────────
@@ -588,8 +623,23 @@ private:
             for (auto run : para.children()) {
                 if (std::string(run.name()) != "hp:run") continue;
                 for (auto item : run.children()) {
-                    if (std::string(item.name()) == "hp:t") {
+                    std::string iname = item.name();
+                    if (iname == "hp:t") {
                         out += extract_text(item);
+                    } else if (iname == "hp:ctrl") {
+                        for (auto ctrl_child : item.children()) {
+                            std::string cn = ctrl_child.name();
+                            if (cn == "hp:footNote" || cn == "hp:endNote") {
+                                int num = ctrl_child.attribute("number").as_int(0);
+                                std::string note_text;
+                                collect_note_text(ctrl_child, note_text);
+                                note_text = util::trim(note_text);
+                                if (!note_text.empty()) {
+                                    out += "[^" + std::to_string(num) + "]";
+                                    footnotes_.push_back("[^" + std::to_string(num) + "]: " + note_text);
+                                }
+                            }
+                        }
                     }
                 }
             }

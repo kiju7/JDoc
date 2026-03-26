@@ -450,10 +450,14 @@ std::string PptParser::to_markdown(const ConvertOptions& opts) {
         md += slide_to_markdown(slide);
     }
 
-    if (opts.extract_images) {
+    {
         auto images = extract_images();
         for (const auto& img : images) {
-            md += "![" + img.name + "](" + img.name + "." + img.format + ")\n\n";
+            std::string filename = img.name + "." + img.format;
+            if (opts.extract_images)
+                md += "![" + filename + "](" + opts.image_ref_prefix + filename + ")\n\n";
+            else
+                md += "![" + filename + "](embedded:" + filename + ")\n\n";
         }
     }
 

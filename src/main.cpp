@@ -12,6 +12,7 @@
 #include <fstream>
 #include <sstream>
 #include <algorithm>
+#include <filesystem>
 
 void print_usage(const char* prog) {
     std::cerr << "Usage: " << prog << " <input_file> [output.md] [options]\n"
@@ -144,6 +145,19 @@ int main(int argc, char* argv[]) {
     if (input_path.empty()) {
         std::cerr << "Error: No input file specified.\n";
         return 1;
+    }
+
+    // Compute image reference prefix: relative path from md file dir to image dir
+    if (opts.extract_images && !opts.image_output_dir.empty()) {
+        namespace fs = std::filesystem;
+        fs::path img_dir = fs::weakly_canonical(fs::absolute(opts.image_output_dir));
+        fs::path md_dir = output_path.empty()
+            ? fs::current_path()
+            : fs::weakly_canonical(fs::absolute(output_path)).parent_path();
+        fs::path rel = fs::relative(img_dir, md_dir);
+        if (rel != ".") {
+            opts.image_ref_prefix = rel.string() + "/";
+        }
     }
 
     try {

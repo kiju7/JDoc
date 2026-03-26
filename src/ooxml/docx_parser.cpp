@@ -161,43 +161,9 @@ void DocxParser::parse_relationships() {
 // ── Header/Footer extraction ────────────────────────────
 
 std::string DocxParser::extract_headers_footers() {
-    std::string result;
-    // Collect unique header/footer texts to avoid duplicating per-section defs
-    std::set<std::string> seen;
-
-    auto extract_part = [&](const std::string& path) {
-        if (!zip_.has_entry(path)) return;
-        auto data = zip_.read_entry(path);
-        pugi::xml_document doc;
-        if (!doc.load_buffer(data.data(), data.size())) return;
-
-        std::string text;
-        std::vector<pugi::xml_node> paras;
-        xml_find_all(doc, "p", paras);
-        for (auto& p : paras) {
-            std::vector<pugi::xml_node> t_nodes;
-            xml_find_all(p, "t", t_nodes);
-            std::string line;
-            for (auto& t : t_nodes) line += xml_text_content(t);
-            line = util::trim(line);
-            if (!line.empty()) {
-                if (!text.empty()) text += "\n";
-                text += line;
-            }
-        }
-        if (!text.empty() && seen.insert(text).second) {
-            result += text + "\n";
-        }
-    };
-
-    // Check for header/footer parts (typical: header1-3, footer1-3)
-    for (int i = 1; i <= 3; ++i) {
-        extract_part("word/header" + std::to_string(i) + ".xml");
-    }
-    for (int i = 1; i <= 3; ++i) {
-        extract_part("word/footer" + std::to_string(i) + ".xml");
-    }
-    return result;
+    // Headers/footers omitted — typically repetitive page-level content
+    // (page numbers, document title). sn3f also skips these.
+    return {};
 }
 
 // ── Footnote/Endnote extraction ─────────────────────────
@@ -440,6 +406,7 @@ struct DocxElement {
     bool is_list = false;
     bool is_ordered = false;
     int list_level = 0;
+    int num_id = 0;
     std::string image_rid;
     // For TABLE:
     std::vector<std::vector<std::string>> table_rows;
@@ -501,6 +468,7 @@ static std::vector<DocxElement> parse_body(
                     if (numId > 0) {
                         elem.is_list = true;
                         elem.list_level = ilvl;
+                        elem.num_id = numId;
                         elem.is_ordered = false; // default
 
                         auto abs_it = num_to_abstract.find(numId);
@@ -525,8 +493,15 @@ static std::vector<DocxElement> parse_body(
                 }
             }
 
-            // Helper: extract formatted text from a run node
-            auto extract_run_text = [&](const pugi::xml_node& run, bool in_heading) -> std::string {
+            // Formatting style flags packed for comparison
+            enum RunStyle : uint8_t { PLAIN = 0, BOLD = 1, ITALIC = 2, BOLD_ITALIC = 3 };
+
+            struct StyledRun {
+                std::string text;
+                RunStyle style;
+            };
+
+            auto extract_run = [&](const pugi::xml_node& run) -> StyledRun {
                 auto rPr = xml_child(run, "rPr");
                 bool bold = false, italic = false;
                 if (rPr) {
@@ -537,18 +512,55 @@ static std::vector<DocxElement> parse_body(
                 std::vector<pugi::xml_node> t_nodes;
                 xml_find_all(run, "t", t_nodes);
                 for (auto& t : t_nodes) run_text += xml_text_content(t);
-                if (run_text.empty()) return "";
-                if (!in_heading) {
-                    if (bold && italic) return "***" + run_text + "***";
-                    if (bold) return "**" + run_text + "**";
-                    if (italic) return "*" + run_text + "*";
-                }
-                return run_text;
+                RunStyle s = PLAIN;
+                if (bold && italic) s = BOLD_ITALIC;
+                else if (bold) s = BOLD;
+                else if (italic) s = ITALIC;
+                return {std::move(run_text), s};
             };
 
-            // Extract runs and hyperlinks from direct children of paragraph
-            std::ostringstream para_text;
+            // Merge consecutive same-style runs and apply markdown formatting
+            auto merge_and_format = [](const std::vector<StyledRun>& runs,
+                                       bool skip_format) -> std::string {
+                std::string out;
+                for (size_t i = 0; i < runs.size(); ) {
+                    size_t j = i + 1;
+                    while (j < runs.size() && runs[j].style == runs[i].style)
+                        ++j;
+                    std::string text;
+                    for (size_t k = i; k < j; ++k) text += runs[k].text;
+                    if (!skip_format && runs[i].style != PLAIN) {
+                        switch (runs[i].style) {
+                            case BOLD_ITALIC: out += "***" + text + "***"; break;
+                            case BOLD:        out += "**" + text + "**";   break;
+                            case ITALIC:      out += "*" + text + "*";     break;
+                            default: break;
+                        }
+                    } else {
+                        out += text;
+                    }
+                    i = j;
+                }
+                return out;
+            };
+
+            // Collect child runs from a node
+            auto collect_runs = [&](const pugi::xml_node& parent) -> std::vector<StyledRun> {
+                std::vector<StyledRun> result;
+                for (auto r = parent.first_child(); r; r = r.next_sibling()) {
+                    const char* n = r.name();
+                    const char* c = strchr(n, ':');
+                    if (strcmp(c ? c + 1 : n, "r") == 0) {
+                        auto sr = extract_run(r);
+                        if (!sr.text.empty())
+                            result.push_back(std::move(sr));
+                    }
+                }
+                return result;
+            };
+
             bool is_heading = (elem.heading_level > 0);
+            std::vector<StyledRun> runs;
 
             for (auto pchild = child.first_child(); pchild; pchild = pchild.next_sibling()) {
                 const char* pname = pchild.name();
@@ -556,34 +568,26 @@ static std::vector<DocxElement> parse_body(
                 const char* plocal = pcolon ? pcolon + 1 : pname;
 
                 if (strcmp(plocal, "r") == 0) {
-                    para_text << extract_run_text(pchild, is_heading);
+                    auto sr = extract_run(pchild);
+                    if (!sr.text.empty())
+                        runs.push_back(std::move(sr));
                 } else if (strcmp(plocal, "hyperlink") == 0) {
-                    // Collect link text from child runs
-                    std::string link_text;
-                    for (auto hr = pchild.first_child(); hr; hr = hr.next_sibling()) {
-                        const char* hrn = hr.name();
-                        const char* hrc = strchr(hrn, ':');
-                        const char* hrl = hrc ? hrc + 1 : hrn;
-                        if (strcmp(hrl, "r") == 0) {
-                            link_text += extract_run_text(hr, is_heading);
-                        }
-                    }
-                    // Resolve hyperlink URL from r:id
+                    auto link_runs = collect_runs(pchild);
+                    std::string link_text = merge_and_format(link_runs, is_heading);
                     const char* rid = xml_attr(pchild, "id");
                     if (rid[0] && !link_text.empty()) {
                         auto hit = hyperlink_targets.find(rid);
-                        if (hit != hyperlink_targets.end()) {
-                            para_text << "[" << link_text << "](" << hit->second << ")";
-                        } else {
-                            para_text << link_text;
-                        }
-                    } else {
-                        para_text << link_text;
+                        if (hit != hyperlink_targets.end())
+                            runs.push_back({"[" + link_text + "](" + hit->second + ")", PLAIN});
+                        else
+                            runs.push_back({link_text, PLAIN});
+                    } else if (!link_text.empty()) {
+                        runs.push_back({link_text, PLAIN});
                     }
                 }
             }
 
-            elem.text = para_text.str();
+            elem.text = merge_and_format(runs, is_heading);
 
             // Check for embedded image references
             elem.image_rid = find_image_rid(child);
@@ -595,6 +599,18 @@ static std::vector<DocxElement> parse_body(
             elem.type = DocxElement::TABLE;
             elem.table_rows = parse_table_node(child);
             elements.push_back(std::move(elem));
+
+        } else if (strcmp(local, "sdt") == 0) {
+            // Structured Document Tag (TOC, bibliography, etc.)
+            auto content = xml_child(child, "sdtContent");
+            if (content) {
+                auto inner = parse_body(content, style_heading_map,
+                                         num_to_abstract, abstract_num_formats,
+                                         hyperlink_targets);
+                elements.insert(elements.end(),
+                    std::make_move_iterator(inner.begin()),
+                    std::make_move_iterator(inner.end()));
+            }
 
         } else if (strcmp(local, "AlternateContent") == 0) {
             // Process mc:Choice only, skip mc:Fallback
@@ -636,21 +652,26 @@ std::string DocxParser::to_markdown(const ConvertOptions& opts) {
                                num_to_abstract_, abstract_num_formats_,
                                hyperlink_targets_);
 
-    // Extract supplementary content
-    std::string header_footer = extract_headers_footers();
     std::string footnotes = extract_footnotes();
     std::string endnotes = extract_endnotes();
 
     std::ostringstream out;
-
-    // Prepend header/footer content if present
-    if (!header_footer.empty()) {
-        out << header_footer << "\n";
-    }
-
-    int ordered_counter = 0;
-    bool in_ordered_list = false;
+    std::map<int64_t, int> ordered_counters;
     int page_num = 1;
+
+    // Increment counter for (num_id, level) and reset all deeper levels
+    auto next_counter = [&](int num_id, int level) -> int {
+        int64_t key = ((int64_t)num_id << 8) | level;
+        int& c = ordered_counters[key];
+        ++c;
+        // Reset deeper levels within the same numId
+        for (int dl = level + 1; dl < 10; ++dl) {
+            int64_t dk = ((int64_t)num_id << 8) | dl;
+            auto it = ordered_counters.find(dk);
+            if (it != ordered_counters.end()) it->second = 0;
+        }
+        return c;
+    };
 
     for (size_t i = 0; i < elements.size(); ++i) {
         auto& elem = elements[i];
@@ -670,10 +691,6 @@ std::string DocxParser::to_markdown(const ConvertOptions& opts) {
 
         // PARAGRAPH
         if (elem.text.empty() && elem.image_rid.empty()) {
-            if (in_ordered_list) {
-                in_ordered_list = false;
-                ordered_counter = 0;
-            }
             continue;
         }
 
@@ -682,22 +699,24 @@ std::string DocxParser::to_markdown(const ConvertOptions& opts) {
             auto it = rel_targets_.find(elem.image_rid);
             if (it != rel_targets_.end()) {
                 std::string img_name = util::get_filename(it->second);
-                if (opts.extract_images) {
-                    out << "![" << img_name << "](" << img_name << ")\n\n";
-                } else {
+                if (opts.extract_images)
+                    out << "![" << img_name << "](" << opts.image_ref_prefix << img_name << ")\n\n";
+                else
                     out << "![" << img_name << "](embedded:" << img_name << ")\n\n";
-                }
             }
         }
 
         if (elem.text.empty()) continue;
 
-        // Heading
+        // Heading (may also be a numbered heading)
         if (elem.heading_level > 0) {
-            in_ordered_list = false;
-            ordered_counter = 0;
             std::string prefix(elem.heading_level, '#');
-            out << prefix << " " << elem.text << "\n\n";
+            if (elem.is_list && elem.is_ordered) {
+                int n = next_counter(elem.num_id, elem.list_level);
+                out << prefix << " " << n << ". " << elem.text << "\n\n";
+            } else {
+                out << prefix << " " << elem.text << "\n\n";
+            }
             continue;
         }
 
@@ -705,41 +724,16 @@ std::string DocxParser::to_markdown(const ConvertOptions& opts) {
         if (elem.is_list) {
             std::string indent(elem.list_level * 2, ' ');
             if (elem.is_ordered) {
-                if (!in_ordered_list) {
-                    in_ordered_list = true;
-                    ordered_counter = 0;
-                }
-                ++ordered_counter;
-                out << indent << ordered_counter << ". " << elem.text << "\n";
+                int n = next_counter(elem.num_id, elem.list_level);
+                out << indent << n << ". " << elem.text << "\n";
             } else {
-                in_ordered_list = false;
-                ordered_counter = 0;
                 out << indent << "- " << elem.text << "\n";
             }
             continue;
         }
 
         // Normal paragraph
-        in_ordered_list = false;
-        ordered_counter = 0;
-
-        // Split inline bullet lists: "- item1- item2" → "- item1\n- item2"
-        if (elem.text.size() > 4 && elem.text[0] == '-' && elem.text[1] == ' ') {
-            std::string buf;
-            size_t p = 0;
-            while (p < elem.text.size()) {
-                if (p > 0 && p + 1 < elem.text.size() &&
-                    elem.text[p] == '-' && elem.text[p + 1] == ' ' &&
-                    p > 0 && elem.text[p - 1] != ' ' && elem.text[p - 1] != '\n') {
-                    buf += "\n";
-                }
-                buf += elem.text[p];
-                p++;
-            }
-            out << buf << "\n\n";
-        } else {
-            out << elem.text << "\n\n";
-        }
+        out << elem.text << "\n\n";
     }
 
     // Append footnotes and endnotes
@@ -784,8 +778,6 @@ std::vector<PageChunk> DocxParser::to_chunks(
 
     auto all_images = extract_images(opts);
 
-    // Extract supplementary content
-    std::string header_footer = extract_headers_footers();
     std::string footnotes = extract_footnotes();
     std::string endnotes = extract_endnotes();
 
@@ -793,13 +785,19 @@ std::vector<PageChunk> DocxParser::to_chunks(
     PageChunk current;
     current.page_number = 1;
     std::ostringstream text;
-    int ordered_counter = 0;
-    bool in_ordered_list = false;
+    std::map<int64_t, int> ordered_counters; // (num_id << 8 | level) -> counter
 
-    // Prepend header/footer content to first chunk
-    if (!header_footer.empty()) {
-        text << header_footer << "\n";
-    }
+    auto next_counter_c = [&](int num_id, int level) -> int {
+        int64_t key = ((int64_t)num_id << 8) | level;
+        int& c = ordered_counters[key];
+        ++c;
+        for (int dl = level + 1; dl < 10; ++dl) {
+            int64_t dk = ((int64_t)num_id << 8) | dl;
+            auto it = ordered_counters.find(dk);
+            if (it != ordered_counters.end()) it->second = 0;
+        }
+        return c;
+    };
 
     auto flush_chunk = [&]() {
         current.text = text.str();
@@ -810,8 +808,7 @@ std::vector<PageChunk> DocxParser::to_chunks(
         current.page_number = static_cast<int>(chunks.size()) + 1;
         text.str("");
         text.clear();
-        ordered_counter = 0;
-        in_ordered_list = false;
+        ordered_counters.clear();
     };
 
     for (auto& elem : elements) {
@@ -836,44 +833,32 @@ std::vector<PageChunk> DocxParser::to_chunks(
             auto it = rel_targets_.find(elem.image_rid);
             if (it != rel_targets_.end()) {
                 std::string img_name = util::get_filename(it->second);
-                if (opts.extract_images) {
-                    text << "![" << img_name << "](" << img_name << ")\n\n";
-                } else {
+                if (opts.extract_images)
+                    text << "![" << img_name << "](" << opts.image_ref_prefix << img_name << ")\n\n";
+                else
                     text << "![" << img_name << "](embedded:" << img_name << ")\n\n";
-                }
             }
         }
 
-        if (elem.text.empty()) {
-            if (in_ordered_list) {
-                in_ordered_list = false;
-                ordered_counter = 0;
-            }
-            continue;
-        }
+        if (elem.text.empty()) continue;
 
         if (elem.heading_level > 0) {
-            in_ordered_list = false;
-            ordered_counter = 0;
             std::string prefix(elem.heading_level, '#');
-            text << prefix << " " << elem.text << "\n\n";
+            if (elem.is_list && elem.is_ordered) {
+                int n = next_counter_c(elem.num_id, elem.list_level);
+                text << prefix << " " << n << ". " << elem.text << "\n\n";
+            } else {
+                text << prefix << " " << elem.text << "\n\n";
+            }
         } else if (elem.is_list) {
             std::string indent(elem.list_level * 2, ' ');
             if (elem.is_ordered) {
-                if (!in_ordered_list) {
-                    in_ordered_list = true;
-                    ordered_counter = 0;
-                }
-                ++ordered_counter;
-                text << indent << ordered_counter << ". " << elem.text << "\n";
+                int n = next_counter_c(elem.num_id, elem.list_level);
+                text << indent << n << ". " << elem.text << "\n";
             } else {
-                in_ordered_list = false;
-                ordered_counter = 0;
                 text << indent << "- " << elem.text << "\n";
             }
         } else {
-            in_ordered_list = false;
-            ordered_counter = 0;
             text << elem.text << "\n\n";
         }
     }

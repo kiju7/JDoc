@@ -808,10 +808,14 @@ std::string XlsParser::to_markdown(const ConvertOptions& opts) {
         md += sheet_to_markdown(sheets_[i], static_cast<int>(i) + 1);
     }
 
-    if (opts.extract_images) {
+    {
         auto images = extract_images();
         for (const auto& img : images) {
-            md += "![" + img.name + "](" + img.name + "." + img.format + ")\n\n";
+            std::string filename = img.name + "." + img.format;
+            if (opts.extract_images)
+                md += "![" + filename + "](" + opts.image_ref_prefix + filename + ")\n\n";
+            else
+                md += "![" + filename + "](embedded:" + filename + ")\n\n";
         }
     }
 

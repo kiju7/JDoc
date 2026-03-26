@@ -757,12 +757,14 @@ std::string HtmlParser::to_markdown(const ConvertOptions& opts) {
     std::vector<ImageData> images;
     std::string md = convert(opts, images);
 
-    // Append image references if extracting
-    if (opts.extract_images && !images.empty()) {
+    // Append image references
+    if (!images.empty()) {
         md += "\n";
         for (auto& img : images) {
-            if (!img.saved_path.empty())
-                md += "![" + img.name + "](" + img.saved_path + ")\n";
+            if (opts.extract_images)
+                md += "![" + img.name + "](" + opts.image_ref_prefix + img.name + ")\n";
+            else
+                md += "![" + img.name + "](embedded:" + img.name + ")\n";
         }
     }
 

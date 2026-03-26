@@ -41,6 +41,10 @@ DocParser::DocParser(OleReader& ole) : ole_(ole) {}
 // ── Character processing (field markers, control chars) ─────────
 
 bool DocParser::process_char(uint32_t ch, std::string& result) {
+    // Inline object placeholder (0x01/0x08) — skip.
+    // DOC has 15+ placeholders but only 5 images; reliable position mapping
+    // requires CHPX sprmCPicLocation parsing which is not yet implemented.
+    if (ch == 0x01 || ch == 0x08) return false;
     // Field begin marker: start tracking nesting.
     if (ch == 0x13) {
         field_depth_++;
@@ -67,13 +71,13 @@ bool DocParser::process_char(uint32_t ch, std::string& result) {
         result.push_back('\n');
         return true;
     }
-    // Cell mark (0x07): tab between cells, newline at row end.
-    // Two consecutive 0x07 = last cell mark + row end mark → emit \t then \n.
+    // Cell mark (0x07): use \x1F (unit separator) to distinguish from regular tabs.
+    // Two consecutive 0x07 = last cell mark + row end mark → emit \x1F then \n.
     if (ch == 0x07) {
-        if (!result.empty() && result.back() == '\t') {
-            result.back() = '\n';  // Replace previous cell tab with row-end newline
+        if (!result.empty() && result.back() == '\x1F') {
+            result.back() = '\n';  // Replace previous cell mark with row-end newline
         } else {
-            result.push_back('\t');
+            result.push_back('\x1F');
         }
         return true;
     }
@@ -402,19 +406,19 @@ std::string DocParser::text_to_markdown(const std::string& raw_text) {
         lines.push_back(line);
     }
 
-    // Helper: check if a line contains tab-separated cells (table row)
-    auto count_tabs = [](const std::string& s) {
+    // Helper: count cell separators (\x1F from 0x07 cell marks)
+    auto count_cells = [](const std::string& s) {
         int n = 0;
-        for (char c : s) if (c == '\t') n++;
+        for (char c : s) if (c == '\x1F') n++;
         return n;
     };
 
-    // Helper: convert tab-separated line to markdown table row
-    auto tabs_to_row = [](const std::string& s) {
+    // Helper: convert cell-separated line to markdown table row
+    auto cells_to_row = [](const std::string& s) {
         std::string row = "|";
         std::string cell;
         for (char c : s) {
-            if (c == '\t') {
+            if (c == '\x1F') {
                 for (auto& ch : cell) { if (ch == '|') ch = '/'; if (ch == '\n') ch = ' '; }
                 row += " " + cell + " |";
                 cell.clear();
@@ -430,7 +434,6 @@ std::string DocParser::text_to_markdown(const std::string& raw_text) {
     std::string md;
     md.reserve(raw_text.size() * 2);
     int consecutive_empty = 0;
-    bool found_title = false;
 
     for (size_t i = 0; i < lines.size(); ++i) {
         const std::string& ln = lines[i];
@@ -443,27 +446,48 @@ std::string DocParser::text_to_markdown(const std::string& raw_text) {
         }
         consecutive_empty = 0;
 
-        // Table detection: 1+ tab in consecutive lines
-        int tabs = count_tabs(ln);
-        if (tabs >= 1) {
-            // Collect all consecutive tab-separated rows
+        // Table detection: 1+ cell separator (\x1F) from DOC cell marks
+        int cells = count_cells(ln);
+        if (cells >= 1) {
+            // Check if this line has actual content (not just tabs/spaces)
+            bool has_content = false;
+            for (char c : ln) {
+                if (c != '\t' && c != ' ') { has_content = true; break; }
+            }
+            if (!has_content) {
+                // Skip blank table rows
+                md.push_back('\n');
+                continue;
+            }
+
+            // Collect all consecutive tab-separated rows with content
             size_t tbl_start = i;
-            int max_cols = tabs + 1;
-            while (i < lines.size() && count_tabs(lines[i]) >= 1) {
-                max_cols = std::max(max_cols, count_tabs(lines[i]) + 1);
+            int max_cols = cells + 1;
+            std::vector<size_t> content_rows;
+            while (i < lines.size() && count_cells(lines[i]) >= 1) {
+                bool row_content = false;
+                for (char c : lines[i]) {
+                    if (c != '\x1F' && c != ' ') { row_content = true; break; }
+                }
+                if (row_content) {
+                    max_cols = std::max(max_cols, count_cells(lines[i]) + 1);
+                    content_rows.push_back(i);
+                }
                 i++;
             }
-            // Emit markdown table
-            for (size_t r = tbl_start; r < i; r++) {
-                md += tabs_to_row(lines[r]) + "\n";
-                if (r == tbl_start) {
-                    md += "|";
-                    for (int c = 0; c < max_cols; c++) md += " --- |";
-                    md += "\n";
+            // Emit markdown table (skip if only blank rows)
+            if (!content_rows.empty()) {
+                for (size_t ri = 0; ri < content_rows.size(); ri++) {
+                    md += cells_to_row(lines[content_rows[ri]]) + "\n";
+                    if (ri == 0) {
+                        md += "|";
+                        for (int c = 0; c < max_cols; c++) md += " --- |";
+                        md += "\n";
+                    }
                 }
+                md += "\n";
             }
-            md += "\n";
-            i--; // will be incremented by for loop
+            i--;
             continue;
         }
 
@@ -502,28 +526,7 @@ std::string DocParser::text_to_markdown(const std::string& raw_text) {
             }
         }
 
-        // First non-empty content line → title (H1)
-        if (!found_title && ln.size() < 120) {
-            md += "# " + ln + "\n\n";
-            found_title = true;
-            continue;
-        }
-
-        // Heading heuristic: short line followed by longer text
-        bool is_heading = false;
-        if (ln.size() < 80) {
-            for (size_t k = i + 1; k < lines.size() && k <= i + 3; ++k) {
-                if (lines[k].empty()) continue;
-                if (lines[k].size() > ln.size()) is_heading = true;
-                break;
-            }
-        }
-
-        if (is_heading) {
-            md += "## " + ln + "\n\n";
-        } else {
-            md += ln + "\n";
-        }
+        md += ln + "\n";
     }
 
     return md;
@@ -708,8 +711,10 @@ std::string DocParser::to_markdown(const ConvertOptions& opts) {
     std::string raw = extract_text();
     std::string md = text_to_markdown(raw);
 
+    auto images = extract_images();
+
     if (opts.extract_images) {
-        auto images = extract_images();
+        // Save images to disk
         for (auto& img : images) {
             std::string filename = img.name + "." + img.format;
             if (!opts.image_output_dir.empty() && !img.data.empty()) {
@@ -718,8 +723,13 @@ std::string DocParser::to_markdown(const ConvertOptions& opts) {
                 std::ofstream ofs(path, std::ios::binary);
                 if (ofs) ofs.write(img.data.data(), img.data.size());
             }
-            md += "\n![" + filename + "](" + filename + ")\n";
         }
+    }
+
+    // Append image references at the end
+    for (auto& img : images) {
+        std::string filename = img.name + "." + img.format;
+        md += "\n![" + filename + "](" + filename + ")\n";
     }
 
     return md;
