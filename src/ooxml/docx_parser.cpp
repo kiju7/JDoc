@@ -40,6 +40,15 @@ void DocxParser::parse_styles() {
         const char* style_id = xml_attr(style, "styleId");
         if (!style_id[0]) continue;
 
+        // Check style name for Title/Subtitle (no outlineLvl but should be headings)
+        auto name_node = xml_child(style, "name");
+        if (name_node) {
+            const char* sname = xml_attr(name_node, "val");
+            std::string sn = sname;
+            if (sn == "Title") { style_heading_map_[style_id] = 1; continue; }
+            if (sn == "Subtitle") { style_heading_map_[style_id] = 2; continue; }
+        }
+
         // Check for outlineLvl in pPr (language-independent heading detection)
         auto pPr = xml_child(style, "pPr");
         if (pPr) {
@@ -49,7 +58,7 @@ void DocxParser::parse_styles() {
                 if (val[0]) {
                     int lvl = std::atoi(val);
                     if (lvl >= 0 && lvl <= 8) {
-                        style_heading_map_[style_id] = lvl + 1; // 0-based to 1-based
+                        style_heading_map_[style_id] = lvl + 1;
                     }
                 }
             }
@@ -713,7 +722,24 @@ std::string DocxParser::to_markdown(const ConvertOptions& opts) {
         // Normal paragraph
         in_ordered_list = false;
         ordered_counter = 0;
-        out << elem.text << "\n\n";
+
+        // Split inline bullet lists: "- item1- item2" → "- item1\n- item2"
+        if (elem.text.size() > 4 && elem.text[0] == '-' && elem.text[1] == ' ') {
+            std::string buf;
+            size_t p = 0;
+            while (p < elem.text.size()) {
+                if (p > 0 && p + 1 < elem.text.size() &&
+                    elem.text[p] == '-' && elem.text[p + 1] == ' ' &&
+                    p > 0 && elem.text[p - 1] != ' ' && elem.text[p - 1] != '\n') {
+                    buf += "\n";
+                }
+                buf += elem.text[p];
+                p++;
+            }
+            out << buf << "\n\n";
+        } else {
+            out << elem.text << "\n\n";
+        }
     }
 
     // Append footnotes and endnotes
