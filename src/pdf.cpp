@@ -26,6 +26,20 @@
 namespace jdoc {
 namespace {
 
+// Portable memmem (not available on Windows)
+static const void* pdf_memmem(const void* hay, size_t hay_len,
+                               const void* needle, size_t needle_len) {
+    if (needle_len == 0) return hay;
+    if (needle_len > hay_len) return nullptr;
+    const uint8_t* h = static_cast<const uint8_t*>(hay);
+    const uint8_t* n = static_cast<const uint8_t*>(needle);
+    size_t limit = hay_len - needle_len;
+    for (size_t i = 0; i <= limit; i++)
+        if (h[i] == n[0] && std::memcmp(h + i, n, needle_len) == 0)
+            return h + i;
+    return nullptr;
+}
+
 // ── PDF Object Model ─────────────────────────────────────
 
 enum class ObjType { NONE, BOOL, INT, REAL, STRING, NAME, ARRAY, DICT, STREAM, REF };
@@ -497,6 +511,7 @@ struct PdfDoc {
 private:
     void parse_xref_table(size_t offset);
     void parse_xref_stream(size_t offset);
+    void rebuild_xref();
     int64_t find_startxref();
     void parse_obj_stream(int stream_num);
 };
@@ -666,26 +681,67 @@ void PdfDoc::parse_xref_stream(size_t offset) {
     }
 }
 
+// Rebuild xref by scanning for "N 0 obj" patterns (repair mode).
+// Used when the xref table is missing, corrupted, or has wrong offsets.
+void PdfDoc::rebuild_xref() {
+    for (size_t i = 0; i + 5 < len; i++) {
+        // Match digit(s) followed by " 0 obj"
+        if (data[i] < '0' || data[i] > '9') continue;
+        size_t j = i + 1;
+        while (j < len && data[j] >= '0' && data[j] <= '9') j++;
+        if (j + 5 >= len) continue;
+        if (data[j] != ' ' || data[j+1] != '0' || data[j+2] != ' '
+            || data[j+3] != 'o' || data[j+4] != 'b' || data[j+5] != 'j') continue;
+        // Verify next char after "obj" is whitespace or delimiter
+        if (j + 6 < len && !PdfLexer::is_ws(data[j+6])
+            && !PdfLexer::is_delim(data[j+6])) continue;
+        int num = 0;
+        for (size_t k = i; k < j; k++) num = num * 10 + (data[k] - '0');
+        if (xref.find(num) == xref.end()) {
+            XrefEntry e;
+            e.offset = static_cast<int64_t>(i);
+            e.gen = 0;
+            e.in_use = true;
+            xref[num] = e;
+        }
+        i = j + 5;
+    }
+    // Scan for trailer dict
+    if (trailer.is_none()) {
+        const char* needle = "trailer";
+        for (size_t i = 0; i + 7 < len; i++) {
+            if (std::memcmp(data + i, needle, 7) == 0) {
+                PdfLexer lex(data, len, i + 7);
+                lex.skip_ws();
+                trailer = lex.parse_object();
+                break;
+            }
+        }
+    }
+}
+
 bool PdfDoc::parse() {
     if (len < 10) return false;
 
     int64_t startxref = find_startxref();
-    if (startxref < 0 || startxref >= (int64_t)len) return false;
+    if (startxref >= 0 && startxref < (int64_t)len) {
+        // Detect if xref is a table or a stream
+        PdfLexer probe(data, len, static_cast<size_t>(startxref));
+        probe.skip_ws();
+        std::string first_tok;
+        while (probe.pos < len && !PdfLexer::is_ws(data[probe.pos])
+               && !PdfLexer::is_delim(data[probe.pos]))
+            first_tok += static_cast<char>(data[probe.pos++]);
 
-    // Detect if xref is a table or a stream
-    PdfLexer probe(data, len, static_cast<size_t>(startxref));
-    probe.skip_ws();
-    size_t probe_start = probe.pos;
-    std::string first_tok;
-    while (probe.pos < len && !PdfLexer::is_ws(data[probe.pos]) && !PdfLexer::is_delim(data[probe.pos])) {
-        first_tok += static_cast<char>(data[probe.pos++]);
+        if (first_tok == "xref")
+            parse_xref_table(static_cast<size_t>(startxref));
+        else
+            parse_xref_stream(static_cast<size_t>(startxref));
     }
 
-    if (first_tok == "xref") {
-        parse_xref_table(static_cast<size_t>(startxref));
-    } else {
-        parse_xref_stream(static_cast<size_t>(startxref));
-    }
+    // Fallback: rebuild xref by scanning for objects
+    if (xref.empty())
+        rebuild_xref();
 
     return !xref.empty();
 }
@@ -730,9 +786,45 @@ PdfObj PdfDoc::get_obj(int num) {
         if (lex.pos < len && data[lex.pos] == '\n') lex.pos++;
 
         int64_t slen = resolve(obj.get("Length")).as_int();
-        if (slen > 0 && lex.pos + slen <= (int64_t)len) {
+        size_t stream_start = lex.pos;
+
+        // Validate Length: scan for "endstream" to find actual extent
+        if (slen <= 0 || stream_start + slen > len) {
+            // Length missing or out of bounds — find endstream
+            const uint8_t* es = (const uint8_t*)pdf_memmem(
+                data + stream_start, len - stream_start, "endstream", 9);
+            if (es) {
+                slen = es - (data + stream_start);
+                while (slen > 0 && (data[stream_start + slen - 1] == '\n'
+                       || data[stream_start + slen - 1] == '\r'))
+                    slen--;
+            }
+        } else {
+            // Length present — verify endstream is nearby
+            size_t expected_end = stream_start + (size_t)slen;
+            bool found_marker = false;
+            for (size_t scan = expected_end; scan < len && scan < expected_end + 4; scan++) {
+                if (scan + 9 <= len && std::memcmp(data + scan, "endstream", 9) == 0) {
+                    found_marker = true;
+                    break;
+                }
+            }
+            if (!found_marker) {
+                // Length is wrong — find actual endstream
+                const uint8_t* es = (const uint8_t*)pdf_memmem(
+                    data + stream_start, len - stream_start, "endstream", 9);
+                if (es) {
+                    slen = es - (data + stream_start);
+                    while (slen > 0 && (data[stream_start + slen - 1] == '\n'
+                           || data[stream_start + slen - 1] == '\r'))
+                        slen--;
+                }
+            }
+        }
+
+        if (slen > 0 && stream_start + slen <= len) {
             obj.type = ObjType::STREAM;
-            obj.stream_ptr = data + lex.pos;
+            obj.stream_ptr = data + stream_start;
             obj.stream_len = static_cast<size_t>(slen);
         }
     }
