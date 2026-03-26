@@ -32,6 +32,7 @@ private:
         bool italic = false;
         bool in_pict = false;    // Inside a \pict group.
         int uc = 1;              // Number of bytes to skip after \uN.
+        int codepage = 1252;     // Default ANSI code page.
     };
 
     // Extracted image from \pict group.
