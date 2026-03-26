@@ -867,7 +867,8 @@ std::string XlsxParser::to_markdown(const ConvertOptions& opts) {
 
         auto sheet = parse_sheet(sheets_[i]);
 
-        if (i > 0) out << "\n--- Page " << sheet_num << " ---\n\n";
+        if (i > 0) out << "\n";
+        out << "--- Page " << sheet_num << " ---\n\n";
 
         if (sheet.cells.empty()) {
             out << "*Empty sheet*\n\n";

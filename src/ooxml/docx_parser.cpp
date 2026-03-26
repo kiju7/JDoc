@@ -673,6 +673,8 @@ std::string DocxParser::to_markdown(const ConvertOptions& opts) {
         return c;
     };
 
+    out << "--- Page " << page_num << " ---\n\n";
+
     for (size_t i = 0; i < elements.size(); ++i) {
         auto& elem = elements[i];
 

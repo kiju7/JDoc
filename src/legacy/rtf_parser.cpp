@@ -158,6 +158,19 @@ void RtfParser::parse(std::string& out_text, std::vector<PictImage>& out_images)
 
             ch = data[pos];
 
+            // \<CR> or \<LF> = paragraph break (RTF spec equivalent to \par)
+            if (ch == '\r' || ch == '\n') {
+                if (!cur.skip && !cur.in_pict) {
+                    if (was_bold) { out_text += "**"; was_bold = false; }
+                    if (was_italic) { out_text += "*"; was_italic = false; }
+                    out_text += "\n\n";
+                }
+                pos++;
+                // Skip CRLF pair
+                if (ch == '\r' && pos < len && data[pos] == '\n') pos++;
+                continue;
+            }
+
             // Special two-character escapes.
             if (ch == '\\' || ch == '{' || ch == '}') {
                 if (!cur.skip && !cur.in_pict) {
@@ -380,7 +393,9 @@ void RtfParser::parse(std::string& out_text, std::vector<PictImage>& out_images)
             // Ignore whitespace and other chars in hex data.
         } else if (!cur.skip) {
             if (ch == '\r' || ch == '\n') {
-                // RTF uses \par for paragraph breaks; CR/LF in the file are ignored.
+                // In standard RTF, file-level CR/LF are ignored.
+                // But in macOS RTF without \par, consecutive newlines
+                // at text boundaries serve as paragraph breaks.
             } else {
                 out_text.push_back(ch);
             }

@@ -1104,8 +1104,7 @@ std::string hwp_to_markdown(const std::string& hwp_path, ConvertOptions opts) {
 
     std::string result;
     for (size_t i = 0; i < chunks.size(); i++) {
-        if (i > 0)
-            result += "\n--- Page " + std::to_string(chunks[i].page_number) + " ---\n\n";
+        if (i > 0) result += "\n";
         if (plaintext)
             result += util::strip_markdown(chunks[i].text);
         else

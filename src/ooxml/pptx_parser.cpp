@@ -312,32 +312,65 @@ static bool is_title_shape(const pugi::xml_node& sp) {
 }
 
 static std::string extract_textbody_text(const pugi::xml_node& txBody) {
-    std::ostringstream text;
+    enum RunStyle : uint8_t { PLAIN = 0, BOLD = 1, ITALIC = 2, BOLD_ITALIC = 3 };
+    struct StyledRun { std::string text; RunStyle style; };
+
+    std::string result;
     bool first_para = true;
 
     for (auto child = txBody.first_child(); child; child = child.next_sibling()) {
         const char* name = child.name();
         const char* colon = strchr(name, ':');
         const char* local = colon ? colon + 1 : name;
-
         if (strcmp(local, "p") != 0) continue;
 
-        if (!first_para) text << "\n";
+        if (!first_para) result += "\n";
         first_para = false;
 
-        std::vector<pugi::xml_node> runs;
-        xml_find_all(child, "r", runs);
+        // Collect styled runs
+        std::vector<StyledRun> runs;
+        std::vector<pugi::xml_node> r_nodes;
+        xml_find_all(child, "r", r_nodes);
 
-        for (auto& run : runs) {
+        for (auto& run : r_nodes) {
+            auto rPr = xml_child(run, "rPr");
+            bool bold = false, italic = false;
+            if (rPr) {
+                const char* b_val = xml_attr(rPr, "b");
+                const char* i_val = xml_attr(rPr, "i");
+                bold = (b_val[0] && strcmp(b_val, "0") != 0);
+                italic = (i_val[0] && strcmp(i_val, "0") != 0);
+            }
+            std::string run_text;
             std::vector<pugi::xml_node> t_nodes;
             xml_find_all(run, "t", t_nodes);
-            for (auto& t : t_nodes) {
-                text << xml_text_content(t);
+            for (auto& t : t_nodes) run_text += xml_text_content(t);
+            if (run_text.empty()) continue;
+
+            RunStyle s = PLAIN;
+            if (bold && italic) s = BOLD_ITALIC;
+            else if (bold) s = BOLD;
+            else if (italic) s = ITALIC;
+            runs.push_back({std::move(run_text), s});
+        }
+
+        // Merge consecutive same-style runs and apply formatting
+        for (size_t ri = 0; ri < runs.size(); ) {
+            size_t rj = ri + 1;
+            while (rj < runs.size() && runs[rj].style == runs[ri].style) ++rj;
+            std::string merged;
+            for (size_t rk = ri; rk < rj; ++rk) merged += runs[rk].text;
+            switch (runs[ri].style) {
+                case BOLD_ITALIC: result += "***" + merged + "***"; break;
+                case BOLD:        result += "**" + merged + "**"; break;
+                case ITALIC:      result += "*" + merged + "*"; break;
+                default:          result += merged; break;
             }
+            ri = rj;
         }
     }
 
-    return text.str();
+    return result;
 }
 
 void PptxParser::extract_text_from_shape(const pugi::xml_node& sp,
@@ -559,7 +592,6 @@ std::vector<ImageData> PptxParser::extract_images(
     const ConvertOptions& opts) {
 
     std::vector<ImageData> images;
-    if (!opts.extract_images) return images;
 
     // Track already-extracted media paths to avoid duplicates
     std::set<std::string> extracted;
@@ -592,18 +624,20 @@ std::vector<ImageData> PptxParser::extract_images(
             img.name = util::get_filename(media_path);
             img.format = fmt;
 
-            if (!opts.image_output_dir.empty()) {
-                util::ensure_dir(opts.image_output_dir);
-                std::string out_path = opts.image_output_dir + "/" + img.name;
-                const ZipReader::Entry* entry_ptr = nullptr;
-                for (auto& e : zip_.entries()) {
-                    if (e.name == media_path) { entry_ptr = &e; break; }
+            if (opts.extract_images) {
+                if (!opts.image_output_dir.empty()) {
+                    util::ensure_dir(opts.image_output_dir);
+                    std::string out_path = opts.image_output_dir + "/" + img.name;
+                    const ZipReader::Entry* entry_ptr = nullptr;
+                    for (auto& e : zip_.entries()) {
+                        if (e.name == media_path) { entry_ptr = &e; break; }
+                    }
+                    if (entry_ptr && zip_.extract_entry_to_file(*entry_ptr, out_path)) {
+                        img.saved_path = out_path;
+                    }
+                } else {
+                    img.data = zip_.read_entry(media_path);
                 }
-                if (entry_ptr && zip_.extract_entry_to_file(*entry_ptr, out_path)) {
-                    img.saved_path = out_path;
-                }
-            } else {
-                img.data = zip_.read_entry(media_path);
             }
 
             images.push_back(std::move(img));
@@ -644,6 +678,13 @@ std::vector<ImageData> PptxParser::extract_images(
 std::string PptxParser::to_markdown(const ConvertOptions& opts) {
     std::ostringstream out;
 
+    // Extract images first, then distribute per slide
+    auto images = extract_images(opts);
+    std::map<int, std::vector<size_t>> slide_images;  // page_number -> image indices
+    for (size_t idx = 0; idx < images.size(); ++idx) {
+        slide_images[images[idx].page_number].push_back(idx);
+    }
+
     for (size_t i = 0; i < slide_paths_.size(); ++i) {
         int slide_num = static_cast<int>(i) + 1;
 
@@ -658,9 +699,8 @@ std::string PptxParser::to_markdown(const ConvertOptions& opts) {
 
         auto content = parse_slide(slide_paths_[i]);
 
-        if (i > 0) {
-            out << "\n--- Page " << slide_num << " ---\n\n";
-        }
+        if (i > 0) out << "\n";
+        out << "--- Page " << slide_num << " ---\n\n";
 
         // Title
         if (!content.title.empty()) {
@@ -679,20 +719,21 @@ std::string PptxParser::to_markdown(const ConvertOptions& opts) {
             }
         }
 
+        // Slide images
+        auto it = slide_images.find(slide_num);
+        if (it != slide_images.end()) {
+            for (size_t idx : it->second) {
+                auto& img = images[idx];
+                if (opts.extract_images)
+                    out << "![" << img.name << "](" << opts.image_ref_prefix << img.name << ")\n\n";
+                else
+                    out << "![" << img.name << "](embedded:" << img.name << ")\n\n";
+            }
+        }
+
         // Notes
         if (!content.notes.empty()) {
             out << "\n> **Notes:** " << content.notes << "\n\n";
-        }
-    }
-
-    // Extract and reference images
-    auto images = extract_images(opts);
-    if (!images.empty()) {
-        for (auto& img : images) {
-            if (opts.extract_images)
-                out << "![" << img.name << "](" << opts.image_ref_prefix << img.name << ")\n\n";
-            else
-                out << "![" << img.name << "](embedded:" << img.name << ")\n\n";
         }
     }
 

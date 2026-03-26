@@ -1444,19 +1444,36 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
 
     auto filter_small_rect = [&]() -> bool {
         if (current_path.size() < 4 || current_path.size() > 6) return false;
-        double min_y = 1e9, max_y = -1e9;
+        double min_x = 1e9, max_x = -1e9, min_y = 1e9, max_y = -1e9;
         double first_x = 0, first_y = 0, last_x = 0, last_y = 0;
         bool has_start = false;
         for (auto& pt : current_path) {
             if (pt.type == PathPoint::MOVE || pt.type == PathPoint::LINE) {
                 if (!has_start) { first_x = pt.x; first_y = pt.y; has_start = true; }
                 last_x = pt.x; last_y = pt.y;
+                if (pt.x < min_x) min_x = pt.x;
+                if (pt.x > max_x) max_x = pt.x;
                 if (pt.y < min_y) min_y = pt.y;
                 if (pt.y > max_y) max_y = pt.y;
             }
         }
         if (std::abs(first_x - last_x) < 2 && std::abs(first_y - last_y) < 2) {
-            if (max_y - min_y < 20.0) return true;
+            double w = max_x - min_x, h = max_y - min_y;
+            // Thin horizontal rect (Word table border) → emit as h-line.
+            if (h < 3.0 && w >= 20.0) {
+                float cy = static_cast<float>((min_y + max_y) / 2.0);
+                result.segments.push_back({static_cast<float>(min_x), cy,
+                                           static_cast<float>(max_x), cy});
+                return true;
+            }
+            // Thin vertical rect → emit as v-line.
+            if (w < 3.0 && h >= 5.0) {
+                float cx = static_cast<float>((min_x + max_x) / 2.0);
+                result.segments.push_back({cx, static_cast<float>(min_y),
+                                           cx, static_cast<float>(max_y)});
+                return true;
+            }
+            if (h < 20.0) return true;
         }
         return false;
     };
@@ -4277,35 +4294,136 @@ ImageData render_page_composite(PdfDoc& doc, const PdfObj& page_obj,
     Canvas canvas(rw, rh);
 
     // ── Rasterize vector paths (anti-aliased scanline fill) ──
-    constexpr int AA_H = 8;  // horizontal subsamples per pixel
-    constexpr int AA_V = 8;  // vertical subsamples per pixel
+    constexpr int AA_H = 4;  // horizontal subsamples per pixel
+    constexpr int AA_V = 4;  // vertical subsamples per pixel
+    constexpr int AA_TOTAL = AA_H * AA_V;
 
-    // Bezier flattening
-    std::function<void(double,double,double,double,double,double,double,double,
-                        std::vector<std::pair<double,double>>&,double,int)> flatten_bezier;
-    flatten_bezier = [&flatten_bezier](double x0, double y0, double cx1, double cy1,
-                              double cx2, double cy2, double x3, double y3,
-                              std::vector<std::pair<double,double>>& pts, double tol, int depth) {
-        if (depth > 10) { pts.push_back({x3, y3}); return; }
-        double dmax = std::max({std::abs(cx1-x0), std::abs(cy1-y0),
-                                std::abs(cx2-x3), std::abs(cy2-y3)});
-        if (dmax < tol) { pts.push_back({x3, y3}); return; }
-        double m01x=(x0+cx1)/2, m01y=(y0+cy1)/2;
-        double m12x=(cx1+cx2)/2, m12y=(cy1+cy2)/2;
-        double m23x=(cx2+x3)/2, m23y=(cy2+y3)/2;
-        double m012x=(m01x+m12x)/2, m012y=(m01y+m12y)/2;
-        double m123x=(m12x+m23x)/2, m123y=(m12y+m23y)/2;
-        double mx=(m012x+m123x)/2, my=(m012y+m123y)/2;
-        flatten_bezier(x0,y0,m01x,m01y,m012x,m012y,mx,my,pts,tol,depth+1);
-        flatten_bezier(mx,my,m123x,m123y,m23x,m23y,x3,y3,pts,tol,depth+1);
+    // Shared scanline helpers — reused across all paths to avoid allocation
+    struct ScanEdge { double x_at_ymin; double inv_slope; int ymin, ymax; };
+    std::vector<ScanEdge> edge_buf;
+    std::vector<double> xs_buf;
+    std::vector<int> hits_buf(rw + 1, 0);
+
+    // Scanline rasterizer with sorted active edge list
+    auto rasterize_edges = [&](std::vector<ScanEdge>& edges, int ymin, int ymax,
+                               uint8_t cr, uint8_t cg, uint8_t cb) {
+        if (edges.empty()) return;
+        ymin = std::max(0, ymin);
+        ymax = std::min(rh * AA_V, ymax);
+        if (ymin >= ymax) return;
+
+        // Sort edges by ymin for active edge list
+        std::sort(edges.begin(), edges.end(),
+                  [](const ScanEdge& a, const ScanEdge& b) { return a.ymin < b.ymin; });
+
+        size_t next_edge = 0;
+        struct ActiveEdge { double x; double inv_slope; int ymax; };
+        std::vector<ActiveEdge> active;
+
+        int prev_row = ymin / AA_V;
+        std::fill(hits_buf.begin(), hits_buf.end(), 0);
+
+        for (int suby = ymin; suby < ymax; suby++) {
+            int cur_row = suby / AA_V;
+            if (cur_row != prev_row) {
+                for (int x = 0; x < rw; x++) {
+                    if (hits_buf[x] > 0) {
+                        int alpha = hits_buf[x] * 255 / AA_TOTAL;
+                        if (alpha > 255) alpha = 255;
+                        canvas.blend_pixel(x, prev_row, cr, cg, cb, static_cast<uint8_t>(alpha));
+                    }
+                }
+                std::fill(hits_buf.begin(), hits_buf.end(), 0);
+                prev_row = cur_row;
+            }
+
+            // Add newly active edges
+            while (next_edge < edges.size() && edges[next_edge].ymin <= suby) {
+                auto& e = edges[next_edge];
+                double x = e.x_at_ymin + (suby - e.ymin) * e.inv_slope;
+                active.push_back({x, e.inv_slope, e.ymax});
+                next_edge++;
+            }
+
+            // Remove expired edges and collect x intersections
+            xs_buf.clear();
+            size_t write = 0;
+            for (size_t i = 0; i < active.size(); i++) {
+                if (suby < active[i].ymax) {
+                    xs_buf.push_back(active[i].x);
+                    active[i].x += active[i].inv_slope;
+                    active[write++] = active[i];
+                }
+            }
+            active.resize(write);
+
+            std::sort(xs_buf.begin(), xs_buf.end());
+
+            // Even-odd fill between pairs
+            for (size_t i = 0; i + 1 < xs_buf.size(); i += 2) {
+                double fx0 = xs_buf[i] / AA_H;
+                double fx1 = xs_buf[i+1] / AA_H;
+                int ix0 = static_cast<int>(fx0);
+                int ix1 = static_cast<int>(fx1);
+                if (ix0 < 0) ix0 = 0;
+                if (ix1 >= rw) ix1 = rw - 1;
+                if (ix0 == ix1) {
+                    hits_buf[ix0] += static_cast<int>((fx1 - fx0) * AA_H);
+                } else {
+                    hits_buf[ix0] += static_cast<int>((ix0 + 1 - fx0) * AA_H);
+                    for (int x = ix0 + 1; x < ix1; x++)
+                        hits_buf[x] += AA_H;
+                    if (ix1 < rw)
+                        hits_buf[ix1] += static_cast<int>((fx1 - ix1) * AA_H);
+                }
+            }
+        }
+        // Flush last row
+        for (int x = 0; x < rw; x++) {
+            if (hits_buf[x] > 0) {
+                int alpha = hits_buf[x] * 255 / AA_TOTAL;
+                if (alpha > 255) alpha = 255;
+                canvas.blend_pixel(x, prev_row, cr, cg, cb, static_cast<uint8_t>(alpha));
+            }
+        }
     };
+
+    // Bezier flattening (non-recursive with explicit stack)
+    struct BezierWork { double x0,y0,cx1,cy1,cx2,cy2,x3,y3; int depth; };
+    std::vector<BezierWork> bez_stack;
+    auto flatten_bezier = [&](double x0, double y0, double cx1, double cy1,
+                              double cx2, double cy2, double x3, double y3,
+                              std::vector<std::pair<double,double>>& pts, double tol) {
+        bez_stack.clear();
+        bez_stack.push_back({x0,y0,cx1,cy1,cx2,cy2,x3,y3,0});
+        while (!bez_stack.empty()) {
+            auto w = bez_stack.back(); bez_stack.pop_back();
+            if (w.depth > 10) { pts.push_back({w.x3, w.y3}); continue; }
+            double dmax = std::max({std::abs(w.cx1-w.x0), std::abs(w.cy1-w.y0),
+                                    std::abs(w.cx2-w.x3), std::abs(w.cy2-w.y3)});
+            if (dmax < tol) { pts.push_back({w.x3, w.y3}); continue; }
+            double m01x=(w.x0+w.cx1)/2, m01y=(w.y0+w.cy1)/2;
+            double m12x=(w.cx1+w.cx2)/2, m12y=(w.cy1+w.cy2)/2;
+            double m23x=(w.cx2+w.x3)/2, m23y=(w.cy2+w.y3)/2;
+            double m012x=(m01x+m12x)/2, m012y=(m01y+m12y)/2;
+            double m123x=(m12x+m23x)/2, m123y=(m12y+m23y)/2;
+            double mx=(m012x+m123x)/2, my=(m012y+m123y)/2;
+            // Push right half first (processed second), left half last (processed first)
+            bez_stack.push_back({mx,my,m123x,m123y,m23x,m23y,w.x3,w.y3,w.depth+1});
+            bez_stack.push_back({w.x0,w.y0,m01x,m01y,m012x,m012y,mx,my,w.depth+1});
+        }
+    };
+
+    // Reusable buffers for path flattening
+    std::vector<std::vector<std::pair<double,double>>> subpaths;
+    std::vector<std::pair<double,double>> cur_sub;
 
     for (auto& rp : parse_result.paths) {
         if (rp.points.empty()) continue;
 
         // Flatten path to line segments
-        std::vector<std::vector<std::pair<double,double>>> subpaths;
-        std::vector<std::pair<double,double>> cur_sub;
+        subpaths.clear();
+        cur_sub.clear();
         double px = 0, py = 0;
         for (auto& pt : rp.points) {
             switch (pt.type) {
@@ -4318,7 +4436,7 @@ ImageData render_page_composite(PdfDoc& doc, const PdfObj& page_obj,
                     cur_sub.push_back({pt.x, pt.y});
                     px = pt.x; py = pt.y; break;
                 case PathPoint::CURVE:
-                    flatten_bezier(px, py, pt.cx1, pt.cy1, pt.cx2, pt.cy2, pt.x, pt.y, cur_sub, 0.25, 0);
+                    flatten_bezier(px, py, pt.cx1, pt.cy1, pt.cx2, pt.cy2, pt.x, pt.y, cur_sub, 0.25);
                     px = pt.x; py = pt.y; break;
                 case PathPoint::CLOSE:
                     if (!cur_sub.empty()) { cur_sub.push_back(cur_sub[0]); px = cur_sub[0].first; py = cur_sub[0].second; }
@@ -4327,138 +4445,53 @@ ImageData render_page_composite(PdfDoc& doc, const PdfObj& page_obj,
         }
         if (!cur_sub.empty()) subpaths.push_back(std::move(cur_sub));
 
-        // Collect edges in subpixel coordinates
-        struct Edge { double x_at_ymin; double inv_slope; int ymin, ymax; int dir; };
-        std::vector<Edge> edges;
-        int global_ymin = rh * AA_V, global_ymax = 0;
-
-        for (auto& sp : subpaths) {
-            for (size_t i = 0; i + 1 < sp.size(); i++) {
-                double sx0 = sp[i].first * scale;
-                double sy0 = (page_h - sp[i].second) * scale;
-                double sx1 = sp[i+1].first * scale;
-                double sy1 = (page_h - sp[i+1].second) * scale;
-                // Convert to subpixel grid
-                int iy0 = static_cast<int>(std::round(sy0 * AA_V));
-                int iy1 = static_cast<int>(std::round(sy1 * AA_V));
-                if (iy0 == iy1) continue;
-                int dir = 1;
-                if (iy0 > iy1) { std::swap(sx0, sx1); std::swap(sy0, sy1); std::swap(iy0, iy1); dir = -1; }
-                double inv_slope = (sx1 - sx0) / (sy1 - sy0);
-                double x_start = sx0 + (iy0 / (double)AA_V - sy0) * inv_slope;
-                edges.push_back({x_start * AA_H, inv_slope / AA_V * AA_H, iy0, iy1, dir});
-                if (iy0 < global_ymin) global_ymin = iy0;
-                if (iy1 > global_ymax) global_ymax = iy1;
-            }
-        }
-        if (edges.empty()) continue;
-
-        global_ymin = std::max(0, global_ymin);
-        global_ymax = std::min(rh * AA_V, global_ymax);
-
-        // Fill using scanline with AA hit-count
+        // Fill
         if (rp.do_fill) {
-            uint8_t fr = static_cast<uint8_t>(std::min(255.0, std::max(0.0, rp.fill_r * 255)));
-            uint8_t fg = static_cast<uint8_t>(std::min(255.0, std::max(0.0, rp.fill_g * 255)));
-            uint8_t fb = static_cast<uint8_t>(std::min(255.0, std::max(0.0, rp.fill_b * 255)));
-
-            // Hit count per pixel: how many sub-samples are inside the path
-            int prev_row = global_ymin / AA_V;
-            std::vector<int> hits(rw + 1, 0);
-
-            for (int suby = global_ymin; suby < global_ymax; suby++) {
-                int cur_row = suby / AA_V;
-                if (cur_row != prev_row) {
-                    // Flush: convert hits to alpha and blend
-                    for (int x = 0; x < rw; x++) {
-                        if (hits[x] > 0) {
-                            int alpha = hits[x] * 255 / (AA_H * AA_V);
-                            if (alpha > 255) alpha = 255;
-                            canvas.blend_pixel(x, prev_row, fr, fg, fb, static_cast<uint8_t>(alpha));
-                        }
-                    }
-                    std::fill(hits.begin(), hits.end(), 0);
-                    prev_row = cur_row;
-                }
-
-                // Find edge intersections at this sub-scanline
-                std::vector<double> xs;
-                for (auto& e : edges) {
-                    if (suby >= e.ymin && suby < e.ymax) {
-                        double x = e.x_at_ymin + (suby - e.ymin) * e.inv_slope;
-                        xs.push_back(x);
-                    }
-                }
-                std::sort(xs.begin(), xs.end());
-
-                // Even-odd: fill between pairs of intersections
-                for (size_t i = 0; i + 1 < xs.size(); i += 2) {
-                    double fx0 = xs[i] / AA_H;
-                    double fx1 = xs[i+1] / AA_H;
-                    int ix0 = static_cast<int>(fx0);
-                    int ix1 = static_cast<int>(fx1);
-                    if (ix0 < 0) ix0 = 0;
-                    if (ix1 >= rw) ix1 = rw - 1;
-
-                    if (ix0 == ix1) {
-                        // Both edges in same pixel
-                        hits[ix0] += static_cast<int>((fx1 - fx0) * AA_H);
-                    } else {
-                        // Left partial pixel
-                        hits[ix0] += static_cast<int>((ix0 + 1 - fx0) * AA_H);
-                        // Full middle pixels
-                        for (int x = ix0 + 1; x < ix1; x++)
-                            hits[x] += AA_H;
-                        // Right partial pixel
-                        if (ix1 < rw)
-                            hits[ix1] += static_cast<int>((fx1 - ix1) * AA_H);
-                    }
-                }
-            }
-            // Flush last row
-            {
-                for (int x = 0; x < rw; x++) {
-                    if (hits[x] > 0) {
-                        int alpha = hits[x] * 255 / (AA_H * AA_V);
-                        if (alpha > 255) alpha = 255;
-                        canvas.blend_pixel(x, prev_row, fr, fg, fb, static_cast<uint8_t>(alpha));
-                    }
-                }
-            }
-        }
-
-        // Stroke: expand line segments into filled quads with AA scanline fill
-        if (rp.do_stroke) {
-            uint8_t sr = static_cast<uint8_t>(std::min(255.0, std::max(0.0, rp.stroke_r * 255)));
-            uint8_t sg = static_cast<uint8_t>(std::min(255.0, std::max(0.0, rp.stroke_g * 255)));
-            uint8_t sb = static_cast<uint8_t>(std::min(255.0, std::max(0.0, rp.stroke_b * 255)));
-            double lw = rp.line_width * scale;
-            if (lw < 0.5) lw = 0.5;
-            double half = lw / 2.0;
-
-            // Collect all stroke quad edges for AA rendering
-            struct Edge { double x_at_ymin; double inv_slope; int ymin, ymax; };
-            std::vector<Edge> stroke_edges;
-            int s_ymin = rh * AA_V, s_ymax = 0;
-
+            edge_buf.clear();
+            int ymin = rh * AA_V, ymax = 0;
             for (auto& sp : subpaths) {
                 for (size_t i = 0; i + 1 < sp.size(); i++) {
                     double sx0 = sp[i].first * scale;
                     double sy0 = (page_h - sp[i].second) * scale;
                     double sx1 = sp[i+1].first * scale;
                     double sy1 = (page_h - sp[i+1].second) * scale;
+                    int iy0 = static_cast<int>(std::round(sy0 * AA_V));
+                    int iy1 = static_cast<int>(std::round(sy1 * AA_V));
+                    if (iy0 == iy1) continue;
+                    if (iy0 > iy1) { std::swap(sx0, sx1); std::swap(sy0, sy1); std::swap(iy0, iy1); }
+                    double inv_slope = (sx1 - sx0) / (sy1 - sy0);
+                    double x_start = sx0 + (iy0 / (double)AA_V - sy0) * inv_slope;
+                    edge_buf.push_back({x_start * AA_H, inv_slope / AA_V * AA_H, iy0, iy1});
+                    if (iy0 < ymin) ymin = iy0;
+                    if (iy1 > ymax) ymax = iy1;
+                }
+            }
+            uint8_t fr = static_cast<uint8_t>(std::min(255.0, std::max(0.0, rp.fill_r * 255)));
+            uint8_t fg = static_cast<uint8_t>(std::min(255.0, std::max(0.0, rp.fill_g * 255)));
+            uint8_t fb = static_cast<uint8_t>(std::min(255.0, std::max(0.0, rp.fill_b * 255)));
+            rasterize_edges(edge_buf, ymin, ymax, fr, fg, fb);
+        }
 
+        // Stroke
+        if (rp.do_stroke) {
+            double lw = rp.line_width * scale;
+            if (lw < 0.5) lw = 0.5;
+            double half = lw / 2.0;
+            edge_buf.clear();
+            int ymin = rh * AA_V, ymax = 0;
+            for (auto& sp : subpaths) {
+                for (size_t i = 0; i + 1 < sp.size(); i++) {
+                    double sx0 = sp[i].first * scale;
+                    double sy0 = (page_h - sp[i].second) * scale;
+                    double sx1 = sp[i+1].first * scale;
+                    double sy1 = (page_h - sp[i+1].second) * scale;
                     double dx = sx1 - sx0, dy = sy1 - sy0;
                     double len = std::sqrt(dx*dx + dy*dy);
                     if (len < 0.01) continue;
                     double nx = -dy / len * half;
                     double ny = dx / len * half;
-
-                    // Quad corners
                     double qx[4] = {sx0+nx, sx1+nx, sx1-nx, sx0-nx};
                     double qy[4] = {sy0+ny, sy1+ny, sy1-ny, sy0-ny};
-
-                    // Add quad edges to edge list
                     for (int e = 0; e < 4; e++) {
                         int e2 = (e + 1) % 4;
                         double ey0 = qy[e], ey1 = qy[e2];
@@ -4469,71 +4502,16 @@ ImageData render_page_composite(PdfDoc& doc, const PdfObj& page_obj,
                         if (iy0 > iy1) { std::swap(iy0, iy1); std::swap(ex0, ex1); std::swap(ey0, ey1); }
                         double inv_s = (ex1 - ex0) / (ey1 - ey0) / AA_V * AA_H;
                         double x_s = ex0 * AA_H + (iy0 / (double)AA_V - ey0) * (ex1 - ex0) / (ey1 - ey0) * AA_H;
-                        stroke_edges.push_back({x_s, inv_s, iy0, iy1});
-                        if (iy0 < s_ymin) s_ymin = iy0;
-                        if (iy1 > s_ymax) s_ymax = iy1;
+                        edge_buf.push_back({x_s, inv_s, iy0, iy1});
+                        if (iy0 < ymin) ymin = iy0;
+                        if (iy1 > ymax) ymax = iy1;
                     }
                 }
             }
-
-            if (!stroke_edges.empty()) {
-                s_ymin = std::max(0, s_ymin);
-                s_ymax = std::min(rh * AA_V, s_ymax);
-                std::vector<double> xs;  // reused across scanlines
-
-                int prev_row = s_ymin / AA_V;
-                std::vector<int> hits(rw + 1, 0);
-
-                for (int suby = s_ymin; suby < s_ymax; suby++) {
-                    int cur_row = suby / AA_V;
-                    if (cur_row != prev_row) {
-                        for (int x = 0; x < rw; x++) {
-                            if (hits[x] > 0) {
-                                int alpha = hits[x] * 255 / (AA_H * AA_V);
-                                if (alpha > 255) alpha = 255;
-                                canvas.blend_pixel(x, prev_row, sr, sg, sb, static_cast<uint8_t>(alpha));
-                            }
-                        }
-                        std::fill(hits.begin(), hits.end(), 0);
-                        prev_row = cur_row;
-                    }
-
-                    xs.clear();
-                    for (auto& e : stroke_edges) {
-                        if (suby >= e.ymin && suby < e.ymax) {
-                            xs.push_back(e.x_at_ymin + (suby - e.ymin) * e.inv_slope);
-                        }
-                    }
-                    std::sort(xs.begin(), xs.end());
-
-                    for (size_t j = 0; j + 1 < xs.size(); j += 2) {
-                        double fx0 = xs[j] / AA_H;
-                        double fx1 = xs[j+1] / AA_H;
-                        int ix0 = static_cast<int>(fx0);
-                        int ix1 = static_cast<int>(fx1);
-                        if (ix0 < 0) ix0 = 0;
-                        if (ix1 >= rw) ix1 = rw - 1;
-
-                        if (ix0 == ix1) {
-                            hits[ix0] += static_cast<int>((fx1 - fx0) * AA_H);
-                        } else {
-                            hits[ix0] += static_cast<int>((ix0 + 1 - fx0) * AA_H);
-                            for (int x = ix0 + 1; x < ix1; x++)
-                                hits[x] += AA_H;
-                            if (ix1 < rw)
-                                hits[ix1] += static_cast<int>((fx1 - ix1) * AA_H);
-                        }
-                    }
-                }
-                // Flush last row
-                for (int x = 0; x < rw; x++) {
-                    if (hits[x] > 0) {
-                        int alpha = hits[x] * 255 / (AA_H * AA_V);
-                        if (alpha > 255) alpha = 255;
-                        canvas.blend_pixel(x, prev_row, sr, sg, sb, static_cast<uint8_t>(alpha));
-                    }
-                }
-            }
+            uint8_t sr = static_cast<uint8_t>(std::min(255.0, std::max(0.0, rp.stroke_r * 255)));
+            uint8_t sg = static_cast<uint8_t>(std::min(255.0, std::max(0.0, rp.stroke_g * 255)));
+            uint8_t sb = static_cast<uint8_t>(std::min(255.0, std::max(0.0, rp.stroke_b * 255)));
+            rasterize_edges(edge_buf, ymin, ymax, sr, sg, sb);
         }
     }
 
@@ -4890,35 +4868,53 @@ std::vector<TextLine> merge_colinear_lines(const std::vector<TextLine>& lines) {
 std::string page_to_markdown(const std::vector<TextLine>& raw_lines,
                               const FontStats& stats,
                               const std::vector<ImageData>& images,
+                              const std::vector<double>& image_y_pos,
                               const std::vector<TableData>& tables) {
     auto lines = merge_colinear_lines(raw_lines);
 
     std::string md;
     md.reserve(lines.size() * 80);
 
-    struct TableInsert {
+    // Build sorted insert lists for tables and images by Y position (top-first in PDF coords)
+    struct InlineInsert {
         double y_pos;
-        size_t table_idx;
+        size_t idx;
+        bool is_image; // false = table, true = image
     };
-    std::vector<TableInsert> table_inserts;
+    std::vector<InlineInsert> inserts;
     for (size_t ti = 0; ti < tables.size(); ti++) {
-        table_inserts.push_back({std::max(tables[ti].y0, tables[ti].y1), ti});
+        inserts.push_back({std::max(tables[ti].y0, tables[ti].y1), ti, false});
     }
-    std::sort(table_inserts.begin(), table_inserts.end(),
-              [](const TableInsert& a, const TableInsert& b) { return a.y_pos > b.y_pos; });
+    for (size_t ii = 0; ii < images.size(); ii++) {
+        double y = (ii < image_y_pos.size()) ? image_y_pos[ii] : 0.0;
+        inserts.push_back({y, ii, true});
+    }
+    std::sort(inserts.begin(), inserts.end(),
+              [](const InlineInsert& a, const InlineInsert& b) { return a.y_pos > b.y_pos; });
 
-    size_t next_table = 0;
+    size_t next_insert = 0;
+
+    auto flush_inserts = [&](double y_threshold) {
+        while (next_insert < inserts.size() &&
+               inserts[next_insert].y_pos >= y_threshold) {
+            auto& ins = inserts[next_insert];
+            if (ins.is_image) {
+                auto& img = images[ins.idx];
+                std::string ref = img.saved_path.empty() ? img.name : img.saved_path;
+                md += "\n![" + img.name + "](" + ref + ")\n";
+            } else {
+                md += "\n";
+                md += format_table(tables[ins.idx]);
+                md += "\n";
+            }
+            next_insert++;
+        }
+    };
 
     for (size_t i = 0; i < lines.size(); i++) {
         const auto& l = lines[i];
 
-        while (next_table < table_inserts.size() &&
-               table_inserts[next_table].y_pos >= l.y_center) {
-            md += "\n";
-            md += format_table(tables[table_inserts[next_table].table_idx]);
-            md += "\n";
-            next_table++;
-        }
+        flush_inserts(l.y_center);
 
         if (line_in_table(l, tables)) continue;
 
@@ -4956,17 +4952,9 @@ std::string page_to_markdown(const std::vector<TextLine>& raw_lines,
         }
     }
 
-    while (next_table < table_inserts.size()) {
-        md += "\n";
-        md += format_table(tables[table_inserts[next_table].table_idx]);
-        md += "\n";
-        next_table++;
-    }
+    // Flush remaining tables and images
+    flush_inserts(-1e9);
 
-    for (auto& img : images) {
-        std::string ref = img.saved_path.empty() ? img.name : img.saved_path;
-        md += "\n![" + img.name + "](" + ref + ")\n";
-    }
     return md;
 }
 
@@ -4975,6 +4963,7 @@ std::string page_to_markdown(const std::vector<TextLine>& raw_lines,
 struct ExtractResult {
     std::vector<std::vector<TextLine>> all_lines;
     std::vector<std::vector<ImageData>> all_images;
+    std::vector<std::vector<double>> all_image_y;  // per-page image Y positions (PDF coords, top=large)
     std::vector<std::vector<TableData>> all_tables;
     std::vector<double> page_widths;
     std::vector<double> page_heights;
@@ -5062,6 +5051,7 @@ ExtractResult extract_pdf(const std::string& pdf_path, const ConvertOptions& opt
     result.total_pages = tp;
     result.all_lines.resize(tp);
     result.all_images.resize(tp);
+    result.all_image_y.resize(tp);
     result.all_tables.resize(tp);
     result.page_widths.resize(tp, 0);
     result.page_heights.resize(tp, 0);
@@ -5100,7 +5090,7 @@ ExtractResult extract_pdf(const std::string& pdf_path, const ConvertOptions& opt
             if (parent.is_dict()) resources = doc.resolve(parent.get("Resources"));
         }
 
-        // Quick check: if no fonts in resources AND no images needed, skip decompress entirely
+        // Quick check: skip pages with no fonts and no extractable images
         bool has_fonts = false;
         {
             auto& font_res = resources.get("Font");
@@ -5152,12 +5142,19 @@ ExtractResult extract_pdf(const std::string& pdf_path, const ConvertOptions& opt
                 // Layered: render as composite
                 auto rendered = render_page_composite(doc, page_obj, parse_result,
                                                       p, page_w, page_h, image_dir);
-                if (!rendered.data.empty())
+                if (!rendered.data.empty()) {
                     result.all_images[p].push_back(std::move(rendered));
+                    result.all_image_y[p].push_back(page_h); // full-page composite goes to top
+                }
             } else {
                 auto extracted = extract_page_images(doc, page_obj, parse_result, p, image_dir);
-                for (auto& ei : extracted)
+                for (auto& ei : extracted) {
+                    // ctm[5] is the Y translation in PDF coordinates (origin bottom-left)
+                    // ctm[3] is vertical scale; y_top = ctm[5] + abs(ctm[3])
+                    double y_top = ei.ctm[5] + std::abs(ei.ctm[3]);
+                    result.all_image_y[p].push_back(y_top);
                     result.all_images[p].push_back(std::move(ei.img));
+                }
             }
 
             // Fallback: render page for scanned/vector-only pages
@@ -5165,8 +5162,10 @@ ExtractResult extract_pdf(const std::string& pdf_path, const ConvertOptions& opt
                 if (!parse_result.images.empty() || !parse_result.segments.empty()) {
                     auto rendered = render_page_composite(doc, page_obj, parse_result,
                                                           p, page_w, page_h, image_dir);
-                    if (!rendered.data.empty())
+                    if (!rendered.data.empty()) {
                         result.all_images[p].push_back(std::move(rendered));
+                        result.all_image_y[p].push_back(page_h);
+                    }
                 }
             }
 
@@ -5254,14 +5253,12 @@ std::string pdf_to_markdown(const std::string& pdf_path, ConvertOptions opts) {
         full_md += "\n";
     }
 
-    bool first = true;
     for (int p : page_indices) {
         if (p < 0 || p >= r.total_pages) continue;
-        if (!first)
-            full_md += "\n--- Page " + std::to_string(p + 1) + " ---\n\n";
-        first = false;
+        full_md += "\n--- Page " + std::to_string(p + 1) + " ---\n\n";
         std::string page_md = page_to_markdown(r.all_lines[p], r.stats,
-                                                r.all_images[p], r.all_tables[p]);
+                                                r.all_images[p], r.all_image_y[p],
+                                                r.all_tables[p]);
         if (plaintext)
             full_md += util::strip_markdown(page_md);
         else
@@ -5292,7 +5289,8 @@ std::vector<PageChunk> pdf_to_markdown_chunks(const std::string& pdf_path,
         chunk.page_height = r.page_heights[p];
         chunk.body_font_size = r.stats.body_size;
         std::string page_md = page_to_markdown(r.all_lines[p], r.stats,
-                                                r.all_images[p], r.all_tables[p]);
+                                                r.all_images[p], r.all_image_y[p],
+                                                r.all_tables[p]);
         chunk.text = plaintext ? util::strip_markdown(page_md) : page_md;
 
         for (auto& td : r.all_tables[p])

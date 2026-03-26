@@ -46,7 +46,8 @@ private:
 
     // Process a single character from a piece, handling field markers,
     // smart quotes, and control characters. Returns false to skip.
-    bool process_char(uint32_t ch, std::string& result);
+    // When is_picture is true, 0x01 emits U+FFFC instead of being skipped.
+    bool process_char(uint32_t ch, std::string& result, bool is_picture = false);
 
     // Image extraction: scan Data stream and WordDocument for embedded images.
     std::vector<ImageData> extract_images();
@@ -66,6 +67,7 @@ private:
     // Field nesting state.
     int field_depth_ = 0;
     bool field_show_result_ = false;
+    int page_num_ = 1;
 };
 
 } // namespace jdoc
