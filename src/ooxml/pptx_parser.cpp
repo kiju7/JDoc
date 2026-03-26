@@ -6,7 +6,6 @@
 #include "common/file_utils.h"
 #include <algorithm>
 #include <cstdlib>
-#include <regex>
 #include <set>
 #include <sstream>
 
@@ -154,6 +153,146 @@ std::string PptxParser::format_table(
     return out.str();
 }
 
+// Forward declaration
+static std::string extract_textbody_text(const pugi::xml_node& txBody);
+
+// ── Chart text extraction ───────────────────────────────
+
+std::string PptxParser::extract_chart_text(const std::string& chart_path) {
+    if (!zip_.has_entry(chart_path)) return "";
+    auto data = zip_.read_entry(chart_path);
+    pugi::xml_document doc;
+    if (!doc.load_buffer(data.data(), data.size())) return "";
+
+    std::string result;
+
+    // Extract chart title: <c:chart><c:title>...<a:t>
+    auto chart = xml_child(doc.first_child(), "chart");
+    if (chart) {
+        auto title_node = xml_child(chart, "title");
+        if (title_node) {
+            std::vector<pugi::xml_node> t_nodes;
+            xml_find_all(title_node, "t", t_nodes);
+            for (auto& t : t_nodes) {
+                result += xml_text_content(t);
+            }
+        }
+    }
+
+    // Extract series names and category labels from <c:strCache><c:pt><c:v>
+    std::vector<pugi::xml_node> str_caches;
+    xml_find_all(doc, "strCache", str_caches);
+    for (auto& cache : str_caches) {
+        std::vector<pugi::xml_node> pts;
+        xml_find_all(cache, "pt", pts);
+        for (auto& pt : pts) {
+            auto v = xml_child(pt, "v");
+            if (v) {
+                std::string val = xml_text_content(v);
+                if (!val.empty()) {
+                    if (!result.empty()) result += " ";
+                    result += val;
+                }
+            }
+        }
+    }
+
+    return result;
+}
+
+// ── SmartArt/Diagram text extraction ────────────────────
+
+std::string PptxParser::extract_diagram_text(
+    const std::string& diagram_data_path) {
+    if (!zip_.has_entry(diagram_data_path)) return "";
+    auto data = zip_.read_entry(diagram_data_path);
+    pugi::xml_document doc;
+    if (!doc.load_buffer(data.data(), data.size())) return "";
+
+    // Extract text from <dgm:pt> data points (skip pres/sibTrans types)
+    // Each pt has <dgm:t><a:p><a:r><a:t>text</a:t></a:r></a:p></dgm:t>
+    std::string result;
+    std::vector<pugi::xml_node> pt_nodes;
+    xml_find_all(doc, "pt", pt_nodes);
+    for (auto& pt : pt_nodes) {
+        const char* pt_type = xml_attr(pt, "type");
+        if (pt_type[0] && strcmp(pt_type, "doc") != 0 &&
+            strcmp(pt_type, "node") != 0 && pt_type[0] != '\0') {
+            // Skip pres, sibTrans, parTrans, asst types
+            if (strcmp(pt_type, "pres") == 0 || strcmp(pt_type, "sibTrans") == 0 ||
+                strcmp(pt_type, "parTrans") == 0)
+                continue;
+        }
+
+        // Find <dgm:t> within this pt
+        auto dgm_t = xml_child(pt, "t");
+        if (!dgm_t) continue;
+
+        // Collect text from <a:p><a:r><a:t> inside dgm:t
+        std::string pt_text;
+        std::vector<pugi::xml_node> p_nodes;
+        xml_find_all(dgm_t, "p", p_nodes);
+        for (size_t pi = 0; pi < p_nodes.size(); ++pi) {
+            if (pi > 0) pt_text += " ";
+            std::vector<pugi::xml_node> r_nodes;
+            xml_find_all(p_nodes[pi], "r", r_nodes);
+            for (auto& r : r_nodes) {
+                auto at = xml_child(r, "t");
+                if (at) pt_text += xml_text_content(at);
+            }
+        }
+
+        if (!pt_text.empty()) {
+            if (!result.empty()) result += "\n";
+            result += pt_text;
+        }
+    }
+    return result;
+}
+
+// ── Notes text extraction ───────────────────────────────
+
+std::string PptxParser::extract_notes_text(const std::string& notes_path) {
+    if (!zip_.has_entry(notes_path)) return "";
+    auto data = zip_.read_entry(notes_path);
+    pugi::xml_document doc;
+    if (!doc.load_buffer(data.data(), data.size())) return "";
+
+    // Notes slide has <p:cSld><p:spTree><p:sp> with placeholder type="body"
+    auto cSld = xml_child(doc.first_child(), "cSld");
+    if (!cSld) return "";
+    auto spTree = xml_child(cSld, "spTree");
+    if (!spTree) return "";
+
+    std::string result;
+    for (auto sp = spTree.first_child(); sp; sp = sp.next_sibling()) {
+        const char* name = sp.name();
+        const char* colon = strchr(name, ':');
+        const char* local = colon ? colon + 1 : name;
+        if (strcmp(local, "sp") != 0) continue;
+
+        // Check if this is the notes body (type="body")
+        auto nvSpPr = xml_child(sp, "nvSpPr");
+        if (!nvSpPr) continue;
+        auto nvPr = xml_child(nvSpPr, "nvPr");
+        if (!nvPr) continue;
+        auto ph = xml_child(nvPr, "ph");
+        if (!ph) continue;
+        const char* type = xml_attr(ph, "type");
+        if (strcmp(type, "body") != 0) continue;
+
+        auto txBody = xml_child(sp, "txBody");
+        if (!txBody) continue;
+
+        std::string text = extract_textbody_text(txBody);
+        if (!text.empty()) {
+            if (!result.empty()) result += "\n";
+            result += text;
+        }
+    }
+    return result;
+}
+
 // ── Shape text extraction ───────────────────────────────
 
 static bool is_title_shape(const pugi::xml_node& sp) {
@@ -231,9 +370,63 @@ void PptxParser::extract_text_from_shape(const pugi::xml_node& sp,
     }
 }
 
-void PptxParser::extract_text_from_group(const pugi::xml_node& grpSp,
+void PptxParser::extract_text_from_graphic_frame(
+    const pugi::xml_node& gf,
+    const std::map<std::string, std::string>& rels,
+    SlideContent& content) {
+
+    // Tables
+    std::vector<pugi::xml_node> tables;
+    xml_find_all(gf, "tbl", tables);
+    for (auto& tbl : tables) {
+        auto rows = parse_table(tbl);
+        if (!rows.empty()) {
+            content.tables.push_back(std::move(rows));
+        }
+    }
+
+    // Charts and diagrams via graphicData
+    std::vector<pugi::xml_node> gd_nodes;
+    xml_find_all(gf, "graphicData", gd_nodes);
+    for (auto& gd : gd_nodes) {
+        // Chart: <c:chart r:id="rIdX"/>
+        auto chart_node = xml_child(gd, "chart");
+        if (chart_node) {
+            const char* rid = xml_attr(chart_node, "id");
+            if (rid[0]) {
+                auto it = rels.find(rid);
+                if (it != rels.end()) {
+                    std::string text = extract_chart_text(it->second);
+                    if (!text.empty()) {
+                        if (!content.body_text.empty()) content.body_text += "\n\n";
+                        content.body_text += text;
+                    }
+                }
+            }
+        }
+
+        // SmartArt/Diagram: <dgm:relIds r:dm="rIdX" .../>
+        auto rel_ids = xml_child(gd, "relIds");
+        if (rel_ids) {
+            const char* dm_rid = xml_attr(rel_ids, "dm");
+            if (dm_rid[0]) {
+                auto it = rels.find(dm_rid);
+                if (it != rels.end()) {
+                    std::string text = extract_diagram_text(it->second);
+                    if (!text.empty()) {
+                        if (!content.body_text.empty()) content.body_text += "\n\n";
+                        content.body_text += text;
+                    }
+                }
+            }
+        }
+    }
+}
+
+void PptxParser::extract_text_from_group(const pugi::xml_node& grp_sp,
+                                          const std::map<std::string, std::string>& rels,
                                           SlideContent& content) {
-    for (auto child = grpSp.first_child(); child; child = child.next_sibling()) {
+    for (auto child = grp_sp.first_child(); child; child = child.next_sibling()) {
         const char* name = child.name();
         const char* colon = strchr(name, ':');
         const char* local = colon ? colon + 1 : name;
@@ -241,17 +434,9 @@ void PptxParser::extract_text_from_group(const pugi::xml_node& grpSp,
         if (strcmp(local, "sp") == 0) {
             extract_text_from_shape(child, content);
         } else if (strcmp(local, "grpSp") == 0) {
-            extract_text_from_group(child, content); // recursive
+            extract_text_from_group(child, rels, content);
         } else if (strcmp(local, "graphicFrame") == 0) {
-            // Tables can also appear in graphic frames
-            std::vector<pugi::xml_node> tables;
-            xml_find_all(child, "tbl", tables);
-            for (auto& tbl : tables) {
-                auto rows = parse_table(tbl);
-                if (!rows.empty()) {
-                    content.tables.push_back(std::move(rows));
-                }
-            }
+            extract_text_from_graphic_frame(child, rels, content);
         }
     }
 }
@@ -266,10 +451,11 @@ PptxParser::SlideContent PptxParser::parse_slide(
     pugi::xml_document doc;
     if (!doc.load_buffer(data.data(), data.size(), pugi::parse_default | pugi::parse_ws_pcdata)) return content;
 
+    auto rels = parse_slide_rels(slide_path);
+
     // Find the shape tree: <p:cSld><p:spTree>
     auto cSld = xml_child(doc.first_child(), "cSld");
     if (!cSld) {
-        // Try deeper
         std::vector<pugi::xml_node> cSlds;
         xml_find_all(doc, "cSld", cSlds);
         if (!cSlds.empty()) cSld = cSlds[0];
@@ -288,17 +474,17 @@ PptxParser::SlideContent PptxParser::parse_slide(
         if (strcmp(local, "sp") == 0) {
             extract_text_from_shape(child, content);
         } else if (strcmp(local, "grpSp") == 0) {
-            extract_text_from_group(child, content);
+            extract_text_from_group(child, rels, content);
         } else if (strcmp(local, "graphicFrame") == 0) {
-            // Tables in graphic frames
-            std::vector<pugi::xml_node> tables;
-            xml_find_all(child, "tbl", tables);
-            for (auto& tbl : tables) {
-                auto rows = parse_table(tbl);
-                if (!rows.empty()) {
-                    content.tables.push_back(std::move(rows));
-                }
-            }
+            extract_text_from_graphic_frame(child, rels, content);
+        }
+    }
+
+    // Extract notes from linked notesSlide
+    for (auto& [rid, target] : rels) {
+        if (target.find("notesSlide") != std::string::npos) {
+            content.notes = extract_notes_text(target);
+            break;
         }
     }
 
@@ -457,7 +643,6 @@ std::vector<ImageData> PptxParser::extract_images(
 
 std::string PptxParser::to_markdown(const ConvertOptions& opts) {
     std::ostringstream out;
-    auto all_images = extract_images(opts);
 
     for (size_t i = 0; i < slide_paths_.size(); ++i) {
         int slide_num = static_cast<int>(i) + 1;
@@ -492,6 +677,11 @@ std::string PptxParser::to_markdown(const ConvertOptions& opts) {
             for (auto& table : content.tables) {
                 out << "\n" << format_table(table) << "\n";
             }
+        }
+
+        // Notes
+        if (!content.notes.empty()) {
+            out << "\n> **Notes:** " << content.notes << "\n\n";
         }
     }
 
@@ -549,6 +739,10 @@ std::vector<PageChunk> PptxParser::to_chunks(
                 chunk.tables.push_back(table);
                 text << "\n" << format_table(table) << "\n";
             }
+        }
+
+        if (!content.notes.empty()) {
+            text << "\n> **Notes:** " << content.notes << "\n\n";
         }
 
         chunk.text = text.str();

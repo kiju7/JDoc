@@ -32,16 +32,25 @@ private:
     struct SlideContent {
         std::string title;
         std::string body_text;
+        std::string notes;
         std::vector<std::vector<std::vector<std::string>>> tables;
     };
 
     SlideContent parse_slide(const std::string& slide_path);
     void extract_text_from_shape(const pugi::xml_node& sp,
                                   SlideContent& content);
-    void extract_text_from_group(const pugi::xml_node& grpSp,
+    void extract_text_from_group(const pugi::xml_node& grp_sp,
+                                  const std::map<std::string, std::string>& rels,
                                   SlideContent& content);
+    void extract_text_from_graphic_frame(
+        const pugi::xml_node& gf,
+        const std::map<std::string, std::string>& rels,
+        SlideContent& content);
     std::vector<std::vector<std::string>> parse_table(
         const pugi::xml_node& tbl);
+    std::string extract_chart_text(const std::string& chart_path);
+    std::string extract_diagram_text(const std::string& diagram_data_path);
+    std::string extract_notes_text(const std::string& notes_path);
 
     std::vector<ImageData> extract_images(
         const ConvertOptions& opts);
