@@ -925,10 +925,10 @@ private:
         std::string ext = ref.extension;
         if (ext.empty()) ext = "jpg";
 
-        // When images not requested, emit markdown reference without loading data
+        // When images not requested, emit embedded reference without loading data
         if (!opts_.extract_images) {
             image_idx++;
-            return "![" + entry->name + "](" + entry->name + ")\n\n";
+            return "![" + entry->name + "](embedded:" + entry->name + ")\n\n";
         }
 
         // Lazy load from OLE storage
@@ -963,8 +963,7 @@ private:
 
         image_idx++;
 
-        std::string ref_path = saved_path.empty() ? entry->name : saved_path;
-        return "![" + entry->name + "](" + ref_path + ")\n\n";
+        return "![" + entry->name + "](" + opts_.image_ref_prefix + entry->name + ")\n\n";
     }
 
     // ── Paragraph to Markdown ───────────────────────────────
