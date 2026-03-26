@@ -12,8 +12,6 @@
 #include <fstream>
 #include <string>
 #include <vector>
-#include <algorithm>
-#include <mutex>
 
 // ---------------------------------------------------------------------------
 // Internal helpers
@@ -21,10 +19,6 @@
 
 enum class FileFormat { PDF, OFFICE, HWP, HWPX, UNKNOWN };
 
-// PDFium is NOT thread-safe — even separate document handles crash
-// under concurrent access. All PDF calls must be serialized.
-// Other formats (OOXML, HWP, HWPX) are safe for concurrent use.
-static std::mutex g_pdf_mutex;
 
 static std::string get_ext(const std::string& path) {
     auto dot = path.rfind('.');
@@ -106,11 +100,8 @@ static char* strdup_cpp(const std::string& s) {
 static std::vector<jdoc::PageChunk> parse_chunks(const std::string& path,
                                                    FileFormat fmt,
                                                    const jdoc::ConvertOptions& opts) {
-    if (fmt == FileFormat::PDF) {
-        std::lock_guard<std::mutex> lock(g_pdf_mutex);
-        return jdoc::pdf_to_markdown_chunks(path, opts);
-    }
     switch (fmt) {
+        case FileFormat::PDF:    return jdoc::pdf_to_markdown_chunks(path, opts);
         case FileFormat::HWPX:   return jdoc::hwpx_to_markdown_chunks(path, opts);
         case FileFormat::HWP:    return jdoc::hwp_to_markdown_chunks(path, opts);
         case FileFormat::OFFICE: return jdoc::office_to_markdown_chunks(path, opts);
@@ -195,16 +186,12 @@ char* jdoc_extract_text(const char* file_path, char* err_buf, int err_buf_size) 
         opts.extract_tables = true;
 
         std::string text;
-        if (fmt == FileFormat::PDF) {
-            std::lock_guard<std::mutex> lock(g_pdf_mutex);
-            text = jdoc::pdf_to_markdown(path, opts);
-        } else {
-            switch (fmt) {
-                case FileFormat::HWPX:   text = jdoc::hwpx_to_markdown(path, opts); break;
-                case FileFormat::HWP:    text = jdoc::hwp_to_markdown(path, opts); break;
-                case FileFormat::OFFICE: text = jdoc::office_to_markdown(path, opts); break;
-                default: break;
-            }
+        switch (fmt) {
+            case FileFormat::PDF:    text = jdoc::pdf_to_markdown(path, opts); break;
+            case FileFormat::HWPX:   text = jdoc::hwpx_to_markdown(path, opts); break;
+            case FileFormat::HWP:    text = jdoc::hwp_to_markdown(path, opts); break;
+            case FileFormat::OFFICE: text = jdoc::office_to_markdown(path, opts); break;
+            default: break;
         }
         return strdup_cpp(text);
     } catch (const std::exception& e) {
@@ -238,9 +225,7 @@ int jdoc_extract_images(const char* file_path, JDocImage** out_images,
         opts.extract_images = true;
         opts.page_chunks = true;
 
-
         auto chunks = parse_chunks(path, fmt, opts);
-
         return build_images(chunks, out_images, err_buf, err_buf_size);
     } catch (const std::exception& e) {
         set_error(err_buf, err_buf_size, e.what());
@@ -274,7 +259,6 @@ char* jdoc_extract_all(const char* file_path,
         opts.extract_images = true;
         opts.extract_tables = true;
         opts.page_chunks = true;
-
 
         auto chunks = parse_chunks(path, fmt, opts);
 
@@ -318,7 +302,6 @@ char* jdoc_extract_all_paged(const char* file_path,
         opts.extract_images = true;
         opts.extract_tables = true;
         opts.page_chunks = true;
-
 
         auto chunks = parse_chunks(path, fmt, opts);
 
