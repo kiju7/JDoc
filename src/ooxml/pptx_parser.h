@@ -29,38 +29,43 @@ private:
 
     void enumerate_slides();
 
+    struct SlideElement {
+        enum Kind : uint8_t { TEXT, IMAGE, TABLE };
+        Kind kind;
+        std::string text;   // TEXT: markdown content, IMAGE: media path in ZIP
+        std::vector<std::vector<std::string>> rows;  // TABLE only
+    };
+
     struct SlideContent {
         std::string title;
-        std::string body_text;
         std::string notes;
-        std::vector<std::vector<std::vector<std::string>>> tables;
+        std::vector<SlideElement> elements;
     };
 
     SlideContent parse_slide(const std::string& slide_path);
-    void extract_text_from_shape(const pugi::xml_node& sp,
-                                  SlideContent& content);
-    void extract_text_from_group(const pugi::xml_node& grp_sp,
-                                  const std::map<std::string, std::string>& rels,
-                                  SlideContent& content);
-    void extract_text_from_graphic_frame(
-        const pugi::xml_node& gf,
-        const std::map<std::string, std::string>& rels,
-        SlideContent& content);
+    void extract_shape(const pugi::xml_node& sp,
+                       const std::map<std::string, std::string>& rels,
+                       SlideContent& content);
+    void extract_group(const pugi::xml_node& grp_sp,
+                       const std::map<std::string, std::string>& rels,
+                       SlideContent& content);
+    void extract_graphic_frame(const pugi::xml_node& gf,
+                               const std::map<std::string, std::string>& rels,
+                               SlideContent& content);
+    void extract_picture(const pugi::xml_node& pic,
+                         const std::map<std::string, std::string>& rels,
+                         SlideContent& content);
     std::vector<std::vector<std::string>> parse_table(
         const pugi::xml_node& tbl);
     std::string extract_chart_text(const std::string& chart_path);
     std::string extract_diagram_text(const std::string& diagram_data_path);
     std::string extract_notes_text(const std::string& notes_path);
 
-    std::vector<ImageData> extract_images(
-        const ConvertOptions& opts);
+    ImageData extract_image_data(const std::string& media_path,
+                                 int page_number,
+                                 const ConvertOptions& opts);
 
-    // Parse slide relationships to map rId -> media target
     std::map<std::string, std::string> parse_slide_rels(const std::string& slide_path);
-
-    // Collect image rIds referenced in a slide's shape tree
-    void collect_image_rids(const pugi::xml_node& node,
-                            std::vector<std::string>& rids);
 
     std::string format_table(
         const std::vector<std::vector<std::string>>& rows);
