@@ -11,11 +11,11 @@
 namespace jdoc {
 
 // Special FAT values.
-static constexpr uint32_t ENDOFCHAIN  = 0xFFFFFFFE;
-static constexpr uint32_t FREESECT    = 0xFFFFFFFF;
-static constexpr uint32_t FATSECT     = 0xFFFFFFFD;
-static constexpr uint32_t DIFSECT     = 0xFFFFFFFC;
-static constexpr uint32_t NOSTREAM    = 0xFFFFFFFF;
+static constexpr uint32_t ENDOFCHAIN = 0xFFFFFFFE;
+static constexpr uint32_t FREESECT   = 0xFFFFFFFF;
+static constexpr uint32_t FATSECT    = 0xFFFFFFFD;
+static constexpr uint32_t DIFSECT    = 0xFFFFFFFC;
+static constexpr uint32_t NOSTREAM   = 0xFFFFFFFF;
 
 // Expected magic signature.
 static const uint8_t kOleMagic[8] = {
