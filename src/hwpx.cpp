@@ -102,6 +102,7 @@ private:
     std::map<std::string, std::vector<hwp::FaceNameInfo>> font_faces_;  // lang -> fonts
     std::vector<std::string> section_paths_;
     std::vector<std::string> footnotes_;
+    int page_num_ = 1;
 
     // ── content.hpf parsing ─────────────────────────────────
     void parse_content_hpf() {
@@ -291,6 +292,8 @@ private:
         int image_idx = 0;
 
         footnotes_.clear();
+        page_num_ = 1;
+        md += "--- Page 1 ---\n\n";
         process_paragraphs(sec, md, chunk, size_counts, image_idx, 0);
 
         // Append collected footnotes/endnotes
@@ -341,6 +344,11 @@ private:
         for (auto child : parent.children()) {
             std::string name = child.name();
             if (name == "hp:p") {
+                // Check for page break before this paragraph
+                int pb = child.attribute("pageBreak").as_int(0);
+                if (pb == 1 && !md.empty()) {
+                    md += "\n--- Page " + std::to_string(++page_num_) + " ---\n\n";
+                }
                 process_paragraph(child, md, chunk, size_counts, image_idx);
             } else if (depth < 3) {
                 // Recurse into containers (but not too deep - avoid secPr etc.)
@@ -740,9 +748,7 @@ std::string hwpx_to_markdown(const std::string& hwpx_path, ConvertOptions opts) 
 
     std::string result;
     for (size_t i = 0; i < chunks.size(); i++) {
-        if (i > 0) {
-            result += "\n--- Page " + std::to_string(chunks[i].page_number) + " ---\n\n";
-        }
+        if (i > 0) result += "\n";
         if (plaintext)
             result += util::strip_markdown(chunks[i].text);
         else

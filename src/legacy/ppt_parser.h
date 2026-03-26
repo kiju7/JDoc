@@ -30,6 +30,7 @@ private:
         std::string title;
         std::string body;
         std::string notes;
+        std::vector<int> blip_indices;  // 1-based BLIP refs from shapes
     };
 
     std::vector<Slide> slides_;
