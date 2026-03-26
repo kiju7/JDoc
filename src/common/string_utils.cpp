@@ -53,49 +53,39 @@ std::string cp1252_to_utf8(uint8_t ch) {
 // Johab/Wansung ordering that maps to the Unicode Hangul Syllables block
 // U+AC00..U+D7A3. This avoids shipping a 170KB lookup table.
 
+// KS X 1001 mapping tables generated from Python codecs cp949
+#include "cp949_tables.inc"
+
 static uint32_t cp949_pair_to_unicode(uint8_t lead, uint8_t trail) {
     // KS X 1001 Hangul syllables: lead 0xB0-0xC8, trail 0xA1-0xFE
-    // These map sequentially to Unicode Hangul Syllables U+AC00+
     if (lead >= 0xB0 && lead <= 0xC8 && trail >= 0xA1 && trail <= 0xFE) {
-        int row = lead - 0xB0;
-        int col = trail - 0xA1;
-        int idx = row * 94 + col;
-        // 2350 Hangul syllables in KS X 1001, mapped to U+AC00..U+D7A3
-        if (idx < 2350) {
-            // The KS X 1001 ordering doesn't map linearly to Unicode,
-            // but for the common Hangul block we can use the standard
-            // Wansung index. The actual mapping requires a table for
-            // exact correspondence, so we use a computational fallback.
-            // This produces correct results for the vast majority of text.
-            return 0xAC00 + idx;
-        }
+        int idx = (lead - 0xB0) * 94 + (trail - 0xA1);
+        if (idx < 2350) return KSX1001_HANGUL[idx];
+    }
+
+    // KS X 1001 symbols/Latin: lead 0xA1-0xAF, trail 0xA1-0xFE
+    if (lead >= 0xA1 && lead <= 0xAF && trail >= 0xA1 && trail <= 0xFE) {
+        int idx = (lead - 0xA1) * 94 + (trail - 0xA1);
+        if (idx < 1410) return KSX1001_SYMBOLS[idx];
     }
 
     // KS X 1001 Hanja: lead 0xCA-0xFD, trail 0xA1-0xFE
-    // KS X 1001 symbols/Latin: lead 0xA1-0xAF, trail 0xA1-0xFE
-    // For symbols in 0xA1-0xAF range: compute linear index
-    if (lead >= 0xA1 && lead <= 0xAF && trail >= 0xA1 && trail <= 0xFE) {
-        // Common symbols — return replacement for now as exact table needed
-        // Most important: 0xA1A1 = ideographic space (U+3000)
-        if (lead == 0xA1 && trail == 0xA1) return 0x3000;
-        if (lead == 0xA1 && trail == 0xA2) return 0x3001; // ideographic comma
-        if (lead == 0xA1 && trail == 0xA3) return 0x3002; // ideographic period
-        return 0xFFFD; // Unmapped symbol
+    if (lead >= 0xCA && lead <= 0xFD && trail >= 0xA1 && trail <= 0xFE) {
+        int idx = (lead - 0xCA) * 94 + (trail - 0xA1);
+        if (idx < 4888) return KSX1001_HANJA[idx];
     }
 
-    // UHC (Unified Hangul Code) extension: non-KS-X-1001 ranges
-    // lead 0x81-0xA0 with specific trail ranges
-    if (lead >= 0x81 && lead <= 0xA0) {
-        int syllable_idx = -1;
-        if (trail >= 0x41 && trail <= 0x5A) {
-            syllable_idx = (lead - 0x81) * 178 + (trail - 0x41);
-        } else if (trail >= 0x61 && trail <= 0x7A) {
-            syllable_idx = (lead - 0x81) * 178 + 26 + (trail - 0x61);
-        } else if (trail >= 0x81 && trail <= 0xFE) {
-            syllable_idx = (lead - 0x81) * 178 + 52 + (trail - 0x81);
-        }
-        if (syllable_idx >= 0 && syllable_idx < 11172) {
-            return 0xAC00 + syllable_idx;
+    // UHC (Unified Hangul Code) extension: lead 0x81-0xC6
+    // Maps to all 11172 Hangul syllables U+AC00..U+D7A3
+    if (lead >= 0x81 && lead <= 0xC6) {
+        int row = lead - 0x81;
+        int col = -1;
+        if (trail >= 0x41 && trail <= 0x5A)      col = trail - 0x41;
+        else if (trail >= 0x61 && trail <= 0x7A)  col = 26 + (trail - 0x61);
+        else if (trail >= 0x81 && trail <= 0xFE)  col = 52 + (trail - 0x81);
+        if (col >= 0) {
+            int idx = row * 178 + col;
+            if (idx < 11172) return 0xAC00 + idx;
         }
     }
 
