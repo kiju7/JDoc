@@ -4427,7 +4427,7 @@ ImageData render_page_composite(PdfDoc& doc, const PdfObj& page_obj,
             }
         }
 
-        // Stroke: expand line segments into filled quads, then scanline fill
+        // Stroke: expand line segments into filled quads with AA scanline fill
         if (rp.do_stroke) {
             uint8_t sr = static_cast<uint8_t>(std::min(255.0, std::max(0.0, rp.stroke_r * 255)));
             uint8_t sg = static_cast<uint8_t>(std::min(255.0, std::max(0.0, rp.stroke_g * 255)));
@@ -4436,6 +4436,11 @@ ImageData render_page_composite(PdfDoc& doc, const PdfObj& page_obj,
             if (lw < 0.5) lw = 0.5;
             double half = lw / 2.0;
 
+            // Collect all stroke quad edges for AA rendering
+            struct Edge { double x_at_ymin; double inv_slope; int ymin, ymax; };
+            std::vector<Edge> stroke_edges;
+            int s_ymin = rh * AA_V, s_ymax = 0;
+
             for (auto& sp : subpaths) {
                 for (size_t i = 0; i + 1 < sp.size(); i++) {
                     double sx0 = sp[i].first * scale;
@@ -4443,43 +4448,89 @@ ImageData render_page_composite(PdfDoc& doc, const PdfObj& page_obj,
                     double sx1 = sp[i+1].first * scale;
                     double sy1 = (page_h - sp[i+1].second) * scale;
 
-                    // Compute perpendicular normal
                     double dx = sx1 - sx0, dy = sy1 - sy0;
                     double len = std::sqrt(dx*dx + dy*dy);
                     if (len < 0.01) continue;
                     double nx = -dy / len * half;
                     double ny = dx / len * half;
 
-                    // Expand to quad (4 corners)
+                    // Quad corners
                     double qx[4] = {sx0+nx, sx1+nx, sx1-nx, sx0-nx};
                     double qy[4] = {sy0+ny, sy1+ny, sy1-ny, sy0-ny};
 
-                    // Find bounding box
-                    int ymin = static_cast<int>(std::min({qy[0],qy[1],qy[2],qy[3]}));
-                    int ymax = static_cast<int>(std::max({qy[0],qy[1],qy[2],qy[3]})) + 1;
-                    ymin = std::max(0, ymin);
-                    ymax = std::min(rh - 1, ymax);
+                    // Add quad edges to edge list
+                    for (int e = 0; e < 4; e++) {
+                        int e2 = (e + 1) % 4;
+                        double ey0 = qy[e], ey1 = qy[e2];
+                        double ex0 = qx[e], ex1 = qx[e2];
+                        int iy0 = static_cast<int>(std::round(ey0 * AA_V));
+                        int iy1 = static_cast<int>(std::round(ey1 * AA_V));
+                        if (iy0 == iy1) continue;
+                        if (iy0 > iy1) { std::swap(iy0, iy1); std::swap(ex0, ex1); std::swap(ey0, ey1); }
+                        double inv_s = (ex1 - ex0) / (ey1 - ey0) / AA_V * AA_H;
+                        double x_s = ex0 * AA_H + (iy0 / (double)AA_V - ey0) * (ex1 - ex0) / (ey1 - ey0) * AA_H;
+                        stroke_edges.push_back({x_s, inv_s, iy0, iy1});
+                        if (iy0 < s_ymin) s_ymin = iy0;
+                        if (iy1 > s_ymax) s_ymax = iy1;
+                    }
+                }
+            }
 
-                    // Scanline fill the quad
-                    for (int y = ymin; y <= ymax; y++) {
-                        double fy = y + 0.5;
-                        // Find intersections with quad edges
-                        std::vector<double> xs;
-                        for (int e = 0; e < 4; e++) {
-                            int e2 = (e + 1) % 4;
-                            double ey0 = qy[e], ey1 = qy[e2];
-                            if ((fy >= ey0 && fy < ey1) || (fy >= ey1 && fy < ey0)) {
-                                double t = (fy - ey0) / (ey1 - ey0);
-                                xs.push_back(qx[e] + t * (qx[e2] - qx[e]));
+            if (!stroke_edges.empty()) {
+                s_ymin = std::max(0, s_ymin);
+                s_ymax = std::min(rh * AA_V, s_ymax);
+                std::vector<double> xs;  // reused across scanlines
+
+                int prev_row = s_ymin / AA_V;
+                std::vector<int> hits(rw + 1, 0);
+
+                for (int suby = s_ymin; suby < s_ymax; suby++) {
+                    int cur_row = suby / AA_V;
+                    if (cur_row != prev_row) {
+                        for (int x = 0; x < rw; x++) {
+                            if (hits[x] > 0) {
+                                int alpha = hits[x] * 255 / (AA_H * AA_V);
+                                if (alpha > 255) alpha = 255;
+                                canvas.blend_pixel(x, prev_row, sr, sg, sb, static_cast<uint8_t>(alpha));
                             }
                         }
-                        if (xs.size() >= 2) {
-                            std::sort(xs.begin(), xs.end());
-                            int x0 = std::max(0, static_cast<int>(xs[0]));
-                            int x1 = std::min(rw - 1, static_cast<int>(xs.back()));
-                            for (int x = x0; x <= x1; x++)
-                                canvas.blend_pixel(x, y, sr, sg, sb, 255);
+                        std::fill(hits.begin(), hits.end(), 0);
+                        prev_row = cur_row;
+                    }
+
+                    xs.clear();
+                    for (auto& e : stroke_edges) {
+                        if (suby >= e.ymin && suby < e.ymax) {
+                            xs.push_back(e.x_at_ymin + (suby - e.ymin) * e.inv_slope);
                         }
+                    }
+                    std::sort(xs.begin(), xs.end());
+
+                    for (size_t j = 0; j + 1 < xs.size(); j += 2) {
+                        double fx0 = xs[j] / AA_H;
+                        double fx1 = xs[j+1] / AA_H;
+                        int ix0 = static_cast<int>(fx0);
+                        int ix1 = static_cast<int>(fx1);
+                        if (ix0 < 0) ix0 = 0;
+                        if (ix1 >= rw) ix1 = rw - 1;
+
+                        if (ix0 == ix1) {
+                            hits[ix0] += static_cast<int>((fx1 - fx0) * AA_H);
+                        } else {
+                            hits[ix0] += static_cast<int>((ix0 + 1 - fx0) * AA_H);
+                            for (int x = ix0 + 1; x < ix1; x++)
+                                hits[x] += AA_H;
+                            if (ix1 < rw)
+                                hits[ix1] += static_cast<int>((fx1 - ix1) * AA_H);
+                        }
+                    }
+                }
+                // Flush last row
+                for (int x = 0; x < rw; x++) {
+                    if (hits[x] > 0) {
+                        int alpha = hits[x] * 255 / (AA_H * AA_V);
+                        if (alpha > 255) alpha = 255;
+                        canvas.blend_pixel(x, prev_row, sr, sg, sb, static_cast<uint8_t>(alpha));
                     }
                 }
             }
