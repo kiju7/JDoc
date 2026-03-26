@@ -4,10 +4,12 @@
 #include "doc_parser.h"
 #include "common/string_utils.h"
 #include "common/binary_utils.h"
+#include "common/file_utils.h"
 
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <fstream>
 #include <sstream>
 
 namespace jdoc {
@@ -395,42 +397,94 @@ std::string DocParser::text_to_markdown(const std::string& raw_text) {
         lines.push_back(line);
     }
 
+    // Helper: check if a line contains tab-separated cells (table row)
+    auto count_tabs = [](const std::string& s) {
+        int n = 0;
+        for (char c : s) if (c == '\t') n++;
+        return n;
+    };
+
+    // Helper: convert tab-separated line to markdown table row
+    auto tabs_to_row = [](const std::string& s) {
+        std::string row = "|";
+        std::string cell;
+        for (char c : s) {
+            if (c == '\t') {
+                for (auto& ch : cell) { if (ch == '|') ch = '/'; if (ch == '\n') ch = ' '; }
+                row += " " + cell + " |";
+                cell.clear();
+            } else {
+                cell += c;
+            }
+        }
+        for (auto& ch : cell) { if (ch == '|') ch = '/'; if (ch == '\n') ch = ' '; }
+        row += " " + cell + " |";
+        return row;
+    };
+
     std::string md;
     md.reserve(raw_text.size() * 2);
+    int consecutive_empty = 0;
+    bool found_title = false;
 
     for (size_t i = 0; i < lines.size(); ++i) {
         const std::string& ln = lines[i];
+
+        // Limit consecutive empty lines to 1
         if (ln.empty()) {
-            md.push_back('\n');
+            consecutive_empty++;
+            if (consecutive_empty <= 1) md.push_back('\n');
+            continue;
+        }
+        consecutive_empty = 0;
+
+        // Table detection: 2+ tabs in consecutive lines
+        int tabs = count_tabs(ln);
+        if (tabs >= 2) {
+            // Collect all consecutive tab-separated rows
+            size_t tbl_start = i;
+            int max_cols = tabs + 1;
+            while (i < lines.size() && count_tabs(lines[i]) >= 2) {
+                max_cols = std::max(max_cols, count_tabs(lines[i]) + 1);
+                i++;
+            }
+            // Emit markdown table
+            for (size_t r = tbl_start; r < i; r++) {
+                md += tabs_to_row(lines[r]) + "\n";
+                if (r == tbl_start) {
+                    md += "|";
+                    for (int c = 0; c < max_cols; c++) md += " --- |";
+                    md += "\n";
+                }
+            }
+            md += "\n";
+            i--; // will be incremented by for loop
             continue;
         }
 
-        // Check for bullet characters.
+        // Bullet detection
         bool is_bullet = false;
         std::string content = ln;
-        if (!ln.empty()) {
-            char first = ln[0];
-            if (first == '-' || first == '*') {
-                if (ln.size() > 1 && (ln[1] == ' ' || ln[1] == '\t')) {
-                    is_bullet = true;
-                    content = ln.substr(2);
-                }
-            } else if (ln.size() >= 3 &&
-                       static_cast<uint8_t>(ln[0]) == 0xE2 &&
-                       static_cast<uint8_t>(ln[1]) == 0x80 &&
-                       static_cast<uint8_t>(ln[2]) == 0xA2) {
+        char first = ln[0];
+        if (first == '-' || first == '*') {
+            if (ln.size() > 1 && (ln[1] == ' ' || ln[1] == '\t')) {
                 is_bullet = true;
-                content = ln.substr(3);
-                while (!content.empty() && content[0] == ' ') content = content.substr(1);
+                content = ln.substr(2);
             }
+        } else if (ln.size() >= 3 &&
+                   static_cast<uint8_t>(ln[0]) == 0xE2 &&
+                   static_cast<uint8_t>(ln[1]) == 0x80 &&
+                   static_cast<uint8_t>(ln[2]) == 0xA2) {
+            is_bullet = true;
+            content = ln.substr(3);
+            while (!content.empty() && content[0] == ' ') content = content.substr(1);
         }
-
         if (is_bullet) {
             md += "- " + content + "\n";
             continue;
         }
 
-        // Check for ordered list.
+        // Ordered list
         {
             size_t j = 0;
             while (j < ln.size() && ln[j] >= '0' && ln[j] <= '9') ++j;
@@ -443,14 +497,19 @@ std::string DocParser::text_to_markdown(const std::string& raw_text) {
             }
         }
 
-        // Heading heuristic: short non-empty line followed by longer text.
+        // First non-empty content line → title (H1)
+        if (!found_title && ln.size() < 120) {
+            md += "# " + ln + "\n\n";
+            found_title = true;
+            continue;
+        }
+
+        // Heading heuristic: short line followed by longer text
         bool is_heading = false;
-        if (ln.size() < 80 && ln.size() > 0) {
+        if (ln.size() < 80) {
             for (size_t k = i + 1; k < lines.size() && k <= i + 3; ++k) {
                 if (lines[k].empty()) continue;
-                if (lines[k].size() > ln.size()) {
-                    is_heading = true;
-                }
+                if (lines[k].size() > ln.size()) is_heading = true;
                 break;
             }
         }
@@ -555,64 +614,80 @@ std::vector<ImageData> DocParser::extract_images() {
         pos = img_end;
     }
 
-    // Also check for OfficeArt BLIP records in the "Data" stream.
+    // Parse OfficeArt records in the "Data" stream for BLIP images.
+    // Handles both standalone BLIPs and BLIPs inline within FBSE records.
     if (ole_.has_stream("Data")) {
         const auto& data = ole_.read_stream("Data");
+
+        auto extract_blip = [&](size_t blip_pos, size_t blip_end) {
+            if (blip_pos + 8 > blip_end) return;
+            uint16_t bvi = util::read_u16_le(data.data() + blip_pos);
+            uint16_t btype = util::read_u16_le(data.data() + blip_pos + 2);
+            uint32_t blen = util::read_u32_le(data.data() + blip_pos + 4);
+            uint16_t binst = bvi >> 4;
+
+            std::string fmt;
+            if (btype == 0xF01D) fmt = "jpeg";
+            else if (btype == 0xF01E) fmt = "png";
+            else if (btype == 0xF01A) fmt = "emf";
+            else if (btype == 0xF01B) fmt = "wmf";
+            else if (btype == 0xF01F) fmt = "bmp";
+            else if (btype == 0xF029) fmt = "tiff";
+            if (fmt.empty()) return;
+
+            // BLIP header: 8 (record) + 16 (UID) + 1 (tag) = 25 bytes
+            // Two-UID variant: 8 + 32 + 1 = 41 bytes
+            size_t skip = 25;
+            if (binst == 0x46B || binst == 0x6E1 || binst == 0x6E3 || binst == 0x6E5)
+                skip = 41;
+
+            size_t img_start = blip_pos + skip;
+            size_t img_end = std::min(blip_pos + 8 + blen, blip_end);
+            if (img_start >= img_end) return;
+            size_t img_size = img_end - img_start;
+
+            // Deduplicate by first 64 bytes
+            for (const auto& existing : images) {
+                if (existing.data.size() == img_size) {
+                    if (std::memcmp(existing.data.data(), data.data() + img_start,
+                                    std::min(size_t(64), img_size)) == 0)
+                        return;
+                }
+            }
+
+            ImageData img;
+            img.page_number = 1;
+            img.name = "image_" + std::to_string(++img_idx);
+            img.format = fmt;
+            img.data.assign(data.begin() + img_start, data.begin() + img_start + img_size);
+            images.push_back(std::move(img));
+        };
+
         pos = 0;
         while (pos + 8 < data.size()) {
-            uint16_t rec_ver_inst = util::read_u16_le(data.data() + pos);
-            uint16_t rec_type     = util::read_u16_le(data.data() + pos + 2);
-            uint32_t rec_len      = util::read_u32_le(data.data() + pos + 4);
+            uint16_t rvi = util::read_u16_le(data.data() + pos);
+            uint16_t rtype = util::read_u16_le(data.data() + pos + 2);
+            uint32_t rlen = util::read_u32_le(data.data() + pos + 4);
 
-            if (rec_type >= 0xF01A && rec_type <= 0xF029 &&
-                rec_len > 17 && pos + 8 + rec_len <= data.size()) {
-                size_t header_skip = 17;
-                uint16_t inst = rec_ver_inst >> 4;
-                if (rec_type == 0xF01D || rec_type == 0xF01E ||
-                    rec_type == 0xF01F || rec_type == 0xF029) {
-                    if (inst == 0x46B || inst == 0x6E1 ||
-                        inst == 0x6E3 || inst == 0x6E5) {
-                        header_skip = 33;
-                    }
+            if (rtype >= 0xF000 && rtype <= 0xF200 && pos + 8 + rlen <= data.size()) {
+                if (rtype == 0xF000 || rtype == 0xF001) {
+                    // Container — descend into children
+                    pos += 8;
+                    continue;
                 }
-
-                if (rec_len > header_skip) {
-                    std::string fmt;
-                    if (rec_type == 0xF01D) fmt = "jpeg";
-                    else if (rec_type == 0xF01E) fmt = "png";
-                    else if (rec_type == 0xF01A) fmt = "emf";
-                    else if (rec_type == 0xF01B) fmt = "wmf";
-                    else if (rec_type == 0xF01F) fmt = "bmp";
-                    else if (rec_type == 0xF029) fmt = "tiff";
-
-                    if (!fmt.empty()) {
-                        size_t img_offset = pos + 8 + header_skip;
-                        size_t img_size = rec_len - header_skip;
-
-                        // Avoid duplicates.
-                        bool duplicate = false;
-                        for (const auto& existing : images) {
-                            if (existing.data.size() == img_size && img_offset + img_size <= data.size()) {
-                                if (std::memcmp(existing.data.data(), data.data() + img_offset,
-                                                std::min(size_t(64), img_size)) == 0) {
-                                    duplicate = true;
-                                    break;
-                                }
-                            }
-                        }
-
-                        if (!duplicate && img_offset + img_size <= data.size()) {
-                            ImageData img;
-                            img.page_number = 1;
-                            img.name = "image_" + std::to_string(++img_idx);
-                            img.format = fmt;
-                            img.data.assign(data.begin() + img_offset,
-                                            data.begin() + img_offset + img_size);
-                            images.push_back(std::move(img));
-                        }
+                if (rtype == 0xF007 && rlen >= 36) {
+                    // FBSE — may contain inline BLIP after 36-byte header
+                    uint8_t cbName = data[pos + 8 + 33];
+                    size_t blip_start = pos + 8 + 36 + cbName;
+                    size_t fbse_end = pos + 8 + rlen;
+                    if (blip_start + 8 < fbse_end) {
+                        extract_blip(blip_start, fbse_end);
                     }
+                } else if (rtype >= 0xF01A && rtype <= 0xF029) {
+                    // Standalone BLIP
+                    extract_blip(pos, pos + 8 + rlen);
                 }
-                pos += 8 + rec_len;
+                pos += 8 + rlen;
             } else {
                 ++pos;
             }
@@ -630,11 +705,15 @@ std::string DocParser::to_markdown(const ConvertOptions& opts) {
 
     if (opts.extract_images) {
         auto images = extract_images();
-        if (!images.empty()) {
-            md += "\n\n---\n\n";
-            for (size_t i = 0; i < images.size(); ++i) {
-                md += "![" + images[i].name + "](" + images[i].name + "." + images[i].format + ")\n\n";
+        for (auto& img : images) {
+            std::string filename = img.name + "." + img.format;
+            if (!opts.image_output_dir.empty() && !img.data.empty()) {
+                util::ensure_dir(opts.image_output_dir);
+                std::string path = opts.image_output_dir + "/" + filename;
+                std::ofstream ofs(path, std::ios::binary);
+                if (ofs) ofs.write(img.data.data(), img.data.size());
             }
+            md += "\n![" + filename + "](" + filename + ")\n";
         }
     }
 
