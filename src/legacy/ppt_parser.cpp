@@ -282,15 +282,22 @@ std::string PptParser::slide_to_markdown(const Slide& slide) {
         }
     }
 
-    // Append notes if present
+    // Append notes if present (blockquote style, matching PPTX)
     if (!slide.notes.empty()) {
-        out << "\n**Notes:**\n";
         std::istringstream niss(slide.notes);
         std::string nline;
+        bool first = true;
         while (std::getline(niss, nline)) {
             while (!nline.empty() && (nline.back() == '\r' || nline.back() == ' '))
                 nline.pop_back();
-            if (!nline.empty()) out << nline << "\n";
+            if (!nline.empty()) {
+                if (first) {
+                    out << "\n> **Notes:** " << nline << "\n";
+                    first = false;
+                } else {
+                    out << "> " << nline << "\n";
+                }
+            }
         }
     }
 
