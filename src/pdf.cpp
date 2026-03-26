@@ -133,38 +133,38 @@ struct PdfLexer {
     std::string read_token() {
         skip_ws();
         if (pos >= len) return "";
-        std::string tok;
         uint8_t c = data[pos];
-        if (c == '/' ) {
+        if (c == '/') {
             pos++;
-            while (pos < len && !is_ws(data[pos]) && !is_delim(data[pos]))
-                tok += static_cast<char>(data[pos++]);
-            return "/" + tok;
+            size_t start = pos;
+            while (pos < len && !is_ws(data[pos]) && !is_delim(data[pos])) pos++;
+            std::string tok("/", 1);
+            tok.append(reinterpret_cast<const char*>(data + start), pos - start);
+            return tok;
         }
         if (is_delim(c)) { pos++; return std::string(1, static_cast<char>(c)); }
-        while (pos < len && !is_ws(data[pos]) && !is_delim(data[pos]))
-            tok += static_cast<char>(data[pos++]);
-        return tok;
+        size_t start = pos;
+        while (pos < len && !is_ws(data[pos]) && !is_delim(data[pos])) pos++;
+        return std::string(reinterpret_cast<const char*>(data + start), pos - start);
     }
 
     std::string read_hex_string() {
-        std::string hex;
-        while (pos < len && data[pos] != '>') {
-            uint8_t c = data[pos++];
-            if (!is_ws(c)) hex += static_cast<char>(c);
-        }
-        if (pos < len) pos++; // skip >
-        if (hex.size() & 1) hex += '0';
+        auto hex_val = [](uint8_t c) -> int {
+            if (c >= '0' && c <= '9') return c - '0';
+            if (c >= 'a' && c <= 'f') return 10 + c - 'a';
+            if (c >= 'A' && c <= 'F') return 10 + c - 'A';
+            return -1;
+        };
         std::string result;
-        for (size_t i = 0; i + 1 < hex.size(); i += 2) {
-            auto hex_val = [](char c) -> int {
-                if (c >= '0' && c <= '9') return c - '0';
-                if (c >= 'a' && c <= 'f') return 10 + c - 'a';
-                if (c >= 'A' && c <= 'F') return 10 + c - 'A';
-                return 0;
-            };
-            result += static_cast<char>((hex_val(hex[i]) << 4) | hex_val(hex[i + 1]));
+        int hi = -1;
+        while (pos < len && data[pos] != '>') {
+            int v = hex_val(data[pos++]);
+            if (v < 0) continue;
+            if (hi < 0) { hi = v; }
+            else { result += static_cast<char>((hi << 4) | v); hi = -1; }
         }
+        if (hi >= 0) result += static_cast<char>(hi << 4);
+        if (pos < len) pos++;
         return result;
     }
 
@@ -1314,6 +1314,7 @@ struct GfxState {
     double line_width = 1;
     int line_cap = 0, line_join = 0;
     double miter_limit = 10;
+    bool in_text = false;
 };
 
 static void mat_multiply(double* out, const double* a, const double* b) {
@@ -1367,18 +1368,31 @@ struct ContentParseResult {
 };
 
 ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>& stream,
-                                         const PdfObj& resources, double page_height) {
+                                         const PdfObj& resources, double page_height,
+                                         std::unordered_map<int, PdfFont>* font_cache = nullptr,
+                                         bool skip_graphics = false) {
     ContentParseResult result;
 
-    // Load fonts from resources
+    // Load fonts from resources, using cross-page cache when available
     std::unordered_map<std::string, PdfFont> fonts;
     auto res = doc.resolve(resources);
     auto& font_dict = res.get("Font");
     if (!font_dict.is_none()) {
         auto fd = doc.resolve(font_dict);
         if (fd.is_dict()) {
-            for (auto& [name, ref] : fd.dict)
+            for (auto& [name, ref] : fd.dict) {
+                int rn = ref.is_ref() ? ref.ref_num : -1;
+                if (font_cache && rn >= 0) {
+                    auto it = font_cache->find(rn);
+                    if (it != font_cache->end()) {
+                        fonts[name] = it->second;
+                        continue;
+                    }
+                }
                 fonts[name] = load_font(doc, ref);
+                if (font_cache && rn >= 0)
+                    (*font_cache)[rn] = fonts[name];
+            }
         }
     }
 
@@ -1495,11 +1509,20 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
                 else if (c == '.' && !has_dot) { has_dot = true; lex.pos++; }
                 else break;
             }
-            const char* nstart = reinterpret_cast<const char*>(lex.data + start);
-            if (has_dot) {
-                operands.push_back(PdfObj::make_real(std::strtod(nstart, nullptr)));
+            // Inline integer parse to avoid strtoll overhead
+            const uint8_t* ndata = lex.data + start;
+            size_t nlen = lex.pos - start;
+            if (!has_dot && nlen <= 10) {
+                int64_t val = 0;
+                bool neg = false;
+                size_t i = 0;
+                if (ndata[0] == '-') { neg = true; i = 1; }
+                else if (ndata[0] == '+') { i = 1; }
+                for (; i < nlen; i++) val = val * 10 + (ndata[i] - '0');
+                operands.push_back(PdfObj::make_int(neg ? -val : val));
             } else {
-                operands.push_back(PdfObj::make_int(std::strtoll(nstart, nullptr, 10)));
+                operands.push_back(PdfObj::make_real(
+                    std::strtod(reinterpret_cast<const char*>(ndata), nullptr)));
             }
             continue;
         }
@@ -1518,96 +1541,109 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
             continue;
         }
 
-        // Bare keyword → operator
+        // Bare keyword → operator (zero-copy: compare via pointer+length)
         size_t saved = lex.pos;
-        std::string tok;
         while (lex.pos < lex.len && !PdfLexer::is_ws(lex.data[lex.pos]) && !PdfLexer::is_delim(lex.data[lex.pos]))
-            tok += static_cast<char>(lex.data[lex.pos++]);
-        if (tok.empty()) { lex.pos++; continue; }
-        if (tok == "true") { operands.push_back(PdfObj::make_bool(true)); continue; }
-        if (tok == "false") { operands.push_back(PdfObj::make_bool(false)); continue; }
-        if (tok == "null") continue;
+            lex.pos++;
+        size_t tok_len = lex.pos - saved;
+        if (tok_len == 0) { lex.pos++; continue; }
+        const char* tok_ptr = reinterpret_cast<const char*>(lex.data + saved);
+
+        auto tok_eq = [&](const char* s) {
+            size_t sl = std::strlen(s);
+            return tok_len == sl && std::memcmp(tok_ptr, s, sl) == 0;
+        };
+
+        if (tok_eq("true")) { operands.push_back(PdfObj::make_bool(true)); continue; }
+        if (tok_eq("false")) { operands.push_back(PdfObj::make_bool(false)); continue; }
+        if (tok_eq("null")) continue;
 
         {
-            std::string op = tok;
 
             // ── Graphics State ──
-            if (op == "q") {
+            if (tok_eq("q")) {
                 state_stack.push_back(gs);
-            } else if (op == "Q") {
+            } else if (tok_eq("Q")) {
                 if (!state_stack.empty()) { gs = state_stack.back(); state_stack.pop_back(); }
-            } else if (op == "cm") {
+            } else if (tok_eq("cm")) {
                 if (operands.size() >= 6) {
                     double m[6] = {pop_num(5), pop_num(4), pop_num(3), pop_num(2), pop_num(1), pop_num(0)};
                     double r[6];
                     mat_multiply(r, m, gs.ctm);
                     std::memcpy(gs.ctm, r, sizeof(r));
                 }
-            } else if (op == "w") {
+            } else if (tok_eq("w")) {
                 gs.line_width = pop_num(0);
-            } else if (op == "J") {
+            } else if (tok_eq("J")) {
                 gs.line_cap = static_cast<int>(pop_num(0));
-            } else if (op == "j") {
+            } else if (tok_eq("j")) {
                 gs.line_join = static_cast<int>(pop_num(0));
-            } else if (op == "M") {
+            } else if (tok_eq("M")) {
                 gs.miter_limit = pop_num(0);
             }
 
-            // ── Color ──
-            else if (op == "RG") {
+            // ── Color (skip when graphics not needed) ──
+            else if (skip_graphics && (tok_eq("RG") || tok_eq("rg") || tok_eq("G") ||
+                     tok_eq("g") || tok_eq("K") || tok_eq("k") || tok_eq("SC") ||
+                     tok_eq("SCN") || tok_eq("sc") || tok_eq("scn") || tok_eq("CS") ||
+                     tok_eq("cs"))) {
+                // skip color ops
+            }
+            else if (tok_eq("RG")) {
                 if (operands.size() >= 3) { gs.stroke_r = pop_num(2); gs.stroke_g = pop_num(1); gs.stroke_b = pop_num(0); }
-            } else if (op == "rg") {
+            } else if (tok_eq("rg")) {
                 if (operands.size() >= 3) { gs.fill_r = pop_num(2); gs.fill_g = pop_num(1); gs.fill_b = pop_num(0); }
-            } else if (op == "G") {
+            } else if (tok_eq("G")) {
                 double g = pop_num(0); gs.stroke_r = gs.stroke_g = gs.stroke_b = g;
-            } else if (op == "g") {
+            } else if (tok_eq("g")) {
                 double g = pop_num(0); gs.fill_r = gs.fill_g = gs.fill_b = g;
-            } else if (op == "K") {
+            } else if (tok_eq("K")) {
                 if (operands.size() >= 4) {
                     double c = pop_num(3), m = pop_num(2), y = pop_num(1), k = pop_num(0);
                     gs.stroke_r = 1 - std::min(1.0, c + k);
                     gs.stroke_g = 1 - std::min(1.0, m + k);
                     gs.stroke_b = 1 - std::min(1.0, y + k);
                 }
-            } else if (op == "k") {
+            } else if (tok_eq("k")) {
                 if (operands.size() >= 4) {
                     double c = pop_num(3), m = pop_num(2), y = pop_num(1), k = pop_num(0);
                     gs.fill_r = 1 - std::min(1.0, c + k);
                     gs.fill_g = 1 - std::min(1.0, m + k);
                     gs.fill_b = 1 - std::min(1.0, y + k);
                 }
-            } else if (op == "SC" || op == "SCN") {
+            } else if (tok_eq("SC") || tok_eq("SCN")) {
                 if (operands.size() >= 3) { gs.stroke_r = pop_num(2); gs.stroke_g = pop_num(1); gs.stroke_b = pop_num(0); }
                 else if (operands.size() >= 1) { double g = pop_num(0); gs.stroke_r = gs.stroke_g = gs.stroke_b = g; }
-            } else if (op == "sc" || op == "scn") {
+            } else if (tok_eq("sc") || tok_eq("scn")) {
                 if (operands.size() >= 3) { gs.fill_r = pop_num(2); gs.fill_g = pop_num(1); gs.fill_b = pop_num(0); }
                 else if (operands.size() >= 1) { double g = pop_num(0); gs.fill_r = gs.fill_g = gs.fill_b = g; }
-            } else if (op == "CS" || op == "cs") {
+            } else if (tok_eq("CS") || tok_eq("cs")) {
                 // Colorspace name — just consume
             }
 
             // ── Text ──
-            else if (op == "BT") {
+            else if (tok_eq("BT")) {
                 double id[6] = {1,0,0,1,0,0};
                 std::memcpy(gs.text_mat, id, sizeof(id));
                 std::memcpy(gs.line_mat, id, sizeof(id));
-            } else if (op == "ET") {
-                // nothing
-            } else if (op == "Tf") {
+                gs.in_text = true;
+            } else if (tok_eq("ET")) {
+                gs.in_text = false;
+            } else if (tok_eq("Tf")) {
                 if (operands.size() >= 2) {
                     gs.font_size = pop_num(0);
                     std::string fname = operands[operands.size() - 2].str_val;
                     auto it = fonts.find(fname);
                     gs.font = (it != fonts.end()) ? &it->second : nullptr;
                 }
-            } else if (op == "Td") {
+            } else if (tok_eq("Td")) {
                 if (operands.size() >= 2) {
                     double tx = pop_num(1), ty = pop_num(0);
                     gs.line_mat[4] += tx * gs.line_mat[0] + ty * gs.line_mat[2];
                     gs.line_mat[5] += tx * gs.line_mat[1] + ty * gs.line_mat[3];
                     std::memcpy(gs.text_mat, gs.line_mat, sizeof(gs.text_mat));
                 }
-            } else if (op == "TD") {
+            } else if (tok_eq("TD")) {
                 if (operands.size() >= 2) {
                     double tx = pop_num(1), ty = pop_num(0);
                     gs.text_leading = -ty;
@@ -1615,36 +1651,36 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
                     gs.line_mat[5] += tx * gs.line_mat[1] + ty * gs.line_mat[3];
                     std::memcpy(gs.text_mat, gs.line_mat, sizeof(gs.text_mat));
                 }
-            } else if (op == "Tm") {
+            } else if (tok_eq("Tm")) {
                 if (operands.size() >= 6) {
                     gs.text_mat[0] = pop_num(5); gs.text_mat[1] = pop_num(4);
                     gs.text_mat[2] = pop_num(3); gs.text_mat[3] = pop_num(2);
                     gs.text_mat[4] = pop_num(1); gs.text_mat[5] = pop_num(0);
                     std::memcpy(gs.line_mat, gs.text_mat, sizeof(gs.line_mat));
                 }
-            } else if (op == "T*") {
+            } else if (tok_eq("T*")) {
                 gs.line_mat[4] += -gs.text_leading * gs.line_mat[2];
                 gs.line_mat[5] += -gs.text_leading * gs.line_mat[3];
                 std::memcpy(gs.text_mat, gs.line_mat, sizeof(gs.text_mat));
-            } else if (op == "TL") {
+            } else if (tok_eq("TL")) {
                 gs.text_leading = pop_num(0);
-            } else if (op == "Tc") {
+            } else if (tok_eq("Tc")) {
                 gs.char_spacing = pop_num(0);
-            } else if (op == "Tw") {
+            } else if (tok_eq("Tw")) {
                 gs.word_spacing = pop_num(0);
-            } else if (op == "Tz") {
+            } else if (tok_eq("Tz")) {
                 gs.h_scaling = pop_num(0);
-            } else if (op == "Ts") {
+            } else if (tok_eq("Ts")) {
                 gs.text_rise = pop_num(0);
             }
 
             // ── Text Show ──
-            else if (op == "Tj" || op == "'" || op == "\"") {
-                if (op == "'") {
+            else if (tok_eq("Tj") || tok_eq("'") || tok_eq("\"")) {
+                if (tok_eq("'")) {
                     gs.line_mat[4] += -gs.text_leading * gs.line_mat[2];
                     gs.line_mat[5] += -gs.text_leading * gs.line_mat[3];
                     std::memcpy(gs.text_mat, gs.line_mat, sizeof(gs.text_mat));
-                } else if (op == "\"") {
+                } else if (tok_eq("\"")) {
                     if (operands.size() >= 3) {
                         gs.word_spacing = operands[0].as_num();
                         gs.char_spacing = operands[1].as_num();
@@ -1718,7 +1754,7 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
                         gs.text_mat[5] += advance * gs.text_mat[1];
                     }
                 }
-            } else if (op == "TJ") {
+            } else if (tok_eq("TJ")) {
                 if (!operands.empty() && operands.back().is_arr()) {
                     auto& arr = operands.back().arr;
                     double fs = gs.font_size;
@@ -1789,22 +1825,29 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
                 }
             }
 
-            // ── Path Construction ──
-            else if (op == "m") {
+            // ── Path Construction (skip when graphics not needed) ──
+            else if (skip_graphics && (tok_eq("m") || tok_eq("l") || tok_eq("c") ||
+                     tok_eq("v") || tok_eq("y") || tok_eq("h") || tok_eq("re") ||
+                     tok_eq("S") || tok_eq("s") || tok_eq("f") || tok_eq("F") ||
+                     tok_eq("f*") || tok_eq("B") || tok_eq("B*") || tok_eq("b") ||
+                     tok_eq("b*") || tok_eq("n") || tok_eq("W") || tok_eq("W*"))) {
+                // skip path ops entirely
+            }
+            else if (tok_eq("m")) {
                 if (operands.size() >= 2) {
                     double x = pop_num(1), y = pop_num(0);
                     double tx, ty;
                     transform_point(gs.ctm, x, y, tx, ty);
                     current_path.push_back({tx, ty, PathPoint::MOVE});
                 }
-            } else if (op == "l") {
+            } else if (tok_eq("l")) {
                 if (operands.size() >= 2) {
                     double x = pop_num(1), y = pop_num(0);
                     double tx, ty;
                     transform_point(gs.ctm, x, y, tx, ty);
                     current_path.push_back({tx, ty, PathPoint::LINE});
                 }
-            } else if (op == "c") {
+            } else if (tok_eq("c")) {
                 if (operands.size() >= 6) {
                     double x1 = pop_num(5), y1 = pop_num(4);
                     double x2 = pop_num(3), y2 = pop_num(2);
@@ -1815,7 +1858,7 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
                     transform_point(gs.ctm, x3, y3, pp.x, pp.y);
                     current_path.push_back(pp);
                 }
-            } else if (op == "v") {
+            } else if (tok_eq("v")) {
                 if (operands.size() >= 4) {
                     double x2 = pop_num(3), y2 = pop_num(2);
                     double x3 = pop_num(1), y3 = pop_num(0);
@@ -1830,7 +1873,7 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
                     transform_point(gs.ctm, x3, y3, pp.x, pp.y);
                     current_path.push_back(pp);
                 }
-            } else if (op == "y") {
+            } else if (tok_eq("y")) {
                 if (operands.size() >= 4) {
                     double x1 = pop_num(3), y1 = pop_num(2);
                     double x3 = pop_num(1), y3 = pop_num(0);
@@ -1841,9 +1884,9 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
                     pp.cx2 = pp.x; pp.cy2 = pp.y;
                     current_path.push_back(pp);
                 }
-            } else if (op == "h") {
+            } else if (tok_eq("h")) {
                 current_path.push_back({0, 0, PathPoint::CLOSE});
-            } else if (op == "re") {
+            } else if (tok_eq("re")) {
                 if (operands.size() >= 4) {
                     double x = pop_num(3), y = pop_num(2), w = pop_num(1), h = pop_num(0);
                     double tx, ty;
@@ -1860,7 +1903,7 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
             }
 
             // ── Path Painting ──
-            else if (op == "S") {
+            else if (tok_eq("S")) {
                 if (!filter_white_stroke() && !filter_small_rect())
                     flush_path_segments();
                 { RenderPath rp; rp.points = current_path;
@@ -1869,7 +1912,7 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
                   rp.line_width = gs.line_width; rp.do_fill = false; rp.do_stroke = true;
                   result.paths.push_back(std::move(rp)); }
                 current_path.clear();
-            } else if (op == "s") {
+            } else if (tok_eq("s")) {
                 current_path.push_back({0, 0, PathPoint::CLOSE});
                 if (!filter_white_stroke() && !filter_small_rect())
                     flush_path_segments();
@@ -1879,7 +1922,7 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
                   rp.line_width = gs.line_width; rp.do_fill = false; rp.do_stroke = true;
                   result.paths.push_back(std::move(rp)); }
                 current_path.clear();
-            } else if (op == "f" || op == "F" || op == "f*") {
+            } else if (tok_eq("f") || tok_eq("F") || tok_eq("f*")) {
                 if (!filter_small_rect()) flush_path_segments();
                 { RenderPath rp; rp.points = current_path;
                   rp.fill_r = gs.fill_r; rp.fill_g = gs.fill_g; rp.fill_b = gs.fill_b;
@@ -1887,8 +1930,8 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
                   rp.line_width = gs.line_width; rp.do_fill = true; rp.do_stroke = false;
                   result.paths.push_back(std::move(rp)); }
                 current_path.clear();
-            } else if (op == "B" || op == "B*" || op == "b" || op == "b*") {
-                if (op == "b" || op == "b*")
+            } else if (tok_eq("B") || tok_eq("B*") || tok_eq("b") || tok_eq("b*")) {
+                if (tok_eq("b") || tok_eq("b*"))
                     current_path.push_back({0, 0, PathPoint::CLOSE});
                 if (!filter_white_stroke() && !filter_small_rect())
                     flush_path_segments();
@@ -1898,12 +1941,12 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
                   rp.line_width = gs.line_width; rp.do_fill = true; rp.do_stroke = true;
                   result.paths.push_back(std::move(rp)); }
                 current_path.clear();
-            } else if (op == "n") {
+            } else if (tok_eq("n")) {
                 current_path.clear();
             }
 
             // ── XObject (images) ──
-            else if (op == "Do") {
+            else if (tok_eq("Do")) {
                 if (!operands.empty() && operands.back().is_name()) {
                     std::string xname = operands.back().str_val;
                     auto& xobjects = res.get("XObject");
@@ -2282,9 +2325,18 @@ bool is_scale_row(const PageCharCache& cache, double left, double right,
 
 std::vector<double> find_column_boundaries(
         const std::vector<PdfLineSegment>& v_lines,
+        const std::vector<PdfLineSegment>& h_lines,
         double table_left, double table_right,
-        double table_bot, double table_top) {
+        double table_bot, double table_top,
+        const std::vector<double>& row_ys) {
     double table_height = table_top - table_bot;
+
+    // Compute average row height for gap tolerance
+    double avg_row_h = table_height;
+    if (row_ys.size() >= 2) {
+        avg_row_h = (row_ys.back() - row_ys.front()) / (double)(row_ys.size() - 1);
+    }
+    double gap_tol = std::max(3.0, avg_row_h * 0.6);
 
     std::vector<double> vx_vals;
     for (auto& vl : v_lines) {
@@ -2297,7 +2349,7 @@ std::vector<double> find_column_boundaries(
     }
     auto vx_clusters = cluster_values(vx_vals, 5.0);
 
-    struct VLineInfo { double x, coverage; };
+    struct VLineInfo { double x, coverage; int seg_count; };
     std::vector<VLineInfo> vline_infos;
     for (double cx : vx_clusters) {
         std::vector<std::pair<double,double>> intervals;
@@ -2310,23 +2362,48 @@ std::vector<double> find_column_boundaries(
             intervals.push_back({vy_lo, vy_hi});
         }
         if (intervals.empty()) continue;
+        int seg_count = (int)intervals.size();
         std::sort(intervals.begin(), intervals.end());
         double total = 0, cur_lo = intervals[0].first, cur_hi = intervals[0].second;
         for (size_t i = 1; i < intervals.size(); i++) {
-            if (intervals[i].first <= cur_hi + 3.0)
+            if (intervals[i].first <= cur_hi + gap_tol)
                 cur_hi = std::max(cur_hi, intervals[i].second);
             else { total += cur_hi - cur_lo; cur_lo = intervals[i].first; cur_hi = intervals[i].second; }
         }
         total += cur_hi - cur_lo;
-        vline_infos.push_back({cx, total});
+        vline_infos.push_back({cx, total, seg_count});
     }
 
+    // Accept column boundary:
+    // - High coverage (≥ 50%): strong continuous v-line
+    // - Many segments (Word→PDF cell-unit borders, ≥ 1/3 of rows)
+    // - Moderate coverage (≥ 15%) with h-line endpoint evidence at ≥ half of row levels
+    int min_segs = std::max(2, (int)(row_ys.size() / 3));
     std::vector<double> col_xs;
     col_xs.push_back(table_left);
-    for (auto& vi : vline_infos)
-        if (vi.coverage >= table_height * 0.4 &&
-            vi.x > table_left + 5 && vi.x < table_right - 5)
+    for (auto& vi : vline_infos) {
+        if (vi.x <= table_left + 5 || vi.x >= table_right - 5) continue;
+        // Count row levels where h-lines terminate at this v-line x (true grid evidence)
+        int rows_with_ep = 0;
+        for (double ry : row_ys) {
+            for (auto& hl : h_lines) {
+                double hy = (hl.y0 + hl.y1) / 2.0;
+                if (std::abs(hy - ry) > 4.0) continue;
+                double hx_lo = std::min((double)hl.x0, (double)hl.x1);
+                double hx_hi = std::max((double)hl.x0, (double)hl.x1);
+                if (std::abs(hx_lo - vi.x) < 8.0 || std::abs(hx_hi - vi.x) < 8.0) {
+                    rows_with_ep++;
+                    break;
+                }
+            }
+        }
+        bool accept = vi.coverage >= table_height * 0.5 ||
+                      vi.seg_count >= min_segs ||
+                      (vi.coverage >= table_height * 0.15 &&
+                       rows_with_ep >= (int)row_ys.size() / 2);
+        if (accept)
             col_xs.push_back(vi.x);
+    }
     col_xs.push_back(table_right);
 
     std::sort(col_xs.begin(), col_xs.end());
@@ -2339,9 +2416,10 @@ std::vector<double> find_column_boundaries(
         for (size_t i = 1; i < col_xs.size() - 1; i++) {
             if (col_xs[i] - merged.back() < 25.0) {
                 double cov = 0;
+                int segs = 0;
                 for (auto& vi : vline_infos)
-                    if (std::abs(vi.x - col_xs[i]) < 6.0) { cov = vi.coverage; break; }
-                if (cov >= table_height * 0.8)
+                    if (std::abs(vi.x - col_xs[i]) < 6.0) { cov = vi.coverage; segs = vi.seg_count; break; }
+                if (cov >= table_height * 0.5 || segs >= min_segs)
                     merged.push_back(col_xs[i]);
             } else {
                 merged.push_back(col_xs[i]);
@@ -2409,8 +2487,8 @@ TableData build_table(const std::vector<double>& row_ys,
         if (rx > table_right) table_right = rx;
     }
 
-    auto col_xs = find_column_boundaries(v_lines, table_left, table_right,
-                                          table_bot, table_top);
+    auto col_xs = find_column_boundaries(v_lines, h_lines, table_left, table_right,
+                                          table_bot, table_top, row_ys);
 
     int internal_vline_count = 0;
     for (auto& vl : v_lines) {
@@ -2509,27 +2587,71 @@ TableData build_table(const std::vector<double>& row_ys,
     int n_sub = sub_boundaries.empty() ? 0 : (int)sub_boundaries.size() - 1;
     int total_cols = (n_sub > 1) ? (n_cols - 1 + n_sub) : n_cols;
 
+    // Detect merged cells: check v-line presence at each internal boundary per row
+    // has_vline[r][b] = true if a v-line exists near col_xs[b] spanning row r
+    std::vector<std::vector<bool>> has_vline(n_rows, std::vector<bool>(n_cols + 1, true));
+    for (int r = 0; r < n_rows; r++) {
+        double row_bot = std::min(actual_ys[r], actual_ys[r + 1]);
+        double row_top = std::max(actual_ys[r], actual_ys[r + 1]);
+        double row_h = row_top - row_bot;
+        for (int b = 1; b < n_cols; b++) {
+            double cx = col_xs[b];
+            bool found = false;
+            for (auto& vl : v_lines) {
+                double vx = (vl.x0 + vl.x1) / 2.0;
+                if (std::abs(vx - cx) > 6.0) continue;
+                double vy_lo = std::min((double)vl.y0, (double)vl.y1);
+                double vy_hi = std::max((double)vl.y0, (double)vl.y1);
+                double overlap = std::min(vy_hi, row_top) - std::max(vy_lo, row_bot);
+                if (overlap >= row_h * 0.3) {
+                    found = true;
+                    break;
+                }
+            }
+            has_vline[r][b] = found;
+        }
+    }
+
+    // Check v-line grid density: a real table has v-lines in most row/boundary positions.
+    // Stray v-lines from body text have sparse coverage.
+    // Only skip text continuation rejection for dense grids (real tables with merged cells).
+    int vline_present = 0, vline_total = n_rows * (n_cols - 1);
+    bool has_merged_cells = false;
+    for (int r = 0; r < n_rows; r++)
+        for (int b = 1; b < n_cols; b++)
+            if (has_vline[r][b]) vline_present++;
+    // Dense grid: >= 40% of positions have v-lines AND some are missing (merged cells)
+    if (vline_total > 0 && vline_present < vline_total && vline_present >= vline_total * 0.4)
+        has_merged_cells = true;
+
     table.rows.resize(n_rows);
     for (int r = 0; r < n_rows; r++) {
         table.rows[r].resize(total_cols);
-        for (int c = 0; c < n_cols; c++) {
+        int c = 0;
+        while (c < n_cols) {
+            // Determine span: extend while no v-line at next boundary
+            int span = 1;
+            while (c + span < n_cols && !has_vline[r][c + span])
+                span++;
+
             double left   = col_xs[c];
-            double right  = col_xs[c + 1];
+            double right  = col_xs[c + span];
             double bottom = actual_ys[r];
             double top    = actual_ys[r + 1];
 
-            if (c == last_col_idx && n_sub > 1) {
+            if (c + span - 1 == last_col_idx && n_sub > 1 && span == 1) {
                 if (is_scale_row(cache, left, right, bottom, top, sub_boundaries)) {
                     for (int sc = 0; sc < n_sub; sc++) {
                         table.rows[r][n_cols - 1 + sc] = cache.get_text_in_rect(
                             sub_boundaries[sc], top, sub_boundaries[sc+1], bottom);
                     }
                 } else {
-                    table.rows[r][n_cols - 1] = cache.get_text_in_rect(left, top, right, bottom);
+                    table.rows[r][c] = cache.get_text_in_rect(left, top, right, bottom);
                 }
             } else {
                 table.rows[r][c] = cache.get_text_in_rect(left, top, right, bottom);
             }
+            c += span;
         }
     }
 
@@ -2554,7 +2676,7 @@ TableData build_table(const std::vector<double>& row_ys,
                 if (row[c].empty()) empty_cells++;
             }
         }
-        if (total_cells > 0 && empty_cells > total_cells * 0.6) {
+        if (total_cells > 0 && empty_cells > total_cells * 0.75) {
             table.rows.clear();
             return table;
         }
@@ -2588,31 +2710,20 @@ TableData build_table(const std::vector<double>& row_ys,
         }
     }
 
-    if (!table.rows.empty() && (int)table.rows[0].size() == 2) {
-        int short_label_rows = 0;
-        int long_content_rows = 0;
-        for (auto& row : table.rows) {
-            if (row.size() >= 2 && row[0].size() <= 6 && !row[0].empty())
-                short_label_rows++;
-            if (row.size() >= 2 && row[1].size() > 15)
-                long_content_rows++;
-        }
-        int valid_rows = (int)table.rows.size();
-        if (valid_rows >= 2 &&
-            short_label_rows >= valid_rows * 0.5 &&
-            long_content_rows >= valid_rows * 0.5) {
-            table.rows.clear();
-        }
-    }
-
     // Reject tables where text continues across column boundaries
     // (body text split by vertical lines — not real tabular data)
-    if (!table.rows.empty()) {
+    // SKIP when merged cells detected: v-line grid confirms real table structure.
+    if (!table.rows.empty() && !has_merged_cells) {
         int n_cols_t = (int)table.rows[0].size();
-        auto is_content = [](unsigned char c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c >= 0x80; };
+        // Detect word continuation: Latin alphanumeric at both boundaries.
+        // CJK characters are self-contained units (not word fragments),
+        // so only check Latin for cross-boundary continuation.
+        // Real CJK tables have independent data in each cell.
+        // Body text split in CJK is caught by the empty cell ratio and
+        // the long_first checks instead.
+        auto is_content = [](unsigned char c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9'); };
 
         if (n_cols_t <= 3) {
-            // 2-3 column: check if most rows have text continuation
             int cont_rows = 0, checked = 0;
             for (auto& row : table.rows) {
                 if ((int)row.size() < 2 || row[0].empty() || row[1].empty()) continue;
@@ -2622,7 +2733,6 @@ TableData build_table(const std::vector<double>& row_ys,
             }
             if (checked >= 3 && cont_rows >= checked * 0.15)
                 table.rows.clear();
-            // Also reject if first column cells are very long (body text, not table data)
             if (!table.rows.empty() && n_cols_t == 2) {
                 int long_first = 0;
                 for (auto& row : table.rows) {
@@ -2630,9 +2740,8 @@ TableData build_table(const std::vector<double>& row_ys,
                 }
                 if (long_first >= 2) table.rows.clear();
             }
-        } else if (n_cols_t >= 8) {
-            // High column count (8+): likely body text split by many vertical lines
-            // Check if majority of non-empty cells are text fragments (short, continuation)
+        } else if (n_cols_t >= 4) {
+            // 4+ columns: Latin-only continuation check + empty column check
             int cont_rows = 0, checked = 0;
             for (auto& row : table.rows) {
                 if ((int)row.size() < n_cols_t) continue;
@@ -2640,14 +2749,70 @@ TableData build_table(const std::vector<double>& row_ys,
                 for (int c = 0; c + 1 < n_cols_t; c++) {
                     if (row[c].empty() || row[c+1].empty()) continue;
                     pairs_ok++;
-                    if (is_content((unsigned char)row[c].back()) && is_content((unsigned char)row[c+1][0]))
-                        pairs_cont++;
+                    unsigned char lc = (unsigned char)row[c].back();
+                    unsigned char rc = (unsigned char)row[c+1][0];
+                    // Latin-only: CJK chars are independent units, not word fragments
+                    bool latin_cont = is_content(lc) && is_content(rc) && lc < 0x80 && rc < 0x80;
+                    if (latin_cont) pairs_cont++;
                 }
                 checked++;
-                // Most adjacent cell pairs show text continuation
-                if (pairs_ok > 0 && pairs_cont >= pairs_ok * 0.6) cont_rows++;
+                // Require ALL non-empty pairs to show Latin continuation.
+                // Data tables often have alphanumeric chars at cell boundaries
+                // (e.g. phone → email) but not ALL pairs will continue.
+                if (pairs_ok >= 2 && pairs_cont == pairs_ok) cont_rows++;
             }
-            if (checked >= 3 && cont_rows >= checked * 0.4)
+            if (checked >= 3 && cont_rows >= checked * 0.5)
+                table.rows.clear();
+
+            // Reject if second column is mostly empty (body text + stray v-lines)
+            if (!table.rows.empty() && (int)table.rows.size() >= 15) {
+                int col1_trivial = 0;
+                for (auto& row : table.rows)
+                    if ((int)row.size() >= 2 && row[1].size() <= 2) col1_trivial++;
+                if (col1_trivial >= (int)table.rows.size() * 0.7)
+                    table.rows.clear();
+            }
+        }
+    }
+
+    // Reject tables where most content concentrates in one column
+    // while others are mostly empty — body text split by stray vertical lines.
+    if (!table.rows.empty() && (int)table.rows.size() >= 3) {
+        int n_cols_t = (int)table.rows[0].size();
+        int nr = (int)table.rows.size();
+        // Find the column with most content
+        int best_col = 0;
+        size_t best_len = 0;
+        for (int c = 0; c < n_cols_t; c++) {
+            size_t total_len = 0;
+            for (auto& row : table.rows)
+                if (c < (int)row.size()) total_len += row[c].size();
+            if (total_len > best_len) { best_len = total_len; best_col = c; }
+        }
+        // Check if all other columns are mostly empty
+        int empty_other_cols = 0;
+        for (int c = 0; c < n_cols_t; c++) {
+            if (c == best_col) continue;
+            int empty = 0;
+            for (auto& row : table.rows)
+                if (c < (int)row.size() && row[c].empty()) empty++;
+            if (empty >= nr / 2) empty_other_cols++;
+        }
+        // If ALL other columns are mostly empty and the main column has long text
+        int long_rows = 0;
+        for (auto& row : table.rows)
+            if (best_col < (int)row.size() && row[best_col].size() > 30) long_rows++;
+        // When all non-primary columns are mostly empty AND their total
+        // content is < 5% of the primary column, it's body text split
+        // by stray v-lines, not real tabular data.
+        if (empty_other_cols == n_cols_t - 1 && best_len > 0) {
+            size_t other_len = 0;
+            for (int c = 0; c < n_cols_t; c++) {
+                if (c == best_col) continue;
+                for (auto& row : table.rows)
+                    if (c < (int)row.size()) other_len += row[c].size();
+            }
+            if (other_len * 10 < best_len)
                 table.rows.clear();
         }
     }
@@ -2834,10 +2999,18 @@ std::vector<TableData> detect_tables(const std::vector<PdfLineSegment>& lines,
     for (int i = 0; i < n_levels - 1; i++) {
         double y_lo = row_ys[i];
         double y_hi = row_ys[i + 1];
+        double row_gap = y_hi - y_lo;
         for (auto& vl : v_lines) {
             double vy_lo = std::min((double)vl.y0, (double)vl.y1);
             double vy_hi = std::max((double)vl.y0, (double)vl.y1);
+            // Full span: v-line covers the entire row gap
             if (vy_lo <= y_lo + 5.0 && vy_hi >= y_hi - 5.0) {
+                connected[i] = true;
+                break;
+            }
+            // Partial span: v-line overlaps >= 50% of row gap (cell-unit v-lines)
+            double overlap = std::min(vy_hi, y_hi) - std::max(vy_lo, y_lo);
+            if (overlap >= row_gap * 0.5) {
                 connected[i] = true;
                 break;
             }
@@ -2874,8 +3047,62 @@ std::vector<TableData> detect_tables(const std::vector<PdfLineSegment>& lines,
 
     if (table_groups.empty()) return {};
 
-    std::vector<TableData> result;
+    // Split groups where v-line column structure changes significantly
+    std::vector<std::vector<double>> final_groups;
     for (auto& group : table_groups) {
+        if (group.size() < 5) { final_groups.push_back(group); continue; }
+        int n = (int)group.size() - 1;
+
+        // Count internal v-lines for each row interval
+        std::vector<int> row_vcount(n, 0);
+        double gl = 1e9, gr = 0;
+        for (auto& hl : h_lines) {
+            double hy = (hl.y0 + hl.y1) / 2.0;
+            for (auto& ry : group)
+                if (std::abs(hy - ry) < 4.0) {
+                    double lx = std::min((double)hl.x0, (double)hl.x1);
+                    double rx = std::max((double)hl.x0, (double)hl.x1);
+                    if (lx < gl) gl = lx;
+                    if (rx > gr) gr = rx;
+                    break;
+                }
+        }
+        for (int i = 0; i < n; i++) {
+            double y_lo = group[i], y_hi = group[i + 1];
+            double row_h = y_hi - y_lo;
+            for (auto& vl : v_lines) {
+                double vx = (vl.x0 + vl.x1) / 2.0;
+                if (vx <= gl + 10 || vx >= gr - 10) continue;
+                double vy_lo = std::min((double)vl.y0, (double)vl.y1);
+                double vy_hi = std::max((double)vl.y0, (double)vl.y1);
+                double overlap = std::min(vy_hi, y_hi) - std::max(vy_lo, y_lo);
+                if (overlap >= row_h * 0.3) row_vcount[i]++;
+            }
+        }
+
+        // Find split points: a row with 0-1 internal v-lines surrounded by
+        // rows with >= 3 indicates a section header between sub-tables
+        std::vector<int> splits;
+        for (int i = 1; i < n - 1; i++) {
+            if (row_vcount[i] <= 1 &&
+                (row_vcount[i - 1] >= 3 || row_vcount[i + 1] >= 3))
+                splits.push_back(i);
+        }
+
+        if (splits.empty()) { final_groups.push_back(group); continue; }
+
+        int start = 0;
+        for (int sp : splits) {
+            std::vector<double> sub(group.begin() + start, group.begin() + sp + 1);
+            if (sub.size() >= 3) final_groups.push_back(sub);
+            start = sp;
+        }
+        std::vector<double> last(group.begin() + start, group.end());
+        if (last.size() >= 3) final_groups.push_back(last);
+    }
+
+    std::vector<TableData> result;
+    for (auto& group : final_groups) {
         TableData t = build_table(group, h_lines, v_lines, cache);
         if (!t.rows.empty()) {
             result.push_back(std::move(t));
@@ -5069,6 +5296,8 @@ ExtractResult extract_pdf(const std::string& pdf_path, const ConvertOptions& opt
         util::ensure_dir(image_dir);
     }
 
+    std::unordered_map<int, PdfFont> font_cache;
+
     for (int p : page_indices) {
         if (p < 0 || p >= tp) continue;
         auto& page_obj = page_objs[p];
@@ -5105,24 +5334,27 @@ ExtractResult extract_pdf(const std::string& pdf_path, const ConvertOptions& opt
         auto content_data = get_page_content(doc, page_obj);
         if (content_data.empty()) continue;
 
-        auto parse_result = parse_content_stream(doc, content_data, resources, page_h);
-
         // Extract text lines
         bool plaintext = (opts.output_format == OutputFormat::PLAINTEXT);
-        result.all_lines[p] = chars_to_lines(parse_result.chars);
-
-        // Table detection
         bool need_tables = opts.extract_tables && !plaintext;
+        bool need_graphics = need_tables || opts.extract_images;
+
+        auto parse_result = parse_content_stream(doc, content_data, resources, page_h,
+                                                  &font_cache, !need_graphics);
+
+        result.all_lines[p] = chars_to_lines(parse_result.chars);
         if (need_tables) {
             PageCharCache cache;
             cache.build(parse_result.chars);
 
             result.all_tables[p] = detect_tables(parse_result.segments, cache,
                 page_w, page_h);
+            int line_table_count = (int)result.all_tables[p].size();
             auto text_tables = detect_text_tables(cache,
                 result.all_tables[p], page_w, page_h);
             for (auto& tt : text_tables)
                 result.all_tables[p].push_back(std::move(tt));
+            (void)line_table_count; // for debugging
         }
 
         // Image extraction
