@@ -2,13 +2,13 @@
 
 #include "rtf_parser.h"
 #include "common/file_utils.h"
+#include "common/image_utils.h"
 #include "common/string_utils.h"
 
 #include <algorithm>
 #include <cctype>
 #include <cstring>
 #include <fstream>
-#include <sstream>
 #include <stack>
 
 namespace jdoc {
@@ -314,12 +314,30 @@ void RtfParser::parse(std::string& out_text, std::vector<PictImage>& out_images)
                     cur.italic = new_italic;
                 } else if (word == "ansicpg") {
                     if (has_param) { cur.codepage = param; doc_codepage = param; }
+                } else if (word == "intbl") {
+                    cur.in_table = true;
+                } else if (word == "trowd") {
+                    cur.in_table = true;
+                } else if (word == "cell") {
+                    if (!cur.skip && !cur.in_pict) {
+                        if (was_bold) { out_text += "**"; was_bold = false; }
+                        if (was_italic) { out_text += "*"; was_italic = false; }
+                        out_text += "\x1F"; // cell separator (same as DOC)
+                    }
+                } else if (word == "row") {
+                    if (!cur.skip && !cur.in_pict) {
+                        if (was_bold) { out_text += "**"; was_bold = false; }
+                        if (was_italic) { out_text += "*"; was_italic = false; }
+                        out_text += "\n";
+                    }
+                    cur.in_table = false;
                 } else if (word == "pard") {
                     // Reset paragraph formatting.
                     if (was_bold) { out_text += "**"; was_bold = false; }
                     if (was_italic) { out_text += "*"; was_italic = false; }
                     cur.bold = false;
                     cur.italic = false;
+                    cur.in_table = false;
                 } else if (word == "u") {
                     // Unicode character.
                     if (has_param && !cur.skip && !cur.in_pict) {
@@ -412,10 +430,75 @@ void RtfParser::parse(std::string& out_text, std::vector<PictImage>& out_images)
 
 // ---------- public API -------------------------------------------------------
 
+// Convert cell-separated text lines to markdown tables.
+static std::string rtf_cells_to_markdown(const std::string& raw) {
+    std::string md;
+    md.reserve(raw.size() * 2);
+
+    std::vector<std::string> table_rows;
+    int max_cols = 0;
+
+    auto flush_table = [&]() {
+        if (table_rows.empty()) return;
+        for (size_t ri = 0; ri < table_rows.size(); ri++) {
+            // Split by \x1F
+            std::vector<std::string> cells;
+            std::string cell;
+            for (char c : table_rows[ri]) {
+                if (c == '\x1F') { cells.push_back(cell); cell.clear(); }
+                else cell += c;
+            }
+            if (!cell.empty()) cells.push_back(cell);
+            if (!cells.empty() && cells.back().empty()) cells.pop_back();
+
+            while (static_cast<int>(cells.size()) < max_cols) cells.emplace_back();
+
+            md += "|";
+            for (auto& c : cells) {
+                for (auto& ch : c) { if (ch == '|') ch = '/'; }
+                md += " " + c + " |";
+            }
+            md += "\n";
+            if (ri == 0) {
+                md += "|";
+                for (int c = 0; c < max_cols; c++) md += " --- |";
+                md += "\n";
+            }
+        }
+        md += "\n";
+        table_rows.clear();
+        max_cols = 0;
+    };
+
+    size_t pos = 0;
+    while (pos < raw.size()) {
+        size_t nl = raw.find('\n', pos);
+        if (nl == std::string::npos) nl = raw.size();
+        std::string line = raw.substr(pos, nl - pos);
+        pos = nl + 1;
+        while (!line.empty() && (line.back() == '\r' || line.back() == '\0'))
+            line.pop_back();
+        int sep_count = 0;
+        for (char c : line) if (c == '\x1F') sep_count++;
+        if (sep_count > 0) {
+            max_cols = std::max(max_cols, sep_count + 1);
+            table_rows.push_back(std::move(line));
+        } else {
+            flush_table();
+            md += line + "\n";
+        }
+    }
+    flush_table();
+    return md;
+}
+
 std::string RtfParser::to_markdown(const ConvertOptions& opts) {
     std::string text;
     std::vector<PictImage> pict_images;
     parse(text, pict_images);
+
+    // Convert cell separators to markdown tables
+    text = rtf_cells_to_markdown(text);
 
     if (!pict_images.empty()) {
         text += "\n\n---\n\n";
