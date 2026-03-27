@@ -68,6 +68,11 @@ private:
     int field_depth_ = 0;
     bool field_show_result_ = false;
     int page_num_ = 1;
+
+    // Hyperlink extraction state.
+    std::string field_instruction_;
+    bool collecting_field_instr_ = false;
+    std::string pending_hyperlink_url_;
 };
 
 } // namespace jdoc
