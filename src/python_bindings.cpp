@@ -5,106 +5,12 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
-#include "jdoc/types.h"
-#include "jdoc/pdf.h"
-#include "jdoc/office.h"
-#include "jdoc/hwp.h"
-#include "jdoc/hwpx.h"
+#include "jdoc/jdoc.h"
 #include "common/file_utils.h"
-#include "zip_reader.h"
-#include "legacy/ole_reader.h"
 
-#include <fstream>
-#include <algorithm>
 #include <cstring>
 
 namespace py = pybind11;
-
-namespace {
-
-// ── Format detection (same as main.cpp) ──────────────────
-
-enum class FileFormat { PDF, OFFICE, HWP, HWPX, UNKNOWN };
-
-static std::string get_ext(const std::string& path) {
-    auto dot = path.rfind('.');
-    if (dot == std::string::npos) return "";
-    std::string ext = path.substr(dot);
-    for (auto& c : ext) c = std::tolower(static_cast<unsigned char>(c));
-    return ext;
-}
-
-static FileFormat detect_format(const std::string& path) {
-    std::string ext = get_ext(path);
-    if (ext == ".pdf") return FileFormat::PDF;
-    if (ext == ".hwpx") return FileFormat::HWPX;
-    if (ext == ".hwp") return FileFormat::HWP;
-    if (ext == ".docx" || ext == ".xlsx" || ext == ".pptx" ||
-        ext == ".doc" || ext == ".xls" || ext == ".ppt" || ext == ".rtf" ||
-        ext == ".html" || ext == ".htm")
-        return FileFormat::OFFICE;
-
-    unsigned char magic[8] = {};
-    std::ifstream f(path, std::ios::binary);
-    if (!f) return FileFormat::UNKNOWN;
-    f.read(reinterpret_cast<char*>(magic), 8);
-
-    if (magic[0] == '%' && magic[1] == 'P' && magic[2] == 'D' && magic[3] == 'F')
-        return FileFormat::PDF;
-    if (magic[0] == 'P' && magic[1] == 'K' && magic[2] == 0x03 && magic[3] == 0x04) {
-        // ZIP: check for HWPX by inspecting internal structure
-        jdoc::ZipReader zip(path);
-        if (zip.is_open()) {
-            if (zip.has_entry("Contents/section0.xml") ||
-                zip.has_entry("META-INF/container.xml"))
-                return FileFormat::HWPX;
-        }
-        return FileFormat::OFFICE;
-    }
-    if (magic[0] == 0xD0 && magic[1] == 0xCF && magic[2] == 0x11 && magic[3] == 0xE0) {
-        // OLE2: check for HWP by inspecting internal streams
-        jdoc::OleReader ole(path);
-        if (ole.is_open()) {
-            if (ole.has_stream("FileHeader") || ole.has_stream("BodyText/Section0"))
-                return FileFormat::HWP;
-        }
-        return FileFormat::OFFICE;
-    }
-    if (magic[0] == '{' && magic[1] == '\\' && magic[2] == 'r' &&
-        magic[3] == 't' && magic[4] == 'f')
-        return FileFormat::OFFICE;
-
-    return FileFormat::UNKNOWN;
-}
-
-// ── Unified convert function ─────────────────────────────
-
-std::string convert_file(const std::string& path, jdoc::ConvertOptions& opts) {
-    auto fmt = detect_format(path);
-    switch (fmt) {
-        case FileFormat::PDF:    return jdoc::pdf_to_markdown(path, opts);
-        case FileFormat::HWPX:   return jdoc::hwpx_to_markdown(path, opts);
-        case FileFormat::HWP:    return jdoc::hwp_to_markdown(path, opts);
-        case FileFormat::OFFICE: return jdoc::office_to_markdown(path, opts);
-        default:
-            throw std::runtime_error("Unsupported file format: " + path);
-    }
-}
-
-std::vector<jdoc::PageChunk> convert_file_chunks(const std::string& path,
-                                                   jdoc::ConvertOptions& opts) {
-    auto fmt = detect_format(path);
-    switch (fmt) {
-        case FileFormat::PDF:    return jdoc::pdf_to_markdown_chunks(path, opts);
-        case FileFormat::HWPX:   return jdoc::hwpx_to_markdown_chunks(path, opts);
-        case FileFormat::HWP:    return jdoc::hwp_to_markdown_chunks(path, opts);
-        case FileFormat::OFFICE: return jdoc::office_to_markdown_chunks(path, opts);
-        default:
-            throw std::runtime_error("Unsupported file format: " + path);
-    }
-}
-
-} // anonymous namespace
 
 // ── Python module definition ─────────────────────────────
 
@@ -197,7 +103,7 @@ PYBIND11_MODULE(_jdoc, m) {
             opts.output_format = jdoc::OutputFormat::PLAINTEXT;
         else
             opts.output_format = jdoc::OutputFormat::MARKDOWN;
-        return convert_file(file_path, opts);
+        return jdoc::convert(file_path, opts);
     },
     py::arg("file_path"),
     py::arg("format") = "markdown",
@@ -235,7 +141,7 @@ Returns:
             opts.output_format = jdoc::OutputFormat::PLAINTEXT;
         else
             opts.output_format = jdoc::OutputFormat::MARKDOWN;
-        return convert_file_chunks(file_path, opts);
+        return jdoc::convert_chunks(file_path, opts);
     },
     py::arg("file_path"),
     py::arg("format") = "markdown",
