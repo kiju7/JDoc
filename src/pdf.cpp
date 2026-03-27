@@ -1514,7 +1514,7 @@ PdfFont load_font(PdfDoc& doc, const PdfObj& font_ref) {
     std::string font_type = subtype.is_name() ? subtype.str_val : "";
 
     // Parse /Widths array for simple fonts (Type1, TrueType)
-    auto& widths_arr = fobj.get("Widths");
+    auto widths_arr = doc.resolve(fobj.get("Widths"));
     if (widths_arr.is_arr()) {
         int first_char = fobj.get("FirstChar").as_int();
         for (size_t i = 0; i < widths_arr.arr.size(); i++) {
@@ -2046,6 +2046,17 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
                         double final_mat[6];
                         mat_multiply(final_mat, trm, gs.ctm);
 
+                        // Skip rotated text (vertical > horizontal direction)
+                        if (std::abs(final_mat[1]) > std::abs(final_mat[0]) * 2) {
+                            double glyph_w_skip = gs.font ? gs.font->get_width(code) : 0;
+                            if (glyph_w_skip <= 0) glyph_w_skip = 600;
+                            double adv = glyph_w_skip / 1000.0 * fs * h_scale + gs.char_spacing;
+                            if (unicode == ' ') adv += gs.word_spacing;
+                            gs.text_mat[4] += adv * gs.text_mat[0];
+                            gs.text_mat[5] += adv * gs.text_mat[1];
+                            continue;
+                        }
+
                         double gx, gy;
                         transform_point(final_mat, 0, 0, gx, gy);
 
@@ -2126,23 +2137,28 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
                                 double final_mat[6];
                                 mat_multiply(final_mat, trm, gs.ctm);
 
-                                double gx, gy;
-                                transform_point(final_mat, 0, 0, gx, gy);
-
                                 double glyph_w = gs.font ? gs.font->get_width(code) : 0;
                                 if (glyph_w <= 0) glyph_w = (gs.font && (gs.font->is_identity || gs.font->is_type0)) ? 1000 : 600;
                                 double char_w_ts = glyph_w / 1000.0 * fs * h_scale;
+
+                                double advance = char_w_ts + gs.char_spacing;
+                                if (unicode == ' ') advance += gs.word_spacing;
+                                gs.text_mat[4] += advance * gs.text_mat[0];
+                                gs.text_mat[5] += advance * gs.text_mat[1];
+
+                                // Skip rotated text (vertical > horizontal direction)
+                                if (std::abs(final_mat[1]) > std::abs(final_mat[0]) * 2)
+                                    continue;
+
+                                double gx, gy;
+                                transform_point(final_mat, 0, 0, gx, gy);
+
                                 double gx2, gy2;
                                 transform_point(final_mat, glyph_w / 1000.0, 0, gx2, gy2);
                                 double char_w = std::abs(gx2 - gx);
                                 if (char_w < 0.1) char_w = std::abs(final_mat[0]) * glyph_w / 1000.0;
                                 double char_h = std::abs(final_mat[3]);
                                 if (char_h < 1) char_h = std::abs(final_mat[0]);
-
-                                double advance = char_w_ts + gs.char_spacing;
-                                if (unicode == ' ') advance += gs.word_spacing;
-                                gs.text_mat[4] += advance * gs.text_mat[0];
-                                gs.text_mat[5] += advance * gs.text_mat[1];
 
                                 double next_gx, next_gy;
                                 {
@@ -2389,6 +2405,119 @@ struct PageCharCache {
     }
 };
 
+// Detect vertical column boundary by counting distinct Y-rows per X-bin.
+// Full-width rows contribute equally to all bins; column rows only to their
+// column's bins, creating a dip at the column gap.
+// Returns the x-coordinate of the column separator, or 0 if single-column.
+double detect_column_boundary(const std::vector<TextChar>& chars,
+                              double median_fs, double y_tol) {
+    double page_left = 1e9, page_right = 0;
+    for (auto& ch : chars) {
+        if (ch.left < page_left) page_left = ch.left;
+        if (ch.right > page_right) page_right = ch.right;
+    }
+    double page_width = page_right - page_left;
+    if (page_width < median_fs * 30) return 0;
+
+    // Group chars into Y-rows
+    std::vector<size_t> y_sorted(chars.size());
+    std::iota(y_sorted.begin(), y_sorted.end(), 0);
+    std::sort(y_sorted.begin(), y_sorted.end(), [&](size_t a, size_t b) {
+        return chars[a].y > chars[b].y;
+    });
+
+    constexpr int NUM_BINS = 200;
+    int row_count[NUM_BINS] = {};
+    int total_rows = 0;
+
+    size_t ri = 0;
+    while (ri < y_sorted.size()) {
+        double row_y = chars[y_sorted[ri]].y;
+        bool bins_hit[NUM_BINS] = {};
+        while (ri < y_sorted.size() && std::abs(chars[y_sorted[ri]].y - row_y) <= y_tol) {
+            auto& ch = chars[y_sorted[ri]];
+            if (ch.unicode != ' ' && ch.unicode != 0xA0) {
+                int b0 = static_cast<int>((ch.left - page_left) / page_width * NUM_BINS);
+                int b1 = static_cast<int>((ch.right - page_left) / page_width * NUM_BINS);
+                if (b0 < 0) b0 = 0;
+                if (b1 >= NUM_BINS) b1 = NUM_BINS - 1;
+                for (int b = b0; b <= b1; b++) bins_hit[b] = true;
+            }
+            ri++;
+        }
+        for (int b = 0; b < NUM_BINS; b++)
+            if (bins_hit[b]) row_count[b]++;
+        total_rows++;
+    }
+
+    if (total_rows < 10) return 0;
+
+    // Find the deepest dip in row_count within center 50% of page
+    int center_start = NUM_BINS / 4;
+    int center_end = NUM_BINS * 3 / 4;
+
+    double left_avg = 0, right_avg = 0;
+    int lc = 0, rc = 0;
+    for (int b = NUM_BINS / 10; b < center_start; b++) { left_avg += row_count[b]; lc++; }
+    for (int b = center_end; b < NUM_BINS * 9 / 10; b++) { right_avg += row_count[b]; rc++; }
+    if (lc > 0) left_avg /= lc;
+    if (rc > 0) right_avg /= rc;
+    double body_avg = (left_avg + right_avg) / 2.0;
+    if (body_avg < 5) return 0;
+
+    // Find the minimum row_count in center region (smoothed over 3 bins)
+    int best_bin = -1;
+    double best_val = 1e9;
+    for (int b = center_start + 1; b < center_end - 1; b++) {
+        double val = (row_count[b - 1] + row_count[b] + row_count[b + 1]) / 3.0;
+        if (val < best_val) { best_val = val; best_bin = b; }
+    }
+
+    // The dip must be significantly lower than body average (at least 30% lower)
+    if (best_val > body_avg * 0.7) return 0;
+
+    return page_left + (best_bin + 0.5) / NUM_BINS * page_width;
+}
+
+// Reorder lines so that within each column band, left-column lines
+// come before right-column lines. Spanning lines stay in place.
+std::vector<TextLine> reorder_column_lines(std::vector<TextLine>& lines,
+                                           double col_boundary) {
+    enum Type { LEFT, RIGHT, SPANNING };
+    std::vector<Type> types(lines.size());
+    for (size_t i = 0; i < lines.size(); i++) {
+        auto& l = lines[i];
+        if (l.x_left < col_boundary - 5 && l.x_right > col_boundary + 5)
+            types[i] = SPANNING;
+        else if ((l.x_left + l.x_right) / 2.0 < col_boundary)
+            types[i] = LEFT;
+        else
+            types[i] = RIGHT;
+    }
+
+    std::vector<TextLine> result;
+    result.reserve(lines.size());
+    size_t i = 0;
+    while (i < lines.size()) {
+        if (types[i] == SPANNING) {
+            result.push_back(std::move(lines[i]));
+            i++;
+            continue;
+        }
+        size_t band_end = i + 1;
+        while (band_end < lines.size() && types[band_end] != SPANNING)
+            band_end++;
+        for (size_t j = i; j < band_end; j++)
+            if (types[j] == LEFT)
+                result.push_back(std::move(lines[j]));
+        for (size_t j = i; j < band_end; j++)
+            if (types[j] == RIGHT)
+                result.push_back(std::move(lines[j]));
+        i = band_end;
+    }
+    return result;
+}
+
 std::vector<TextLine> chars_to_lines(const std::vector<TextChar>& chars) {
     if (chars.empty()) return {};
 
@@ -2406,6 +2535,8 @@ std::vector<TextLine> chars_to_lines(const std::vector<TextChar>& chars) {
     }
     double y_tol = median_fs * 0.4;
     if (y_tol < 2) y_tol = 2;
+
+    double col_boundary = detect_column_boundary(chars, median_fs, y_tol);
 
     std::sort(idx.begin(), idx.end(), [&](size_t a, size_t b) {
         if (std::abs(chars[a].y - chars[b].y) > y_tol) return chars[a].y > chars[b].y;
@@ -2437,6 +2568,17 @@ std::vector<TextLine> chars_to_lines(const std::vector<TextChar>& chars) {
             flush();
             cur_y = ch.y;
         }
+
+        // Split line at column boundary when a large gap crosses it
+        if (col_boundary > 0 && !cur.text.empty() && prev_right > -1e8) {
+            double gap = ch.left - prev_right;
+            if (gap > median_fs * 1.5 &&
+                prev_right < col_boundary && ch.left > col_boundary) {
+                flush();
+                cur_y = ch.y;
+            }
+        }
+
         cur.y_center = ch.y;
         if (ch.left < cur.x_left) cur.x_left = ch.left;
         if (ch.right > cur.x_right) cur.x_right = ch.right;
@@ -2461,6 +2603,10 @@ std::vector<TextLine> chars_to_lines(const std::vector<TextChar>& chars) {
         prev_right = ch.right;
     }
     flush();
+
+    if (col_boundary > 0)
+        lines = reorder_column_lines(lines, col_boundary);
+
     return lines;
 }
 
@@ -2481,7 +2627,7 @@ struct FontStats {
         for (auto& pl : all_lines)
             for (auto& l : pl)
                 if (l.font_size > 1.0)
-                    counts[(int)(l.font_size * 10)]++;
+                    counts[static_cast<int>(l.font_size * 10)]++;
 
         int max_c = 0, max_k = 120;
         for (auto& [k, c] : counts)
@@ -2721,7 +2867,7 @@ std::vector<double> find_column_boundaries(
     // - High coverage (≥ 50%): strong continuous v-line
     // - Many segments (Word→PDF cell-unit borders, ≥ 1/3 of rows)
     // - Moderate coverage (≥ 15%) with h-line endpoint evidence at ≥ half of row levels
-    int min_segs = std::max(2, (int)(row_ys.size() / 3));
+    int min_segs = std::max(2, static_cast<int>(row_ys.size() / 3));
     std::vector<double> col_xs;
     col_xs.push_back(table_left);
     for (auto& vi : vline_infos) {
@@ -3262,7 +3408,7 @@ std::vector<double> infer_columns_from_text(const PageCharCache& cache,
     }
 
     double width = right - left;
-    int n_bins = std::max(20, (int)(width / 5.0));
+    int n_bins = std::max(20, static_cast<int>(width / 5.0));
     double bin_w = width / n_bins;
     std::vector<int> gap_counts(n_bins, 0);
 
@@ -3284,7 +3430,7 @@ std::vector<double> infer_columns_from_text(const PageCharCache& cache,
     int non_empty_rows = 0;
     for (int r = 0; r < n_rows; r++)
         if (!per_row[r].empty()) non_empty_rows++;
-    int threshold = std::max(1, (int)(non_empty_rows * 0.4));
+    int threshold = std::max(1, static_cast<int>(non_empty_rows * 0.4));
 
     std::vector<double> boundaries;
     boundaries.push_back(left);
@@ -3748,14 +3894,14 @@ std::vector<TableData> detect_text_tables(const PageCharCache& cache,
                 cluster_sum += all_gaps[i];
                 cluster_count++;
             } else {
-                if (cluster_count >= std::max(2, (int)(multi_span_rows * 0.5))) {
+                if (cluster_count >= std::max(2, static_cast<int>(multi_span_rows * 0.5))) {
                     col_boundaries.push_back(cluster_sum / cluster_count);
                 }
                 cluster_sum = all_gaps[i];
                 cluster_count = 1;
             }
         }
-        if (cluster_count >= std::max(2, (int)(multi_span_rows * 0.5))) {
+        if (cluster_count >= std::max(2, static_cast<int>(multi_span_rows * 0.5))) {
             col_boundaries.push_back(cluster_sum / cluster_count);
         }
         col_boundaries.push_back(ref_xmax);
@@ -3764,7 +3910,7 @@ std::vector<TableData> detect_text_tables(const PageCharCache& cache,
         if (n_cols < 2) { start = group_indices.back() + 1; continue; }
 
         if (n_cols == 2 && multi_span_rows >= 3) {
-            if (cluster_count < (int)(multi_span_rows * 0.7)) {
+            if (cluster_count < static_cast<int>(multi_span_rows * 0.7)) {
                 start = group_indices.back() + 1; continue;
             }
         }
