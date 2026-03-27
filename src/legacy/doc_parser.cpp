@@ -5,6 +5,7 @@
 #include "common/string_utils.h"
 #include "common/binary_utils.h"
 #include "common/file_utils.h"
+#include "common/image_utils.h"
 
 #include <algorithm>
 #include <cmath>
@@ -209,22 +210,57 @@ bool DocParser::process_char(uint32_t ch, std::string& result, bool is_picture) 
     if (ch == 0x13) {
         field_depth_++;
         field_show_result_ = false;
+        collecting_field_instr_ = true;
+        field_instruction_.clear();
         return false;
     }
     // Field separator: switch to showing result text.
     if (ch == 0x14) {
+        collecting_field_instr_ = false;
         field_show_result_ = true;
+        // Check if instruction is HYPERLINK
+        pending_hyperlink_url_.clear();
+        if (field_instruction_.size() > 10) {
+            // Field instruction: " HYPERLINK \"url\" " or " HYPERLINK url "
+            auto pos = field_instruction_.find("HYPERLINK");
+            if (pos != std::string::npos) {
+                auto url_start = field_instruction_.find('"', pos + 9);
+                if (url_start != std::string::npos) {
+                    auto url_end = field_instruction_.find('"', url_start + 1);
+                    if (url_end != std::string::npos)
+                        pending_hyperlink_url_ = field_instruction_.substr(url_start + 1, url_end - url_start - 1);
+                } else {
+                    // No quotes — take the rest as URL
+                    size_t s = pos + 9;
+                    while (s < field_instruction_.size() && field_instruction_[s] == ' ') s++;
+                    size_t e = field_instruction_.find(' ', s);
+                    if (e == std::string::npos) e = field_instruction_.size();
+                    if (e > s) pending_hyperlink_url_ = field_instruction_.substr(s, e - s);
+                }
+            }
+        }
+        if (!pending_hyperlink_url_.empty())
+            result += "[";
         return false;
     }
     // Field end marker: close nesting.
     if (ch == 0x15) {
+        if (!pending_hyperlink_url_.empty()) {
+            result += "](" + pending_hyperlink_url_ + ")";
+            pending_hyperlink_url_.clear();
+        }
         if (field_depth_ > 0) field_depth_--;
         field_show_result_ = false;
+        collecting_field_instr_ = false;
         return false;
     }
 
-    // Inside a field's instruction part (before separator): skip.
-    if (field_depth_ > 0 && !field_show_result_) return false;
+    // Inside a field's instruction part (before separator): collect instruction.
+    if (field_depth_ > 0 && !field_show_result_) {
+        if (collecting_field_instr_ && ch >= 0x20 && ch < 0x80)
+            field_instruction_ += static_cast<char>(ch);
+        return false;
+    }
 
     // Line/paragraph breaks.
     if (ch == 0x0D || ch == 0x0A) {
@@ -1046,6 +1082,21 @@ std::string DocParser::text_to_markdown(const std::string& raw_text) {
                     continue;
                 }
             }
+        }
+
+        // Heading heuristic: short line (≤80 chars), not a list, surrounded by
+        // empty lines or at document start, likely a heading/title.
+        bool prev_empty = (i == 0) || (i > 0 && lines[i-1].empty());
+        bool next_empty = (i + 1 >= lines.size()) || lines[i + 1].empty();
+        bool is_short = (ln.size() <= 80);
+        bool no_period = (ln.back() != '.' && ln.back() != ';' && ln.back() != ',');
+
+        bool has_nonws = false;
+        for (char c : ln) { if (c != ' ' && c != '\t') { has_nonws = true; break; } }
+        if (prev_empty && next_empty && is_short && no_period && ln.size() > 1 && has_nonws) {
+            // Looks like a heading — use ## (H2) for general section titles
+            md += "## " + ln + "\n";
+            continue;
         }
 
         md += ln + "\n";
