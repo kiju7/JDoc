@@ -644,7 +644,7 @@ std::string PptxParser::to_markdown(const ConvertOptions& opts) {
         out << "--- Page " << slide_num << " ---\n\n";
 
         if (!content.title.empty()) {
-            out << "### " << content.title << "\n\n";
+            out << "# " << content.title << "\n\n";
         }
 
         for (auto& elem : content.elements) {
@@ -712,7 +712,7 @@ std::vector<PageChunk> PptxParser::to_chunks(
         std::ostringstream text;
 
         if (!content.title.empty()) {
-            text << "### " << content.title << "\n\n";
+            text << "# " << content.title << "\n\n";
         }
 
         for (auto& elem : content.elements) {
