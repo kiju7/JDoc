@@ -2,10 +2,9 @@
 // File and path utility functions
 // License: MIT
 
-#include "jdoc/types.h"
-
 #include <algorithm>
 #include <cctype>
+#include <cstdint>
 #include <string>
 #include <utility>
 
@@ -222,22 +221,6 @@ inline std::pair<unsigned, unsigned> image_dimensions_from_data(
     }
 
     return {0, 0};
-}
-
-// Populate width/height on ImageData from its raw data if not already set.
-inline void populate_image_dimensions(jdoc::ImageData& img) {
-    if (img.width > 0 && img.height > 0) return;
-    if (img.data.empty()) return;
-    auto [w, h] = image_dimensions_from_data(img.data.data(), img.data.size());
-    if (w > 0 && h > 0) { img.width = w; img.height = h; }
-}
-
-// Check if image is below minimum size threshold.
-// Returns true if image should be skipped (either dimension < min_size).
-inline bool is_image_too_small(const jdoc::ImageData& img, unsigned min_size) {
-    if (min_size == 0) return false;
-    if (img.width == 0 && img.height == 0) return false; // unknown dims, keep
-    return img.width < min_size || img.height < min_size;
 }
 
 }} // namespace jdoc::util
