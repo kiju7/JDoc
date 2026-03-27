@@ -6,6 +6,7 @@
 #include "common/string_utils.h"
 #include "common/binary_utils.h"
 #include "common/file_utils.h"
+#include "common/image_utils.h"
 
 #include <algorithm>
 #include <cstring>
