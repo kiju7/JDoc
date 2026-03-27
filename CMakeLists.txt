@@ -61,10 +61,16 @@ add_library(jdoc_office STATIC
 target_include_directories(jdoc_office PUBLIC include PRIVATE src vendor)
 target_link_libraries(jdoc_office PUBLIC pugixml jdoc_zip jdoc_common)
 
+# ── Unified API (auto-detect format) ─────────────────────────
+
+add_library(jdoc_all STATIC src/jdoc.cpp)
+target_include_directories(jdoc_all PUBLIC include PRIVATE src)
+target_link_libraries(jdoc_all PUBLIC jdoc_pdf jdoc_office jdoc_hwpx jdoc_hwp)
+
 # ── Shared library with C API ─────────────────────────────────
 
 add_library(jdoc_shared SHARED src/jdoc_c_api.cpp)
-target_link_libraries(jdoc_shared PRIVATE jdoc_pdf jdoc_office jdoc_hwpx jdoc_hwp)
+target_link_libraries(jdoc_shared PRIVATE jdoc_all)
 target_include_directories(jdoc_shared PUBLIC include PRIVATE src)
 set_target_properties(jdoc_shared PROPERTIES
     OUTPUT_NAME "jdoc"
@@ -81,7 +87,7 @@ endif()
 # ── Unified CLI ───────────────────────────────────────────────
 
 add_executable(jdoc src/main.cpp)
-target_link_libraries(jdoc PRIVATE jdoc_pdf jdoc_office jdoc_hwpx jdoc_hwp)
+target_link_libraries(jdoc PRIVATE jdoc_all)
 target_include_directories(jdoc PRIVATE include src)
 
 # GCC 8 requires explicit linking for std::filesystem
@@ -107,7 +113,7 @@ option(BUILD_PYTHON "Build Python bindings" OFF)
 if(BUILD_PYTHON)
     find_package(pybind11 REQUIRED)
     pybind11_add_module(_jdoc src/python_bindings.cpp)
-    target_link_libraries(_jdoc PRIVATE jdoc_pdf jdoc_office jdoc_hwpx jdoc_hwp)
+    target_link_libraries(_jdoc PRIVATE jdoc_all)
     target_include_directories(_jdoc PRIVATE include src)
     if(APPLE)
         set_target_properties(_jdoc PROPERTIES
@@ -125,5 +131,5 @@ endif()
 # ── Install ───────────────────────────────────────────────────
 
 install(TARGETS jdoc DESTINATION bin)
-install(TARGETS jdoc_shared jdoc_common jdoc_zip jdoc_pdf jdoc_hwpx jdoc_hwp jdoc_office DESTINATION lib)
+install(TARGETS jdoc_shared jdoc_all jdoc_common jdoc_zip jdoc_pdf jdoc_hwpx jdoc_hwp jdoc_office DESTINATION lib)
 install(DIRECTORY include/jdoc DESTINATION include)
