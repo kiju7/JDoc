@@ -946,7 +946,7 @@ private:
             auto [iw, ih] = util::image_dimensions_from_data(
                 reinterpret_cast<const char*>(entry->data.data()), entry->data.size());
             if (opts_.min_image_size > 0 && iw > 0 && ih > 0 &&
-                iw < opts_.min_image_size && ih < opts_.min_image_size)
+                (iw < opts_.min_image_size || ih < opts_.min_image_size))
                 return "";
         }
 

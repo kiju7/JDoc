@@ -233,11 +233,11 @@ inline void populate_image_dimensions(jdoc::ImageData& img) {
 }
 
 // Check if image is below minimum size threshold.
-// Returns true if image should be skipped (both dimensions < min_size).
+// Returns true if image should be skipped (either dimension < min_size).
 inline bool is_image_too_small(const jdoc::ImageData& img, unsigned min_size) {
     if (min_size == 0) return false;
     if (img.width == 0 && img.height == 0) return false; // unknown dims, keep
-    return img.width < min_size && img.height < min_size;
+    return img.width < min_size || img.height < min_size;
 }
 
 }} // namespace jdoc::util

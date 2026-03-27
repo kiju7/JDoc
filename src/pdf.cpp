@@ -4663,8 +4663,8 @@ std::vector<ExtractedImage> extract_page_images(PdfDoc& doc, const PdfObj& page_
         int h = xobj.get("Height").as_int();
         if (w <= 0 || h <= 0) continue;
         if (min_image_size > 0 &&
-            static_cast<unsigned>(w) < min_image_size &&
-            static_cast<unsigned>(h) < min_image_size)
+            (static_cast<unsigned>(w) < min_image_size ||
+             static_cast<unsigned>(h) < min_image_size))
             continue;
 
         ImageData img;
@@ -4765,6 +4765,11 @@ std::vector<ExtractedImage> extract_page_images(PdfDoc& doc, const PdfObj& page_
             }
 
             int components = 3;
+            bool is_indexed = false;
+            int indexed_hival = 0;
+            std::vector<uint8_t> indexed_lookup;
+            int indexed_base_comps = 3;
+
             if (cs_name == "DeviceGray" || cs_name == "CalGray") components = 1;
             else if (cs_name == "DeviceCMYK") components = 4;
             else if (cs_name == "DeviceRGB" || cs_name == "CalRGB") components = 3;
@@ -4774,6 +4779,48 @@ std::vector<ExtractedImage> extract_page_images(PdfDoc& doc, const PdfObj& page_
                     int n = icc_stream.get("N").as_int();
                     if (n > 0) components = n;
                 }
+            } else if (cs_name == "Indexed" || cs_name == "I") {
+                // Indexed (palette) color space: [/Indexed base hival lookup]
+                is_indexed = true;
+                components = 1; // index values are single-byte
+                if (cs_obj.is_arr() && cs_obj.arr.size() >= 4) {
+                    // Base color space
+                    auto base_cs = doc.resolve(cs_obj.arr[1]);
+                    if (base_cs.is_name()) {
+                        if (base_cs.str_val == "DeviceRGB" || base_cs.str_val == "CalRGB")
+                            indexed_base_comps = 3;
+                        else if (base_cs.str_val == "DeviceCMYK")
+                            indexed_base_comps = 4;
+                        else if (base_cs.str_val == "DeviceGray" || base_cs.str_val == "CalGray")
+                            indexed_base_comps = 1;
+                    } else if (base_cs.is_arr() && !base_cs.arr.empty()) {
+                        auto bn = doc.resolve(base_cs.arr[0]);
+                        if (bn.is_name() && bn.str_val == "ICCBased" && base_cs.arr.size() >= 2) {
+                            auto icc = doc.resolve(base_cs.arr[1]);
+                            int n = icc.get("N").as_int();
+                            if (n > 0) indexed_base_comps = n;
+                        }
+                    }
+                    // hival
+                    indexed_hival = doc.resolve(cs_obj.arr[2]).as_int();
+                    // lookup table (string or stream)
+                    auto lut = doc.resolve(cs_obj.arr[3]);
+                    if (lut.is_str()) {
+                        indexed_lookup.assign(lut.str_val.begin(), lut.str_val.end());
+                    } else if (lut.is_stream()) {
+                        indexed_lookup = doc.decode_stream(lut);
+                    }
+                }
+            } else if (cs_name == "Separation") {
+                // Separation: treat as grayscale for extraction
+                components = 1;
+            } else if (cs_name == "DeviceN") {
+                // DeviceN: use N parameter if available
+                if (cs_obj.is_arr() && cs_obj.arr.size() >= 2) {
+                    auto names_arr = doc.resolve(cs_obj.arr[1]);
+                    if (names_arr.is_arr())
+                        components = static_cast<int>(names_arr.arr.size());
+                }
             }
 
             size_t expected = static_cast<size_t>(w) * h * components * bpc / 8;
@@ -4782,6 +4829,24 @@ std::vector<ExtractedImage> extract_page_images(PdfDoc& doc, const PdfObj& page_
                 size_t total = static_cast<size_t>(w) * h;
                 if (total > 0 && decoded.size() % total == 0)
                     components = static_cast<int>(decoded.size() / total);
+            }
+
+            // Apply Indexed palette expansion
+            if (is_indexed && !indexed_lookup.empty() && components == 1) {
+                size_t pixel_count = static_cast<size_t>(w) * h;
+                std::vector<uint8_t> expanded(pixel_count * indexed_base_comps);
+                size_t lut_stride = static_cast<size_t>(indexed_base_comps);
+                for (size_t px = 0; px < pixel_count && px < decoded.size(); px++) {
+                    int idx = decoded[px];
+                    if (idx > indexed_hival) idx = indexed_hival;
+                    size_t lut_off = static_cast<size_t>(idx) * lut_stride;
+                    for (int c = 0; c < indexed_base_comps; c++) {
+                        expanded[px * lut_stride + c] =
+                            (lut_off + c < indexed_lookup.size()) ? indexed_lookup[lut_off + c] : 0;
+                    }
+                }
+                decoded = std::move(expanded);
+                components = indexed_base_comps;
             }
 
             img.format = "raw";
@@ -5304,6 +5369,38 @@ ImageData render_page_composite(PdfDoc& doc, const PdfObj& page_obj,
                             int n = icc.get("N").as_int();
                             if (n > 0) components = n;
                         }
+                    } else if (cs_name == "Indexed" || cs_name == "I") {
+                        // Indexed color space: expand palette
+                        components = 1;
+                        if (cs_obj.is_arr() && cs_obj.arr.size() >= 4) {
+                            auto base_cs = doc.resolve(cs_obj.arr[1]);
+                            int base_comps = 3;
+                            if (base_cs.is_name()) {
+                                if (base_cs.str_val == "DeviceGray" || base_cs.str_val == "CalGray") base_comps = 1;
+                                else if (base_cs.str_val == "DeviceCMYK") base_comps = 4;
+                            }
+                            int hival = doc.resolve(cs_obj.arr[2]).as_int();
+                            auto lut_obj = doc.resolve(cs_obj.arr[3]);
+                            std::vector<uint8_t> lut;
+                            if (lut_obj.is_str()) lut.assign(lut_obj.str_val.begin(), lut_obj.str_val.end());
+                            else if (lut_obj.is_stream()) lut = doc.decode_stream(lut_obj);
+
+                            if (!lut.empty()) {
+                                size_t px_count = static_cast<size_t>(w) * h;
+                                std::vector<uint8_t> expanded(px_count * base_comps);
+                                for (size_t pi = 0; pi < px_count && pi < decoded.size(); pi++) {
+                                    int idx = decoded[pi];
+                                    if (idx > hival) idx = hival;
+                                    size_t lo = static_cast<size_t>(idx) * base_comps;
+                                    for (int c = 0; c < base_comps; c++)
+                                        expanded[pi * base_comps + c] = (lo + c < lut.size()) ? lut[lo + c] : 0;
+                                }
+                                decoded = std::move(expanded);
+                                components = base_comps;
+                            }
+                        }
+                    } else if (cs_name == "Separation") {
+                        components = 1;
                     }
                     pixels = std::move(decoded);
                 }
@@ -5618,7 +5715,8 @@ std::string page_to_markdown(const std::vector<TextLine>& raw_lines,
                               const FontStats& stats,
                               const std::vector<ImageData>& images,
                               const std::vector<double>& image_y_pos,
-                              const std::vector<TableData>& tables) {
+                              const std::vector<TableData>& tables,
+                              const std::vector<AnnotEntry>& annots = {}) {
     auto lines = merge_colinear_lines(raw_lines);
 
     std::string md;
@@ -5713,6 +5811,32 @@ std::string page_to_markdown(const std::vector<TextLine>& raw_lines,
 
     // Flush remaining tables and images
     flush_inserts(-1e9);
+
+    // Append annotations (links, text notes) at end of page
+    if (!annots.empty()) {
+        bool has_links = false, has_notes = false;
+        for (auto& a : annots) {
+            if (!a.uri.empty()) has_links = true;
+            if (!a.text.empty() && a.subtype != "Link") has_notes = true;
+        }
+        if (has_links) {
+            md += "\n**Links:**\n";
+            for (auto& a : annots) {
+                if (a.uri.empty()) continue;
+                if (!a.text.empty())
+                    md += "- [" + a.text + "](" + a.uri + ")\n";
+                else
+                    md += "- <" + a.uri + ">\n";
+            }
+        }
+        if (has_notes) {
+            md += "\n**Notes:**\n";
+            for (auto& a : annots) {
+                if (a.text.empty() || a.subtype == "Link") continue;
+                md += "> " + a.text + "\n\n";
+            }
+        }
+    }
 
     return md;
 }
@@ -5879,6 +6003,10 @@ ExtractResult extract_pdf(const std::string& pdf_path, const ConvertOptions& opt
                                                   &font_cache, !need_graphics);
 
         result.all_lines[p] = chars_to_lines(parse_result.chars);
+
+        // Extract annotations (text notes, links)
+        result.all_annots[p] = extract_annotations(doc, page_obj, page_h);
+
         if (need_tables) {
             PageCharCache cache;
             cache.build(parse_result.chars);
@@ -6027,7 +6155,8 @@ std::string pdf_to_markdown(const std::string& pdf_path, ConvertOptions opts) {
         full_md += "--- Page " + std::to_string(p + 1) + " ---\n\n";
         std::string page_md = page_to_markdown(r.all_lines[p], r.stats,
                                                 r.all_images[p], r.all_image_y[p],
-                                                r.all_tables[p]);
+                                                r.all_tables[p],
+                                                p < (int)r.all_annots.size() ? r.all_annots[p] : std::vector<AnnotEntry>{});
         if (plaintext)
             full_md += util::strip_markdown(page_md);
         else
@@ -6059,7 +6188,8 @@ std::vector<PageChunk> pdf_to_markdown_chunks(const std::string& pdf_path,
         chunk.body_font_size = r.stats.body_size;
         std::string page_md = page_to_markdown(r.all_lines[p], r.stats,
                                                 r.all_images[p], r.all_image_y[p],
-                                                r.all_tables[p]);
+                                                r.all_tables[p],
+                                                p < (int)r.all_annots.size() ? r.all_annots[p] : std::vector<AnnotEntry>{});
         chunk.text = plaintext ? util::strip_markdown(page_md) : page_md;
 
         for (auto& td : r.all_tables[p])
