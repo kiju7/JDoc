@@ -7,6 +7,7 @@
 #include "jdoc/hwp_types.h"
 #include "legacy/ole_reader.h"
 #include "common/file_utils.h"
+#include "common/image_utils.h"
 #include "common/string_utils.h"
 #include <zlib.h>
 #include <algorithm>

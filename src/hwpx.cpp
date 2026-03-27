@@ -5,6 +5,7 @@
 #include "jdoc/hwpx.h"
 #include "jdoc/hwp_types.h"
 #include "common/file_utils.h"
+#include "common/image_utils.h"
 #include "common/string_utils.h"
 #include "zip_reader.h"
 #include <pugixml.hpp>
