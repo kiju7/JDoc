@@ -4,6 +4,7 @@
 #include "ooxml/xlsx_parser.h"
 #include "xml_utils.h"
 #include "common/file_utils.h"
+#include "common/image_utils.h"
 #include <algorithm>
 #include <cctype>
 #include <cmath>
