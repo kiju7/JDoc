@@ -25,11 +25,19 @@ public:
 private:
     OleReader& ole_;
 
+    // Font properties from FONT records.
+    struct FontInfo {
+        bool bold = false;
+        bool italic = false;
+    };
+
     // A single cell value.
     struct Cell {
         uint16_t row;
         uint16_t col;
         std::string value;
+        bool bold = false;
+        bool italic = false;
     };
 
     // A parsed sheet with name and cell data.
@@ -49,6 +57,12 @@ private:
 
     // Number formatting: XF record (xfIndex → numFmtId).
     std::vector<int> xf_num_fmt_ids_;
+
+    // Font records.
+    std::vector<FontInfo> fonts_;
+
+    // XF → fontId mapping.
+    std::vector<int> xf_font_ids_;
 
     // Parse the Workbook (or Book) stream.
     void parse_workbook();

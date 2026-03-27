@@ -2,6 +2,7 @@
 
 #include "xls_parser.h"
 #include "common/file_utils.h"
+#include "common/image_utils.h"
 #include "common/string_utils.h"
 #include "common/binary_utils.h"
 
@@ -31,6 +32,7 @@ static constexpr uint16_t RT_BOOLERR    = 0x0205;
 static constexpr uint16_t RT_FORMAT     = 0x041E;
 static constexpr uint16_t RT_XF         = 0x00E0;
 static constexpr uint16_t RT_FILEPASS   = 0x002F;
+static constexpr uint16_t RT_FONT      = 0x0031;
 static constexpr uint16_t RT_MSODRAWING = 0x00EC;
 
 // ---------- helpers ----------------------------------------------------------
@@ -419,10 +421,27 @@ void XlsParser::parse_workbook() {
                 }
             }
 
-            // XF record: offset 2-3 = numFmtId (2 bytes)
+            // FONT record: bytes 2-3 = options (bit 0=bold weight>=700, bit 1=italic)
+            if (rec_type == RT_FONT && rec_size >= 4) {
+                FontInfo fi;
+                uint16_t options = rd16(rec_data + 2);
+                fi.italic = (options & 0x02) != 0;
+                // Bold detection: weight field at offset 6 (BIFF8) >= 700
+                if (rec_size >= 8) {
+                    uint16_t weight = rd16(rec_data + 6);
+                    fi.bold = (weight >= 700);
+                } else {
+                    fi.bold = (options & 0x01) != 0;
+                }
+                fonts_.push_back(fi);
+            }
+
+            // XF record: bytes 0-1 = fontId, bytes 2-3 = numFmtId
             if (rec_type == RT_XF && rec_size >= 4) {
+                uint16_t font_id = rd16(rec_data);
                 uint16_t fmt_id = rd16(rec_data + 2);
                 xf_num_fmt_ids_.push_back(static_cast<int>(fmt_id));
+                xf_font_ids_.push_back(static_cast<int>(font_id));
             }
 
             if (rec_type == RT_SST) {
@@ -500,15 +519,29 @@ void XlsParser::parse_workbook() {
             expect_string = false;
         }
 
+        // Helper: look up bold/italic from xf index
+        auto get_font_info = [&](int xf_idx) -> std::pair<bool,bool> {
+            if (xf_idx >= 0 && xf_idx < static_cast<int>(xf_font_ids_.size())) {
+                int font_id = xf_font_ids_[xf_idx];
+                // BIFF8 skips font index 4 (reserved)
+                if (font_id >= 4) font_id--;
+                if (font_id >= 0 && font_id < static_cast<int>(fonts_.size()))
+                    return {fonts_[font_id].bold, fonts_[font_id].italic};
+            }
+            return {false, false};
+        };
+
         if (current_sheet >= 0 && current_sheet < static_cast<int>(sheets_.size())) {
             Sheet& sheet = sheets_[current_sheet];
 
             if (rec_type == RT_LABELSST && rec_size >= 10) {
                 uint16_t row = rd16(rec_data);
                 uint16_t col = rd16(rec_data + 2);
+                uint16_t xf_idx = rd16(rec_data + 4);
                 uint32_t sst_idx = rd32(rec_data + 6);
                 if (sst_idx < sst_.size()) {
-                    sheet.cells.push_back({row, col, sst_[sst_idx]});
+                    auto [b, it] = get_font_info(xf_idx);
+                    sheet.cells.push_back({row, col, sst_[sst_idx], b, it});
                 }
             } else if (rec_type == RT_BOOLERR && rec_size >= 8) {
                 // BOOLERR record: boolean or error cell
@@ -649,12 +682,13 @@ std::string XlsParser::sheet_to_markdown(const Sheet& sheet, int sheet_num) {
     uint16_t limit_row = std::min(max_row, uint16_t(10000));
     uint16_t limit_col = std::min(max_col, uint16_t(100));
 
-    // Build grid.
-    std::vector<std::vector<std::string>> grid(limit_row + 1,
-                                                std::vector<std::string>(limit_col + 1));
+    // Build grid with formatting.
+    struct GridCell { std::string value; bool bold = false; bool italic = false; };
+    std::vector<std::vector<GridCell>> grid(limit_row + 1,
+                                             std::vector<GridCell>(limit_col + 1));
     for (const auto& c : sheet.cells) {
         if (c.row <= limit_row && c.col <= limit_col) {
-            grid[c.row][c.col] = c.value;
+            grid[c.row][c.col] = {c.value, c.bold, c.italic};
         }
     }
 
@@ -662,7 +696,7 @@ std::string XlsParser::sheet_to_markdown(const Sheet& sheet, int sheet_num) {
     int used_rows = 0, used_cols = 0;
     for (int r = 0; r <= limit_row; ++r) {
         for (int c = 0; c <= limit_col; ++c) {
-            if (!grid[r][c].empty()) {
+            if (!grid[r][c].value.empty()) {
                 used_rows = std::max(used_rows, r + 1);
                 used_cols = std::max(used_cols, c + 1);
             }
@@ -677,9 +711,17 @@ std::string XlsParser::sheet_to_markdown(const Sheet& sheet, int sheet_num) {
     for (int r = 0; r < used_rows; ++r) {
         out << "|";
         for (int c = 0; c < used_cols; ++c) {
-            std::string val = grid[r][c];
+            std::string val = grid[r][c].value;
             for (size_t i = 0; i < val.size(); ++i) {
                 if (val[i] == '|') val.replace(i, 1, "\\|");
+            }
+            if (!val.empty()) {
+                if (grid[r][c].bold && grid[r][c].italic)
+                    val = "***" + val + "***";
+                else if (grid[r][c].bold)
+                    val = "**" + val + "**";
+                else if (grid[r][c].italic)
+                    val = "*" + val + "*";
             }
             out << " " << val << " |";
         }
