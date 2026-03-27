@@ -138,7 +138,7 @@ jdoc_free_images(images, image_count);
 | Feature | PDF | DOCX | DOC | XLSX/XLSB | XLS | PPTX | PPT | HWP/HWPX | RTF | HTML | TXT |
 |---|---|---|---|---|---|---|---|---|---|---|---|
 | Text | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| Headings | ✓ | ✓ | ✓ | | | | | ✓ | | | |
+| Headings | ✓ | ✓ | ✓ | | | ✓ | ✓ | ✓ | | | |
 | Bold/Italic | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | |
 | Tables | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | | ✓ | ✓ | ✓ | |
 | Images | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | |
