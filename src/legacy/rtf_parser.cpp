@@ -1,6 +1,7 @@
 // .rtf (Rich Text Format) parser implementation.
 
 #include "rtf_parser.h"
+#include "common/file_utils.h"
 #include "common/string_utils.h"
 
 #include <algorithm>

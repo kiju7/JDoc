@@ -1,6 +1,7 @@
 // .xls (BIFF8) parser implementation.
 
 #include "xls_parser.h"
+#include "common/file_utils.h"
 #include "common/string_utils.h"
 #include "common/binary_utils.h"
 
