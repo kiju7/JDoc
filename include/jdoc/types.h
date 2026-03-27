@@ -41,6 +41,7 @@ struct ConvertOptions {
     bool extract_images = false;
     std::string image_output_dir;
     std::string image_ref_prefix;   // prepended to image filenames in markdown refs
+    unsigned min_image_size = 50;   // skip images smaller than NxN pixels (0 = no filter)
     OutputFormat output_format = OutputFormat::MARKDOWN;
 };
 

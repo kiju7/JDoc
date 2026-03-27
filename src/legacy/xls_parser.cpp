@@ -700,7 +700,7 @@ std::string XlsParser::sheet_to_markdown(const Sheet& sheet, int sheet_num) {
 
 // ---------- image extraction -------------------------------------------------
 
-std::vector<ImageData> XlsParser::extract_images() {
+std::vector<ImageData> XlsParser::extract_images(unsigned min_image_size) {
     std::vector<ImageData> images;
 
     std::vector<char> wb;
@@ -787,7 +787,12 @@ std::vector<ImageData> XlsParser::extract_images() {
                     img.format = fmt;
                     img.data.assign(drawing_data.begin() + img_offset,
                                     drawing_data.begin() + img_offset + img_size);
-                    images.push_back(std::move(img));
+                    util::populate_image_dimensions(img);
+                    if (util::is_image_too_small(img, min_image_size)) {
+                        --img_idx;
+                    } else {
+                        images.push_back(std::move(img));
+                    }
                 }
             }
 
@@ -809,7 +814,7 @@ std::string XlsParser::to_markdown(const ConvertOptions& opts) {
     }
 
     {
-        auto images = extract_images();
+        auto images = extract_images(opts.min_image_size);
         for (const auto& img : images) {
             std::string filename = img.name + "." + img.format;
             if (opts.extract_images)
@@ -825,7 +830,7 @@ std::string XlsParser::to_markdown(const ConvertOptions& opts) {
 std::vector<PageChunk> XlsParser::to_chunks(const ConvertOptions& opts) {
     std::vector<PageChunk> chunks;
 
-    auto images = opts.extract_images ? extract_images() : std::vector<ImageData>{};
+    auto images = opts.extract_images ? extract_images(opts.min_image_size) : std::vector<ImageData>{};
     int img_per_sheet = images.empty() ? 0 : static_cast<int>((images.size() + sheets_.size() - 1) / sheets_.size());
 
     for (size_t i = 0; i < sheets_.size(); ++i) {

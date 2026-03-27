@@ -65,6 +65,9 @@ private:
                                  int page_number,
                                  const ConvertOptions& opts);
 
+    // Per-slide image index counter for unified naming
+    std::map<int, int> slide_image_idx_;
+
     std::map<std::string, std::string> parse_slide_rels(const std::string& slide_path);
 
     std::string format_table(

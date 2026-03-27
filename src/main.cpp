@@ -23,6 +23,7 @@ void print_usage(const char* prog) {
               << "  --no-tables     Disable table detection\n"
               << "  --chunks        Output per-page/slide/sheet chunks\n"
               << "  --images DIR    Extract images to directory\n"
+              << "  --min-image-size N  Skip images smaller than NxN pixels (default: 50, 0=no filter)\n"
               << "  --plaintext     Output plain text instead of Markdown\n"
               << "  --help          Show this help\n";
 }
@@ -130,6 +131,9 @@ int main(int argc, char* argv[]) {
         else if (arg == "--images" && i + 1 < argc) {
             opts.extract_images = true;
             opts.image_output_dir = argv[++i];
+        }
+        else if (arg == "--min-image-size" && i + 1 < argc) {
+            opts.min_image_size = static_cast<unsigned>(std::stoi(argv[++i]));
         }
         else if (arg == "--plaintext" || arg == "--text") {
             opts.output_format = jdoc::OutputFormat::PLAINTEXT;

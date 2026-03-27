@@ -556,7 +556,7 @@ std::string PptParser::slide_to_markdown(const Slide& slide) {
 
 // ── Image extraction from Pictures stream ───────────────────
 
-std::vector<ImageData> PptParser::extract_images() {
+std::vector<ImageData> PptParser::extract_images(unsigned min_image_size) {
     std::vector<ImageData> images;
 
     if (!ole_.has_stream("Pictures")) return images;
@@ -642,6 +642,11 @@ std::vector<ImageData> PptParser::extract_images() {
                 img.name = "slide_image_" + std::to_string(++img_idx);
                 img.format = fmt;
                 img.data = std::move(img_data);
+                util::populate_image_dimensions(img);
+                if (util::is_image_too_small(img, min_image_size)) {
+                    --img_idx;
+                    continue;
+                }
                 images.push_back(std::move(img));
             }
         }
@@ -656,7 +661,7 @@ std::vector<ImageData> PptParser::extract_images() {
 
 std::string PptParser::to_markdown(const ConvertOptions& opts) {
     std::string md;
-    auto all_images = extract_images();
+    auto all_images = extract_images(opts.min_image_size);
 
     // Save images to disk if requested
     if (opts.extract_images && !opts.image_output_dir.empty()) {
@@ -699,7 +704,7 @@ std::string PptParser::to_markdown(const ConvertOptions& opts) {
 
 std::vector<PageChunk> PptParser::to_chunks(const ConvertOptions& opts) {
     std::vector<PageChunk> chunks;
-    auto all_images = extract_images();
+    auto all_images = extract_images(opts.min_image_size);
 
     if (opts.extract_images && !opts.image_output_dir.empty()) {
         util::ensure_dir(opts.image_output_dir);
