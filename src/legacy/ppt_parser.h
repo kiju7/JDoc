@@ -39,7 +39,7 @@ private:
     void parse_document();
 
     // Extract images from the "Pictures" stream.
-    std::vector<ImageData> extract_images();
+    std::vector<ImageData> extract_images(unsigned min_image_size = 0);
 
     // Format a slide as markdown.
     static std::string slide_to_markdown(const Slide& slide);

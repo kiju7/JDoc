@@ -1097,7 +1097,7 @@ size_t DocParser::find_png_end(const char* data, size_t len) {
 
 // ── Image extraction ────────────────────────────────────────────
 
-std::vector<ImageData> DocParser::extract_images() {
+std::vector<ImageData> DocParser::extract_images(unsigned min_image_size) {
     std::vector<ImageData> images;
 
     // Try "Data" stream first, then fall back to "WordDocument".
@@ -1138,7 +1138,12 @@ std::vector<ImageData> DocParser::extract_images() {
             img.name = "image_" + std::to_string(++img_idx);
             img.format = fmt;
             img.data.assign(stream.begin() + img_start, stream.begin() + img_end);
-            images.push_back(std::move(img));
+            util::populate_image_dimensions(img);
+            if (util::is_image_too_small(img, min_image_size)) {
+                --img_idx;
+            } else {
+                images.push_back(std::move(img));
+            }
         }
 
         pos = img_end;
@@ -1190,6 +1195,11 @@ std::vector<ImageData> DocParser::extract_images() {
             img.name = "image_" + std::to_string(++img_idx);
             img.format = fmt;
             img.data.assign(data.begin() + img_start, data.begin() + img_start + img_size);
+            util::populate_image_dimensions(img);
+            if (util::is_image_too_small(img, min_image_size)) {
+                --img_idx;
+                return;
+            }
             images.push_back(std::move(img));
         };
 
@@ -1234,7 +1244,7 @@ std::string DocParser::to_markdown(const ConvertOptions& opts) {
     std::string raw = extract_text();
     std::string md = "--- Page 1 ---\n\n" + text_to_markdown(raw);
 
-    auto images = extract_images();
+    auto images = extract_images(opts.min_image_size);
 
     if (opts.extract_images) {
         // Save images to disk
@@ -1262,7 +1272,7 @@ std::vector<PageChunk> DocParser::to_chunks(const ConvertOptions& opts) {
     chunk.text = strip_image_markers(text_to_markdown(raw));
 
     if (opts.extract_images) {
-        chunk.images = extract_images();
+        chunk.images = extract_images(opts.min_image_size);
     }
 
     chunk.page_width = 612.0;

@@ -494,19 +494,236 @@ struct XrefEntry {
     int stream_idx = -1;
 };
 
+// ── PDF Encryption (Standard Security Handler) ──────────
+// Supports: V1/V2 (40/128-bit RC4), V4 (AES-128)
+
+static void pdf_md5(const uint8_t* data, size_t len, uint8_t digest[16]) {
+    static const uint32_t T[64] = {
+        0xd76aa478,0xe8c7b756,0x242070db,0xc1bdceee,0xf57c0faf,0x4787c62a,0xa8304613,0xfd469501,
+        0x698098d8,0x8b44f7af,0xffff5bb1,0x895cd7be,0x6b901122,0xfd987193,0xa679438e,0x49b40821,
+        0xf61e2562,0xc040b340,0x265e5a51,0xe9b6c7aa,0xd62f105d,0x02441453,0xd8a1e681,0xe7d3fbc8,
+        0x21e1cde6,0xc33707d6,0xf4d50d87,0x455a14ed,0xa9e3e905,0xfcefa3f8,0x676f02d9,0x8d2a4c8a,
+        0xfffa3942,0x8771f681,0x6d9d6122,0xfde5380c,0xa4beea44,0x4bdecfa9,0xf6bb4b60,0xbebfbc70,
+        0x289b7ec6,0xeaa127fa,0xd4ef3085,0x04881d05,0xd9d4d039,0xe6db99e5,0x1fa27cf8,0xc4ac5665,
+        0xf4292244,0x432aff97,0xab9423a7,0xfc93a039,0x655b59c3,0x8f0ccc92,0xffeff47d,0x85845dd1,
+        0x6fa87e4f,0xfe2ce6e0,0xa3014314,0x4e0811a1,0xf7537e82,0xbd3af235,0x2ad7d2bb,0xeb86d391
+    };
+    static const int S[64] = {
+        7,12,17,22,7,12,17,22,7,12,17,22,7,12,17,22,
+        5,9,14,20,5,9,14,20,5,9,14,20,5,9,14,20,
+        4,11,16,23,4,11,16,23,4,11,16,23,4,11,16,23,
+        6,10,15,21,6,10,15,21,6,10,15,21,6,10,15,21
+    };
+    size_t pad_len = ((len + 8) / 64 + 1) * 64;
+    std::vector<uint8_t> msg(pad_len, 0);
+    std::memcpy(msg.data(), data, len);
+    msg[len] = 0x80;
+    uint64_t bit_len = static_cast<uint64_t>(len) * 8;
+    std::memcpy(msg.data() + pad_len - 8, &bit_len, 8);
+
+    uint32_t a0 = 0x67452301, b0 = 0xefcdab89, c0 = 0x98badcfe, d0 = 0x10325476;
+    for (size_t off = 0; off < pad_len; off += 64) {
+        auto* M = reinterpret_cast<const uint32_t*>(msg.data() + off);
+        uint32_t a = a0, b = b0, c = c0, d = d0;
+        for (int i = 0; i < 64; i++) {
+            uint32_t f, g;
+            if (i < 16)      { f = (b & c) | (~b & d); g = static_cast<uint32_t>(i); }
+            else if (i < 32) { f = (d & b) | (~d & c); g = (5*i+1) % 16; }
+            else if (i < 48) { f = b ^ c ^ d;          g = (3*i+5) % 16; }
+            else             { f = c ^ (b | ~d);        g = (7*i) % 16; }
+            uint32_t tmp = d; d = c; c = b;
+            uint32_t x = a + f + T[i] + M[g];
+            b = b + ((x << S[i]) | (x >> (32 - S[i])));
+            a = tmp;
+        }
+        a0 += a; b0 += b; c0 += c; d0 += d;
+    }
+    std::memcpy(digest,      &a0, 4);
+    std::memcpy(digest + 4,  &b0, 4);
+    std::memcpy(digest + 8,  &c0, 4);
+    std::memcpy(digest + 12, &d0, 4);
+}
+
+static void pdf_rc4(const uint8_t* key, int key_len, uint8_t* data, size_t data_len) {
+    uint8_t s[256];
+    for (int i = 0; i < 256; i++) s[i] = static_cast<uint8_t>(i);
+    int j = 0;
+    for (int i = 0; i < 256; i++) {
+        j = (j + s[i] + key[i % key_len]) & 0xFF;
+        std::swap(s[i], s[j]);
+    }
+    int si = 0; j = 0;
+    for (size_t k = 0; k < data_len; k++) {
+        si = (si + 1) & 0xFF;
+        j = (j + s[si]) & 0xFF;
+        std::swap(s[si], s[j]);
+        data[k] ^= s[(s[si] + s[j]) & 0xFF];
+    }
+}
+
+static constexpr uint8_t PDF_PASSWORD_PAD[32] = {
+    0x28,0xBF,0x4E,0x5E,0x4E,0x75,0x8A,0x41,0x64,0x00,0x4E,0x56,0xFF,0xFA,0x01,0x08,
+    0x2E,0x2E,0x00,0xB6,0xD0,0x68,0x3E,0x80,0x2F,0x0C,0xA9,0xFE,0x64,0x53,0x69,0x7A
+};
+
+struct PdfCrypt {
+    bool active = false;
+    int version = 0;   // V value
+    int revision = 0;  // R value
+    int key_len = 5;   // in bytes (5 for 40-bit, 16 for 128-bit)
+    uint8_t file_key[16] = {};
+    bool meta_encrypted = true;
+
+    bool init(const PdfObj& trailer_dict, const PdfObj& encrypt_obj,
+              const std::string& password = "") {
+        auto& v_obj = encrypt_obj.get("V");
+        auto& r_obj = encrypt_obj.get("R");
+        version = v_obj.as_int();
+        revision = r_obj.as_int();
+
+        int length_bits = encrypt_obj.get("Length").as_int();
+        if (length_bits <= 0) length_bits = 40;
+        key_len = length_bits / 8;
+        if (key_len > 16) key_len = 16;
+        if (key_len < 5) key_len = 5;
+
+        // Extract O, U, P values
+        auto& o_obj = encrypt_obj.get("O");
+        auto& u_obj = encrypt_obj.get("U");
+        int p_val = encrypt_obj.get("P").as_int();
+
+        if (!o_obj.is_str() || !u_obj.is_str()) return false;
+
+        // Get file ID
+        auto& id_arr = trailer_dict.get("ID");
+        std::string file_id;
+        if (id_arr.is_arr() && !id_arr.arr.empty() && id_arr.arr[0].is_str())
+            file_id = id_arr.arr[0].str_val;
+
+        // Pad password
+        uint8_t padded[32];
+        size_t pw_len = password.size();
+        if (pw_len > 32) pw_len = 32;
+        std::memcpy(padded, password.data(), pw_len);
+        std::memcpy(padded + pw_len, PDF_PASSWORD_PAD, 32 - pw_len);
+
+        // Compute file encryption key (Algorithm 2 from PDF spec)
+        // MD5(padded_pw || O || P(4 bytes LE) || FileID)
+        std::vector<uint8_t> input;
+        input.insert(input.end(), padded, padded + 32);
+        input.insert(input.end(), o_obj.str_val.begin(), o_obj.str_val.end());
+        uint8_t p_bytes[4] = {
+            static_cast<uint8_t>(p_val & 0xFF),
+            static_cast<uint8_t>((p_val >> 8) & 0xFF),
+            static_cast<uint8_t>((p_val >> 16) & 0xFF),
+            static_cast<uint8_t>((p_val >> 24) & 0xFF)
+        };
+        input.insert(input.end(), p_bytes, p_bytes + 4);
+        input.insert(input.end(), file_id.begin(), file_id.end());
+
+        // For R>=4 and metadata not encrypted, append 0xFFFFFFFF
+        if (revision >= 4) {
+            auto& em = encrypt_obj.get("EncryptMetadata");
+            if (em.is_bool() && !em.bool_val) {
+                meta_encrypted = false;
+                uint8_t ff4[4] = {0xFF, 0xFF, 0xFF, 0xFF};
+                input.insert(input.end(), ff4, ff4 + 4);
+            }
+        }
+
+        uint8_t hash[16];
+        pdf_md5(input.data(), input.size(), hash);
+
+        // R>=3: hash 50 more times (first key_len bytes)
+        if (revision >= 3) {
+            for (int i = 0; i < 50; i++)
+                pdf_md5(hash, key_len, hash);
+        }
+
+        std::memcpy(file_key, hash, key_len);
+
+        // Verify against U value (try user password first)
+        if (verify_user_password(u_obj.str_val, file_id)) {
+            active = true;
+            return true;
+        }
+        return false;
+    }
+
+    bool verify_user_password(const std::string& u_value, const std::string& file_id) {
+        if (revision <= 2) {
+            // Algorithm 4: RC4-encrypt the padding
+            uint8_t result[32];
+            std::memcpy(result, PDF_PASSWORD_PAD, 32);
+            pdf_rc4(file_key, key_len, result, 32);
+            return std::memcmp(result, u_value.data(),
+                               std::min<size_t>(u_value.size(), 32)) == 0;
+        }
+        // Algorithm 5 (R>=3): MD5(pad || fileID), then RC4 with 20 key iterations
+        std::vector<uint8_t> input(PDF_PASSWORD_PAD, PDF_PASSWORD_PAD + 32);
+        input.insert(input.end(), file_id.begin(), file_id.end());
+        uint8_t hash[16];
+        pdf_md5(input.data(), input.size(), hash);
+
+        uint8_t tmp_key[16];
+        // Apply RC4 with key XOR 0..19
+        for (int i = 0; i < 20; i++) {
+            for (int j = 0; j < key_len; j++)
+                tmp_key[j] = file_key[j] ^ static_cast<uint8_t>(i);
+            pdf_rc4(tmp_key, key_len, hash, 16);
+        }
+        return std::memcmp(hash, u_value.data(), 16) == 0;
+    }
+
+    // Compute per-object key for decryption
+    void object_key(int obj_num, int gen_num, uint8_t out_key[16], int* out_len) const {
+        uint8_t buf[21];
+        std::memcpy(buf, file_key, key_len);
+        buf[key_len]     = static_cast<uint8_t>(obj_num & 0xFF);
+        buf[key_len + 1] = static_cast<uint8_t>((obj_num >> 8) & 0xFF);
+        buf[key_len + 2] = static_cast<uint8_t>((obj_num >> 16) & 0xFF);
+        buf[key_len + 3] = static_cast<uint8_t>(gen_num & 0xFF);
+        buf[key_len + 4] = static_cast<uint8_t>((gen_num >> 8) & 0xFF);
+        int eff_len = key_len + 5;
+        if (eff_len > 16) eff_len = 16;
+        uint8_t hash[16];
+        pdf_md5(buf, eff_len, hash);
+        std::memcpy(out_key, hash, eff_len);
+        *out_len = eff_len;
+    }
+
+    // Decrypt string or stream data in place
+    void decrypt_data(std::vector<uint8_t>& data, int obj_num, int gen_num) const {
+        if (!active || data.empty()) return;
+        uint8_t obj_key[16];
+        int obj_key_len;
+        object_key(obj_num, gen_num, obj_key, &obj_key_len);
+        pdf_rc4(obj_key, obj_key_len, data.data(), data.size());
+    }
+
+    std::string decrypt_string(const std::string& s, int obj_num, int gen_num) const {
+        if (!active || s.empty()) return s;
+        std::vector<uint8_t> buf(s.begin(), s.end());
+        decrypt_data(buf, obj_num, gen_num);
+        return std::string(buf.begin(), buf.end());
+    }
+};
+
 struct PdfDoc {
     const uint8_t* data;
     size_t len;
     std::map<int, XrefEntry> xref;
     PdfObj trailer;
     std::map<int, PdfObj> obj_cache;
+    PdfCrypt crypt;
 
     PdfDoc(const uint8_t* d, size_t l) : data(d), len(l) {}
 
     bool parse();
+    bool init_encryption(const std::string& password = "");
     PdfObj resolve(const PdfObj& obj);
     PdfObj get_obj(int num);
-    std::vector<uint8_t> decode_stream(const PdfObj& obj);
+    std::vector<uint8_t> decode_stream(const PdfObj& obj, int obj_num = -1, int gen_num = 0);
 
 private:
     void parse_xref_table(size_t offset);
@@ -746,6 +963,18 @@ bool PdfDoc::parse() {
     return !xref.empty();
 }
 
+bool PdfDoc::init_encryption(const std::string& password) {
+    if (!trailer.has("Encrypt")) return true; // not encrypted
+    auto encrypt_obj = resolve(trailer.get("Encrypt"));
+    if (!encrypt_obj.is_dict()) return false;
+
+    // Check /Filter = /Standard
+    auto& filter = encrypt_obj.get("Filter");
+    if (filter.is_name() && filter.str_val != "Standard") return false;
+
+    return crypt.init(trailer, encrypt_obj, password);
+}
+
 PdfObj PdfDoc::get_obj(int num) {
     static const PdfObj empty;
     auto cached = obj_cache.find(num);
@@ -867,7 +1096,7 @@ PdfObj PdfDoc::resolve(const PdfObj& obj) {
     return obj;
 }
 
-std::vector<uint8_t> PdfDoc::decode_stream(const PdfObj& obj) {
+std::vector<uint8_t> PdfDoc::decode_stream(const PdfObj& obj, int obj_num, int gen_num) {
     if (!obj.is_stream()) return {};
     // Use zero-copy pointer if available, otherwise use stored data
     std::vector<uint8_t> result;
@@ -875,6 +1104,11 @@ std::vector<uint8_t> PdfDoc::decode_stream(const PdfObj& obj) {
         result.assign(obj.stream_ptr, obj.stream_ptr + obj.stream_len);
     } else {
         result = obj.stream_data;
+    }
+
+    // Decrypt stream data if encryption is active
+    if (crypt.active && obj_num >= 0) {
+        crypt.decrypt_data(result, obj_num, gen_num);
     }
 
     auto filter_obj = resolve(obj.get("Filter"));
@@ -1827,11 +2061,25 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
                         double char_h = std::abs(final_mat[3]);
                         if (char_h < 1) char_h = std::abs(final_mat[0]);
 
+                        // Advance text position first, then compute right edge
+                        double advance = char_w_ts + gs.char_spacing;
+                        if (unicode == ' ') advance += gs.word_spacing;
+                        gs.text_mat[4] += advance * gs.text_mat[0];
+                        gs.text_mat[5] += advance * gs.text_mat[1];
+
+                        // Right edge = next char position (from advanced text matrix)
+                        double next_gx, next_gy;
+                        {
+                            double next_mat[6];
+                            mat_multiply(next_mat, gs.text_mat, gs.ctm);
+                            transform_point(next_mat, 0, 0, next_gx, next_gy);
+                        }
+
                         TextChar tc;
                         tc.x = gx;
                         tc.y = gy;
                         tc.left = gx;
-                        tc.right = gx + char_w;
+                        tc.right = next_gx;
                         tc.top = gy + char_h * 0.8;
                         tc.bot = gy - char_h * 0.2;
                         tc.font_size = char_h;
@@ -1839,12 +2087,6 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
                         tc.is_bold = gs.font ? gs.font->is_bold : false;
                         tc.is_italic = gs.font ? gs.font->is_italic : false;
                         result.chars.push_back(tc);
-
-                        // Advance text position
-                        double advance = char_w_ts + gs.char_spacing;
-                        if (unicode == ' ') advance += gs.word_spacing;
-                        gs.text_mat[4] += advance * gs.text_mat[0];
-                        gs.text_mat[5] += advance * gs.text_mat[1];
                     }
                 }
             } else if (tok_eq("TJ")) {
@@ -1897,9 +2139,21 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
                                 double char_h = std::abs(final_mat[3]);
                                 if (char_h < 1) char_h = std::abs(final_mat[0]);
 
+                                double advance = char_w_ts + gs.char_spacing;
+                                if (unicode == ' ') advance += gs.word_spacing;
+                                gs.text_mat[4] += advance * gs.text_mat[0];
+                                gs.text_mat[5] += advance * gs.text_mat[1];
+
+                                double next_gx, next_gy;
+                                {
+                                    double nm[6];
+                                    mat_multiply(nm, gs.text_mat, gs.ctm);
+                                    transform_point(nm, 0, 0, next_gx, next_gy);
+                                }
+
                                 TextChar tc;
                                 tc.x = gx; tc.y = gy;
-                                tc.left = gx; tc.right = gx + char_w;
+                                tc.left = gx; tc.right = next_gx;
                                 tc.top = gy + char_h * 0.8;
                                 tc.bot = gy - char_h * 0.2;
                                 tc.font_size = char_h;
@@ -1907,11 +2161,6 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
                                 tc.is_bold = gs.font ? gs.font->is_bold : false;
                                 tc.is_italic = gs.font ? gs.font->is_italic : false;
                                 result.chars.push_back(tc);
-
-                                double advance = char_w_ts + gs.char_spacing;
-                                if (unicode == ' ') advance += gs.word_spacing;
-                                gs.text_mat[4] += advance * gs.text_mat[0];
-                                gs.text_mat[5] += advance * gs.text_mat[1];
                             }
                         }
                     }
@@ -2196,9 +2445,9 @@ std::vector<TextLine> chars_to_lines(const std::vector<TextChar>& chars) {
         if (!cur.text.empty() && ch.unicode != ' ' && ch.unicode != 0xA0 && prev_right > -1e8) {
             double gap = ch.left - prev_right;
             // Use font-size-relative threshold for word spacing
-            double word_gap = ch.font_size * 0.25;
-            if (word_gap < 2) word_gap = 2;
-            if (gap > word_gap && gap < ch.font_size * 8)
+            double word_gap = ch.font_size * 0.15;
+            if (word_gap < 1) word_gap = 1;
+            if (gap > word_gap && gap < ch.font_size * 8 && cur.text.back() != ' ')
                 cur.text += ' ';
         }
 
@@ -2219,6 +2468,7 @@ std::vector<TextLine> chars_to_lines(const std::vector<TextChar>& chars) {
 
 struct TableData {
     std::vector<std::vector<std::string>> rows;
+    std::string title;  // full-width title row extracted from top of table
     double x0, y0, x1, y1;
     int page = 0;
 };
@@ -2657,10 +2907,13 @@ TableData build_table(const std::vector<double>& row_ys,
         if (use_text_rows && !table_row_centers.empty()) {
             std::sort(table_row_centers.begin(), table_row_centers.end());
             double half = row_h / 2.0;
-            actual_ys.push_back(table_row_centers.front() - half);
+            // Clamp to h-line grid boundaries — don't extend beyond the table
+            double grid_top = row_ys.back() + half;
+            double grid_bot = row_ys.front() - half;
+            actual_ys.push_back(std::max(table_row_centers.front() - half, grid_bot));
             for (size_t i = 0; i < table_row_centers.size() - 1; i++)
                 actual_ys.push_back((table_row_centers[i] + table_row_centers[i + 1]) / 2.0);
-            actual_ys.push_back(table_row_centers.back() + half);
+            actual_ys.push_back(std::min(table_row_centers.back() + half, grid_top));
         } else {
             actual_ys = row_ys;
         }
@@ -2750,6 +3003,24 @@ TableData build_table(const std::vector<double>& row_ys,
 
     std::reverse(table.rows.begin(), table.rows.end());
     trim_table(table);
+
+    // Extract title rows: rows at top where only one cell has content,
+    // the table has 3+ columns, and the text is long (form titles inside table borders).
+    // Skip for 2-column tables where single-fill rows are normal (key-value pairs).
+    if (n_cols >= 3) {
+        while (table.rows.size() >= 3) {
+            auto& row = table.rows.front();
+            int filled = 0;
+            for (int c = 0; c < (int)row.size(); c++)
+                if (!row[c].empty()) filled++;
+            if (filled != 1 || row[0].empty()) break;
+            // Must be long text (>30 bytes) to look like a title, not a short label
+            if (row[0].size() <= 30) break;
+            if (!table.title.empty()) table.title += " ";
+            table.title += row[0];
+            table.rows.erase(table.rows.begin());
+        }
+    }
 
     int meaningful_rows = 0;
     for (auto& row : table.rows) {
@@ -3122,9 +3393,50 @@ std::vector<TableData> detect_tables(const std::vector<PdfLineSegment>& lines,
     for (int i = 0; i < n_levels - 1; i++) {
         double gap = row_ys[i + 1] - row_ys[i];
         bool close_enough = gap < 200.0;
-        if (connected[i] || (x_overlap[i] && close_enough)) {
+        // Include row if v-line connected, h-lines share span,
+        // or h-lines share span with a small gap (merged-cell rows in forms)
+        bool h_span_ok = x_overlap[i] && close_enough;
+        if (connected[i] || h_span_ok) {
             current_group.push_back(row_ys[i + 1]);
             if (connected[i]) group_vline_connections++;
+        } else if (close_enough && group_vline_connections > 0) {
+            // No v-line and no x-overlap, but we're already in a connected group.
+            // Check if the next row's h-lines share x-range with the group's h-lines.
+            double g_left = 1e9, g_right = 0;
+            for (auto& hl : h_lines) {
+                double hy = (hl.y0 + hl.y1) / 2.0;
+                for (auto& gy : current_group) {
+                    if (std::abs(hy - gy) < 4.0) {
+                        double lx = std::min((double)hl.x0, (double)hl.x1);
+                        double rx = std::max((double)hl.x0, (double)hl.x1);
+                        if (lx < g_left) g_left = lx;
+                        if (rx > g_right) g_right = rx;
+                        break;
+                    }
+                }
+            }
+            double n_left = 1e9, n_right = 0;
+            for (auto& hl : h_lines) {
+                double hy = (hl.y0 + hl.y1) / 2.0;
+                if (std::abs(hy - row_ys[i + 1]) < 4.0) {
+                    double lx = std::min((double)hl.x0, (double)hl.x1);
+                    double rx = std::max((double)hl.x0, (double)hl.x1);
+                    if (lx < n_left) n_left = lx;
+                    if (rx > n_right) n_right = rx;
+                }
+            }
+            double extent = std::max(g_right - g_left, n_right - n_left);
+            double overlap = std::min(g_right, n_right) - std::max(g_left, n_left);
+            if (extent > 50 && overlap >= extent * 0.7) {
+                current_group.push_back(row_ys[i + 1]);
+            } else {
+                if (current_group.size() >= 3 &&
+                    (group_vline_connections > 0 || current_group.size() >= 7))
+                    table_groups.push_back(current_group);
+                current_group.clear();
+                group_vline_connections = 0;
+                current_group.push_back(row_ys[i + 1]);
+            }
         } else {
             if (current_group.size() >= 3 &&
                 (group_vline_connections > 0 || current_group.size() >= 7))
@@ -3137,6 +3449,45 @@ std::vector<TableData> detect_tables(const std::vector<PdfLineSegment>& lines,
     if (current_group.size() >= 3 &&
         (group_vline_connections > 0 || current_group.size() >= 7))
         table_groups.push_back(current_group);
+
+    // Merge adjacent groups that share the same h-line x-range.
+    // Handles forms where some row intervals lack v-lines (merged cells)
+    // but the h-lines clearly continue the same table.
+    if (table_groups.size() >= 2) {
+        auto h_x_range = [&](const std::vector<double>& group) -> std::pair<double,double> {
+            double lo = 1e9, hi = 0;
+            for (auto& hl : h_lines) {
+                double hy = (hl.y0 + hl.y1) / 2.0;
+                for (auto& ry : group) {
+                    if (std::abs(hy - ry) < 4.0) {
+                        double lx = std::min((double)hl.x0, (double)hl.x1);
+                        double rx = std::max((double)hl.x0, (double)hl.x1);
+                        if (lx < lo) lo = lx;
+                        if (rx > hi) hi = rx;
+                        break;
+                    }
+                }
+            }
+            return {lo, hi};
+        };
+
+        std::vector<std::vector<double>> merged;
+        merged.push_back(table_groups[0]);
+        for (size_t g = 1; g < table_groups.size(); g++) {
+            auto [lo1, hi1] = h_x_range(merged.back());
+            auto [lo2, hi2] = h_x_range(table_groups[g]);
+            double extent = std::max(hi1 - lo1, hi2 - lo2);
+            double overlap = std::min(hi1, hi2) - std::max(lo1, lo2);
+            double y_gap = table_groups[g].front() - merged.back().back();
+            if (extent > 50 && overlap >= extent * 0.7 && y_gap < 100) {
+                for (auto& y : table_groups[g])
+                    merged.back().push_back(y);
+            } else {
+                merged.push_back(table_groups[g]);
+            }
+        }
+        table_groups = std::move(merged);
+    }
 
     if (table_groups.empty()) return {};
 
@@ -3173,12 +3524,13 @@ std::vector<TableData> detect_tables(const std::vector<PdfLineSegment>& lines,
             }
         }
 
-        // Find split points: a row with 0-1 internal v-lines surrounded by
-        // rows with >= 3 indicates a section header between sub-tables
+        // Find split points: a row with 0-1 internal v-lines is a split
+        // only if BOTH neighbors have >= 3 v-lines (true section boundary).
+        // A single transition (many → few) is just a merged-cell area.
         std::vector<int> splits;
         for (int i = 1; i < n - 1; i++) {
             if (row_vcount[i] <= 1 &&
-                (row_vcount[i - 1] >= 3 || row_vcount[i + 1] >= 3))
+                row_vcount[i - 1] >= 3 && row_vcount[i + 1] >= 3)
                 splits.push_back(i);
         }
 
@@ -4285,7 +4637,8 @@ struct ExtractedImage {
 std::vector<ExtractedImage> extract_page_images(PdfDoc& doc, const PdfObj& page_obj,
                                                  const ContentParseResult& parse_result,
                                                  int page_num,
-                                                 const std::string& output_dir) {
+                                                 const std::string& output_dir,
+                                                 unsigned min_image_size = 0) {
     std::vector<ExtractedImage> images;
     int img_idx = 0;
 
@@ -4309,6 +4662,10 @@ std::vector<ExtractedImage> extract_page_images(PdfDoc& doc, const PdfObj& page_
         int w = xobj.get("Width").as_int();
         int h = xobj.get("Height").as_int();
         if (w <= 0 || h <= 0) continue;
+        if (min_image_size > 0 &&
+            static_cast<unsigned>(w) < min_image_size &&
+            static_cast<unsigned>(h) < min_image_size)
+            continue;
 
         ImageData img;
         img.page_number = page_num;
@@ -4990,7 +5347,7 @@ ImageData render_page_composite(PdfDoc& doc, const PdfObj& page_obj,
 
     ImageData img;
     img.page_number = page_num;
-    img.name = "page" + std::to_string(page_num + 1) + "_render";
+    img.name = "page" + std::to_string(page_num + 1) + "_img0";
     img.format = "raw";
     img.width = rw;
     img.height = rh;
@@ -5101,6 +5458,78 @@ void collect_bookmarks(PdfDoc& doc, const PdfObj& node, int depth,
             break;
         }
     }
+}
+
+// ── Annotation Extraction ────────────────────────────────
+
+struct AnnotEntry {
+    std::string text;     // annotation body text
+    std::string uri;      // for Link annotations
+    std::string subtype;  // Text, Link, FreeText, etc.
+    double y = 0;         // vertical position on page
+};
+
+std::vector<AnnotEntry> extract_annotations(PdfDoc& doc, const PdfObj& page_obj, double page_h) {
+    std::vector<AnnotEntry> result;
+
+    auto annots_ref = page_obj.get("Annots");
+    if (annots_ref.is_none()) return result;
+
+    auto annots = doc.resolve(annots_ref);
+    if (!annots.is_arr()) return result;
+
+    for (auto& aref : annots.arr) {
+        auto annot = doc.resolve(aref);
+        if (!annot.is_dict()) continue;
+
+        AnnotEntry entry;
+
+        // Get subtype
+        auto& subtype = annot.get("Subtype");
+        if (subtype.is_name()) entry.subtype = subtype.str_val;
+
+        // Get position from Rect
+        auto& rect = annot.get("Rect");
+        if (rect.is_arr() && rect.arr.size() >= 4)
+            entry.y = rect.arr[3].as_num(); // top y
+
+        // Extract text content (Contents key)
+        auto& contents = annot.get("Contents");
+        if (contents.is_str() && !contents.str_val.empty()) {
+            auto& s = contents.str_val;
+            // Detect UTF-16BE BOM
+            if (s.size() >= 2 &&
+                static_cast<uint8_t>(s[0]) == 0xFE &&
+                static_cast<uint8_t>(s[1]) == 0xFF) {
+                for (size_t i = 2; i + 1 < s.size(); i += 2) {
+                    uint32_t cp = (static_cast<uint8_t>(s[i]) << 8) |
+                                   static_cast<uint8_t>(s[i + 1]);
+                    util::append_utf8(entry.text, cp);
+                }
+            } else {
+                for (unsigned char c : s)
+                    util::append_utf8(entry.text, static_cast<uint32_t>(c));
+            }
+        }
+
+        // Extract URI for Link annotations
+        if (entry.subtype == "Link") {
+            auto action = doc.resolve(annot.get("A"));
+            if (action.is_dict()) {
+                auto& act_s = action.get("S");
+                if (act_s.is_name() && act_s.str_val == "URI") {
+                    auto& uri = action.get("URI");
+                    if (uri.is_str()) entry.uri = uri.str_val;
+                }
+            }
+        }
+
+        // Only include annotations with actual content
+        if (!entry.text.empty() || !entry.uri.empty())
+            result.push_back(std::move(entry));
+    }
+
+    return result;
 }
 
 // ── Markdown Formatting ──────────────────────────────────
@@ -5220,11 +5649,21 @@ std::string page_to_markdown(const std::vector<TextLine>& raw_lines,
             auto& ins = inserts[next_insert];
             if (ins.is_image) {
                 auto& img = images[ins.idx];
-                std::string ref = img.saved_path.empty() ? img.name : img.saved_path;
+                std::string ref = "embedded:" + img.name;
+                if (!img.saved_path.empty()) {
+                    // Use filename only from saved path
+                    auto slash = img.saved_path.find_last_of('/');
+                    ref = (slash != std::string::npos)
+                        ? img.saved_path.substr(slash + 1)
+                        : img.saved_path;
+                }
                 md += "\n![" + img.name + "](" + ref + ")\n";
             } else {
+                auto& tbl = tables[ins.idx];
+                if (!tbl.title.empty())
+                    md += "\n" + tbl.title + "\n";
                 md += "\n";
-                md += format_table(tables[ins.idx]);
+                md += format_table(tbl);
                 md += "\n";
             }
             next_insert++;
@@ -5285,6 +5724,7 @@ struct ExtractResult {
     std::vector<std::vector<ImageData>> all_images;
     std::vector<std::vector<double>> all_image_y;  // per-page image Y positions (PDF coords, top=large)
     std::vector<std::vector<TableData>> all_tables;
+    std::vector<std::vector<AnnotEntry>> all_annots;
     std::vector<double> page_widths;
     std::vector<double> page_heights;
     std::vector<BookmarkEntry> bookmarks;
@@ -5336,9 +5776,11 @@ ExtractResult extract_pdf(const std::string& pdf_path, const ConvertOptions& opt
     if (!doc.parse())
         throw std::runtime_error("Failed to parse PDF structure: " + pdf_path);
 
-    // Check for encryption
-    if (doc.trailer.has("Encrypt"))
-        throw std::runtime_error("Encrypted PDF files are not supported: " + pdf_path);
+    // Handle encryption (supports Standard Security Handler with empty password)
+    if (doc.trailer.has("Encrypt")) {
+        if (!doc.init_encryption(""))
+            throw std::runtime_error("Encrypted PDF requires a password: " + pdf_path);
+    }
 
     // Get page tree
     auto root = doc.resolve(doc.trailer.get("Root"));
@@ -5373,6 +5815,7 @@ ExtractResult extract_pdf(const std::string& pdf_path, const ConvertOptions& opt
     result.all_images.resize(tp);
     result.all_image_y.resize(tp);
     result.all_tables.resize(tp);
+    result.all_annots.resize(tp);
     result.page_widths.resize(tp, 0);
     result.page_heights.resize(tp, 0);
 
@@ -5467,12 +5910,12 @@ ExtractResult extract_pdf(const std::string& pdf_path, const ConvertOptions& opt
                 // Layered: render as composite
                 auto rendered = render_page_composite(doc, page_obj, parse_result,
                                                       p, page_w, page_h, image_dir);
-                if (!rendered.data.empty()) {
+                if (!rendered.data.empty() || !rendered.pixels.empty()) {
                     result.all_images[p].push_back(std::move(rendered));
                     result.all_image_y[p].push_back(page_h); // full-page composite goes to top
                 }
             } else {
-                auto extracted = extract_page_images(doc, page_obj, parse_result, p, image_dir);
+                auto extracted = extract_page_images(doc, page_obj, parse_result, p, image_dir, opts.min_image_size);
                 for (auto& ei : extracted) {
                     // ctm[5] is the Y translation in PDF coordinates (origin bottom-left)
                     // ctm[3] is vertical scale; y_top = ctm[5] + abs(ctm[3])
@@ -5487,7 +5930,7 @@ ExtractResult extract_pdf(const std::string& pdf_path, const ConvertOptions& opt
                 if (!parse_result.images.empty() || !parse_result.segments.empty()) {
                     auto rendered = render_page_composite(doc, page_obj, parse_result,
                                                           p, page_w, page_h, image_dir);
-                    if (!rendered.data.empty()) {
+                    if (!rendered.data.empty() || !rendered.pixels.empty()) {
                         result.all_images[p].push_back(std::move(rendered));
                         result.all_image_y[p].push_back(page_h);
                     }
@@ -5580,7 +6023,8 @@ std::string pdf_to_markdown(const std::string& pdf_path, ConvertOptions opts) {
 
     for (int p : page_indices) {
         if (p < 0 || p >= r.total_pages) continue;
-        full_md += "\n--- Page " + std::to_string(p + 1) + " ---\n\n";
+        if (!full_md.empty()) full_md += '\n';
+        full_md += "--- Page " + std::to_string(p + 1) + " ---\n\n";
         std::string page_md = page_to_markdown(r.all_lines[p], r.stats,
                                                 r.all_images[p], r.all_image_y[p],
                                                 r.all_tables[p]);

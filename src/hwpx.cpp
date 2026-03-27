@@ -435,10 +435,14 @@ private:
                         para_has_content = true;
                         // Add image reference in markdown
                         auto& saved = chunk.images.back();
-                        if (!saved.saved_path.empty())
-                            para_text += "![" + saved.name + "](" + opts_.image_ref_prefix + saved.name + ")";
-                        else
+                        if (!saved.saved_path.empty()) {
+                            auto slash = saved.saved_path.find_last_of('/');
+                            std::string ref = (slash != std::string::npos)
+                                ? saved.saved_path.substr(slash + 1) : saved.saved_path;
+                            para_text += "![" + saved.name + "](" + ref + ")";
+                        } else {
                             para_text += "![" + saved.name + "](embedded:" + saved.name + ")";
+                        }
                     }
                 }
                 else if (in == "hp:ctrl") {
@@ -713,10 +717,15 @@ private:
         if (raw.empty()) return img;
 
         img.data.assign(raw.begin(), raw.end());
-        img.name = file_path;
         img.format = util::image_format_from_ext(util::get_extension(file_path));
+        std::string ext = (img.format == "jpeg") ? "jpg" : img.format;
+        img.name = "page" + std::to_string(page_number) +
+                   "_img" + std::to_string(image_idx);
         img.width = width;
         img.height = height;
+        util::populate_image_dimensions(img);
+        if (util::is_image_too_small(img, opts_.min_image_size))
+            return {};
 
         // Save to disk if requested
         if (opts_.extract_images && !opts_.image_output_dir.empty()) {

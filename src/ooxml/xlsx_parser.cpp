@@ -10,6 +10,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <cstdio>
+#include <fstream>
 #include <map>
 #include <set>
 #include <sstream>
@@ -719,6 +720,7 @@ std::vector<ImageData> XlsxParser::extract_images(
     std::set<std::string> extracted;
 
     // Per-sheet image extraction via drawing relationships
+    int img_idx = 0;
     for (size_t i = 0; i < sheets_.size(); ++i) {
         int sheet_num = static_cast<int>(i) + 1;
         const auto& info = sheets_[i];
@@ -802,21 +804,27 @@ std::vector<ImageData> XlsxParser::extract_images(
 
                 ImageData img;
                 img.page_number = sheet_num;
-                img.name = util::get_filename(media_path);
-                img.format = util::image_format_from_ext(util::get_extension(media_path));
+                std::string ext = util::get_extension(media_path);
+                img.format = util::image_format_from_ext(ext);
+                img.name = "page" + std::to_string(sheet_num) + "_img" + std::to_string(img_idx);
+                std::string filename = img.name + (ext.empty() ? ".png" : ext);
+
+                img.data = zip_.read_entry(media_path);
+                util::populate_image_dimensions(img);
+                if (util::is_image_too_small(img, opts.min_image_size))
+                    continue;
+                img_idx++;
 
                 if (!opts.image_output_dir.empty()) {
                     util::ensure_dir(opts.image_output_dir);
-                    std::string out_path = opts.image_output_dir + "/" + img.name;
-                    for (auto& e : zip_.entries()) {
-                        if (e.name == media_path) {
-                            if (zip_.extract_entry_to_file(e, out_path))
-                                img.saved_path = out_path;
-                            break;
-                        }
+                    std::string out_path = opts.image_output_dir + "/" + filename;
+                    std::ofstream ofs(out_path, std::ios::binary);
+                    if (ofs) {
+                        ofs.write(img.data.data(), img.data.size());
+                        img.saved_path = out_path;
                     }
-                } else {
-                    img.data = zip_.read_entry(media_path);
+                    img.data.clear();
+                    img.data.shrink_to_fit();
                 }
                 images.push_back(std::move(img));
             }
@@ -831,17 +839,27 @@ std::vector<ImageData> XlsxParser::extract_images(
 
         ImageData img;
         img.page_number = 1;
-        img.name = util::get_filename(entry->name);
-        img.format = util::image_format_from_ext(util::get_extension(entry->name));
+        std::string ext = util::get_extension(entry->name);
+        img.format = util::image_format_from_ext(ext);
+        img.name = "page1_img" + std::to_string(img_idx);
+        std::string filename = img.name + (ext.empty() ? ".png" : ext);
+
+        img.data = zip_.read_entry(*entry);
+        util::populate_image_dimensions(img);
+        if (util::is_image_too_small(img, opts.min_image_size))
+            continue;
+        img_idx++;
 
         if (!opts.image_output_dir.empty()) {
             util::ensure_dir(opts.image_output_dir);
-            std::string out_path = opts.image_output_dir + "/" + img.name;
-            if (zip_.extract_entry_to_file(*entry, out_path)) {
+            std::string out_path = opts.image_output_dir + "/" + filename;
+            std::ofstream ofs(out_path, std::ios::binary);
+            if (ofs) {
+                ofs.write(img.data.data(), img.data.size());
                 img.saved_path = out_path;
             }
-        } else {
-            img.data = zip_.read_entry(*entry);
+            img.data.clear();
+            img.data.shrink_to_fit();
         }
         images.push_back(std::move(img));
     }
@@ -973,10 +991,12 @@ std::vector<PageChunk> XlsxParser::to_chunks(
             for (auto& c : chunks) {
                 if (c.page_number == img.page_number) { target = &c; break; }
             }
-            std::string ref = img.saved_path.empty()
-                ? "embedded:" + img.name
-                : opts.image_ref_prefix + img.name;
-            target->text += "![" + img.name + "](" + ref + ")\n\n";
+            std::string ref_name = img.name;
+            if (!img.saved_path.empty()) {
+                auto sl = img.saved_path.find_last_of('/');
+                ref_name = (sl != std::string::npos) ? img.saved_path.substr(sl + 1) : img.saved_path;
+            }
+            target->text += "![" + img.name + "](" + ref_name + ")\n\n";
             target->images.push_back(std::move(img));
         }
     }

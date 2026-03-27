@@ -925,10 +925,14 @@ private:
         std::string ext = ref.extension;
         if (ext.empty()) ext = "jpg";
 
+        std::string unified = "page" + std::to_string(chunk.page_number)
+                             + "_img" + std::to_string(image_idx);
+        std::string filename = unified + "." + ext;
+
         // When images not requested, emit embedded reference without loading data
         if (!opts_.extract_images) {
             image_idx++;
-            return "![" + entry->name + "](embedded:" + entry->name + ")\n\n";
+            return "![" + unified + "](embedded:" + unified + ")\n\n";
         }
 
         // Lazy load from OLE storage
@@ -937,11 +941,18 @@ private:
             if (entry->data.empty()) return "";
         }
 
+        // Check dimensions before saving
+        {
+            auto [iw, ih] = util::image_dimensions_from_data(
+                reinterpret_cast<const char*>(entry->data.data()), entry->data.size());
+            if (opts_.min_image_size > 0 && iw > 0 && ih > 0 &&
+                iw < opts_.min_image_size && ih < opts_.min_image_size)
+                return "";
+        }
+
         std::string saved_path;
         if (!opts_.image_output_dir.empty()) {
             util::ensure_dir(opts_.image_output_dir);
-            std::string filename = "page" + std::to_string(chunk.page_number)
-                                 + "_img" + std::to_string(image_idx) + "." + ext;
             saved_path = opts_.image_output_dir + "/" + filename;
             std::ofstream out(saved_path, std::ios::binary);
             if (out) {
@@ -951,19 +962,20 @@ private:
 
         ImageData idata;
         idata.page_number = chunk.page_number;
-        idata.name = entry->name;
+        idata.name = unified;
         idata.format = ext;
-        // Move data instead of copying — halves peak memory for large images
         idata.data.assign(reinterpret_cast<const char*>(entry->data.data()),
                           reinterpret_cast<const char*>(entry->data.data()) + entry->data.size());
         entry->data.clear();
         entry->data.shrink_to_fit();
+        util::populate_image_dimensions(idata);
+
         idata.saved_path = saved_path;
         chunk.images.push_back(std::move(idata));
 
         image_idx++;
 
-        return "![" + entry->name + "](" + opts_.image_ref_prefix + entry->name + ")\n\n";
+        return "![" + unified + "](" + filename + ")\n\n";
     }
 
     // ── Paragraph to Markdown ───────────────────────────────

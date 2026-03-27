@@ -462,6 +462,10 @@ std::vector<PageChunk> RtfParser::to_chunks(const ConvertOptions& opts) {
                 img.data = hex_to_binary(pi.hex_data);
             }
 
+            util::populate_image_dimensions(img);
+            if (util::is_image_too_small(img, opts.min_image_size))
+                continue;
+
             chunk.images.push_back(std::move(img));
         }
     }

@@ -50,7 +50,7 @@ private:
     bool process_char(uint32_t ch, std::string& result, bool is_picture = false);
 
     // Image extraction: scan Data stream and WordDocument for embedded images.
-    std::vector<ImageData> extract_images();
+    std::vector<ImageData> extract_images(unsigned min_image_size = 0);
 
     // Convert raw extracted text to markdown with heuristic formatting.
     std::string text_to_markdown(const std::string& raw_text);

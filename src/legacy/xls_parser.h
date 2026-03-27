@@ -80,7 +80,7 @@ private:
     static std::string sheet_to_markdown(const Sheet& sheet, int sheet_num);
 
     // Extract images from MSODRAWING records.
-    std::vector<ImageData> extract_images();
+    std::vector<ImageData> extract_images(unsigned min_image_size = 0);
 
 };
 

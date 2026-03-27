@@ -34,6 +34,9 @@ private:
     // Relationship ID -> target path (for images and hyperlinks)
     std::map<std::string, std::string> rel_targets_;
 
+    // Original media filename -> unified name (page1_img0, etc.)
+    std::map<std::string, std::string> image_name_map_;
+
     // External hyperlink targets (rId -> URL)
     std::map<std::string, std::string> hyperlink_targets_;
 

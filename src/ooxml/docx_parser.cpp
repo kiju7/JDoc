@@ -6,6 +6,7 @@
 #include "common/file_utils.h"
 #include <algorithm>
 #include <cstdlib>
+#include <fstream>
 #include <map>
 #include <set>
 #include <sstream>
@@ -236,27 +237,39 @@ std::vector<ImageData> DocxParser::extract_images(
     if (!opts.extract_images) return images;
 
     auto entries = zip_.entries_with_prefix("word/media/");
+    int img_idx = 0;
     for (auto* entry : entries) {
         std::string ext = util::get_extension(entry->name);
         std::string fmt = util::image_format_from_ext(ext);
 
         ImageData img;
         img.page_number = 1;
-        img.name = util::get_filename(entry->name);
+        img.name = "page1_img" + std::to_string(img_idx);
         img.format = fmt;
 
+        img.data = zip_.read_entry(*entry);
+
+        util::populate_image_dimensions(img);
+        if (util::is_image_too_small(img, opts.min_image_size))
+            continue;
+
+        std::string filename = img.name + (ext.empty() ? ".png" : ext);
         if (!opts.image_output_dir.empty()) {
             util::ensure_dir(opts.image_output_dir);
-            std::string out_path =
-                opts.image_output_dir + "/" + img.name;
-            if (zip_.extract_entry_to_file(*entry, out_path)) {
+            std::string out_path = opts.image_output_dir + "/" + filename;
+            std::ofstream ofs(out_path, std::ios::binary);
+            if (ofs) {
+                ofs.write(img.data.data(), img.data.size());
                 img.saved_path = out_path;
             }
-        } else {
-            img.data = zip_.read_entry(*entry);
+            img.data.clear();
+            img.data.shrink_to_fit();
         }
 
+        std::string orig_name = util::get_filename(entry->name);
+        image_name_map_[orig_name] = filename;
         images.push_back(std::move(img));
+        img_idx++;
     }
     return images;
 }
@@ -673,6 +686,9 @@ std::string DocxParser::to_markdown(const ConvertOptions& opts) {
         return c;
     };
 
+    // Extract images first to build the name map for inline references
+    auto images = extract_images(opts);
+
     out << "--- Page " << page_num << " ---\n\n";
 
     for (size_t i = 0; i < elements.size(); ++i) {
@@ -700,11 +716,13 @@ std::string DocxParser::to_markdown(const ConvertOptions& opts) {
         if (!elem.image_rid.empty()) {
             auto it = rel_targets_.find(elem.image_rid);
             if (it != rel_targets_.end()) {
-                std::string img_name = util::get_filename(it->second);
-                if (opts.extract_images)
-                    out << "![" << img_name << "](" << opts.image_ref_prefix << img_name << ")\n\n";
-                else
-                    out << "![" << img_name << "](embedded:" << img_name << ")\n\n";
+                std::string orig = util::get_filename(it->second);
+                auto nm = image_name_map_.find(orig);
+                std::string ref = (nm != image_name_map_.end()) ? nm->second : orig;
+                // alt text without extension, href with extension
+                auto dot = ref.rfind('.');
+                std::string alt = (dot != std::string::npos) ? ref.substr(0, dot) : ref;
+                out << "![" << alt << "](" << ref << ")\n\n";
             }
         }
 
@@ -744,11 +762,6 @@ std::string DocxParser::to_markdown(const ConvertOptions& opts) {
     }
     if (!endnotes.empty()) {
         out << "\n" << endnotes;
-    }
-
-    auto images = extract_images(opts);
-    if (!images.empty() && opts.extract_images) {
-        // Images already referenced inline where possible
     }
 
     return out.str();
@@ -834,11 +847,12 @@ std::vector<PageChunk> DocxParser::to_chunks(
         if (!elem.image_rid.empty()) {
             auto it = rel_targets_.find(elem.image_rid);
             if (it != rel_targets_.end()) {
-                std::string img_name = util::get_filename(it->second);
-                if (opts.extract_images)
-                    text << "![" << img_name << "](" << opts.image_ref_prefix << img_name << ")\n\n";
-                else
-                    text << "![" << img_name << "](embedded:" << img_name << ")\n\n";
+                std::string orig = util::get_filename(it->second);
+                auto nm = image_name_map_.find(orig);
+                std::string ref = (nm != image_name_map_.end()) ? nm->second : orig;
+                auto dot = ref.rfind('.');
+                std::string alt = (dot != std::string::npos) ? ref.substr(0, dot) : ref;
+                text << "![" << alt << "](" << ref << ")\n\n";
             }
         }
 

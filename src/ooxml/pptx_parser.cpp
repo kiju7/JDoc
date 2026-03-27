@@ -6,6 +6,7 @@
 #include "common/file_utils.h"
 #include <algorithm>
 #include <cstdlib>
+#include <fstream>
 #include <set>
 #include <sstream>
 
@@ -587,21 +588,31 @@ ImageData PptxParser::extract_image_data(const std::string& media_path,
                                           const ConvertOptions& opts) {
     ImageData img;
     img.page_number = page_number;
-    img.name = util::get_filename(media_path);
-    img.format = util::image_format_from_ext(util::get_extension(media_path));
 
-    if (opts.extract_images && !opts.image_output_dir.empty()) {
-        util::ensure_dir(opts.image_output_dir);
-        std::string out_path = opts.image_output_dir + "/" + img.name;
-        for (auto& e : zip_.entries()) {
-            if (e.name == media_path) {
-                if (zip_.extract_entry_to_file(e, out_path))
-                    img.saved_path = out_path;
-                break;
-            }
-        }
-    } else if (opts.extract_images) {
+    std::string ext = util::get_extension(media_path);
+    img.format = util::image_format_from_ext(ext);
+
+    // Assign unified name: page{N}_img{M}
+    int& idx = slide_image_idx_[page_number];
+    img.name = "page" + std::to_string(page_number) + "_img" + std::to_string(idx);
+    std::string filename = img.name + (ext.empty() ? ".png" : ext);
+    idx++;
+
+    if (opts.extract_images) {
         img.data = zip_.read_entry(media_path);
+        util::populate_image_dimensions(img);
+
+        if (!opts.image_output_dir.empty() && !img.data.empty()) {
+            util::ensure_dir(opts.image_output_dir);
+            std::string out_path = opts.image_output_dir + "/" + filename;
+            std::ofstream ofs(out_path, std::ios::binary);
+            if (ofs) {
+                ofs.write(img.data.data(), img.data.size());
+                img.saved_path = out_path;
+            }
+            img.data.clear();
+            img.data.shrink_to_fit();
+        }
     }
 
     return img;
@@ -641,16 +652,18 @@ std::string PptxParser::to_markdown(const ConvertOptions& opts) {
                     out << elem.text << "\n\n";
                     break;
                 case SlideElement::IMAGE: {
-                    std::string name = util::get_filename(elem.text);
-                    if (opts.extract_images)
-                        out << "![" << name << "](" << opts.image_ref_prefix << name << ")\n\n";
-                    else
-                        out << "![" << name << "](embedded:" << name << ")\n\n";
                     if (!extracted.count(elem.text) && zip_.has_entry(elem.text)) {
                         extracted.insert(elem.text);
-                        if (opts.extract_images && !opts.image_output_dir.empty()) {
-                            extract_image_data(elem.text, slide_num, opts);
+                        ImageData img = extract_image_data(elem.text, slide_num, opts);
+                        if (util::is_image_too_small(img, opts.min_image_size))
+                            break;
+                        std::string ref_name = img.name;
+                        if (!img.saved_path.empty()) {
+                            auto sl = img.saved_path.find_last_of('/');
+                            ref_name = (sl != std::string::npos)
+                                ? img.saved_path.substr(sl + 1) : img.saved_path;
                         }
+                        out << "![" << img.name << "](" << ref_name << ")\n\n";
                     }
                     break;
                 }
@@ -712,11 +725,16 @@ std::vector<PageChunk> PptxParser::to_chunks(
                     if (first_ref) extracted.insert(elem.text);
 
                     ImageData img = extract_image_data(elem.text, slide_num, img_opts);
+                    if (util::is_image_too_small(img, opts.min_image_size))
+                        break;
 
-                    std::string ref = img.saved_path.empty()
-                        ? "embedded:" + img.name
-                        : opts.image_ref_prefix + img.name;
-                    text << "![" << img.name << "](" << ref << ")\n\n";
+                    std::string ref_name = img.name;
+                    if (!img.saved_path.empty()) {
+                        auto slash = img.saved_path.find_last_of('/');
+                        ref_name = (slash != std::string::npos)
+                            ? img.saved_path.substr(slash + 1) : img.saved_path;
+                    }
+                    text << "![" << img.name << "](" << ref_name << ")\n\n";
 
                     if (first_ref)
                         chunk.images.push_back(std::move(img));

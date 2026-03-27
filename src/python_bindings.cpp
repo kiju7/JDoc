@@ -164,6 +164,7 @@ PYBIND11_MODULE(_jdoc, m) {
         .def_readwrite("extract_tables", &jdoc::ConvertOptions::extract_tables)
         .def_readwrite("extract_images", &jdoc::ConvertOptions::extract_images)
         .def_readwrite("image_output_dir", &jdoc::ConvertOptions::image_output_dir)
+        .def_readwrite("min_image_size", &jdoc::ConvertOptions::min_image_size)
         .def_readwrite("output_format", &jdoc::ConvertOptions::output_format);
 
     // DocFormat enum
@@ -185,11 +186,13 @@ PYBIND11_MODULE(_jdoc, m) {
                          const std::string& format,
                          const std::vector<int>& pages,
                          bool extract_images,
-                         const std::string& image_output_dir) -> std::string {
+                         const std::string& image_output_dir,
+                         unsigned min_image_size) -> std::string {
         jdoc::ConvertOptions opts;
         opts.pages = pages;
         opts.extract_images = extract_images;
         opts.image_output_dir = image_output_dir;
+        opts.min_image_size = min_image_size;
         if (format == "text" || format == "plaintext" || format == "plain")
             opts.output_format = jdoc::OutputFormat::PLAINTEXT;
         else
@@ -201,6 +204,7 @@ PYBIND11_MODULE(_jdoc, m) {
     py::arg("pages") = std::vector<int>{},
     py::arg("extract_images") = false,
     py::arg("image_output_dir") = "",
+    py::arg("min_image_size") = 50,
     R"doc(Convert a document file to text.
 
 Args:
@@ -209,6 +213,7 @@ Args:
     pages: List of page numbers (0-based). Empty = all pages.
     extract_images: Whether to extract images
     image_output_dir: Directory to save extracted images (if empty, images kept in memory only)
+    min_image_size: Skip images smaller than NxN pixels (default: 50, 0=no filter)
 
 Returns:
     Converted text as string
@@ -218,12 +223,14 @@ Returns:
                                const std::string& format,
                                const std::vector<int>& pages,
                                bool extract_images,
-                               const std::string& image_output_dir)
+                               const std::string& image_output_dir,
+                               unsigned min_image_size)
                                -> std::vector<jdoc::PageChunk> {
         jdoc::ConvertOptions opts;
         opts.pages = pages;
         opts.extract_images = extract_images;
         opts.image_output_dir = image_output_dir;
+        opts.min_image_size = min_image_size;
         if (format == "text" || format == "plaintext" || format == "plain")
             opts.output_format = jdoc::OutputFormat::PLAINTEXT;
         else
@@ -235,6 +242,7 @@ Returns:
     py::arg("pages") = std::vector<int>{},
     py::arg("extract_images") = false,
     py::arg("image_output_dir") = "",
+    py::arg("min_image_size") = 50,
     R"doc(Convert a document file to per-page chunks.
 
 Args:
@@ -243,6 +251,7 @@ Args:
     pages: List of page numbers (0-based). Empty = all pages.
     extract_images: Whether to extract images (accessible via chunk.images)
     image_output_dir: Directory to save images (if empty, images available via ImageData.data bytes)
+    min_image_size: Skip images smaller than NxN pixels (default: 50, 0=no filter)
 
 Returns:
     List of PageChunk objects, one per page/slide/sheet
