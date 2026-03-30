@@ -185,7 +185,10 @@ void OleReader::parse_directories() {
     // Read all sectors in the directory chain.
     std::vector<char> dir_data;
     uint32_t sec = first_dir_sector_;
+    uint32_t max_dir_sectors = static_cast<uint32_t>(fat_.size()) + 1;
+    uint32_t visited = 0;
     while (sec != ENDOFCHAIN && sec != FREESECT && sec < fat_.size()) {
+        if (++visited > max_dir_sectors) break;
         size_t old_size = dir_data.size();
         dir_data.resize(old_size + sector_size_);
         read_sector(sec, dir_data.data() + old_size);
@@ -246,7 +249,9 @@ void OleReader::parse_mini_fat() {
     uint32_t sec = first_mini_fat_sector;
     std::vector<uint8_t> sbuf(sector_size_);
 
+    uint32_t mf_visited = 0;
     while (sec != ENDOFCHAIN && sec != FREESECT && sec < fat_.size()) {
+        if (++mf_visited > num_mini_fat_sectors + 1) break;
         read_sector(sec, sbuf.data());
         for (uint32_t j = 0; j < entries_per_sector; ++j) {
             mini_fat_.push_back(util::read_u32_le(sbuf.data() + j * 4));
@@ -263,9 +268,13 @@ std::vector<char> OleReader::read_chain(uint32_t start, uint64_t size) const {
     uint32_t sec = start;
     uint64_t written = 0;
 
+    uint32_t max_sectors = static_cast<uint32_t>(size / sector_size_ + 2);
+
     if (mem_data_) {
         // Memory-based: direct copy from mapped buffer, no intermediate buffer
+        uint32_t visited = 0;
         while (sec != ENDOFCHAIN && sec != FREESECT && sec < fat_.size() && written < size) {
+            if (++visited > max_sectors) break;  // circular chain guard
             uint64_t offset = static_cast<uint64_t>(sec + 1) * sector_size_;
             uint64_t to_copy = std::min(static_cast<uint64_t>(sector_size_), size - written);
             if (offset + to_copy <= mem_size_) {
@@ -276,8 +285,10 @@ std::vector<char> OleReader::read_chain(uint32_t start, uint64_t size) const {
         }
     } else {
         // File-based: sector-at-a-time
+        uint32_t visited = 0;
         std::vector<char> sbuf(sector_size_);
         while (sec != ENDOFCHAIN && sec != FREESECT && sec < fat_.size() && written < size) {
+            if (++visited > max_sectors) break;  // circular chain guard
             read_sector(sec, sbuf.data());
             uint64_t to_copy = std::min(static_cast<uint64_t>(sector_size_), size - written);
             std::memcpy(result.data() + written, sbuf.data(), static_cast<size_t>(to_copy));
@@ -298,7 +309,10 @@ std::vector<char> OleReader::read_mini_chain(uint32_t start, uint64_t size) cons
     uint32_t sec = start;
     uint64_t remaining = size;
 
+    uint32_t max_sectors = static_cast<uint32_t>(size / mini_sector_size_ + 2);
+    uint32_t visited = 0;
     while (sec != ENDOFCHAIN && sec != FREESECT && sec < mini_fat_.size() && remaining > 0) {
+        if (++visited > max_sectors) break;
         uint64_t offset = static_cast<uint64_t>(sec) * mini_sector_size_;
         uint64_t to_copy = std::min(static_cast<uint64_t>(mini_sector_size_), remaining);
         if (offset + to_copy <= mini_stream_.size()) {
