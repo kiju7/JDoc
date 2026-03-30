@@ -5,6 +5,7 @@
 #include "xml_utils.h"
 #include "common/file_utils.h"
 #include "common/image_utils.h"
+#include "common/png_encode.h"
 #include <algorithm>
 #include <cstdlib>
 #include <fstream>
@@ -603,14 +604,10 @@ ImageData PptxParser::extract_image_data(const std::string& media_path,
         img.data = zip_.read_entry(media_path);
         util::populate_image_dimensions(img);
 
-        if (!opts.image_output_dir.empty() && !img.data.empty()) {
-            util::ensure_dir(opts.image_output_dir);
-            std::string out_path = opts.image_output_dir + "/" + filename;
-            std::ofstream ofs(out_path, std::ios::binary);
-            if (ofs) {
-                ofs.write(img.data.data(), img.data.size());
-                img.saved_path = out_path;
-            }
+        img.saved_path = util::save_image_to_file(
+            opts.image_output_dir, img.name, img.format,
+            img.data.data(), img.data.size());
+        if (!img.saved_path.empty()) {
             img.data.clear();
             img.data.shrink_to_fit();
         }

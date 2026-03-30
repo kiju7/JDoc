@@ -6,6 +6,7 @@
 #include "jdoc/hwp_types.h"
 #include "common/file_utils.h"
 #include "common/image_utils.h"
+#include "common/png_encode.h"
 #include "common/string_utils.h"
 #include "zip_reader.h"
 #include <pugixml.hpp>
@@ -728,19 +729,13 @@ private:
         if (util::is_image_too_small(img, opts_.min_image_size))
             return {};
 
-        // Save to disk if requested
-        if (opts_.extract_images && !opts_.image_output_dir.empty()) {
-            util::ensure_dir(opts_.image_output_dir);
-            std::string filename = "page" + std::to_string(page_number) +
-                                   "_img" + std::to_string(image_idx) +
-                                   "." + (img.format == "jpeg" ? "jpg" : img.format);
-            std::string save_path = opts_.image_output_dir + "/" + filename;
-            FILE* f = fopen(save_path.c_str(), "wb");
-            if (f) {
-                fwrite(img.data.data(), 1, img.data.size(), f);
-                fclose(f);
-                img.saved_path = save_path;
-            }
+        // Save to disk if requested (BMP -> PNG for compression)
+        if (opts_.extract_images) {
+            std::string save_name = "page" + std::to_string(page_number) +
+                                    "_img" + std::to_string(image_idx);
+            img.saved_path = util::save_image_to_file(
+                opts_.image_output_dir, save_name, img.format,
+                img.data.data(), img.data.size());
         }
 
         return img;

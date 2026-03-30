@@ -6,6 +6,7 @@
 #include "common/binary_utils.h"
 #include "common/file_utils.h"
 #include "common/image_utils.h"
+#include "common/png_encode.h"
 
 #include <algorithm>
 #include <cmath>
@@ -217,25 +218,35 @@ bool DocParser::process_char(uint32_t ch, std::string& result, bool is_picture) 
     // Field separator: switch to showing result text.
     if (ch == 0x14) {
         collecting_field_instr_ = false;
+
+        // TOC field: suppress entire result (content appears as headings later).
+        if (field_instruction_.find("TOC") != std::string::npos) {
+            toc_field_depth_ = field_depth_;
+            return false;
+        }
+
         field_show_result_ = true;
-        // Check if instruction is HYPERLINK
+        // Check if instruction is HYPERLINK (skip local bookmark links with \l).
         pending_hyperlink_url_.clear();
         if (field_instruction_.size() > 10) {
             // Field instruction: " HYPERLINK \"url\" " or " HYPERLINK url "
             auto pos = field_instruction_.find("HYPERLINK");
             if (pos != std::string::npos) {
-                auto url_start = field_instruction_.find('"', pos + 9);
-                if (url_start != std::string::npos) {
-                    auto url_end = field_instruction_.find('"', url_start + 1);
-                    if (url_end != std::string::npos)
-                        pending_hyperlink_url_ = field_instruction_.substr(url_start + 1, url_end - url_start - 1);
-                } else {
-                    // No quotes — take the rest as URL
-                    size_t s = pos + 9;
-                    while (s < field_instruction_.size() && field_instruction_[s] == ' ') s++;
-                    size_t e = field_instruction_.find(' ', s);
-                    if (e == std::string::npos) e = field_instruction_.size();
-                    if (e > s) pending_hyperlink_url_ = field_instruction_.substr(s, e - s);
+                bool is_local = field_instruction_.find("\\l") != std::string::npos;
+                if (!is_local) {
+                    auto url_start = field_instruction_.find('"', pos + 9);
+                    if (url_start != std::string::npos) {
+                        auto url_end = field_instruction_.find('"', url_start + 1);
+                        if (url_end != std::string::npos)
+                            pending_hyperlink_url_ = field_instruction_.substr(url_start + 1, url_end - url_start - 1);
+                    } else {
+                        // No quotes — take the rest as URL
+                        size_t s = pos + 9;
+                        while (s < field_instruction_.size() && field_instruction_[s] == ' ') s++;
+                        size_t e = field_instruction_.find(' ', s);
+                        if (e == std::string::npos) e = field_instruction_.size();
+                        if (e > s) pending_hyperlink_url_ = field_instruction_.substr(s, e - s);
+                    }
                 }
             }
         }
@@ -245,6 +256,9 @@ bool DocParser::process_char(uint32_t ch, std::string& result, bool is_picture) 
     }
     // Field end marker: close nesting.
     if (ch == 0x15) {
+        if (toc_field_depth_ > 0 && field_depth_ == toc_field_depth_) {
+            toc_field_depth_ = 0;
+        }
         if (!pending_hyperlink_url_.empty()) {
             result += "](" + pending_hyperlink_url_ + ")";
             pending_hyperlink_url_.clear();
@@ -254,6 +268,10 @@ bool DocParser::process_char(uint32_t ch, std::string& result, bool is_picture) 
         collecting_field_instr_ = false;
         return false;
     }
+
+    // Inside a TOC field result: suppress all content.
+    if (toc_field_depth_ > 0)
+        return false;
 
     // Inside a field's instruction part (before separator): collect instruction.
     if (field_depth_ > 0 && !field_show_result_) {
@@ -572,6 +590,7 @@ std::string DocParser::extract_text() {
     // Reset field state for extraction.
     field_depth_ = 0;
     field_show_result_ = false;
+    toc_field_depth_ = 0;
 
     // Select which table stream to use.
     uint16_t flags = util::read_u16_le(word_doc.data() + 0x0A);
@@ -1298,16 +1317,9 @@ std::string DocParser::to_markdown(const ConvertOptions& opts) {
     auto images = extract_images(opts.min_image_size);
 
     if (opts.extract_images) {
-        // Save images to disk
-        for (auto& img : images) {
-            std::string filename = img.name + "." + img.format;
-            if (!opts.image_output_dir.empty() && !img.data.empty()) {
-                util::ensure_dir(opts.image_output_dir);
-                std::string path = opts.image_output_dir + "/" + filename;
-                std::ofstream ofs(path, std::ios::binary);
-                if (ofs) ofs.write(img.data.data(), img.data.size());
-            }
-        }
+        for (auto& img : images)
+            util::save_image_to_file(opts.image_output_dir, img.name, img.format,
+                                     img.data.data(), img.data.size());
     }
 
     return replace_image_markers(md, images, opts.image_ref_prefix);
