@@ -5325,6 +5325,7 @@ ImageData render_page_composite(PdfDoc& doc, const PdfObj& page_obj,
         for (int x = 0; x < xspan; x++) {
             if (cov_buf[x] > 0) {
                 int alpha = cov_buf[x] / AA_V;
+                if (alpha < 16) { cov_buf[x] = 0; continue; }
                 if (alpha > 255) alpha = 255;
                 canvas.blend_pixel(x + xmin, prev_row, cr, cg, cb, static_cast<uint8_t>(alpha));
             }
@@ -5418,7 +5419,7 @@ ImageData render_page_composite(PdfDoc& doc, const PdfObj& page_obj,
         // Stroke
         if (rp.do_stroke) {
             double lw = rp.line_width * scale;
-            if (lw < 0.5) lw = 0.5;
+            if (lw < 1.0) lw = 1.0;
             double half = lw / 2.0;
             edge_buf.clear();
             int ymin = rh * AA_V, ymax = 0;
