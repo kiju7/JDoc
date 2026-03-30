@@ -5,54 +5,62 @@
 extern "C" {
 #endif
 
-/* Extract plain text from a document file.
- * Returns a malloc'd string (caller must call jdoc_free_string).
- * Returns NULL on error; error message written to err_buf if non-NULL. */
-char* jdoc_extract_text(const char* file_path, char* err_buf, int err_buf_size);
+/* ── Options ──────────────────────────────────────────────── */
 
-/* Extract images from a document file.
- * Images are returned as a contiguous buffer of JDocImage structs.
- * Returns the number of images, or -1 on error.
- * Caller must call jdoc_free_images to release memory. */
+typedef struct {
+    int extract_images;              /* 0 = skip images, 1 = extract */
+    const char* image_output_dir;    /* NULL = keep in memory only */
+    unsigned int min_image_size;     /* skip images smaller than NxN (0 = no filter) */
+    const int* pages;                /* page numbers to extract (NULL = all) */
+    int page_count;                  /* length of pages array */
+    int plaintext;                   /* 0 = markdown, 1 = plaintext */
+} JDocOptions;
+
+/* Returns default options: no images, markdown, all pages, min_size=50. */
+JDocOptions jdoc_default_options(void);
+
+/* ── Image ────────────────────────────────────────────────── */
+
 typedef struct {
     int page_number;
-    char* name;
+    char* name;                      /* e.g. "page1_img0" */
     unsigned int width;
     unsigned int height;
-    char* data;
+    char* data;                      /* raw image bytes (jpeg/png/bmp) */
     int data_size;
-    char* format;
+    char* format;                    /* "jpeg", "png", "bmp", ... */
+    char* saved_path;                /* disk path if image_output_dir was set */
 } JDocImage;
 
-int jdoc_extract_images(const char* file_path, JDocImage** out_images,
-                        char* err_buf, int err_buf_size);
+/* ── Page ─────────────────────────────────────────────────── */
 
-/* Extract text and images in a single parse pass.
- * Returns malloc'd text (caller must call jdoc_free_string).
- * Images are written to *out_images, count to *out_image_count.
- * Returns NULL on error. */
-char* jdoc_extract_all(const char* file_path,
-                       JDocImage** out_images, int* out_image_count,
-                       char* err_buf, int err_buf_size);
-
-/* Per-page text chunk returned by jdoc_extract_all_paged. */
 typedef struct {
     int page_number;
-    char* text;
-} JDocPageText;
+    char* text;                      /* markdown or plaintext for this page */
+    JDocImage* images;               /* images belonging to this page */
+    int image_count;
+} JDocPage;
 
-/* Extract text (per-page), images in a single parse pass.
- * Returns malloc'd concatenated text. Per-page texts are written to *out_pages,
- * count to *out_page_count. Caller must call jdoc_free_page_texts to release.
+/* ── API ──────────────────────────────────────────────────── */
+
+/* Convert document to text. Returns malloc'd string.
+ * opts may be NULL for defaults.
+ * Returns NULL on error; message written to err_buf. */
+char* jdoc_convert(const char* file_path, const JDocOptions* opts,
+                   char* err_buf, int err_buf_size);
+
+/* Convert document to per-page chunks with images.
+ * opts may be NULL for defaults.
+ * Returns malloc'd array of JDocPage; count written to *out_count.
  * Returns NULL on error. */
-char* jdoc_extract_all_paged(const char* file_path,
-                              JDocImage** out_images, int* out_image_count,
-                              JDocPageText** out_pages, int* out_page_count,
+JDocPage* jdoc_convert_pages(const char* file_path, const JDocOptions* opts,
+                              int* out_count,
                               char* err_buf, int err_buf_size);
 
-void jdoc_free_page_texts(JDocPageText* pages, int count);
+/* ── Free ─────────────────────────────────────────────────── */
+
 void jdoc_free_string(char* str);
-void jdoc_free_images(JDocImage* images, int count);
+void jdoc_free_pages(JDocPage* pages, int count);
 
 #ifdef __cplusplus
 }
