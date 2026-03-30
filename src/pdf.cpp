@@ -4705,40 +4705,6 @@ static void png_write_chunk(std::vector<char>& out, const char type[4],
     png_put32(out, crc);
 }
 
-static std::vector<char> pixels_to_jpeg(const uint8_t* pixels, int w, int h,
-                                        int quality = 85) {
-    if (!pixels || w <= 0 || h <= 0) return {};
-    struct jpeg_compress_struct cinfo;
-    struct jpeg_error_mgr jerr;
-    cinfo.err = jpeg_std_error(&jerr);
-    jpeg_create_compress(&cinfo);
-
-    unsigned char* outbuf = nullptr;
-    unsigned long outsize = 0;
-    jpeg_mem_dest(&cinfo, &outbuf, &outsize);
-
-    cinfo.image_width = w;
-    cinfo.image_height = h;
-    cinfo.input_components = 3;
-    cinfo.in_color_space = JCS_RGB;
-    jpeg_set_defaults(&cinfo);
-    jpeg_set_quality(&cinfo, quality, TRUE);
-    jpeg_start_compress(&cinfo, TRUE);
-
-    int row_stride = w * 3;
-    while (cinfo.next_scanline < cinfo.image_height) {
-        const uint8_t* row = pixels + cinfo.next_scanline * row_stride;
-        jpeg_write_scanlines(&cinfo, const_cast<JSAMPARRAY>(&row), 1);
-    }
-    jpeg_finish_compress(&cinfo);
-    jpeg_destroy_compress(&cinfo);
-
-    std::vector<char> result(reinterpret_cast<char*>(outbuf),
-                             reinterpret_cast<char*>(outbuf) + outsize);
-    free(outbuf);
-    return result;
-}
-
 static std::vector<char> pixels_to_png(const uint8_t* pixels, int w, int h,
                                         int components, int level = Z_BEST_SPEED) {
     if (!pixels || w <= 0 || h <= 0) return {};
@@ -5105,7 +5071,7 @@ std::vector<ExtractedImage> extract_page_images(PdfDoc& doc, const PdfObj& page_
 
 struct Canvas {
     int width, height;
-    std::vector<uint8_t> pixels; // RGBA
+    std::vector<uint8_t> pixels; // RGB
 
     Canvas(int w, int h) : width(w), height(h), pixels(static_cast<size_t>(w) * h * 3, 255) {}
 
