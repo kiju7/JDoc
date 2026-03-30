@@ -13,69 +13,25 @@ static void set_error(char* buf, int buf_size, const char* msg) {
     }
 }
 
-static char* strdup_cpp(const std::string& s) {
+static char* strdup_c(const std::string& s) {
     char* p = (char*)malloc(s.size() + 1);
-    if (!p) {
-        p = (char*)malloc(1);
-        if (p) p[0] = '\0';
-        return p;
-    }
+    if (!p) return nullptr;
     memcpy(p, s.c_str(), s.size() + 1);
     return p;
 }
 
-
-// Concatenate chunk texts with pre-reserved buffer
-static std::string concat_text(const std::vector<jdoc::PageChunk>& chunks) {
-    size_t total = 0;
-    for (auto& c : chunks) total += c.text.size() + 1;
-
-    std::string text;
-    text.reserve(total);
-    for (auto& c : chunks) {
-        if (!text.empty() && !c.text.empty()) text += '\n';
-        text += c.text;
-    }
-    return text;
-}
-
-// Build C image array from chunks. Returns count, -1 on alloc failure.
-static int build_images(const std::vector<jdoc::PageChunk>& chunks,
-                        JDocImage** out, char* err_buf, int err_buf_size) {
-    size_t n = 0;
-    for (auto& c : chunks) n += c.images.size();
-
-    if (n == 0) {
-        *out = nullptr;
-        return 0;
-    }
-
-    JDocImage* arr = (JDocImage*)calloc(n, sizeof(JDocImage));
-    if (!arr) {
-        set_error(err_buf, err_buf_size, "memory allocation failed");
-        return -1;
-    }
-
-    size_t idx = 0;
-    for (auto& c : chunks) {
-        for (auto& src : c.images) {
-            arr[idx].page_number = src.page_number;
-            arr[idx].name = strdup_cpp(src.name);
-            arr[idx].width = src.width;
-            arr[idx].height = src.height;
-            arr[idx].format = strdup_cpp(src.format);
-            arr[idx].data_size = (int)src.data.size();
-            if (!src.data.empty()) {
-                arr[idx].data = (char*)malloc(src.data.size());
-                if (arr[idx].data)
-                    memcpy(arr[idx].data, src.data.data(), src.data.size());
-            }
-            idx++;
-        }
-    }
-
-    *out = arr;
-    return (int)n;
+static jdoc::ConvertOptions to_cpp_opts(const JDocOptions* opts) {
+    jdoc::ConvertOptions o;
+    if (!opts) return o;
+    o.extract_images = (opts->extract_images != 0);
+    if (opts->image_output_dir)
+        o.image_output_dir = opts->image_output_dir;
+    o.min_image_size = opts->min_image_size;
+    if (opts->pages && opts->page_count > 0)
+        o.pages.assign(opts->pages, opts->pages + opts->page_count);
+    if (opts->plaintext)
+        o.output_format = jdoc::OutputFormat::PLAINTEXT;
+    return o;
 }
 
 // ---------------------------------------------------------------------------
@@ -84,16 +40,21 @@ static int build_images(const std::vector<jdoc::PageChunk>& chunks,
 
 extern "C" {
 
-char* jdoc_extract_text(const char* file_path, char* err_buf, int err_buf_size) {
+JDocOptions jdoc_default_options(void) {
+    JDocOptions o = {};
+    o.min_image_size = 50;
+    return o;
+}
+
+char* jdoc_convert(const char* file_path, const JDocOptions* opts,
+                   char* err_buf, int err_buf_size) {
     if (!file_path) {
         set_error(err_buf, err_buf_size, "file_path is NULL");
         return nullptr;
     }
     try {
-        jdoc::ConvertOptions opts;
-        opts.output_format = jdoc::OutputFormat::PLAINTEXT;
-        opts.extract_tables = true;
-        return strdup_cpp(jdoc::convert(file_path, opts));
+        auto cpp_opts = to_cpp_opts(opts);
+        return strdup_c(jdoc::convert(file_path, cpp_opts));
     } catch (const std::exception& e) {
         set_error(err_buf, err_buf_size, e.what());
         return nullptr;
@@ -103,114 +64,57 @@ char* jdoc_extract_text(const char* file_path, char* err_buf, int err_buf_size) 
     }
 }
 
-int jdoc_extract_images(const char* file_path, JDocImage** out_images,
-                        char* err_buf, int err_buf_size) {
-    if (!file_path) {
-        set_error(err_buf, err_buf_size, "file_path is NULL");
-        return -1;
-    }
-    if (!out_images) {
-        set_error(err_buf, err_buf_size, "out_images is NULL");
-        return -1;
-    }
-    try {
-        jdoc::ConvertOptions opts;
-        opts.extract_images = true;
-        auto chunks = jdoc::convert_chunks(file_path, opts);
-        return build_images(chunks, out_images, err_buf, err_buf_size);
-    } catch (const std::exception& e) {
-        set_error(err_buf, err_buf_size, e.what());
-        return -1;
-    } catch (...) {
-        set_error(err_buf, err_buf_size, "unknown error");
-        return -1;
-    }
-}
-
-char* jdoc_extract_all(const char* file_path,
-                       JDocImage** out_images, int* out_image_count,
-                       char* err_buf, int err_buf_size) {
-    if (!file_path) {
-        set_error(err_buf, err_buf_size, "file_path is NULL");
-        return nullptr;
-    }
-    if (!out_images || !out_image_count) {
-        set_error(err_buf, err_buf_size, "output pointer is NULL");
-        return nullptr;
-    }
-    try {
-        jdoc::ConvertOptions opts;
-        opts.extract_images = true;
-        opts.extract_tables = true;
-
-        auto chunks = jdoc::convert_chunks(file_path, opts);
-
-        std::string text = concat_text(chunks);
-
-        int img_count = build_images(chunks, out_images, err_buf, err_buf_size);
-        if (img_count < 0) return nullptr;
-        *out_image_count = img_count;
-
-        return strdup_cpp(text);
-    } catch (const std::exception& e) {
-        set_error(err_buf, err_buf_size, e.what());
-        return nullptr;
-    } catch (...) {
-        set_error(err_buf, err_buf_size, "unknown error");
-        return nullptr;
-    }
-}
-
-char* jdoc_extract_all_paged(const char* file_path,
-                              JDocImage** out_images, int* out_image_count,
-                              JDocPageText** out_pages, int* out_page_count,
+JDocPage* jdoc_convert_pages(const char* file_path, const JDocOptions* opts,
+                              int* out_count,
                               char* err_buf, int err_buf_size) {
-    if (!file_path) {
-        set_error(err_buf, err_buf_size, "file_path is NULL");
+    if (!file_path || !out_count) {
+        set_error(err_buf, err_buf_size, "file_path or out_count is NULL");
         return nullptr;
     }
-    if (!out_images || !out_image_count || !out_pages || !out_page_count) {
-        set_error(err_buf, err_buf_size, "output pointer is NULL");
-        return nullptr;
-    }
+    *out_count = 0;
     try {
-        jdoc::ConvertOptions opts;
-        opts.extract_images = true;
-        opts.extract_tables = true;
+        auto cpp_opts = to_cpp_opts(opts);
+        auto chunks = jdoc::convert_chunks(file_path, cpp_opts);
+        if (chunks.empty()) return nullptr;
 
-        auto chunks = jdoc::convert_chunks(file_path, opts);
-
-        std::string text = concat_text(chunks);
-
-        // Build per-page text
-        if (chunks.empty()) {
-            *out_pages = nullptr;
-            *out_page_count = 0;
-        } else {
-            JDocPageText* pages = (JDocPageText*)calloc(chunks.size(), sizeof(JDocPageText));
-            if (!pages) {
-                set_error(err_buf, err_buf_size, "memory allocation failed");
-                return nullptr;
-            }
-            for (size_t i = 0; i < chunks.size(); i++) {
-                pages[i].page_number = chunks[i].page_number;
-                pages[i].text = strdup_cpp(chunks[i].text);
-            }
-            *out_pages = pages;
-            *out_page_count = (int)chunks.size();
-        }
-
-        // Build images
-        int img_count = build_images(chunks, out_images, err_buf, err_buf_size);
-        if (img_count < 0) {
-            jdoc_free_page_texts(*out_pages, *out_page_count);
-            *out_pages = nullptr;
-            *out_page_count = 0;
+        JDocPage* pages = (JDocPage*)calloc(chunks.size(), sizeof(JDocPage));
+        if (!pages) {
+            set_error(err_buf, err_buf_size, "memory allocation failed");
             return nullptr;
         }
-        *out_image_count = img_count;
 
-        return strdup_cpp(text);
+        for (size_t i = 0; i < chunks.size(); i++) {
+            auto& src = chunks[i];
+            pages[i].page_number = src.page_number;
+            pages[i].text = strdup_c(src.text);
+
+            size_t n = src.images.size();
+            if (n == 0) continue;
+
+            pages[i].images = (JDocImage*)calloc(n, sizeof(JDocImage));
+            if (!pages[i].images) continue;
+            pages[i].image_count = (int)n;
+
+            for (size_t j = 0; j < n; j++) {
+                auto& si = src.images[j];
+                auto& di = pages[i].images[j];
+                di.page_number = si.page_number;
+                di.name = strdup_c(si.name);
+                di.width = si.width;
+                di.height = si.height;
+                di.format = strdup_c(si.format);
+                di.saved_path = strdup_c(si.saved_path);
+                di.data_size = (int)si.data.size();
+                if (!si.data.empty()) {
+                    di.data = (char*)malloc(si.data.size());
+                    if (di.data)
+                        memcpy(di.data, si.data.data(), si.data.size());
+                }
+            }
+        }
+
+        *out_count = (int)chunks.size();
+        return pages;
     } catch (const std::exception& e) {
         set_error(err_buf, err_buf_size, e.what());
         return nullptr;
@@ -218,24 +122,23 @@ char* jdoc_extract_all_paged(const char* file_path,
         set_error(err_buf, err_buf_size, "unknown error");
         return nullptr;
     }
-}
-
-void jdoc_free_page_texts(JDocPageText* pages, int count) {
-    if (!pages) return;
-    for (int i = 0; i < count; i++) free(pages[i].text);
-    free(pages);
 }
 
 void jdoc_free_string(char* str) { free(str); }
 
-void jdoc_free_images(JDocImage* images, int count) {
-    if (!images) return;
+void jdoc_free_pages(JDocPage* pages, int count) {
+    if (!pages) return;
     for (int i = 0; i < count; i++) {
-        free(images[i].name);
-        free(images[i].data);
-        free(images[i].format);
+        free(pages[i].text);
+        for (int j = 0; j < pages[i].image_count; j++) {
+            free(pages[i].images[j].name);
+            free(pages[i].images[j].data);
+            free(pages[i].images[j].format);
+            free(pages[i].images[j].saved_path);
+        }
+        free(pages[i].images);
     }
-    free(images);
+    free(pages);
 }
 
 } // extern "C"

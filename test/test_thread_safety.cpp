@@ -132,7 +132,7 @@ static BenchResult run_bench(const std::string& label,
 
 static bool extract_text(const std::string& path) {
     char err[256] = {};
-    char* text = jdoc_extract_text(path.c_str(), err, sizeof(err));
+    char* text = jdoc_convert(path.c_str(), nullptr, err, sizeof(err));
     if (text && strlen(text) > 0) {
         jdoc_free_string(text);
         return true;
@@ -143,16 +143,12 @@ static bool extract_text(const std::string& path) {
 
 static bool extract_all_paged(const std::string& path) {
     char err[256] = {};
-    JDocImage* images = nullptr;
-    int img_count = 0;
-    JDocPageText* pages = nullptr;
-    int page_count = 0;
-    char* text = jdoc_extract_all_paged(path.c_str(),
-        &images, &img_count, &pages, &page_count, err, sizeof(err));
-    if (text) {
-        jdoc_free_string(text);
-        if (images) jdoc_free_images(images, img_count);
-        if (pages) jdoc_free_page_texts(pages, page_count);
+    JDocOptions opts = jdoc_default_options();
+    opts.extract_images = 1;
+    int count = 0;
+    JDocPage* pages = jdoc_convert_pages(path.c_str(), &opts, &count, err, sizeof(err));
+    if (pages || count == 0) {
+        jdoc_free_pages(pages, count);
         return true;
     }
     return false;
