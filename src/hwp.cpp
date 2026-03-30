@@ -460,7 +460,14 @@ private:
     std::vector<uint8_t> load_bin_data(const std::string& name) {
         if (!ole_) return {};
         std::string full_path = "BinData/" + name;
-        return read_ole_stream(*ole_, full_path);
+        auto raw = read_ole_stream(*ole_, full_path);
+        if (raw.empty()) return raw;
+        // BinData streams are deflate-compressed when the document is compressed
+        if (compressed_) {
+            auto dec = decompress(raw.data(), raw.size());
+            if (!dec.empty()) return dec;
+        }
+        return raw;
     }
     // ── Section parsing ─────────────────────────────────────
     void parse_section(int section_idx, PageChunk& chunk) {
@@ -941,6 +948,17 @@ private:
             entry->data = load_bin_data(entry->name);
             if (entry->data.empty()) return "";
         }
+
+        // Detect actual format from magic bytes
+        if (entry->data.size() >= 4) {
+            auto* h = entry->data.data();
+            if (h[0] == 0xFF && h[1] == 0xD8) ext = "jpg";
+            else if (h[0] == 0x89 && h[1] == 'P' && h[2] == 'N' && h[3] == 'G') ext = "png";
+            else if (h[0] == 'G' && h[1] == 'I' && h[2] == 'F') ext = "gif";
+            else if (h[0] == 'B' && h[1] == 'M') ext = "bmp";
+            else if (h[0] == 0x00 && h[1] == 0x00 && h[2] == 0x01 && h[3] == 0x00) ext = "emf";
+        }
+        filename = unified + "." + ext;
 
         // Check dimensions before saving
         {
