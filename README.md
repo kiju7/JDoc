@@ -116,21 +116,30 @@ target_link_libraries(your_app PRIVATE jdoc_all)
 ```c
 #include <jdoc/jdoc_c_api.h>
 
-// Text extraction
 char err[256];
-char* text = jdoc_extract_text("input.pdf", err, sizeof(err));
+
+// Simple text conversion
+char* text = jdoc_convert("input.pdf", NULL, err, sizeof(err));
 // use text...
 jdoc_free_string(text);
 
-// Text + images in one pass
-JDocImage* images;
-int image_count;
-char* text = jdoc_extract_all("input.pdf", &images, &image_count, err, sizeof(err));
-for (int i = 0; i < image_count; i++) {
-    // images[i].name, .width, .height, .data, .data_size, .format
+// Per-page chunks with images
+JDocOptions opts = jdoc_default_options();
+opts.extract_images = 1;
+opts.image_output_dir = "./images";  // NULL = keep in memory only
+
+int page_count;
+JDocPage* pages = jdoc_convert_pages("input.pdf", &opts, &page_count, err, sizeof(err));
+for (int i = 0; i < page_count; i++) {
+    printf("Page %d: %s\n", pages[i].page_number, pages[i].text);
+    for (int j = 0; j < pages[i].image_count; j++) {
+        JDocImage* img = &pages[i].images[j];
+        // img->name, img->width, img->height, img->format
+        // img->data (raw bytes), img->data_size
+        // img->saved_path (when image_output_dir is set)
+    }
 }
-jdoc_free_string(text);
-jdoc_free_images(images, image_count);
+jdoc_free_pages(pages, page_count);
 ```
 
 ## Format Support
