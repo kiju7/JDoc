@@ -5228,8 +5228,8 @@ ImageData render_page_composite(PdfDoc& doc, const PdfObj& page_obj,
 
     Canvas canvas(rw, rh);
 
-    // ── Rasterize vector paths (2× vertical AA + analytic horizontal coverage) ──
-    constexpr int AA_V = 2;
+    // ── Rasterize vector paths (8× vertical AA + analytic horizontal coverage) ──
+    constexpr int AA_V = 8;
 
     struct ScanEdge { double x_at_ymin; double inv_slope; int ymin, ymax; };
     std::vector<ScanEdge> edge_buf;
@@ -5313,11 +5313,11 @@ ImageData render_page_composite(PdfDoc& doc, const PdfObj& page_obj,
                 int ix1 = std::min(xmax - 1, static_cast<int>(fx1));
                 if (ix0 > ix1) continue;
                 if (ix0 == ix1) {
-                    cov_buf[ix0 - xmin] += static_cast<int>((fx1 - fx0) * 256);
+                    cov_buf[ix0 - xmin] += static_cast<int>((fx1 - fx0) * 256 + 0.5);
                 } else {
-                    cov_buf[ix0 - xmin] += static_cast<int>((ix0 + 1 - fx0) * 256);
+                    cov_buf[ix0 - xmin] += static_cast<int>((ix0 + 1 - fx0) * 256 + 0.5);
                     for (int x = ix0 + 1; x < ix1; x++) cov_buf[x - xmin] += 256;
-                    cov_buf[ix1 - xmin] += static_cast<int>((fx1 - ix1) * 256);
+                    cov_buf[ix1 - xmin] += static_cast<int>((fx1 - ix1) * 256 + 0.5);
                 }
             }
         }
@@ -5325,7 +5325,6 @@ ImageData render_page_composite(PdfDoc& doc, const PdfObj& page_obj,
         for (int x = 0; x < xspan; x++) {
             if (cov_buf[x] > 0) {
                 int alpha = cov_buf[x] / AA_V;
-                if (alpha < 16) { cov_buf[x] = 0; continue; }
                 if (alpha > 255) alpha = 255;
                 canvas.blend_pixel(x + xmin, prev_row, cr, cg, cb, static_cast<uint8_t>(alpha));
             }
