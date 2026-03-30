@@ -573,10 +573,8 @@ std::vector<ImageData> PptParser::extract_images(unsigned min_image_size) {
         uint16_t rec_type = rd16(pics.data() + pos + 2);
         uint32_t rec_len  = rd32(pics.data() + pos + 4);
 
-        if (rec_len == 0 || pos + 8 + rec_len > pics.size()) {
-            pos += 8;
-            continue;
-        }
+        if (rec_len == 0) break;
+        if (pos + 8 + rec_len > pics.size()) break;
 
         size_t blip_start = pos + 8;
         size_t blip_end = blip_start + rec_len;
@@ -646,6 +644,7 @@ std::vector<ImageData> PptParser::extract_images(unsigned min_image_size) {
                 util::populate_image_dimensions(img);
                 if (util::is_image_too_small(img, min_image_size)) {
                     --img_idx;
+                    pos = blip_end;
                     continue;
                 }
                 images.push_back(std::move(img));
