@@ -534,7 +534,7 @@ std::vector<PageChunk> RtfParser::to_chunks(const ConvertOptions& opts) {
             const auto& pi = pict_images[i];
             ImageData img;
             img.page_number = 1;
-            img.name = "rtf_image_" + std::to_string(i + 1);
+            img.name = "page1_img" + std::to_string(i);
             img.format = pi.format.empty() ? "bin" : pi.format;
             img.width = pi.width;
             img.height = pi.height;
