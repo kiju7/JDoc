@@ -4705,6 +4705,40 @@ static void png_write_chunk(std::vector<char>& out, const char type[4],
     png_put32(out, crc);
 }
 
+static std::vector<char> pixels_to_jpeg(const uint8_t* pixels, int w, int h,
+                                        int quality = 85) {
+    if (!pixels || w <= 0 || h <= 0) return {};
+    struct jpeg_compress_struct cinfo;
+    struct jpeg_error_mgr jerr;
+    cinfo.err = jpeg_std_error(&jerr);
+    jpeg_create_compress(&cinfo);
+
+    unsigned char* outbuf = nullptr;
+    unsigned long outsize = 0;
+    jpeg_mem_dest(&cinfo, &outbuf, &outsize);
+
+    cinfo.image_width = w;
+    cinfo.image_height = h;
+    cinfo.input_components = 3;
+    cinfo.in_color_space = JCS_RGB;
+    jpeg_set_defaults(&cinfo);
+    jpeg_set_quality(&cinfo, quality, TRUE);
+    jpeg_start_compress(&cinfo, TRUE);
+
+    int row_stride = w * 3;
+    while (cinfo.next_scanline < cinfo.image_height) {
+        const uint8_t* row = pixels + cinfo.next_scanline * row_stride;
+        jpeg_write_scanlines(&cinfo, const_cast<JSAMPARRAY>(&row), 1);
+    }
+    jpeg_finish_compress(&cinfo);
+    jpeg_destroy_compress(&cinfo);
+
+    std::vector<char> result(reinterpret_cast<char*>(outbuf),
+                             reinterpret_cast<char*>(outbuf) + outsize);
+    free(outbuf);
+    return result;
+}
+
 static std::vector<char> pixels_to_png(const uint8_t* pixels, int w, int h,
                                         int components, int level = Z_BEST_SPEED) {
     if (!pixels || w <= 0 || h <= 0) return {};
@@ -5073,34 +5107,20 @@ struct Canvas {
     int width, height;
     std::vector<uint8_t> pixels; // RGBA
 
-    Canvas(int w, int h) : width(w), height(h), pixels(static_cast<size_t>(w) * h * 4, 255) {
-        // Initialize to white, opaque
-        for (size_t i = 0; i < pixels.size(); i += 4) {
-            pixels[i] = 255;     // R
-            pixels[i + 1] = 255; // G
-            pixels[i + 2] = 255; // B
-            pixels[i + 3] = 255; // A
-        }
-    }
+    Canvas(int w, int h) : width(w), height(h), pixels(static_cast<size_t>(w) * h * 3, 255) {}
 
     void blend_pixel(int x, int y, uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
-        if (x < 0 || x >= width || y < 0 || y >= height) return;
-        size_t off = (static_cast<size_t>(y) * width + x) * 4;
-        if (a == 255) {
-            pixels[off] = r;
-            pixels[off + 1] = g;
-            pixels[off + 2] = b;
-            pixels[off + 3] = 255;
+        if (static_cast<unsigned>(x) >= static_cast<unsigned>(width) ||
+            static_cast<unsigned>(y) >= static_cast<unsigned>(height)) return;
+        uint8_t* p = pixels.data() + (static_cast<size_t>(y) * width + x) * 3;
+        if (a >= 255) {
+            p[0] = r; p[1] = g; p[2] = b;
         } else if (a > 0) {
-            float sa = a / 255.0f;
-            float da = pixels[off + 3] / 255.0f;
-            float oa = sa + da * (1 - sa);
-            if (oa > 0) {
-                pixels[off]     = static_cast<uint8_t>((r * sa + pixels[off] * da * (1 - sa)) / oa);
-                pixels[off + 1] = static_cast<uint8_t>((g * sa + pixels[off + 1] * da * (1 - sa)) / oa);
-                pixels[off + 2] = static_cast<uint8_t>((b * sa + pixels[off + 2] * da * (1 - sa)) / oa);
-                pixels[off + 3] = static_cast<uint8_t>(oa * 255);
-            }
+            // Alpha blend onto opaque white background (no dst alpha needed)
+            unsigned inv = 255 - a;
+            p[0] = static_cast<uint8_t>((r * a + p[0] * inv + 127) >> 8);
+            p[1] = static_cast<uint8_t>((g * a + p[1] * inv + 127) >> 8);
+            p[2] = static_cast<uint8_t>((b * a + p[2] * inv + 127) >> 8);
         }
     }
 
@@ -5189,14 +5209,7 @@ struct Canvas {
     }
 
     std::vector<char> to_png(int level = Z_BEST_SPEED) const {
-        // Convert RGBA to RGB for PNG output
-        std::vector<uint8_t> rgb(static_cast<size_t>(width) * height * 3);
-        for (int i = 0; i < width * height; i++) {
-            rgb[i*3]   = pixels[i*4];
-            rgb[i*3+1] = pixels[i*4+1];
-            rgb[i*3+2] = pixels[i*4+2];
-        }
-        return pixels_to_png(rgb.data(), width, height, 3, level);
+        return pixels_to_png(pixels.data(), width, height, 3, level);
     }
 };
 
@@ -5215,26 +5228,39 @@ ImageData render_page_composite(PdfDoc& doc, const PdfObj& page_obj,
 
     Canvas canvas(rw, rh);
 
-    // ── Rasterize vector paths (anti-aliased scanline fill) ──
-    constexpr int AA_H = 4;  // horizontal subsamples per pixel
-    constexpr int AA_V = 4;  // vertical subsamples per pixel
-    constexpr int AA_TOTAL = AA_H * AA_V;
+    // ── Rasterize vector paths (analytic coverage anti-aliasing) ──
+    // Uses signed area coverage per pixel row — no supersampling needed.
+    // Each edge contributes fractional coverage as it crosses pixel boundaries.
 
-    // Shared scanline helpers — reused across all paths to avoid allocation
     struct ScanEdge { double x_at_ymin; double inv_slope; int ymin, ymax; };
     std::vector<ScanEdge> edge_buf;
     std::vector<double> xs_buf;
-    std::vector<int> hits_buf(rw + 1, 0);
+    std::vector<int> cov_buf;  // coverage accumulator per pixel (scaled by 256)
 
-    // Scanline rasterizer with sorted active edge list
     auto rasterize_edges = [&](std::vector<ScanEdge>& edges, int ymin, int ymax,
                                uint8_t cr, uint8_t cg, uint8_t cb) {
         if (edges.empty()) return;
-        ymin = std::max(0, ymin);
-        ymax = std::min(rh * AA_V, ymax);
+        if (ymin < 0) ymin = 0;
+        if (ymax > rh) ymax = rh;
         if (ymin >= ymax) return;
 
-        // Sort edges by ymin for active edge list
+        // Find x-bounds to avoid scanning full width
+        double xmin_d = 1e9, xmax_d = -1e9;
+        for (auto& e : edges) {
+            double x0 = e.x_at_ymin;
+            double x1 = x0 + (e.ymax - e.ymin) * e.inv_slope;
+            double lo = std::min(x0, x1), hi = std::max(x0, x1);
+            if (lo < xmin_d) xmin_d = lo;
+            if (hi > xmax_d) xmax_d = hi;
+        }
+        int xmin = std::max(0, static_cast<int>(xmin_d) - 1);
+        int xmax = std::min(rw, static_cast<int>(xmax_d) + 2);
+        int xspan = xmax - xmin;
+        if (xspan <= 0) return;
+
+        cov_buf.assign(xspan + 1, 0);
+
+        // Sort edges by ymin
         std::sort(edges.begin(), edges.end(),
                   [](const ScanEdge& a, const ScanEdge& b) { return a.ymin < b.ymin; });
 
@@ -5242,70 +5268,67 @@ ImageData render_page_composite(PdfDoc& doc, const PdfObj& page_obj,
         struct ActiveEdge { double x; double inv_slope; int ymax; };
         std::vector<ActiveEdge> active;
 
-        int prev_row = ymin / AA_V;
-        std::fill(hits_buf.begin(), hits_buf.end(), 0);
-
-        for (int suby = ymin; suby < ymax; suby++) {
-            int cur_row = suby / AA_V;
-            if (cur_row != prev_row) {
-                for (int x = 0; x < rw; x++) {
-                    if (hits_buf[x] > 0) {
-                        int alpha = hits_buf[x] * 255 / AA_TOTAL;
-                        if (alpha > 255) alpha = 255;
-                        canvas.blend_pixel(x, prev_row, cr, cg, cb, static_cast<uint8_t>(alpha));
-                    }
-                }
-                std::fill(hits_buf.begin(), hits_buf.end(), 0);
-                prev_row = cur_row;
-            }
-
+        for (int y = ymin; y < ymax; y++) {
             // Add newly active edges
-            while (next_edge < edges.size() && edges[next_edge].ymin <= suby) {
+            while (next_edge < edges.size() && edges[next_edge].ymin <= y) {
                 auto& e = edges[next_edge];
-                double x = e.x_at_ymin + (suby - e.ymin) * e.inv_slope;
+                double x = e.x_at_ymin + (y - e.ymin) * e.inv_slope;
                 active.push_back({x, e.inv_slope, e.ymax});
                 next_edge++;
             }
 
-            // Remove expired edges and collect x intersections
+            // Collect x-intersections with insertion sort (typically 2-8 edges)
             xs_buf.clear();
             size_t write = 0;
             for (size_t i = 0; i < active.size(); i++) {
-                if (suby < active[i].ymax) {
-                    xs_buf.push_back(active[i].x);
+                if (y < active[i].ymax) {
+                    // Insertion sort into xs_buf
+                    double xval = active[i].x;
+                    size_t pos = xs_buf.size();
+                    xs_buf.push_back(xval);
+                    while (pos > 0 && xs_buf[pos - 1] > xval) {
+                        xs_buf[pos] = xs_buf[pos - 1];
+                        pos--;
+                    }
+                    xs_buf[pos] = xval;
                     active[i].x += active[i].inv_slope;
                     active[write++] = active[i];
                 }
             }
             active.resize(write);
 
-            std::sort(xs_buf.begin(), xs_buf.end());
-
-            // Even-odd fill between pairs
+            // Even-odd fill: set coverage between pairs
             for (size_t i = 0; i + 1 < xs_buf.size(); i += 2) {
-                double fx0 = xs_buf[i] / AA_H;
-                double fx1 = xs_buf[i+1] / AA_H;
+                double fx0 = xs_buf[i];
+                double fx1 = xs_buf[i + 1];
                 int ix0 = static_cast<int>(fx0);
                 int ix1 = static_cast<int>(fx1);
-                if (ix0 < 0) ix0 = 0;
-                if (ix1 >= rw) ix1 = rw - 1;
+                if (ix0 < xmin) ix0 = xmin;
+                if (ix1 >= xmax) ix1 = xmax - 1;
+                if (ix0 > ix1) continue;
+
                 if (ix0 == ix1) {
-                    hits_buf[ix0] += static_cast<int>((fx1 - fx0) * AA_H);
+                    // Subpixel span within one pixel
+                    cov_buf[ix0 - xmin] += static_cast<int>((fx1 - fx0) * 256);
                 } else {
-                    hits_buf[ix0] += static_cast<int>((ix0 + 1 - fx0) * AA_H);
+                    // Partial left pixel
+                    cov_buf[ix0 - xmin] += static_cast<int>((ix0 + 1 - fx0) * 256);
+                    // Full middle pixels
                     for (int x = ix0 + 1; x < ix1; x++)
-                        hits_buf[x] += AA_H;
-                    if (ix1 < rw)
-                        hits_buf[ix1] += static_cast<int>((fx1 - ix1) * AA_H);
+                        cov_buf[x - xmin] += 256;
+                    // Partial right pixel
+                    cov_buf[ix1 - xmin] += static_cast<int>((fx1 - ix1) * 256);
                 }
             }
-        }
-        // Flush last row
-        for (int x = 0; x < rw; x++) {
-            if (hits_buf[x] > 0) {
-                int alpha = hits_buf[x] * 255 / AA_TOTAL;
-                if (alpha > 255) alpha = 255;
-                canvas.blend_pixel(x, prev_row, cr, cg, cb, static_cast<uint8_t>(alpha));
+
+            // Flush row: blend pixels with accumulated coverage
+            for (int x = 0; x < xspan; x++) {
+                if (cov_buf[x] > 0) {
+                    int alpha = cov_buf[x];
+                    if (alpha > 255) alpha = 255;
+                    canvas.blend_pixel(x + xmin, y, cr, cg, cb, static_cast<uint8_t>(alpha));
+                    cov_buf[x] = 0;
+                }
             }
         }
     };
@@ -5370,20 +5393,20 @@ ImageData render_page_composite(PdfDoc& doc, const PdfObj& page_obj,
         // Fill
         if (rp.do_fill) {
             edge_buf.clear();
-            int ymin = rh * AA_V, ymax = 0;
+            int ymin = rh, ymax = 0;
             for (auto& sp : subpaths) {
                 for (size_t i = 0; i + 1 < sp.size(); i++) {
                     double sx0 = sp[i].first * scale;
                     double sy0 = (page_h - sp[i].second) * scale;
                     double sx1 = sp[i+1].first * scale;
                     double sy1 = (page_h - sp[i+1].second) * scale;
-                    int iy0 = static_cast<int>(std::round(sy0 * AA_V));
-                    int iy1 = static_cast<int>(std::round(sy1 * AA_V));
+                    int iy0 = static_cast<int>(std::round(sy0));
+                    int iy1 = static_cast<int>(std::round(sy1));
                     if (iy0 == iy1) continue;
                     if (iy0 > iy1) { std::swap(sx0, sx1); std::swap(sy0, sy1); std::swap(iy0, iy1); }
                     double inv_slope = (sx1 - sx0) / (sy1 - sy0);
-                    double x_start = sx0 + (iy0 / (double)AA_V - sy0) * inv_slope;
-                    edge_buf.push_back({x_start * AA_H, inv_slope / AA_V * AA_H, iy0, iy1});
+                    double x_start = sx0 + (iy0 - sy0) * inv_slope;
+                    edge_buf.push_back({x_start, inv_slope, iy0, iy1});
                     if (iy0 < ymin) ymin = iy0;
                     if (iy1 > ymax) ymax = iy1;
                 }
@@ -5400,7 +5423,7 @@ ImageData render_page_composite(PdfDoc& doc, const PdfObj& page_obj,
             if (lw < 0.5) lw = 0.5;
             double half = lw / 2.0;
             edge_buf.clear();
-            int ymin = rh * AA_V, ymax = 0;
+            int ymin = rh, ymax = 0;
             for (auto& sp : subpaths) {
                 for (size_t i = 0; i + 1 < sp.size(); i++) {
                     double sx0 = sp[i].first * scale;
@@ -5418,12 +5441,12 @@ ImageData render_page_composite(PdfDoc& doc, const PdfObj& page_obj,
                         int e2 = (e + 1) % 4;
                         double ey0 = qy[e], ey1 = qy[e2];
                         double ex0 = qx[e], ex1 = qx[e2];
-                        int iy0 = static_cast<int>(std::round(ey0 * AA_V));
-                        int iy1 = static_cast<int>(std::round(ey1 * AA_V));
+                        int iy0 = static_cast<int>(std::round(ey0));
+                        int iy1 = static_cast<int>(std::round(ey1));
                         if (iy0 == iy1) continue;
                         if (iy0 > iy1) { std::swap(iy0, iy1); std::swap(ex0, ex1); std::swap(ey0, ey1); }
-                        double inv_s = (ex1 - ex0) / (ey1 - ey0) / AA_V * AA_H;
-                        double x_s = ex0 * AA_H + (iy0 / (double)AA_V - ey0) * (ex1 - ex0) / (ey1 - ey0) * AA_H;
+                        double inv_s = (ex1 - ex0) / (ey1 - ey0);
+                        double x_s = ex0 + (iy0 - ey0) * inv_s;
                         edge_buf.push_back({x_s, inv_s, iy0, iy1});
                         if (iy0 < ymin) ymin = iy0;
                         if (iy1 > ymax) ymax = iy1;
@@ -5630,22 +5653,18 @@ ImageData render_page_composite(PdfDoc& doc, const PdfObj& page_obj,
     img.height = rh;
     img.components = 3;
 
-    // Extract RGB from RGBA canvas
-    img.pixels.resize(static_cast<size_t>(rw) * rh * 3);
-    for (int i = 0; i < rw * rh; i++) {
-        img.pixels[i*3]   = canvas.pixels[i*4];
-        img.pixels[i*3+1] = canvas.pixels[i*4+1];
-        img.pixels[i*3+2] = canvas.pixels[i*4+2];
-    }
+    // Canvas is already RGB — move directly
+    img.pixels = std::move(canvas.pixels);
 
     if (!output_dir.empty()) {
-        auto png = pixels_to_png(img.pixels.data(), rw, rh, 3, Z_BEST_SPEED);
-        if (!png.empty()) {
-            std::string path = output_dir + "/" + img.name + ".png";
+        auto jpg = pixels_to_jpeg(img.pixels.data(), rw, rh, 85);
+        if (!jpg.empty()) {
+            std::string path = output_dir + "/" + img.name + ".jpg";
             std::ofstream f(path, std::ios::binary);
             if (f) {
-                f.write(png.data(), static_cast<std::streamsize>(png.size()));
+                f.write(jpg.data(), static_cast<std::streamsize>(jpg.size()));
                 img.saved_path = path;
+                img.format = "jpeg";
             }
         }
     }
