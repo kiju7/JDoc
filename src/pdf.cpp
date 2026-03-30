@@ -1494,7 +1494,8 @@ PdfFont load_font(PdfDoc& doc, const PdfObj& font_ref) {
         for (char c : font.name) lower += std::tolower(static_cast<unsigned char>(c));
         font.is_bold = lower.find("bold") != std::string::npos ||
                        lower.find("heavy") != std::string::npos ||
-                       lower.find("black") != std::string::npos;
+                       lower.find("black") != std::string::npos ||
+                       lower.find("-medi") != std::string::npos;
         font.is_italic = lower.find("italic") != std::string::npos ||
                          lower.find("oblique") != std::string::npos;
     }
@@ -2337,6 +2338,7 @@ struct TextLine {
     double font_size = 0;
     bool is_bold = false;
     bool is_italic = false;
+    bool is_column_split = false;
     double y_center = 0;
     double x_left = 1e9;
     double x_right = 0;
@@ -2484,10 +2486,26 @@ double detect_column_boundary(const std::vector<TextChar>& chars,
 std::vector<TextLine> reorder_column_lines(std::vector<TextLine>& lines,
                                            double col_boundary) {
     enum Type { LEFT, RIGHT, SPANNING };
+
+    // Compute content width for SPANNING minimum width threshold
+    double min_left = 1e9, max_right = 0;
+    for (auto& l : lines) {
+        if (l.x_left < min_left) min_left = l.x_left;
+        if (l.x_right > max_right) max_right = l.x_right;
+    }
+    double content_width = max_right - min_left;
+    double span_min_width = content_width * 0.6;
+    double page_center = (min_left + max_right) / 2.0;
+
     std::vector<Type> types(lines.size());
     for (size_t i = 0; i < lines.size(); i++) {
         auto& l = lines[i];
-        if (l.x_left < col_boundary - 5 && l.x_right > col_boundary + 5)
+        double line_width = l.x_right - l.x_left;
+        double line_center = (l.x_left + l.x_right) / 2.0;
+        bool straddles = l.x_left < col_boundary - 5 && l.x_right > col_boundary + 5;
+        bool is_wide = line_width > span_min_width;
+        bool is_centered = straddles && std::abs(line_center - page_center) < content_width * 0.15;
+        if (straddles && (is_wide || is_centered))
             types[i] = SPANNING;
         else if ((l.x_left + l.x_right) / 2.0 < col_boundary)
             types[i] = LEFT;
@@ -2508,17 +2526,22 @@ std::vector<TextLine> reorder_column_lines(std::vector<TextLine>& lines,
         while (band_end < lines.size() && types[band_end] != SPANNING)
             band_end++;
         for (size_t j = i; j < band_end; j++)
-            if (types[j] == LEFT)
+            if (types[j] == LEFT) {
+                lines[j].is_column_split = true;
                 result.push_back(std::move(lines[j]));
+            }
         for (size_t j = i; j < band_end; j++)
-            if (types[j] == RIGHT)
+            if (types[j] == RIGHT) {
+                lines[j].is_column_split = true;
                 result.push_back(std::move(lines[j]));
+            }
         i = band_end;
     }
     return result;
 }
 
-std::vector<TextLine> chars_to_lines(const std::vector<TextChar>& chars) {
+std::vector<TextLine> chars_to_lines(const std::vector<TextChar>& chars,
+                                    double* out_col_boundary = nullptr) {
     if (chars.empty()) return {};
 
     // Sort by y (descending, top-first) then x (left-to-right)
@@ -2537,6 +2560,7 @@ std::vector<TextLine> chars_to_lines(const std::vector<TextChar>& chars) {
     if (y_tol < 2) y_tol = 2;
 
     double col_boundary = detect_column_boundary(chars, median_fs, y_tol);
+    if (out_col_boundary) *out_col_boundary = col_boundary;
 
     std::sort(idx.begin(), idx.end(), [&](size_t a, size_t b) {
         if (std::abs(chars[a].y - chars[b].y) > y_tol) return chars[a].y > chars[b].y;
@@ -2636,12 +2660,13 @@ struct FontStats {
         if (body_size < 4.0) body_size = 12.0;
     }
 
-    int heading_level(double fs) const {
+    int heading_level(double fs, bool is_bold = false) const {
         if (fs <= 0) return 0;
         double r = fs / body_size;
         if (r >= 1.8) return 1;
         if (r >= 1.5) return 2;
         if (r >= 1.3) return 3;
+        if (is_bold && r >= 1.1) return 3;
         return 0;
     }
 };
@@ -3833,15 +3858,20 @@ std::vector<TableData> detect_text_tables(const PageCharCache& cache,
                     group_indices.push_back(j);
                     continue;
                 }
-                break;
+                // Skip rows whose center is outside the table region
+                continue;
             }
 
-            double overlap_l = std::max(ref_xmin, rs.x_min);
-            double overlap_r = std::min(ref_xmax, rs.x_max);
-            double extent = std::max(ref_xmax - ref_xmin, rs.x_max - rs.x_min);
-            if (extent < 50) break;
-            if (overlap_r - overlap_l < extent * 0.5) break;
+            // For multi-span rows, check if any span overlaps the table region
+            bool has_table_span = false;
+            for (auto& sp : rs.spans) {
+                if (sp.second > ref_xmin - 5 && sp.first < ref_xmax + 5)
+                    has_table_span = true;
+            }
+            if (!has_table_span) continue;
 
+            // Check gap pattern match first (handles rows wider than
+            // the table region, e.g. body text + table text at same Y)
             auto cur_gaps = get_gaps(rs);
             if (cur_gaps.size() > 0) {
                 int matching = 0;
@@ -3853,11 +3883,15 @@ std::vector<TableData> detect_text_tables(const PageCharCache& cache,
                 int min_gaps = (int)std::min(cur_gaps.size(), ref_gaps.size());
                 if (min_gaps > 0 && matching >= (min_gaps + 1) / 2) {
                     group_indices.push_back(j);
-                    ref_xmin = std::min(ref_xmin, rs.x_min);
-                    ref_xmax = std::max(ref_xmax, rs.x_max);
                     continue;
                 }
             }
+
+            double overlap_l = std::max(ref_xmin, rs.x_min);
+            double overlap_r = std::min(ref_xmax, rs.x_max);
+            double extent = std::max(ref_xmax - ref_xmin, rs.x_max - rs.x_min);
+            if (extent < 50) break;
+            if (overlap_r - overlap_l < extent * 0.5) break;
 
             break;
         }
@@ -3956,9 +3990,8 @@ std::vector<TableData> detect_text_tables(const PageCharCache& cache,
 
         // Early reject: check text continuity across columns
         {
-            auto is_content_byte = [](unsigned char c) -> bool {
-                return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-                       (c >= '0' && c <= '9') || c >= 0x80;
+            auto is_lower_or_multibyte = [](unsigned char c) -> bool {
+                return (c >= 'a' && c <= 'z') || c >= 0x80;
             };
             int continuation_rows = 0;
             int checked_rows = 0;
@@ -3969,8 +4002,8 @@ std::vector<TableData> detect_text_tables(const PageCharCache& cache,
                 for (int c = 0; c + 1 < n_cols; c++) {
                     if (r[c].empty() || r[c+1].empty()) continue;
                     pairs_checked++;
-                    if (is_content_byte((unsigned char)r[c].back()) &&
-                        is_content_byte((unsigned char)r[c+1][0]))
+                    if (is_lower_or_multibyte((unsigned char)r[c].back()) &&
+                        is_lower_or_multibyte((unsigned char)r[c+1][0]))
                         pairs_continued++;
                 }
                 checked_rows++;
@@ -4090,10 +4123,6 @@ std::vector<TableData> detect_text_tables(const PageCharCache& cache,
             }
 
             if (!looks_like_list) {
-                auto is_content_char = [](unsigned char c) -> bool {
-                    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-                           (c >= '0' && c <= '9') || c >= 0x80;
-                };
                 auto is_filler_only = [](const std::string& s) -> bool {
                     for (char c : s)
                         if (c != '.' && c != ',' && c != ' ' && c != '\t' &&
@@ -4124,7 +4153,9 @@ std::vector<TableData> detect_text_tables(const PageCharCache& cache,
                         unsigned char left_last = (unsigned char)row[c].back();
                         unsigned char right_first = (unsigned char)row[c+1][0];
                         pairs_checked++;
-                        if (is_content_char(left_last) && is_content_char(right_first))
+                        bool ll = (left_last >= 'a' && left_last <= 'z') || left_last >= 0x80;
+                        bool rf = (right_first >= 'a' && right_first <= 'z') || right_first >= 0x80;
+                        if (ll && rf)
                             pairs_continued++;
                     }
                     if (pairs_checked > 0 && pairs_continued > pairs_checked / 2)
@@ -4168,9 +4199,9 @@ std::vector<TableData> detect_text_tables(const PageCharCache& cache,
                     total_rows++;
                     sum_first += row[0].size();
                     if (n_cols >= 2 && row.size() >= 2) sum_second += row[1].size();
-                    // First column > 3x second column
+                    // First column > 5x second column
                     if (n_cols == 2 && row.size() >= 2 && !row[1].empty() &&
-                        row[0].size() > row[1].size() * 3)
+                        row[0].size() > row[1].size() * 5)
                         unbalanced++;
                 }
                 if (total_rows >= 3) {
@@ -4178,6 +4209,9 @@ std::vector<TableData> detect_text_tables(const PageCharCache& cache,
                     double avg_second = (n_cols >= 2) ? sum_second / total_rows : 0;
                     // First column avg > 30 chars and 3x larger than second → body text
                     if (avg_first > 30 && avg_second > 0 && avg_first > avg_second * 2.5)
+                        looks_like_list = true;
+                    // Both columns avg > 30 chars → likely body text, not table
+                    if (n_cols == 2 && avg_first > 30 && avg_second > 30)
                         looks_like_list = true;
                     // >40% rows have heavily unbalanced columns
                     if (unbalanced >= total_rows * 0.4)
@@ -5804,6 +5838,10 @@ bool line_in_table(const TextLine& line, const std::vector<TableData>& tables) {
 std::vector<TextLine> merge_colinear_lines(const std::vector<TextLine>& lines) {
     if (lines.size() < 2) return lines;
 
+    // Skip merging when lines have been column-reordered
+    for (auto& l : lines)
+        if (l.is_column_split) return lines;
+
     std::vector<size_t> idx(lines.size());
     for (size_t i = 0; i < idx.size(); i++) idx[i] = i;
     std::sort(idx.begin(), idx.end(), [&](size_t a, size_t b) {
@@ -5822,8 +5860,14 @@ std::vector<TextLine> merge_colinear_lines(const std::vector<TextLine>& lines) {
             j++;
         }
 
-        if (group.size() == 1) {
-            merged.push_back(lines[group[0]]);
+        // Don't merge column-split lines
+        bool has_col_split = false;
+        for (auto gi : group)
+            if (lines[gi].is_column_split) has_col_split = true;
+
+        if (group.size() == 1 || has_col_split) {
+            for (auto gi : group)
+                merged.push_back(lines[gi]);
         } else {
             std::sort(group.begin(), group.end(), [&](size_t a, size_t b) {
                 return lines[a].x_left < lines[b].x_left;
@@ -5861,9 +5905,16 @@ std::string page_to_markdown(const std::vector<TextLine>& raw_lines,
                               const FontStats& stats,
                               const std::vector<ImageData>& images,
                               const std::vector<double>& image_y_pos,
+                              const std::vector<double>& image_x_pos,
                               const std::vector<TableData>& tables,
-                              const std::vector<AnnotEntry>& annots = {}) {
+                              const std::vector<AnnotEntry>& annots = {},
+                              double col_boundary = 0) {
     auto lines = merge_colinear_lines(raw_lines);
+
+    // Detect if page has column-split lines (for image placement)
+    bool has_columns = false;
+    for (auto& l : lines)
+        if (l.is_column_split) { has_columns = true; break; }
 
     std::string md;
     md.reserve(lines.size() * 80);
@@ -5871,45 +5922,63 @@ std::string page_to_markdown(const std::vector<TextLine>& raw_lines,
     // Build sorted insert lists for tables and images by Y position (top-first in PDF coords)
     struct InlineInsert {
         double y_pos;
+        double x_pos;
         size_t idx;
         bool is_image; // false = table, true = image
     };
     std::vector<InlineInsert> inserts;
     for (size_t ti = 0; ti < tables.size(); ti++) {
-        inserts.push_back({std::max(tables[ti].y0, tables[ti].y1), ti, false});
+        double tx = (tables[ti].x0 + tables[ti].x1) / 2.0;
+        inserts.push_back({std::max(tables[ti].y0, tables[ti].y1), tx, ti, false});
     }
     for (size_t ii = 0; ii < images.size(); ii++) {
         double y = (ii < image_y_pos.size()) ? image_y_pos[ii] : 0.0;
-        inserts.push_back({y, ii, true});
+        double x = (ii < image_x_pos.size()) ? image_x_pos[ii] : 0.0;
+        inserts.push_back({y, x, ii, true});
     }
     std::sort(inserts.begin(), inserts.end(),
               [](const InlineInsert& a, const InlineInsert& b) { return a.y_pos > b.y_pos; });
 
     size_t next_insert = 0;
 
-    auto flush_inserts = [&](double y_threshold) {
+    // For column-split pages, defer inserts whose X doesn't match current text column
+    std::vector<size_t> deferred_inserts;
+
+    auto emit_insert = [&](const InlineInsert& ins) {
+        if (ins.is_image) {
+            auto& img = images[ins.idx];
+            std::string ref = "embedded:" + img.name;
+            if (!img.saved_path.empty()) {
+                auto slash = img.saved_path.find_last_of('/');
+                ref = (slash != std::string::npos)
+                    ? img.saved_path.substr(slash + 1)
+                    : img.saved_path;
+            }
+            md += "\n![" + img.name + "](" + ref + ")\n";
+        } else {
+            auto& tbl = tables[ins.idx];
+            if (!tbl.title.empty())
+                md += "\n" + tbl.title + "\n";
+            md += "\n";
+            md += format_table(tbl);
+            md += "\n";
+        }
+    };
+
+    auto flush_inserts = [&](double y_threshold, bool is_left_col = false, bool is_right_col = false) {
         while (next_insert < inserts.size() &&
                inserts[next_insert].y_pos >= y_threshold) {
             auto& ins = inserts[next_insert];
-            if (ins.is_image) {
-                auto& img = images[ins.idx];
-                std::string ref = "embedded:" + img.name;
-                if (!img.saved_path.empty()) {
-                    // Use filename only from saved path
-                    auto slash = img.saved_path.find_last_of('/');
-                    ref = (slash != std::string::npos)
-                        ? img.saved_path.substr(slash + 1)
-                        : img.saved_path;
+            // On column-split pages, defer inserts from the other column
+            if (col_boundary > 0 && ins.x_pos > 0) {
+                bool ins_is_left = ins.x_pos < col_boundary;
+                if ((is_left_col && !ins_is_left) || (is_right_col && ins_is_left)) {
+                    deferred_inserts.push_back(next_insert);
+                    next_insert++;
+                    continue;
                 }
-                md += "\n![" + img.name + "](" + ref + ")\n";
-            } else {
-                auto& tbl = tables[ins.idx];
-                if (!tbl.title.empty())
-                    md += "\n" + tbl.title + "\n";
-                md += "\n";
-                md += format_table(tbl);
-                md += "\n";
             }
+            emit_insert(ins);
             next_insert++;
         }
     };
@@ -5917,7 +5986,22 @@ std::string page_to_markdown(const std::vector<TextLine>& raw_lines,
     for (size_t i = 0; i < lines.size(); i++) {
         const auto& l = lines[i];
 
-        flush_inserts(l.y_center);
+        bool is_left = l.is_column_split && (l.x_left + l.x_right) / 2.0 < col_boundary;
+        bool is_right = l.is_column_split && !is_left;
+        flush_inserts(l.y_center, is_left, is_right);
+
+        // Emit deferred inserts (from other column) when their Y matches current line
+        for (auto it = deferred_inserts.begin(); it != deferred_inserts.end(); ) {
+            auto& ins = inserts[*it];
+            bool ins_is_left = ins.x_pos < col_boundary;
+            if (ins.y_pos >= l.y_center &&
+                ((is_left && ins_is_left) || (is_right && !ins_is_left) || !l.is_column_split)) {
+                emit_insert(ins);
+                it = deferred_inserts.erase(it);
+            } else {
+                ++it;
+            }
+        }
 
         if (line_in_table(l, tables)) continue;
 
@@ -5932,7 +6016,7 @@ std::string page_to_markdown(const std::vector<TextLine>& raw_lines,
             if (only_filler) continue;
         }
 
-        int hlevel = stats.heading_level(l.font_size);
+        int hlevel = stats.heading_level(l.font_size, l.is_bold);
 
         if (hlevel >= 3 && !l.is_bold && l.text.size() > 60)
             hlevel = 0;
@@ -5957,6 +6041,10 @@ std::string page_to_markdown(const std::vector<TextLine>& raw_lines,
 
     // Flush remaining tables and images
     flush_inserts(-1e9);
+
+    // Emit deferred inserts (images/tables from other column)
+    for (auto di : deferred_inserts)
+        emit_insert(inserts[di]);
 
     // Append annotations (links, text notes) at end of page
     if (!annots.empty()) {
@@ -5993,6 +6081,8 @@ struct ExtractResult {
     std::vector<std::vector<TextLine>> all_lines;
     std::vector<std::vector<ImageData>> all_images;
     std::vector<std::vector<double>> all_image_y;  // per-page image Y positions (PDF coords, top=large)
+    std::vector<std::vector<double>> all_image_x;  // per-page image X positions
+    std::vector<double> col_boundaries;  // per-page column boundary (0 if single-column)
     std::vector<std::vector<TableData>> all_tables;
     std::vector<std::vector<AnnotEntry>> all_annots;
     std::vector<double> page_widths;
@@ -6084,6 +6174,8 @@ ExtractResult extract_pdf(const std::string& pdf_path, const ConvertOptions& opt
     result.all_lines.resize(tp);
     result.all_images.resize(tp);
     result.all_image_y.resize(tp);
+    result.all_image_x.resize(tp);
+    result.col_boundaries.resize(tp, 0);
     result.all_tables.resize(tp);
     result.all_annots.resize(tp);
     result.page_widths.resize(tp, 0);
@@ -6148,7 +6240,7 @@ ExtractResult extract_pdf(const std::string& pdf_path, const ConvertOptions& opt
         auto parse_result = parse_content_stream(doc, content_data, resources, page_h,
                                                   &font_cache, !need_graphics);
 
-        result.all_lines[p] = chars_to_lines(parse_result.chars);
+        result.all_lines[p] = chars_to_lines(parse_result.chars, &result.col_boundaries[p]);
 
         // Extract annotations (text notes, links)
         result.all_annots[p] = extract_annotations(doc, page_obj, page_h);
@@ -6187,6 +6279,7 @@ ExtractResult extract_pdf(const std::string& pdf_path, const ConvertOptions& opt
                 if (!rendered.data.empty() || !rendered.pixels.empty()) {
                     result.all_images[p].push_back(std::move(rendered));
                     result.all_image_y[p].push_back(page_h); // full-page composite goes to top
+                    result.all_image_x[p].push_back(0);
                 }
             } else {
                 auto extracted = extract_page_images(doc, page_obj, parse_result, p, image_dir, opts.min_image_size);
@@ -6195,6 +6288,7 @@ ExtractResult extract_pdf(const std::string& pdf_path, const ConvertOptions& opt
                     // ctm[3] is vertical scale; y_top = ctm[5] + abs(ctm[3])
                     double y_top = ei.ctm[5] + std::abs(ei.ctm[3]);
                     result.all_image_y[p].push_back(y_top);
+                    result.all_image_x[p].push_back(ei.ctm[4]); // X position
                     result.all_images[p].push_back(std::move(ei.img));
                 }
             }
@@ -6207,6 +6301,7 @@ ExtractResult extract_pdf(const std::string& pdf_path, const ConvertOptions& opt
                     if (!rendered.data.empty() || !rendered.pixels.empty()) {
                         result.all_images[p].push_back(std::move(rendered));
                         result.all_image_y[p].push_back(page_h);
+                        result.all_image_x[p].push_back(0);
                     }
                 }
             }
@@ -6300,9 +6395,10 @@ std::string pdf_to_markdown(const std::string& pdf_path, ConvertOptions opts) {
         if (!full_md.empty()) full_md += '\n';
         full_md += "--- Page " + std::to_string(p + 1) + " ---\n\n";
         std::string page_md = page_to_markdown(r.all_lines[p], r.stats,
-                                                r.all_images[p], r.all_image_y[p],
+                                                r.all_images[p], r.all_image_y[p], r.all_image_x[p],
                                                 r.all_tables[p],
-                                                p < (int)r.all_annots.size() ? r.all_annots[p] : std::vector<AnnotEntry>{});
+                                                p < (int)r.all_annots.size() ? r.all_annots[p] : std::vector<AnnotEntry>{},
+                                                r.col_boundaries[p]);
         if (plaintext)
             full_md += util::strip_markdown(page_md);
         else
@@ -6333,9 +6429,10 @@ std::vector<PageChunk> pdf_to_markdown_chunks(const std::string& pdf_path,
         chunk.page_height = r.page_heights[p];
         chunk.body_font_size = r.stats.body_size;
         std::string page_md = page_to_markdown(r.all_lines[p], r.stats,
-                                                r.all_images[p], r.all_image_y[p],
+                                                r.all_images[p], r.all_image_y[p], r.all_image_x[p],
                                                 r.all_tables[p],
-                                                p < (int)r.all_annots.size() ? r.all_annots[p] : std::vector<AnnotEntry>{});
+                                                p < (int)r.all_annots.size() ? r.all_annots[p] : std::vector<AnnotEntry>{},
+                                                r.col_boundaries[p]);
         chunk.text = plaintext ? util::strip_markdown(page_md) : page_md;
 
         for (auto& td : r.all_tables[p])
