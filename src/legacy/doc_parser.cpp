@@ -1205,7 +1205,7 @@ std::vector<ImageData> DocParser::extract_images(unsigned min_image_size) {
         if (img_size > 16) {
             ImageData img;
             img.page_number = 1;
-            img.name = "image_" + std::to_string(++img_idx);
+            img.name = "page1_img" + std::to_string(img_idx++);
             img.format = fmt;
             img.data.assign(stream.begin() + img_start, stream.begin() + img_end);
             util::populate_image_dimensions(img);
@@ -1262,7 +1262,7 @@ std::vector<ImageData> DocParser::extract_images(unsigned min_image_size) {
 
             ImageData img;
             img.page_number = 1;
-            img.name = "image_" + std::to_string(++img_idx);
+            img.name = "page1_img" + std::to_string(img_idx++);
             img.format = fmt;
             img.data.assign(data.begin() + img_start, data.begin() + img_start + img_size);
             util::populate_image_dimensions(img);

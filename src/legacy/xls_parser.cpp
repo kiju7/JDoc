@@ -826,7 +826,7 @@ std::vector<ImageData> XlsParser::extract_images(unsigned min_image_size) {
                 if (img_offset + img_size <= drawing_data.size()) {
                     ImageData img;
                     img.page_number = 1;
-                    img.name = "xls_image_" + std::to_string(++img_idx);
+                    img.name = "page1_img" + std::to_string(img_idx++);
                     img.format = fmt;
                     img.data.assign(drawing_data.begin() + img_offset,
                                     drawing_data.begin() + img_offset + img_size);

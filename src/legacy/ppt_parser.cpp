@@ -638,8 +638,8 @@ std::vector<ImageData> PptParser::extract_images(unsigned min_image_size) {
                 }
 
                 ImageData img;
-                img.page_number = img_idx + 1;
-                img.name = "slide_image_" + std::to_string(++img_idx);
+                img.page_number = 1;
+                img.name = "page1_img" + std::to_string(img_idx++);
                 img.format = fmt;
                 img.data = std::move(img_data);
                 util::populate_image_dimensions(img);
