@@ -6312,6 +6312,8 @@ ExtractResult extract_pdf(const std::string& pdf_path, const ConvertOptions& opt
                     if (!img.saved_path.empty()) {
                         img.data.clear();
                         img.data.shrink_to_fit();
+                        img.pixels.clear();
+                        img.pixels.shrink_to_fit();
                     }
                 }
             }
