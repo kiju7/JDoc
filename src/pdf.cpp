@@ -5143,16 +5143,37 @@ struct Canvas {
             int dh = static_cast<int>(std::abs(ph));
             if (dw <= 0 || dh <= 0) return;
 
+            bool downscale = (dw < sw || dh < sh);
             for (int y = 0; y < dh; y++) {
-                int sy = y * sh / dh;
-                if (sy >= sh) sy = sh - 1;
                 for (int x = 0; x < dw; x++) {
-                    int sx = x * sw / dw;
-                    if (sx >= sw) sx = sw - 1;
-                    const uint8_t* sp = src + (sy * sw + sx) * scomp;
                     uint8_t r, g, b;
-                    if (scomp >= 3) { r = sp[0]; g = sp[1]; b = sp[2]; }
-                    else { r = g = b = sp[0]; }
+                    if (downscale) {
+                        // Area sampling for downscale
+                        int sy0 = y * sh / dh, sy1 = (y + 1) * sh / dh;
+                        int sx0 = x * sw / dw, sx1 = (x + 1) * sw / dw;
+                        if (sy1 <= sy0) sy1 = sy0 + 1;
+                        if (sx1 <= sx0) sx1 = sx0 + 1;
+                        if (sy1 > sh) sy1 = sh;
+                        if (sx1 > sw) sx1 = sw;
+                        int sr = 0, sg = 0, sb = 0, cnt = 0;
+                        for (int ry = sy0; ry < sy1; ry++)
+                            for (int rx = sx0; rx < sx1; rx++) {
+                                const uint8_t* sp = src + (ry * sw + rx) * scomp;
+                                if (scomp >= 3) { sr += sp[0]; sg += sp[1]; sb += sp[2]; }
+                                else { sr += sp[0]; sg += sp[0]; sb += sp[0]; }
+                                cnt++;
+                            }
+                        r = static_cast<uint8_t>(sr / cnt);
+                        g = static_cast<uint8_t>(sg / cnt);
+                        b = static_cast<uint8_t>(sb / cnt);
+                    } else {
+                        // Nearest-neighbor for upscale
+                        int sy = y * sh / dh; if (sy >= sh) sy = sh - 1;
+                        int sx = x * sw / dw; if (sx >= sw) sx = sw - 1;
+                        const uint8_t* sp = src + (sy * sw + sx) * scomp;
+                        if (scomp >= 3) { r = sp[0]; g = sp[1]; b = sp[2]; }
+                        else { r = g = b = sp[0]; }
+                    }
                     blend_pixel(dx + x, dy + y, r, g, b, 255);
                 }
             }
@@ -5626,16 +5647,29 @@ ImageData render_page_composite(PdfDoc& doc, const PdfObj& page_obj,
             int dx = static_cast<int>(px), dy = static_cast<int>(py);
             int dw = static_cast<int>(pw), dh = static_cast<int>(ph);
             if (dw <= 0 || dh <= 0) continue;
+            // Area sampling for ImageMask: compute coverage ratio in source region
             for (int y = 0; y < dh && dy + y >= 0 && dy + y < canvas.height; y++) {
-                int sy = y * h / dh;
-                if (sy >= h) sy = h - 1;
+                int sy0 = y * h / dh;
+                int sy1 = (y + 1) * h / dh;
+                if (sy1 <= sy0) sy1 = sy0 + 1;
+                if (sy1 > h) sy1 = h;
                 for (int x = 0; x < dw && dx + x < canvas.width; x++) {
                     if (dx + x < 0) continue;
-                    int sx = x * w / dw;
-                    if (sx >= w) sx = w - 1;
-                    // pixels[sy*w+sx]: 255=bit set(paint), 0=clear(transparent)
-                    if (pixels[sy * w + sx] > 128)
-                        canvas.blend_pixel(dx + x, dy + y, fr, fg, fb, 255);
+                    int sx0 = x * w / dw;
+                    int sx1 = (x + 1) * w / dw;
+                    if (sx1 <= sx0) sx1 = sx0 + 1;
+                    if (sx1 > w) sx1 = w;
+                    // Count set pixels in source region
+                    int total = (sy1 - sy0) * (sx1 - sx0);
+                    if (total <= 0) continue;
+                    int set = 0;
+                    for (int ry = sy0; ry < sy1; ry++)
+                        for (int rx = sx0; rx < sx1; rx++)
+                            if (pixels[ry * w + rx] > 128) set++;
+                    if (set > 0) {
+                        uint8_t a = static_cast<uint8_t>(set * 255 / total);
+                        canvas.blend_pixel(dx + x, dy + y, fr, fg, fb, a);
+                    }
                 }
             }
         } else {
