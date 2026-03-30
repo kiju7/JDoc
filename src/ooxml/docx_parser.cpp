@@ -5,6 +5,7 @@
 #include "xml_utils.h"
 #include "common/file_utils.h"
 #include "common/image_utils.h"
+#include "common/png_encode.h"
 #include <algorithm>
 #include <cstdlib>
 #include <fstream>
@@ -255,14 +256,11 @@ std::vector<ImageData> DocxParser::extract_images(
             continue;
 
         std::string filename = img.name + (ext.empty() ? ".png" : ext);
-        if (!opts.image_output_dir.empty()) {
-            util::ensure_dir(opts.image_output_dir);
-            std::string out_path = opts.image_output_dir + "/" + filename;
-            std::ofstream ofs(out_path, std::ios::binary);
-            if (ofs) {
-                ofs.write(img.data.data(), img.data.size());
-                img.saved_path = out_path;
-            }
+        img.saved_path = util::save_image_to_file(
+            opts.image_output_dir, img.name, fmt,
+            img.data.data(), img.data.size());
+        if (!img.saved_path.empty()) {
+            filename = util::get_filename(img.saved_path);
             img.data.clear();
             img.data.shrink_to_fit();
         }

@@ -7,6 +7,7 @@
 #include "common/binary_utils.h"
 #include "common/file_utils.h"
 #include "common/image_utils.h"
+#include "common/png_encode.h"
 
 #include <algorithm>
 #include <cstring>
@@ -664,16 +665,11 @@ std::string PptParser::to_markdown(const ConvertOptions& opts) {
     auto all_images = extract_images(opts.min_image_size);
 
     // Save images to disk if requested
-    if (opts.extract_images && !opts.image_output_dir.empty()) {
-        util::ensure_dir(opts.image_output_dir);
-        for (auto& img : all_images) {
-            if (img.data.empty()) continue;
-            std::string filename = img.name + "." + img.format;
-            std::string path = opts.image_output_dir + "/" + filename;
-            std::ofstream ofs(path, std::ios::binary);
-            if (ofs) ofs.write(img.data.data(), img.data.size());
-            img.saved_path = path;
-        }
+    if (opts.extract_images) {
+        for (auto& img : all_images)
+            img.saved_path = util::save_image_to_file(
+                opts.image_output_dir, img.name, img.format,
+                img.data.data(), img.data.size());
     }
 
     for (const auto& slide : slides_) {
@@ -706,16 +702,11 @@ std::vector<PageChunk> PptParser::to_chunks(const ConvertOptions& opts) {
     std::vector<PageChunk> chunks;
     auto all_images = extract_images(opts.min_image_size);
 
-    if (opts.extract_images && !opts.image_output_dir.empty()) {
-        util::ensure_dir(opts.image_output_dir);
-        for (auto& img : all_images) {
-            if (img.data.empty()) continue;
-            std::string filename = img.name + "." + img.format;
-            std::string path = opts.image_output_dir + "/" + filename;
-            std::ofstream ofs(path, std::ios::binary);
-            if (ofs) ofs.write(img.data.data(), img.data.size());
-            img.saved_path = path;
-        }
+    if (opts.extract_images) {
+        for (auto& img : all_images)
+            img.saved_path = util::save_image_to_file(
+                opts.image_output_dir, img.name, img.format,
+                img.data.data(), img.data.size());
     }
 
     for (const auto& slide : slides_) {
