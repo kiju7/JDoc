@@ -8,6 +8,7 @@
 #include "legacy/ole_reader.h"
 #include "common/file_utils.h"
 #include "common/image_utils.h"
+#include "common/png_encode.h"
 #include "common/string_utils.h"
 #include <zlib.h>
 #include <algorithm>
@@ -631,6 +632,7 @@ private:
                     HWPParagraph tmp;
                     parse_para_text(data.data() + offset, hdr.size, tmp);
                     for (auto ch : tmp.text) {
+                        if (!is_hwp_printable(ch)) continue;
                         util::append_utf8(current_cell_text, ch);
                     }
                     if (!current_cell_text.empty() && current_cell_text.back() != ' ')
@@ -794,6 +796,12 @@ private:
         if (in_cell) flush_cell();
     }
 
+    static bool is_hwp_printable(char16_t ch) {
+        if (ch < 0x20) return ch == '\t' || ch == '\n';
+        if (ch >= 0x0F00 && ch <= 0x0FFF) return false;  // HWP internal codes
+        return true;
+    }
+
     void parse_para_text(const uint8_t* data, uint32_t size, HWPParagraph& para) {
         size_t off = 0;
         uint32_t char_pos = 0;
@@ -814,6 +822,8 @@ private:
                     para.text.push_back(u'\n');
                 } else if (code == 9) {
                     para.text.push_back(u'\t');
+                } else {
+                    para.text.push_back(0);  // placeholder
                 }
                 char_pos++;
                 break;
@@ -824,7 +834,9 @@ private:
                 if (off + 14 <= size) {
                     off += 14;  // skip 12 addition bytes + 2 trailing code bytes
                 }
-                char_pos += 8;  // ControlExtend occupies 8 char positions
+                // Add placeholders to keep para.text in sync with char_pos
+                for (int k = 0; k < 8; k++) para.text.push_back(0);
+                char_pos += 8;
                 break;
 
             case hwp::HWPCharType::ControlInline:
@@ -832,6 +844,7 @@ private:
                 if (off + 14 <= size) {
                     off += 14;
                 }
+                for (int k = 0; k < 8; k++) para.text.push_back(0);
                 char_pos += 8;
                 break;
             }
@@ -958,6 +971,7 @@ private:
             else if (h[0] == 'B' && h[1] == 'M') ext = "bmp";
             else if (h[0] == 0x00 && h[1] == 0x00 && h[2] == 0x01 && h[3] == 0x00) ext = "emf";
         }
+
         filename = unified + "." + ext;
 
         // Check dimensions before saving
@@ -969,15 +983,9 @@ private:
                 return "";
         }
 
-        std::string saved_path;
-        if (!opts_.image_output_dir.empty()) {
-            util::ensure_dir(opts_.image_output_dir);
-            saved_path = opts_.image_output_dir + "/" + filename;
-            std::ofstream out(saved_path, std::ios::binary);
-            if (out) {
-                out.write(reinterpret_cast<const char*>(entry->data.data()), entry->data.size());
-            }
-        }
+        std::string saved_path = util::save_image_to_file(
+            opts_.image_output_dir, unified, ext,
+            entry->data.data(), entry->data.size());
 
         ImageData idata;
         idata.page_number = chunk.page_number;
@@ -1038,7 +1046,9 @@ private:
         if (para.char_shapes.empty()) {
             FormattedSpan span;
             for (size_t i = 0; i < para.text.size(); i++) {
-                util::append_utf8(span.text, para.text[i]);
+                char16_t ch = para.text[i];
+                if (!is_hwp_printable(ch)) continue;
+                util::append_utf8(span.text, ch);
             }
             spans.push_back(std::move(span));
         } else {
@@ -1059,7 +1069,9 @@ private:
                 }
 
                 for (uint32_t pos = start; pos < end && pos < para.text.size(); pos++) {
-                    util::append_utf8(span.text, para.text[pos]);
+                    char16_t ch = para.text[pos];
+                    if (!is_hwp_printable(ch)) continue;
+                    util::append_utf8(span.text, ch);
                 }
 
                 if (!span.text.empty()) {
