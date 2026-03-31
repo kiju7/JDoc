@@ -378,7 +378,7 @@ static bool has_page_break(const pugi::xml_node& para) {
 // ── Main document parsing ───────────────────────────────
 
 static std::vector<std::vector<std::string>> parse_table_node(
-    const pugi::xml_node& tbl) {
+    const pugi::xml_node& tbl, std::vector<std::string>& image_rids) {
 
     std::vector<std::vector<std::string>> rows;
     std::vector<pugi::xml_node> tr_nodes;
@@ -400,6 +400,11 @@ static std::vector<std::vector<std::string>> parse_table_node(
                 xml_find_all(paras[i], "t", runs);
                 for (auto& t : runs) {
                     cell_text += xml_text_content(t);
+                }
+                // Collect image references from cell paragraphs
+                std::string rid = find_image_rid(paras[i]);
+                if (!rid.empty()) {
+                    image_rids.push_back(rid);
                 }
             }
             // Replace pipe characters to avoid markdown table issues
@@ -427,6 +432,7 @@ struct DocxElement {
     std::string image_rid;
     // For TABLE:
     std::vector<std::vector<std::string>> table_rows;
+    std::vector<std::string> table_image_rids;
 };
 
 static std::vector<DocxElement> parse_body(
@@ -614,7 +620,7 @@ static std::vector<DocxElement> parse_body(
         } else if (strcmp(local, "tbl") == 0) {
             DocxElement elem;
             elem.type = DocxElement::TABLE;
-            elem.table_rows = parse_table_node(child);
+            elem.table_rows = parse_table_node(child, elem.table_image_rids);
             elements.push_back(std::move(elem));
 
         } else if (strcmp(local, "sdt") == 0) {
@@ -708,6 +714,18 @@ std::string DocxParser::to_markdown(const ConvertOptions& opts) {
             if (opts.extract_tables) {
                 out << "\n" << format_table(elem.table_rows) << "\n";
             }
+            // Emit images from table cells after the table
+            for (auto& rid : elem.table_image_rids) {
+                auto it = rel_targets_.find(rid);
+                if (it != rel_targets_.end()) {
+                    std::string orig = util::get_filename(it->second);
+                    auto nm = image_name_map_.find(orig);
+                    std::string ref = (nm != image_name_map_.end()) ? nm->second : orig;
+                    auto dot = ref.rfind('.');
+                    std::string alt = (dot != std::string::npos) ? ref.substr(0, dot) : ref;
+                    out << "![" << alt << "](" << ref << ")\n\n";
+                }
+            }
             continue;
         }
 
@@ -723,7 +741,6 @@ std::string DocxParser::to_markdown(const ConvertOptions& opts) {
                 std::string orig = util::get_filename(it->second);
                 auto nm = image_name_map_.find(orig);
                 std::string ref = (nm != image_name_map_.end()) ? nm->second : orig;
-                // alt text without extension, href with extension
                 auto dot = ref.rfind('.');
                 std::string alt = (dot != std::string::npos) ? ref.substr(0, dot) : ref;
                 out << "![" << alt << "](" << ref << ")\n\n";
@@ -842,6 +859,17 @@ std::vector<PageChunk> DocxParser::to_chunks(
                 current.tables.push_back(elem.table_rows);
                 // Also add to text as markdown table
                 text << "\n" << format_table(elem.table_rows) << "\n";
+            }
+            for (auto& rid : elem.table_image_rids) {
+                auto it = rel_targets_.find(rid);
+                if (it != rel_targets_.end()) {
+                    std::string orig = util::get_filename(it->second);
+                    auto nm = image_name_map_.find(orig);
+                    std::string ref = (nm != image_name_map_.end()) ? nm->second : orig;
+                    auto dot = ref.rfind('.');
+                    std::string alt = (dot != std::string::npos) ? ref.substr(0, dot) : ref;
+                    text << "![" << alt << "](" << ref << ")\n\n";
+                }
             }
             continue;
         }
