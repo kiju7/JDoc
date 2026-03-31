@@ -688,8 +688,9 @@ private:
                 }
 
                 // If in table but a new ctrl at same level, flush remaining cell
-                // Skip flush for "gso " (image) — it handles cell state itself
-                if (in_cell && ctrl_state == IN_TABLE && ctrl_str != "gso ") {
+                // Skip for "gso " (image) and "tbl " (nested table) — they manage state
+                if (in_cell && ctrl_state == IN_TABLE &&
+                    ctrl_str != "gso " && ctrl_str != "tbl ") {
                     flush_cell();
                     in_cell = false;
                 }
