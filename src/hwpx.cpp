@@ -415,7 +415,7 @@ private:
                 else if (in == "hp:tbl") {
                     // Table
                     if (opts_.extract_tables) {
-                        std::string table_md = process_table(item);
+                        std::string table_md = process_table(item, chunk.page_number, &image_idx);
                         if (!table_md.empty()) {
                             // Flush preceding text
                             if (!para_text.empty()) {
@@ -556,8 +556,10 @@ private:
     }
 
     // ── Table processing ────────────────────────────────────
-    std::string process_table(pugi::xml_node tbl) {
+    std::string process_table(pugi::xml_node tbl,
+                              int page_number = 1, int* p_image_idx = nullptr) {
         std::vector<std::vector<std::string>> rows;
+        std::vector<pugi::xml_node> table_pics;
 
         int declared_cols = tbl.attribute("colCnt").as_int(0);
 
@@ -570,7 +572,7 @@ private:
 
                 // Extract cell text from subList -> paragraphs
                 std::string cell_text;
-                extract_cell_text(tc, cell_text);
+                extract_cell_text(tc, cell_text, &table_pics);
                 row.push_back(util::escape_cell(cell_text));
 
                 // Handle colSpan: add empty cells for spanned columns
@@ -618,43 +620,63 @@ private:
             md += "\n";
         }
 
+        // Emit images found in table cells
+        if (p_image_idx) {
+            for (auto& pic : table_pics) {
+                ImageData idata = process_picture(pic, page_number, *p_image_idx);
+                if (!idata.name.empty()) {
+                    std::string ref = idata.name + "." + idata.format;
+                    md += "\n![" + idata.name + "](" + ref + ")\n";
+                    (*p_image_idx)++;
+                }
+            }
+        }
+
         return md;
     }
 
-    void extract_cell_text(pugi::xml_node tc, std::string& out) {
+    void extract_cell_text(pugi::xml_node tc, std::string& out,
+                           std::vector<pugi::xml_node>* cell_pics = nullptr) {
         for (auto child : tc.children()) {
             std::string cn = child.name();
             if (cn == "hp:subList") {
-                extract_sublist_text(child, out);
+                extract_sublist_text(child, out, cell_pics);
             }
         }
     }
 
-    void extract_sublist_text(pugi::xml_node sublist, std::string& out) {
+    void extract_sublist_text(pugi::xml_node sublist, std::string& out,
+                              std::vector<pugi::xml_node>* cell_pics = nullptr) {
         for (auto para : sublist.children()) {
             if (std::string(para.name()) != "hp:p") continue;
             if (!out.empty()) out += " ";
             for (auto run : para.children()) {
-                if (std::string(run.name()) != "hp:run") continue;
-                for (auto item : run.children()) {
-                    std::string iname = item.name();
-                    if (iname == "hp:t") {
-                        out += extract_text(item);
-                    } else if (iname == "hp:ctrl") {
-                        for (auto ctrl_child : item.children()) {
-                            std::string cn = ctrl_child.name();
-                            if (cn == "hp:footNote" || cn == "hp:endNote") {
-                                int num = ctrl_child.attribute("number").as_int(0);
-                                std::string note_text;
-                                collect_note_text(ctrl_child, note_text);
-                                note_text = util::trim(note_text);
-                                if (!note_text.empty()) {
-                                    out += "[^" + std::to_string(num) + "]";
-                                    footnotes_.push_back("[^" + std::to_string(num) + "]: " + note_text);
+                std::string rname = run.name();
+                if (rname == "hp:run") {
+                    for (auto item : run.children()) {
+                        std::string iname = item.name();
+                        if (iname == "hp:t") {
+                            out += extract_text(item);
+                        } else if (iname == "hp:pic" && cell_pics) {
+                            cell_pics->push_back(item);
+                        } else if (iname == "hp:ctrl") {
+                            for (auto ctrl_child : item.children()) {
+                                std::string cn = ctrl_child.name();
+                                if (cn == "hp:footNote" || cn == "hp:endNote") {
+                                    int num = ctrl_child.attribute("number").as_int(0);
+                                    std::string note_text;
+                                    collect_note_text(ctrl_child, note_text);
+                                    note_text = util::trim(note_text);
+                                    if (!note_text.empty()) {
+                                        out += "[^" + std::to_string(num) + "]";
+                                        footnotes_.push_back("[^" + std::to_string(num) + "]: " + note_text);
+                                    }
                                 }
                             }
                         }
                     }
+                } else if (rname == "hp:pic" && cell_pics) {
+                    cell_pics->push_back(run);
                 }
             }
         }
