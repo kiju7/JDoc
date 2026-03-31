@@ -32,6 +32,13 @@ public:
     // Supports "/" separator for nested paths.
     std::vector<char> read_stream(const std::string& name) const;
 
+    // Write a stream directly to a file without loading into memory.
+    // Returns bytes written, or 0 on failure.
+    size_t write_stream_to_file(const std::string& name, const std::string& path) const;
+
+    // Get stream size without reading data.
+    uint64_t stream_size(const std::string& name) const;
+
     // Check if a stream with the given name exists.
     bool has_stream(const std::string& name) const;
 

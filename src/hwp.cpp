@@ -1011,47 +1011,34 @@ private:
             return "![" + unified + "](embedded:" + unified + ")\n\n";
         }
 
-        // Lazy load from OLE storage
-        if (entry->data.empty()) {
-            entry->data = load_bin_data(entry->name);
-            if (entry->data.empty()) return "";
-        }
-
-        // Detect actual format from magic bytes
-        if (entry->data.size() >= 4) {
-            auto* h = entry->data.data();
-            if (h[0] == 0xFF && h[1] == 0xD8) ext = "jpg";
-            else if (h[0] == 0x89 && h[1] == 'P' && h[2] == 'N' && h[3] == 'G') ext = "png";
-            else if (h[0] == 'G' && h[1] == 'I' && h[2] == 'F') ext = "gif";
-            else if (h[0] == 'B' && h[1] == 'M') ext = "bmp";
-            else if (h[0] == 0x00 && h[1] == 0x00 && h[2] == 0x01 && h[3] == 0x00) ext = "emf";
+        // Detect format from file extension in OLE name
+        {
+            auto dot = entry->name.rfind('.');
+            if (dot != std::string::npos) {
+                std::string name_ext = entry->name.substr(dot + 1);
+                for (auto& c : name_ext) c = std::tolower(c);
+                if (name_ext == "png" || name_ext == "jpg" || name_ext == "jpeg" ||
+                    name_ext == "gif" || name_ext == "bmp" || name_ext == "emf")
+                    ext = name_ext;
+            }
         }
 
         filename = unified + "." + ext;
 
-        // Check dimensions before saving
-        {
-            auto [iw, ih] = util::image_dimensions_from_data(
-                reinterpret_cast<const char*>(entry->data.data()), entry->data.size());
-            if (opts_.min_image_size > 0 && iw > 0 && ih > 0 &&
-                (iw < opts_.min_image_size || ih < opts_.min_image_size))
-                return "";
+        // Stream directly to file (avoids loading large images into memory)
+        std::string stream_path = "BinData/" + entry->name;
+        std::string saved_path = opts_.image_output_dir + "/" + filename;
+        if (ole_) {
+            size_t written = ole_->write_stream_to_file(stream_path, saved_path);
+            if (written == 0) return "";
+        } else {
+            return "";
         }
-
-        std::string saved_path = util::save_image_to_file(
-            opts_.image_output_dir, unified, ext,
-            entry->data.data(), entry->data.size());
 
         ImageData idata;
         idata.page_number = chunk.page_number;
         idata.name = unified;
         idata.format = ext;
-        idata.data.assign(reinterpret_cast<const char*>(entry->data.data()),
-                          reinterpret_cast<const char*>(entry->data.data()) + entry->data.size());
-        entry->data.clear();
-        entry->data.shrink_to_fit();
-        util::populate_image_dimensions(idata);
-
         idata.saved_path = saved_path;
         chunk.images.push_back(std::move(idata));
 

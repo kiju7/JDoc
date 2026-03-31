@@ -441,4 +441,64 @@ std::vector<char> OleReader::read_stream(const std::string& name) const {
     }
 }
 
+uint64_t OleReader::stream_size(const std::string& name) const {
+    int idx = find_entry(name);
+    if (idx < 0) return 0;
+    return dirs_[idx].size;
+}
+
+size_t OleReader::write_stream_to_file(const std::string& name,
+                                        const std::string& path) const {
+    int idx = find_entry(name);
+    if (idx < 0) return 0;
+
+    const DirEntry& e = dirs_[idx];
+    if (e.size == 0) return 0;
+
+    // Mini-stream: small enough to read into memory
+    if (e.size < mini_cutoff_) {
+        auto data = read_mini_chain(e.start_sector, e.size);
+        FILE* out = std::fopen(path.c_str(), "wb");
+        if (!out) return 0;
+        size_t written = std::fwrite(data.data(), 1, data.size(), out);
+        std::fclose(out);
+        return written;
+    }
+
+    // Regular chain: stream sector-by-sector to file
+    FILE* out = std::fopen(path.c_str(), "wb");
+    if (!out) return 0;
+
+    uint32_t sec = e.start_sector;
+    uint64_t remaining = e.size;
+    uint32_t max_sectors = static_cast<uint32_t>(e.size / sector_size_ + 2);
+    uint32_t visited = 0;
+    std::vector<char> sbuf(sector_size_);
+
+    if (mem_data_) {
+        while (sec != ENDOFCHAIN && sec != FREESECT && sec < fat_.size() && remaining > 0) {
+            if (++visited > max_sectors) break;
+            uint64_t offset = static_cast<uint64_t>(sec + 1) * sector_size_;
+            uint64_t to_write = std::min(static_cast<uint64_t>(sector_size_), remaining);
+            if (offset + to_write <= mem_size_) {
+                std::fwrite(mem_data_ + offset, 1, static_cast<size_t>(to_write), out);
+            }
+            remaining -= to_write;
+            sec = fat_[sec];
+        }
+    } else {
+        while (sec != ENDOFCHAIN && sec != FREESECT && sec < fat_.size() && remaining > 0) {
+            if (++visited > max_sectors) break;
+            read_sector(sec, sbuf.data());
+            uint64_t to_write = std::min(static_cast<uint64_t>(sector_size_), remaining);
+            std::fwrite(sbuf.data(), 1, static_cast<size_t>(to_write), out);
+            remaining -= to_write;
+            sec = fat_[sec];
+        }
+    }
+
+    std::fclose(out);
+    return static_cast<size_t>(e.size - remaining);
+}
+
 } // namespace jdoc
