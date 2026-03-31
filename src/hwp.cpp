@@ -536,6 +536,8 @@ private:
         int table_parsed_cells = 0;
         std::string current_cell_text;
         bool in_cell = false;
+        int post_table_para = -1;
+        int cell_list_header_level = -1;  // record level of the outer cell's LIST_HEADER
         int cur_cell_col = 0, cur_cell_row = 0;
         int cur_cell_colspan = 1, cur_cell_rowspan = 1;
         bool gso_in_cell = false;
@@ -573,6 +575,7 @@ private:
             current_cell_text.clear();
             cell_image_bin_ids.clear();
             gso_in_cell = false;
+            cell_list_header_level = -1;
         };
 
         // Restore outer table state after nested table finishes
@@ -592,6 +595,8 @@ private:
                 ctrl_state = IN_TABLE;
                 table_stack.pop_back();
             } else {
+                if (post_table_para < 0)
+                    post_table_para = current_table_para;
                 ctrl_state = NONE;
                 current_table_para = -1;
                 current_table_idx = -1;
@@ -643,6 +648,26 @@ private:
                     }
                     if (!current_cell_text.empty() && current_cell_text.back() != ' ')
                         current_cell_text += ' ';
+                } else if (post_table_para >= 0) {
+                    // Text belonging to the last cell of the table that just ended
+                    HWPParagraph tmp;
+                    parse_para_text(data.data() + offset, hdr.size, tmp);
+                    std::string text;
+                    for (auto ch : tmp.text) {
+                        if (!is_hwp_printable(ch)) continue;
+                        util::append_utf8(text, ch);
+                    }
+                    if (!text.empty() && post_table_para < (int)paragraphs.size()) {
+                        auto& tbls = paragraphs[post_table_para].tables;
+                        if (!tbls.empty()) {
+                            auto& last_tbl = tbls.back();
+                            if (!last_tbl.cells.empty()) {
+                                auto& last_cell = last_tbl.cells.back();
+                                if (!last_cell.text.empty()) last_cell.text += " ";
+                                last_cell.text += util::trim(text);
+                            }
+                        }
+                    }
                 } else if (cur_para()) {
                     parse_para_text(data.data() + offset, hdr.size, *cur_para());
                 }
@@ -696,15 +721,10 @@ private:
                 }
 
                 if (ctrl_str == "tbl ") {
-                    // Save current table state for nested tables
+                    // Nested table inside cell: ignore as separate table,
+                    // its content will flow into the current cell as plain text
                     if (ctrl_state == IN_TABLE && in_cell) {
-                        table_stack.push_back({current_table_para, current_table_idx,
-                                              table_total_cells, table_parsed_cells,
-                                              current_cell_text, in_cell,
-                                              cur_cell_col, cur_cell_row,
-                                              cur_cell_colspan, cur_cell_rowspan});
-                        current_cell_text.clear();
-                        in_cell = false;
+                        break;  // nested table — content flows into current cell
                     }
                     ctrl_state = IN_TABLE;
                     auto* p = cur_para();
@@ -725,6 +745,7 @@ private:
             }
 
             case hwp::TABLE: {
+                if (in_cell) break;  // nested table inside cell — skip
                 auto* tbl = cur_table();
                 if (ctrl_state == IN_TABLE && tbl && hdr.size >= 8) {
                     tbl->row_count = util::read_u16_le(data.data() + offset + 4);
@@ -753,14 +774,19 @@ private:
                         cur_para()->image_bin_ids.push_back(sequential_bin_id);
                 }
                 if (ctrl_state == IN_TABLE && cur_table()) {
+                    // Skip LIST_HEADER from nested tables — they are at deeper levels
+                    if (cell_list_header_level >= 0 && hdr.level > cell_list_header_level) {
+                        if (in_cell && !current_cell_text.empty())
+                            current_cell_text += ' ';
+                        break;
+                    }
                     if (in_cell) {
                         flush_cell();
                         table_parsed_cells++;
                     }
                     in_cell = true;
+                    cell_list_header_level = hdr.level;
 
-                    // LIST_HEADER layout for table cells:
-                    // paraCount(4) + properties(4) + colAddr(2) + rowAddr(2) + colSpan(2) + rowSpan(2)
                     if (hdr.size >= 16) {
                         cur_cell_col = util::read_u16_le(data.data() + offset + 8);
                         cur_cell_row = util::read_u16_le(data.data() + offset + 10);
@@ -771,7 +797,6 @@ private:
                         cur_cell_colspan = 1; cur_cell_rowspan = 1;
                     }
 
-                    // Check if all cells parsed -> exit table mode (or restore outer table)
                     if (table_total_cells > 0 && table_parsed_cells >= table_total_cells) {
                         in_cell = false;
                         restore_table_state();
