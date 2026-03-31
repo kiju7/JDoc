@@ -74,8 +74,7 @@ private:
     bool collecting_field_instr_ = false;
     std::string pending_hyperlink_url_;
 
-    // TOC field suppression: depth at which the TOC field began (0 = not in TOC).
-    int toc_field_depth_ = 0;
+
 };
 
 } // namespace jdoc

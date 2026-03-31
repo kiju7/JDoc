@@ -108,8 +108,24 @@ struct ListCounter {
             if (korean && counts[2] >= 1 && counts[2] <= KOREAN_SYLLABLE_COUNT)
                 return std::string(KOREAN_SYLLABLES[counts[2] - 1]) + ". ";
             return std::string(1, 'a' + ((counts[2] - 1) % 26)) + ". ";
-        default:
-            return "";
+        case 3:
+            return "(" + std::to_string(counts[3]) + ") ";
+        case 4:
+            if (korean && counts[4] >= 1 && counts[4] <= KOREAN_SYLLABLE_COUNT)
+                return "(" + std::string(KOREAN_SYLLABLES[counts[4] - 1]) + ") ";
+            return "(" + std::string(1, 'a' + ((counts[4] - 1) % 26)) + ") ";
+        default: {
+            // ① ② ③ ... (U+2460 = 0x2460 + n-1, up to ⑳ U+2473)
+            int idx = ilvl >= 5 ? ilvl - 5 : 0;
+            int num = counts[ilvl];
+            if (num >= 1 && num <= 20) {
+                std::string s;
+                util::append_utf8(s, 0x2460 + num - 1);
+                s += ' ';
+                return s;
+            }
+            return std::to_string(num) + ") ";
+        }
         }
     }
 };
@@ -219,12 +235,6 @@ bool DocParser::process_char(uint32_t ch, std::string& result, bool is_picture) 
     if (ch == 0x14) {
         collecting_field_instr_ = false;
 
-        // TOC field: suppress entire result (content appears as headings later).
-        if (field_instruction_.find("TOC") != std::string::npos) {
-            toc_field_depth_ = field_depth_;
-            return false;
-        }
-
         field_show_result_ = true;
         // Check if instruction is HYPERLINK (skip local bookmark links with \l).
         pending_hyperlink_url_.clear();
@@ -256,22 +266,15 @@ bool DocParser::process_char(uint32_t ch, std::string& result, bool is_picture) 
     }
     // Field end marker: close nesting.
     if (ch == 0x15) {
-        if (toc_field_depth_ > 0 && field_depth_ == toc_field_depth_) {
-            toc_field_depth_ = 0;
-        }
         if (!pending_hyperlink_url_.empty()) {
             result += "](" + pending_hyperlink_url_ + ")";
             pending_hyperlink_url_.clear();
         }
         if (field_depth_ > 0) field_depth_--;
-        field_show_result_ = false;
+        field_show_result_ = (field_depth_ > 0);
         collecting_field_instr_ = false;
         return false;
     }
-
-    // Inside a TOC field result: suppress all content.
-    if (toc_field_depth_ > 0)
-        return false;
 
     // Inside a field's instruction part (before separator): collect instruction.
     if (field_depth_ > 0 && !field_show_result_) {
@@ -590,7 +593,6 @@ std::string DocParser::extract_text() {
     // Reset field state for extraction.
     field_depth_ = 0;
     field_show_result_ = false;
-    toc_field_depth_ = 0;
 
     // Select which table stream to use.
     uint16_t flags = util::read_u16_le(word_doc.data() + 0x0A);
@@ -941,10 +943,12 @@ std::string DocParser::text_to_markdown(const std::string& raw_text) {
         lines.push_back(line);
     }
 
-    // Helper: count cell separators (\x1F from 0x07 cell marks)
+    // Helper: count cell separators (\x1F from 0x07 cell marks).
+    // Subtract one if the line ends with \x1F (trailing empty cell from row-end mark).
     auto count_cells = [](const std::string& s) {
         int n = 0;
         for (char c : s) if (c == '\x1F') n++;
+        if (n > 0 && !s.empty() && s.back() == '\x1F') n--;
         return n;
     };
 
