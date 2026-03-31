@@ -93,6 +93,7 @@ struct HWPTableCell {
     int row_addr = 0;
     int col_span = 1;
     int row_span = 1;
+    std::vector<int> image_bin_ids;
 };
 
 struct HWPTable {
@@ -126,18 +127,10 @@ struct HWPEmbeddedImage {
 class HWPParser {
 public:
     HWPParser(const std::string& path, ConvertOptions opts)
-        : opts_(std::move(opts)) {
-        // Read entire file into memory for OleReader
-        std::ifstream f(path, std::ios::binary);
-        if (!f) throw std::runtime_error("Cannot open HWP file: " + path);
-        f.seekg(0, std::ios::end);
-        file_data_.resize(f.tellg());
-        f.seekg(0);
-        f.read(reinterpret_cast<char*>(file_data_.data()), file_data_.size());
-    }
+        : opts_(std::move(opts)), path_(path) {}
 
     bool parse() {
-        ole_ = std::make_unique<OleReader>(file_data_.data(), file_data_.size());
+        ole_ = std::make_unique<OleReader>(path_);
         if (!ole_->is_open()) {
             throw std::runtime_error("Not a valid HWP file (OLE2 open failed)");
         }
@@ -163,8 +156,8 @@ public:
             throw std::runtime_error("No BodyText sections found in HWP file");
         }
 
-        // Keep ole_ and file_data_ alive for lazy BinData loading.
-        // They are released in release_storage() after convert_chunks().
+        // Keep ole_ alive for lazy BinData loading.
+        // Released in release_storage() after convert_chunks().
 
         return true;
     }
@@ -188,6 +181,8 @@ public:
             chunk.page_height = 841.88;
 
             parse_section(i, chunk);
+            section_data_[i].clear();
+            section_data_[i].shrink_to_fit();
             chunks.push_back(std::move(chunk));
         }
 
@@ -197,13 +192,11 @@ public:
 
     void release_storage() {
         ole_.reset();
-        file_data_.clear();
-        file_data_.shrink_to_fit();
     }
 
 private:
     ConvertOptions opts_;
-    std::vector<uint8_t> file_data_;
+    std::string path_;
     std::unique_ptr<OleReader> ole_;
 
     bool compressed_ = true;
@@ -545,6 +538,10 @@ private:
         bool in_cell = false;
         int cur_cell_col = 0, cur_cell_row = 0;
         int cur_cell_colspan = 1, cur_cell_rowspan = 1;
+        bool gso_in_cell = false;
+        std::vector<int> cell_image_bin_ids;
+        bool sc_pending_image = false;
+        int sequential_bin_id = 0;
 
         // Stack for nested tables
         struct TableState {
@@ -565,8 +562,11 @@ private:
             cell.row_addr = cur_cell_row;
             cell.col_span = cur_cell_colspan;
             cell.row_span = cur_cell_rowspan;
+            cell.image_bin_ids = std::move(cell_image_bin_ids);
             tbl->cells.push_back(std::move(cell));
             current_cell_text.clear();
+            cell_image_bin_ids.clear();
+            gso_in_cell = false;
         };
 
         // Restore outer table state after nested table finishes
@@ -659,18 +659,34 @@ private:
                     current_table_idx = -1;
                 }
 
-                // If in table but a new ctrl at same level, flush remaining cell
-                if (in_cell && ctrl_state == IN_TABLE) {
-                    flush_cell();
-                    in_cell = false;
-                }
-
                 uint32_t ctrl_id = util::read_u32_le(data.data() + offset);
                 char c0 = (ctrl_id >> 24) & 0xFF;
                 char c1 = (ctrl_id >> 16) & 0xFF;
                 char c2 = (ctrl_id >> 8) & 0xFF;
                 char c3 = ctrl_id & 0xFF;
                 std::string ctrl_str = {c0, c1, c2, c3};
+
+                // Flush pending image from SHAPE_COMPONENT without SHAPE_COMPONENT_PICTURE
+                if (sc_pending_image) {
+                    sc_pending_image = false;
+                    sequential_bin_id++;
+                    if (gso_in_cell)
+                        cell_image_bin_ids.push_back(sequential_bin_id);
+                    else if (cur_para())
+                        cur_para()->image_bin_ids.push_back(sequential_bin_id);
+                }
+
+                // GSO inside table cell: set flag before flush
+                if (ctrl_str == "gso " && ctrl_state == IN_TABLE && in_cell) {
+                    gso_in_cell = true;
+                }
+
+                // If in table but a new ctrl at same level, flush remaining cell
+                // Skip flush for "gso " (image) — it handles cell state itself
+                if (in_cell && ctrl_state == IN_TABLE && ctrl_str != "gso ") {
+                    flush_cell();
+                    in_cell = false;
+                }
 
                 if (ctrl_str == "tbl ") {
                     // Save current table state for nested tables
@@ -749,39 +765,46 @@ private:
             }
 
             case hwp::SHAPE_COMPONENT: {
-                if (ctrl_state == IN_GSO && hdr.size >= 10) {
+                if ((ctrl_state == IN_GSO || gso_in_cell) && hdr.size >= 10) {
                     char sc_name[5] = {};
                     memcpy(sc_name, data.data() + offset, 4);
                     if (std::string(sc_name) == "cip$" || std::string(sc_name) == "$pic") {
-                        if (hdr.size >= 20) {
-                            uint16_t bin_id = util::read_u16_le(data.data() + offset + 18);
-                            if (bin_id > 0 && cur_para()) {
-                                cur_para()->image_bin_ids.push_back(bin_id);
-                            }
-                        }
+                        // bin_id comes from the subsequent SHAPE_COMPONENT_PICTURE record.
+                        // If that record is missing, use sequential BinData index as fallback.
+                        sc_pending_image = true;
                     }
                 }
                 break;
             }
 
             case hwp::SHAPE_COMPONENT_PICTURE: {
-                if (ctrl_state == IN_GSO && hdr.size >= 15) {
+                if ((ctrl_state == IN_GSO || gso_in_cell) && hdr.size >= 15) {
+                    sc_pending_image = false;
+                    sequential_bin_id++;
                     uint16_t bin_id = util::read_u16_le(data.data() + offset + 13);
-                    if (bin_id > 0 && cur_para()) {
-                        cur_para()->image_bin_ids.push_back(bin_id);
+                    if (bin_id > 0) {
+                        if (gso_in_cell)
+                            cell_image_bin_ids.push_back(bin_id);
+                        else if (cur_para())
+                            cur_para()->image_bin_ids.push_back(bin_id);
                     }
-                    ctrl_state = NONE;
+                    if (!gso_in_cell) ctrl_state = NONE;
+                    gso_in_cell = false;
                 }
                 break;
             }
 
             case hwp::SHAPE_COMPONENT_OLE: {
-                if (ctrl_state == IN_GSO && hdr.size >= 15) {
+                if ((ctrl_state == IN_GSO || gso_in_cell) && hdr.size >= 15) {
                     uint16_t bin_id = util::read_u16_le(data.data() + offset + 13);
-                    if (bin_id > 0 && cur_para()) {
-                        cur_para()->image_bin_ids.push_back(bin_id);
+                    if (bin_id > 0) {
+                        if (gso_in_cell)
+                            cell_image_bin_ids.push_back(bin_id);
+                        else if (cur_para())
+                            cur_para()->image_bin_ids.push_back(bin_id);
                     }
-                    ctrl_state = NONE;
+                    if (!gso_in_cell) ctrl_state = NONE;
+                    gso_in_cell = false;
                 }
                 break;
             }
@@ -793,12 +816,26 @@ private:
             offset = record_end;
         }
 
+        // Flush any pending image at end of section
+        if (sc_pending_image) {
+            sc_pending_image = false;
+            sequential_bin_id++;
+            if (gso_in_cell)
+                cell_image_bin_ids.push_back(sequential_bin_id);
+            else if (cur_para())
+                cur_para()->image_bin_ids.push_back(sequential_bin_id);
+        }
         if (in_cell) flush_cell();
     }
 
     static bool is_hwp_printable(char16_t ch) {
         if (ch < 0x20) return ch == '\t' || ch == '\n';
-        if (ch >= 0x0F00 && ch <= 0x0FFF) return false;  // HWP internal codes
+        // Filter ranges that never appear in Korean documents:
+        // 0x0100-0x02FF: Latin Extended / IPA / Spacing Modifiers (special font glyphs)
+        // 0x0500-0x0EFF: Armenian..Lao (HWP special font mapped codes)
+        // 0x0F00-0x0FFF: HWP internal codes
+        if (ch >= 0x0100 && ch <= 0x02FF) return false;
+        if (ch >= 0x0500 && ch <= 0x0FFF) return false;
         return true;
     }
 
@@ -813,7 +850,10 @@ private:
             auto type = hwp::classify_hwp_char(code);
             switch (type) {
             case hwp::HWPCharType::Normal:
-                para.text.push_back(static_cast<char16_t>(code));
+                if (is_hwp_printable(static_cast<char16_t>(code)))
+                    para.text.push_back(static_cast<char16_t>(code));
+                else
+                    para.text.push_back(0);
                 char_pos++;
                 break;
 
@@ -865,7 +905,7 @@ private:
     }
 
     // ── Table formatting ─────────────────────────────────────
-    std::string format_table(const HWPTable& table) {
+    std::string format_table(const HWPTable& table, PageChunk& chunk, int& image_idx) {
         if (table.cells.empty() || table.col_count == 0 || table.row_count == 0) {
             // If there are cells but row/col is 0, emit cell text as body text
             if (!table.cells.empty()) {
@@ -887,7 +927,19 @@ private:
 
         for (auto& cell : table.cells) {
             if (cell.row_addr < table.row_count && cell.col_addr < table.col_count) {
-                grid[cell.row_addr][cell.col_addr] = util::escape_cell(cell.text);
+                std::string content = util::escape_cell(cell.text);
+                // Append inline image references into cell text
+                for (int bin_id : cell.image_bin_ids) {
+                    std::string img_md = format_image(bin_id, chunk, image_idx);
+                    if (!img_md.empty()) {
+                        // Strip trailing newlines for inline use
+                        while (!img_md.empty() && img_md.back() == '\n')
+                            img_md.pop_back();
+                        if (!content.empty()) content += " ";
+                        content += img_md;
+                    }
+                }
+                grid[cell.row_addr][cell.col_addr] = content;
             }
         }
 
@@ -908,28 +960,31 @@ private:
             }
         }
         md += "\n";
+
         return md;
     }
 
     // ── Image handling ─────────────────────────────────────────
     // Resolve the BinData entry name for a given bin_id.
     HWPEmbeddedImage* find_image_entry(int bin_id) {
-        if (bin_id <= 0 || bin_id > (int)doc_info_.bin_data_refs.size()) return nullptr;
-        auto& ref = doc_info_.bin_data_refs[bin_id - 1];
-        std::string ext = ref.extension;
-        if (ext.empty()) ext = "jpg";
+        // Primary: look up via bin_data_refs table
+        if (bin_id > 0 && bin_id <= (int)doc_info_.bin_data_refs.size()) {
+            auto& ref = doc_info_.bin_data_refs[bin_id - 1];
+            std::string ext = ref.extension;
+            if (ext.empty()) ext = "jpg";
 
-        char hex_name[32];
-        snprintf(hex_name, sizeof(hex_name), "bin%04x.%s",
-                 ref.bin_data_id, ext.c_str());
-        std::string lookup_key = hex_name;
-        for (auto& c : lookup_key) c = std::tolower(c);
+            char hex_name[32];
+            snprintf(hex_name, sizeof(hex_name), "bin%04x.%s",
+                     ref.bin_data_id, ext.c_str());
+            std::string lookup_key = hex_name;
+            for (auto& c : lookup_key) c = std::tolower(c);
 
-        auto it = embedded_images_.find(lookup_key);
-        if (it != embedded_images_.end()) return &it->second;
+            auto it = embedded_images_.find(lookup_key);
+            if (it != embedded_images_.end()) return &it->second;
+        }
 
         // Fallback: match by index in insertion order
-        if (bin_id <= (int)embedded_image_keys_.size()) {
+        if (bin_id > 0 && bin_id <= (int)embedded_image_keys_.size()) {
             auto fit = embedded_images_.find(embedded_image_keys_[bin_id - 1]);
             if (fit != embedded_images_.end()) return &fit->second;
         }
@@ -937,14 +992,14 @@ private:
     }
 
     std::string format_image(int bin_id, PageChunk& chunk, int& image_idx) {
-        if (bin_id <= 0 || bin_id > (int)doc_info_.bin_data_refs.size()) return "";
-
         auto* entry = find_image_entry(bin_id);
         if (!entry) return "";
 
-        auto& ref = doc_info_.bin_data_refs[bin_id - 1];
-        std::string ext = ref.extension;
-        if (ext.empty()) ext = "jpg";
+        std::string ext = "jpg";
+        if (bin_id > 0 && bin_id <= (int)doc_info_.bin_data_refs.size()) {
+            auto& ref = doc_info_.bin_data_refs[bin_id - 1];
+            if (!ref.extension.empty()) ext = ref.extension;
+        }
 
         std::string unified = "page" + std::to_string(chunk.page_number)
                              + "_img" + std::to_string(image_idx);
@@ -1013,7 +1068,7 @@ private:
         // First, handle any tables attached to this paragraph
         if (opts_.extract_tables) {
             for (auto& tbl : para.tables) {
-                result += format_table(tbl);
+                result += format_table(tbl, chunk, image_idx);
             }
         }
 
