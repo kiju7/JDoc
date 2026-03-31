@@ -361,6 +361,11 @@ static bool has_page_break(const pugi::xml_node& para) {
         if (std::string(type) == "page") return true;
     }
 
+    // Check <w:r><w:lastRenderedPageBreak/> (soft page break from Word's layout engine)
+    std::vector<pugi::xml_node> lrpbs;
+    xml_find_all(para, "lastRenderedPageBreak", lrpbs);
+    if (!lrpbs.empty()) return true;
+
     // Check <w:pPr><w:pageBreakBefore/>
     auto pPr = xml_child(para, "pPr");
     if (pPr) {
