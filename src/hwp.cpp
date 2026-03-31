@@ -958,17 +958,31 @@ private:
             }
         }
 
+        // Trim trailing empty columns
+        int used_cols = table.col_count;
+        while (used_cols > 1) {
+            bool col_empty = true;
+            for (int r = 0; r < table.row_count; r++) {
+                if (!grid[r][used_cols - 1].empty()) {
+                    col_empty = false;
+                    break;
+                }
+            }
+            if (!col_empty) break;
+            used_cols--;
+        }
+
         std::string md;
         for (int r = 0; r < table.row_count; r++) {
             md += "|";
-            for (int c = 0; c < table.col_count; c++) {
+            for (int c = 0; c < used_cols; c++) {
                 md += " " + grid[r][c] + " |";
             }
             md += "\n";
 
             if (r == 0) {
                 md += "|";
-                for (int c = 0; c < table.col_count; c++) {
+                for (int c = 0; c < used_cols; c++) {
                     md += " --- |";
                 }
                 md += "\n";
