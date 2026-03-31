@@ -554,6 +554,12 @@ private:
 
         // Flush current cell into the table's cell list
         auto flush_cell = [&]() {
+            // Flush any pending image into this cell before closing
+            if (sc_pending_image) {
+                sc_pending_image = false;
+                sequential_bin_id++;
+                cell_image_bin_ids.push_back(sequential_bin_id);
+            }
             auto* tbl = cur_table();
             if (!tbl) return;
             HWPTableCell cell;
@@ -670,7 +676,7 @@ private:
                 if (sc_pending_image) {
                     sc_pending_image = false;
                     sequential_bin_id++;
-                    if (gso_in_cell)
+                    if (gso_in_cell || in_cell)
                         cell_image_bin_ids.push_back(sequential_bin_id);
                     else if (cur_para())
                         cur_para()->image_bin_ids.push_back(sequential_bin_id);
@@ -736,6 +742,15 @@ private:
             }
 
             case hwp::LIST_HEADER: {
+                // Flush pending image before cell boundary
+                if (sc_pending_image) {
+                    sc_pending_image = false;
+                    sequential_bin_id++;
+                    if (gso_in_cell || in_cell)
+                        cell_image_bin_ids.push_back(sequential_bin_id);
+                    else if (cur_para())
+                        cur_para()->image_bin_ids.push_back(sequential_bin_id);
+                }
                 if (ctrl_state == IN_TABLE && cur_table()) {
                     if (in_cell) {
                         flush_cell();
@@ -820,7 +835,7 @@ private:
         if (sc_pending_image) {
             sc_pending_image = false;
             sequential_bin_id++;
-            if (gso_in_cell)
+            if (gso_in_cell || in_cell)
                 cell_image_bin_ids.push_back(sequential_bin_id);
             else if (cur_para())
                 cur_para()->image_bin_ids.push_back(sequential_bin_id);
