@@ -93,7 +93,6 @@ struct HWPTableCell {
     int row_addr = 0;
     int col_span = 1;
     int row_span = 1;
-    std::vector<int> image_bin_ids;
 };
 
 struct HWPTable {
@@ -201,6 +200,7 @@ private:
 
     bool compressed_ = true;
     uint32_t version_ = 0;
+    int sequential_bin_id_ = 0;  // sequential image counter for fallback bin_id
 
     HWPDocInfo doc_info_;
     std::vector<std::vector<uint8_t>> section_data_;
@@ -465,6 +465,7 @@ private:
     }
     // ── Section parsing ─────────────────────────────────────
     void parse_section(int section_idx, PageChunk& chunk) {
+        sequential_bin_id_ = 0;
         auto& raw = section_data_[section_idx];
 
         std::vector<uint8_t> data;
@@ -483,7 +484,8 @@ private:
 
         // Parse paragraphs from record stream
         std::vector<HWPParagraph> paragraphs;
-        parse_paragraph_records(data, paragraphs);
+        RecordCursor cur(data.data(), data.size());
+        read_paragraph_list(cur, 0, paragraphs);
 
         // Convert paragraphs to markdown
         std::string md;
@@ -511,362 +513,462 @@ private:
         chunk.text = md;
     }
 
-    void parse_paragraph_records(const std::vector<uint8_t>& data,
-                                  std::vector<HWPParagraph>& paragraphs) {
-        size_t offset = 0;
-        int current_idx = -1;
+    // ── RecordCursor: sequential record reader ───────────────
+    struct Record {
+        uint16_t tag = 0;
+        uint16_t level = 0;
+        uint32_t size = 0;
+        const uint8_t* data = nullptr;
+    };
 
-        // State for control parsing
-        enum CtrlState { NONE, IN_TABLE, IN_GSO };
-        CtrlState ctrl_state = NONE;
-        int current_table_para = -1;
-        int current_table_idx = -1;
+    class RecordCursor {
+        const uint8_t* buf_;
+        size_t len_;
+        size_t pos_ = 0;
+    public:
+        RecordCursor(const uint8_t* buf, size_t len) : buf_(buf), len_(len) {}
 
-        // Helper lambdas (declared after variables they capture)
-        auto cur_para = [&]() -> HWPParagraph* {
-            return current_idx >= 0 ? &paragraphs[current_idx] : nullptr;
-        };
-        auto cur_table = [&]() -> HWPTable* {
-            if (current_table_para < 0 || current_table_idx < 0) return nullptr;
-            auto& tbls = paragraphs[current_table_para].tables;
-            if (current_table_idx >= (int)tbls.size()) return nullptr;
-            return &tbls[current_table_idx];
-        };
-        int table_total_cells = 0;
-        int table_parsed_cells = 0;
-        std::string current_cell_text;
-        bool in_cell = false;
-        int post_table_para = -1;
-        int cell_list_header_level = -1;  // record level of the outer cell's LIST_HEADER
-        int cur_cell_col = 0, cur_cell_row = 0;
-        int cur_cell_colspan = 1, cur_cell_rowspan = 1;
-        bool gso_in_cell = false;
-        std::vector<int> cell_image_bin_ids;
-        bool sc_pending_image = false;
-        int sequential_bin_id = 0;
+        bool has_next() const { return pos_ + 4 <= len_; }
 
-        // Stack for nested tables
-        struct TableState {
-            int tbl_para, tbl_idx, total_cells, parsed_cells;
-            std::string cell_text;
-            bool was_in_cell;
-            int cell_col, cell_row, cell_colspan, cell_rowspan;
-        };
-        std::vector<TableState> table_stack;
-
-        // Flush current cell into the table's cell list
-        auto flush_cell = [&]() {
-            // Flush any pending image into this cell before closing
-            if (sc_pending_image) {
-                sc_pending_image = false;
-                sequential_bin_id++;
-                cell_image_bin_ids.push_back(sequential_bin_id);
+        Record peek() const {
+            Record r;
+            if (pos_ + 4 > len_) return r;
+            size_t tmp = pos_;
+            uint32_t val = util::read_u32_le(buf_ + tmp);
+            tmp += 4;
+            r.tag   = val & 0x3FF;
+            r.level = (val >> 10) & 0x3FF;
+            r.size  = (val >> 20) & 0xFFF;
+            if (r.size == 0xFFF && tmp + 4 <= len_) {
+                r.size = util::read_u32_le(buf_ + tmp);
+                tmp += 4;
             }
-            auto* tbl = cur_table();
-            if (!tbl) return;
-            HWPTableCell cell;
-            cell.text = util::trim(current_cell_text);
-            cell.col_addr = cur_cell_col;
-            cell.row_addr = cur_cell_row;
-            cell.col_span = cur_cell_colspan;
-            cell.row_span = cur_cell_rowspan;
-            cell.image_bin_ids = std::move(cell_image_bin_ids);
-            tbl->cells.push_back(std::move(cell));
-            current_cell_text.clear();
-            cell_image_bin_ids.clear();
-            gso_in_cell = false;
-            cell_list_header_level = -1;
-        };
+            if (tmp + r.size <= len_)
+                r.data = buf_ + tmp;
+            else
+                r.data = nullptr;
+            return r;
+        }
 
-        // Restore outer table state after nested table finishes
-        auto restore_table_state = [&]() {
-            if (!table_stack.empty()) {
-                auto& s = table_stack.back();
-                current_table_para = s.tbl_para;
-                current_table_idx = s.tbl_idx;
-                table_total_cells = s.total_cells;
-                table_parsed_cells = s.parsed_cells;
-                current_cell_text = std::move(s.cell_text);
-                in_cell = s.was_in_cell;
-                cur_cell_col = s.cell_col;
-                cur_cell_row = s.cell_row;
-                cur_cell_colspan = s.cell_colspan;
-                cur_cell_rowspan = s.cell_rowspan;
-                ctrl_state = IN_TABLE;
-                table_stack.pop_back();
+        Record next() {
+            Record r = peek();
+            // Advance past header
+            uint32_t val = util::read_u32_le(buf_ + pos_);
+            pos_ += 4;
+            uint32_t raw_size = (val >> 20) & 0xFFF;
+            if (raw_size == 0xFFF) pos_ += 4;
+            // Advance past data
+            pos_ += r.size;
+            if (pos_ > len_) pos_ = len_;
+            return r;
+        }
+
+        void skip() { next(); }
+    };
+
+    // ── Recursive descent paragraph parser ──────────────────
+
+    // Read a list of paragraphs.
+    // expected_level: the level paragraphs must be at (or -1 to accept any PARA_HEADER)
+    void read_paragraph_list(RecordCursor& cur, int expected_level,
+                             std::vector<HWPParagraph>& out) {
+        while (cur.has_next()) {
+            auto r = cur.peek();
+            if (r.tag != hwp::PARA_HEADER) return;
+            // If expected_level >= 0, only accept paragraphs at that exact level
+            if (expected_level >= 0 && r.level != (uint16_t)expected_level) return;
+            HWPParagraph para;
+            read_paragraph(cur, r.level, para);
+            out.push_back(std::move(para));
+        }
+    }
+
+    // Read a single paragraph: PARA_HEADER + PARA_TEXT + PARA_CHAR_SHAPE +
+    // PARA_LINE_SEG + PARA_RANGE_TAG + controls
+    void read_paragraph(RecordCursor& cur, uint16_t para_level, HWPParagraph& para) {
+        // Consume PARA_HEADER
+        auto hdr = cur.next();
+        if (hdr.tag != hwp::PARA_HEADER) return;
+        if (hdr.data && hdr.size >= 6) {
+            para.char_count = util::read_u32_le(hdr.data);
+            para.control_mask = util::read_u16_le(hdr.data + 4);
+            if (hdr.size >= 8)
+                para.para_shape_id = util::read_u16_le(hdr.data + 6);
+            if (hdr.size >= 10)
+                para.style_id = util::read_u16_le(hdr.data + 8);
+        }
+
+        // Consume optional PARA_TEXT, PARA_CHAR_SHAPE, PARA_LINE_SEG, PARA_RANGE_TAG
+        while (cur.has_next()) {
+            auto r = cur.peek();
+            if (r.level <= para_level) break;
+            if (r.tag == hwp::PARA_TEXT) {
+                auto rec = cur.next();
+                if (rec.data) parse_para_text(rec.data, rec.size, para);
+            } else if (r.tag == hwp::PARA_CHAR_SHAPE) {
+                auto rec = cur.next();
+                if (rec.data) parse_para_char_shape(rec.data, rec.size, para);
+            } else if (r.tag == hwp::PARA_LINE_SEG || r.tag == hwp::PARA_RANGE_TAG) {
+                cur.skip();
+            } else if (r.tag == hwp::CTRL_HEADER) {
+                read_control_dispatch(cur, para_level, para);
             } else {
-                if (post_table_para < 0)
-                    post_table_para = current_table_para;
-                ctrl_state = NONE;
-                current_table_para = -1;
-                current_table_idx = -1;
+                // Unknown record inside paragraph — skip if deeper
+                if (r.level > para_level) cur.skip();
+                else break;
             }
-        };
+        }
+    }
 
-        while (offset + 4 <= data.size()) {
-            auto hdr = hwp::parse_record_header(data.data(), offset);
-            size_t record_end = offset + hdr.size;
-            if (record_end > data.size()) break;
+    // Dispatch a CTRL_HEADER: peek ctrl_id, call appropriate reader
+    void read_control_dispatch(RecordCursor& cur, uint16_t para_level, HWPParagraph& para) {
+        auto r = cur.peek();
+        if (r.tag != hwp::CTRL_HEADER || !r.data || r.size < 4) {
+            cur.skip();
+            return;
+        }
+        uint16_t ctrl_level = r.level;
+        uint32_t ctrl_id = util::read_u32_le(r.data);
+        char c0 = (ctrl_id >> 24) & 0xFF;
+        char c1 = (ctrl_id >> 16) & 0xFF;
+        char c2 = (ctrl_id >> 8) & 0xFF;
+        char c3 = ctrl_id & 0xFF;
+        std::string ctrl_str = {c0, c1, c2, c3};
 
-            switch (hdr.tag_id) {
-            case hwp::PARA_HEADER: {
-                if (in_cell && hdr.level == 0) {
-                    flush_cell();
-                    in_cell = false;
-                    ctrl_state = NONE;
-                    current_table_para = -1;
-                    current_table_idx = -1;
+        cur.skip(); // consume CTRL_HEADER
+
+        if (ctrl_str == "tbl ") {
+            read_table(cur, ctrl_level, para);
+        } else if (ctrl_str == "gso ") {
+            std::string dummy;
+            read_gso(cur, ctrl_level, para, false, dummy);
+        } else {
+            // Skip all records belonging to this control
+            skip_control(cur, ctrl_level);
+        }
+    }
+
+    // Skip records deeper than ctrl_level (unknown control types)
+    void skip_control(RecordCursor& cur, uint16_t ctrl_level) {
+        while (cur.has_next()) {
+            auto r = cur.peek();
+            if (r.level <= ctrl_level) return;
+            cur.skip();
+        }
+    }
+
+    // Read a table: TABLE record + N cells via LIST_HEADER
+    void read_table(RecordCursor& cur, uint16_t ctrl_level, HWPParagraph& para) {
+        // Expect TABLE record next
+        if (!cur.has_next()) return;
+        auto r = cur.peek();
+        if (r.tag != hwp::TABLE) {
+            skip_control(cur, ctrl_level);
+            return;
+        }
+
+        HWPTable table;
+        auto tbl_rec = cur.next();
+        if (tbl_rec.data && tbl_rec.size >= 8) {
+            table.row_count = util::read_u16_le(tbl_rec.data + 4);
+            table.col_count = util::read_u16_le(tbl_rec.data + 6);
+        }
+
+        // Count total cells from cellsPerRow array at offset 18
+        int total_cells = 0;
+        if (tbl_rec.data && tbl_rec.size >= 18) {
+            size_t cpr_off = 18;
+            for (int row = 0; row < table.row_count; row++) {
+                if (cpr_off + 2 <= tbl_rec.size) {
+                    total_cells += util::read_u16_le(tbl_rec.data + cpr_off);
+                    cpr_off += 2;
                 }
-
-                // If we're inside a table cell, skip paragraph creation
-                if (in_cell) break;
-
-                // Start new paragraph (level 0 = top-level, level > 0 = inside GSO/textbox)
-                paragraphs.emplace_back();
-                current_idx = (int)paragraphs.size() - 1;
-                if (hdr.level == 0) ctrl_state = NONE;
-
-                if (hdr.size >= 6) {
-                    auto* p = cur_para();
-                    p->char_count = util::read_u32_le(data.data() + offset);
-                    p->control_mask = util::read_u16_le(data.data() + offset + 4);
-                    if (hdr.size >= 8)
-                        p->para_shape_id = util::read_u16_le(data.data() + offset + 6);
-                    if (hdr.size >= 10)
-                        p->style_id = util::read_u16_le(data.data() + offset + 8);
-                }
-                break;
             }
+        }
+        if (total_cells == 0)
+            total_cells = table.row_count * table.col_count;
 
-            case hwp::PARA_TEXT:
-                if (in_cell) {
-                    HWPParagraph tmp;
-                    parse_para_text(data.data() + offset, hdr.size, tmp);
-                    for (auto ch : tmp.text) {
-                        if (!is_hwp_printable(ch)) continue;
-                        util::append_utf8(current_cell_text, ch);
-                    }
-                    if (!current_cell_text.empty() && current_cell_text.back() != ' ')
-                        current_cell_text += ' ';
-                } else if (post_table_para >= 0) {
-                    // Text belonging to the last cell of the table that just ended
-                    HWPParagraph tmp;
-                    parse_para_text(data.data() + offset, hdr.size, tmp);
-                    std::string text;
-                    for (auto ch : tmp.text) {
-                        if (!is_hwp_printable(ch)) continue;
-                        util::append_utf8(text, ch);
-                    }
-                    if (!text.empty() && post_table_para < (int)paragraphs.size()) {
-                        auto& tbls = paragraphs[post_table_para].tables;
-                        if (!tbls.empty()) {
-                            auto& last_tbl = tbls.back();
-                            if (!last_tbl.cells.empty()) {
-                                auto& last_cell = last_tbl.cells.back();
-                                if (!last_cell.text.empty()) last_cell.text += " ";
-                                last_cell.text += util::trim(text);
-                            }
-                        }
-                    }
-                } else if (cur_para()) {
-                    parse_para_text(data.data() + offset, hdr.size, *cur_para());
-                }
-                break;
-
-            case hwp::PARA_CHAR_SHAPE:
-                if (!in_cell && cur_para()) {
-                    parse_para_char_shape(data.data() + offset, hdr.size, *cur_para());
-                }
-                break;
-
-            case hwp::CTRL_HEADER: {
-                if (hdr.size < 4) break;
-
-                if (in_cell && hdr.level == 0) {
-                    flush_cell();
-                    in_cell = false;
-                    ctrl_state = NONE;
-                    current_table_para = -1;
-                    current_table_idx = -1;
-                }
-
-                uint32_t ctrl_id = util::read_u32_le(data.data() + offset);
-                char c0 = (ctrl_id >> 24) & 0xFF;
-                char c1 = (ctrl_id >> 16) & 0xFF;
-                char c2 = (ctrl_id >> 8) & 0xFF;
-                char c3 = ctrl_id & 0xFF;
-                std::string ctrl_str = {c0, c1, c2, c3};
-
-                // Flush pending image from SHAPE_COMPONENT without SHAPE_COMPONENT_PICTURE
-                if (sc_pending_image) {
-                    sc_pending_image = false;
-                    sequential_bin_id++;
-                    if (gso_in_cell || in_cell)
-                        cell_image_bin_ids.push_back(sequential_bin_id);
-                    else if (cur_para())
-                        cur_para()->image_bin_ids.push_back(sequential_bin_id);
-                }
-
-                // GSO inside table cell: set flag before flush
-                if (ctrl_str == "gso " && ctrl_state == IN_TABLE && in_cell) {
-                    gso_in_cell = true;
-                }
-
-                // If in table but a new ctrl at same level, flush remaining cell
-                // Skip for "gso " (image) and "tbl " (nested table) — they manage state
-                if (in_cell && ctrl_state == IN_TABLE &&
-                    ctrl_str != "gso " && ctrl_str != "tbl ") {
-                    flush_cell();
-                    in_cell = false;
-                }
-
-                if (ctrl_str == "tbl ") {
-                    // Nested table inside cell: ignore as separate table,
-                    // its content will flow into the current cell as plain text
-                    if (ctrl_state == IN_TABLE && in_cell) {
-                        break;  // nested table — content flows into current cell
-                    }
-                    ctrl_state = IN_TABLE;
-                    auto* p = cur_para();
-                    if (p) {
-                        p->tables.emplace_back();
-                        current_table_para = current_idx;
-                        current_table_idx = (int)p->tables.size() - 1;
-                    }
-                    table_parsed_cells = 0;
-                    table_total_cells = 0;
-                    in_cell = false;
-                } else if (ctrl_str == "gso ") {
-                    if (ctrl_state != IN_TABLE) {
-                        ctrl_state = IN_GSO;
-                    }
-                }
-                break;
+        // Read cells: each begins with LIST_HEADER
+        for (int ci = 0; ci < total_cells && cur.has_next(); ci++) {
+            auto pk = cur.peek();
+            if (pk.level <= ctrl_level) break;
+            if (pk.tag == hwp::LIST_HEADER) {
+                HWPTableCell cell = read_cell(cur);
+                table.cells.push_back(std::move(cell));
+            } else {
+                cur.skip();
+                ci--;
             }
+        }
 
-            case hwp::TABLE: {
-                if (in_cell) break;  // nested table inside cell — skip
-                auto* tbl = cur_table();
-                if (ctrl_state == IN_TABLE && tbl && hdr.size >= 8) {
-                    tbl->row_count = util::read_u16_le(data.data() + offset + 4);
-                    tbl->col_count = util::read_u16_le(data.data() + offset + 6);
+        // Skip any remaining deeper records (e.g. CTRL_DATA after cells)
+        while (cur.has_next()) {
+            auto pk = cur.peek();
+            if (pk.level <= ctrl_level) break;
+            cur.skip();
+        }
 
-                    size_t cpr_off = offset + 18;
-                    table_total_cells = 0;
-                    for (int r = 0; r < tbl->row_count; r++) {
-                        if (cpr_off + 2 <= record_end) {
-                            table_total_cells += util::read_u16_le(data.data() + cpr_off);
-                            cpr_off += 2;
-                        }
-                    }
-                }
+        para.tables.push_back(std::move(table));
+    }
+
+    // Read a single cell: LIST_HEADER + paragraph list
+    // Cell paragraphs are flattened into cell.text with \x01 image markers and \x02 breaks
+    HWPTableCell read_cell(RecordCursor& cur) {
+        HWPTableCell cell;
+        auto lh = cur.next(); // consume LIST_HEADER
+        if (lh.tag != hwp::LIST_HEADER) return cell;
+
+        uint16_t cell_level = lh.level;
+
+        if (lh.data && lh.size >= 16) {
+            cell.col_addr  = util::read_u16_le(lh.data + 8);
+            cell.row_addr  = util::read_u16_le(lh.data + 10);
+            cell.col_span  = util::read_u16_le(lh.data + 12);
+            cell.row_span  = util::read_u16_le(lh.data + 14);
+        }
+
+        // Read cell paragraphs recursively.
+        // Cell paragraphs are at the same level as LIST_HEADER (siblings),
+        // so we accept records at cell_level (not just > cell_level).
+        std::vector<HWPParagraph> cell_paras;
+        while (cur.has_next()) {
+            auto pk = cur.peek();
+            if (pk.level < cell_level) break;
+            if (pk.tag == hwp::PARA_HEADER) {
+                HWPParagraph cpara;
+                read_paragraph(cur, pk.level, cpara);
+                cell_paras.push_back(std::move(cpara));
+            } else if (pk.tag == hwp::LIST_HEADER && pk.level == cell_level) {
+                // Next cell's LIST_HEADER — stop reading this cell
                 break;
+            } else {
+                cur.skip();
             }
+        }
 
-            case hwp::LIST_HEADER: {
-                // Flush pending image before cell boundary
-                if (sc_pending_image) {
-                    sc_pending_image = false;
-                    sequential_bin_id++;
-                    if (gso_in_cell || in_cell)
-                        cell_image_bin_ids.push_back(sequential_bin_id);
-                    else if (cur_para())
-                        cur_para()->image_bin_ids.push_back(sequential_bin_id);
-                }
-                if (ctrl_state == IN_TABLE && cur_table()) {
-                    // Skip LIST_HEADER from nested tables — they are at deeper levels
-                    if (cell_list_header_level >= 0 && hdr.level > cell_list_header_level) {
-                        if (in_cell && !current_cell_text.empty())
-                            current_cell_text += ' ';
-                        break;
-                    }
-                    if (in_cell) {
-                        flush_cell();
-                        table_parsed_cells++;
-                    }
-                    in_cell = true;
-                    cell_list_header_level = hdr.level;
+        // Flatten cell paragraphs into cell.text
+        flatten_cell_paragraphs(cell_paras, cell.text);
 
-                    if (hdr.size >= 16) {
-                        cur_cell_col = util::read_u16_le(data.data() + offset + 8);
-                        cur_cell_row = util::read_u16_le(data.data() + offset + 10);
-                        cur_cell_colspan = util::read_u16_le(data.data() + offset + 12);
-                        cur_cell_rowspan = util::read_u16_le(data.data() + offset + 14);
-                    } else {
-                        cur_cell_col = 0; cur_cell_row = 0;
-                        cur_cell_colspan = 1; cur_cell_rowspan = 1;
-                    }
+        cell.text = util::trim(cell.text);
+        return cell;
+    }
 
-                    if (table_total_cells > 0 && table_parsed_cells >= table_total_cells) {
-                        in_cell = false;
-                        restore_table_state();
+    // Flatten paragraphs into a cell text string with inline markers
+    void flatten_cell_paragraphs(std::vector<HWPParagraph>& paras, std::string& out) {
+        for (size_t pi = 0; pi < paras.size(); pi++) {
+            auto& cpara = paras[pi];
+
+            // Flatten nested tables recursively, then clear to prevent
+            // format_paragraph from re-rendering them
+            for (auto& tbl : cpara.tables) {
+                for (auto& tcell : tbl.cells) {
+                    if (!tcell.text.empty()) {
+                        if (!out.empty()) out += '\x02';
+                        out += tcell.text;
                     }
                 }
-                break;
             }
+            cpara.tables.clear();
 
-            case hwp::SHAPE_COMPONENT: {
-                if ((ctrl_state == IN_GSO || gso_in_cell) && hdr.size >= 10) {
+            // Append images as \x01 + 2-byte bin_id, then clear
+            for (int bid : cpara.image_bin_ids) {
+                out += '\x01';
+                out += (char)((bid >> 8) & 0xFF);
+                out += (char)(bid & 0xFF);
+            }
+            cpara.image_bin_ids.clear();
+
+            // Append text
+            std::string txt;
+            for (auto ch : cpara.text) {
+                if (!is_hwp_printable(ch)) continue;
+                util::append_utf8(txt, ch);
+            }
+            txt = util::trim(txt);
+            if (!txt.empty()) {
+                if (!out.empty() && out.back() != '\x02') {
+                    // Add separator between paragraphs
+                    if (!out.empty()) out += ' ';
+                }
+                out += txt;
+            }
+        }
+    }
+
+    // Extract binItemID from SHAPE_COMPONENT fillInfo (for 'cip$'/'$pic' images).
+    // Returns bin_id > 0 on success, 0 if not an image shape.
+    int extract_shape_component_image(const uint8_t* data, uint32_t size) {
+        if (size < 8) return 0;
+        // Check name: first 4 bytes
+        char name[5] = {};
+        memcpy(name, data, 4);
+        bool is_pic = (std::string(name) == "cip$" || std::string(name) == "$pic");
+        if (!is_pic) return 0;
+
+        // Layout after name(4) + id2(4):
+        // commonPart: 42 bytes fixed + renderingInfo (variable)
+        size_t off = 8; // skip name + id2
+        // commonPart fixed fields: 42 bytes
+        off += 42; // off = 50
+        if (off + 2 > size) return 0;
+        uint16_t mat_count = util::read_u16_le(data + off);
+        off += 2;
+        off += 48; // translation matrix (6 doubles)
+        off += (size_t)mat_count * 96;
+        if (off > size) return 0;
+
+        // lineInfo: color(4) + thickness(4) + property(4) + outlineStyle(1) = 13 bytes
+        off += 13;
+        if (off + 4 > size) return 0;
+
+        // fillInfo: type(4)
+        uint32_t fill_type = util::read_u32_le(data + off);
+        off += 4;
+        if (fill_type == 0) {
+            return 0;
+        }
+
+        // patternFill: if bit 0 set, 12 bytes
+        if (fill_type & 0x01) {
+            off += 12; // backColor(4) + patternColor(4) + patternType(4)
+        }
+
+        // gradientFill: if bit 1 set
+        if (fill_type & 0x02) {
+            off += 1; // gradientType
+            off += 4; // startAngle
+            off += 4; // centerX
+            off += 4; // centerY
+            off += 4; // blurringDegree
+            if (off + 4 > size) return 0;
+            uint32_t color_count = util::read_u32_le(data + off);
+            off += 4;
+            if (color_count > 2)
+                off += (size_t)color_count * 4; // changePoints
+            off += (size_t)color_count * 4;     // colors
+        }
+
+        // imageFill: if bit 2 set
+        if (fill_type & 0x04) {
+            // imageFillType(1) + brightness(1) + contrast(1) + effect(1) + binItemID(2)
+            off += 1 + 1 + 1 + 1;
+            if (off + 2 > size) return 0;
+            uint16_t bin_id = util::read_u16_le(data + off);
+            return bin_id;
+        }
+
+        return 0;
+    }
+
+    // Helper: emit a resolved bin_id to either cell_text or para.image_bin_ids
+    void emit_image(int bin_id, bool in_cell, std::string& cell_text, HWPParagraph& para) {
+        if (bin_id <= 0) return;
+        if (in_cell) {
+            cell_text += '\x01';
+            cell_text += (char)((bin_id >> 8) & 0xFF);
+            cell_text += (char)(bin_id & 0xFF);
+        } else {
+            para.image_bin_ids.push_back(bin_id);
+        }
+    }
+
+    // Read GSO (graphic shape object): SHAPE_COMPONENT + picture/OLE/container
+    void read_gso(RecordCursor& cur, uint16_t ctrl_level, HWPParagraph& para,
+                  bool in_cell, std::string& cell_text) {
+        bool sc_pending = false;
+
+        while (cur.has_next()) {
+            auto r = cur.peek();
+            if (r.level <= ctrl_level) break;
+
+            if (r.tag == hwp::SHAPE_COMPONENT_PICTURE) {
+                auto rec = cur.next();
+                if (sc_pending) {
+                    sc_pending = false;
+                    sequential_bin_id_++;
+                    int bin_id = 0;
+                    if (rec.data && rec.size >= 73)
+                        bin_id = util::read_u16_le(rec.data + 71);
+                    if (bin_id == 0) bin_id = sequential_bin_id_;
+                    emit_image(bin_id, in_cell, cell_text, para);
+                }
+            } else if (r.tag == hwp::SHAPE_COMPONENT_OLE) {
+                auto rec = cur.next();
+                if (sc_pending) {
+                    sc_pending = false;
+                    sequential_bin_id_++;
+                    int bin_id = 0;
+                    if (rec.data && rec.size >= 14)
+                        bin_id = util::read_u16_le(rec.data + 12);
+                    if (bin_id == 0) bin_id = sequential_bin_id_;
+                    emit_image(bin_id, in_cell, cell_text, para);
+                }
+            } else if (r.tag == hwp::SHAPE_COMPONENT) {
+                auto rec = cur.next();
+                if (rec.data && rec.size >= 4) {
                     char sc_name[5] = {};
-                    memcpy(sc_name, data.data() + offset, 4);
-                    if (std::string(sc_name) == "cip$" || std::string(sc_name) == "$pic") {
-                        // bin_id comes from the subsequent SHAPE_COMPONENT_PICTURE record.
-                        // If that record is missing, use sequential BinData index as fallback.
-                        sc_pending_image = true;
+                    memcpy(sc_name, rec.data, 4);
+                    bool is_pic = (std::string(sc_name) == "cip$" ||
+                                   std::string(sc_name) == "$pic");
+                    if (is_pic) {
+                        // Try fillInfo extraction from SHAPE_COMPONENT data
+                        int fill_bid = extract_shape_component_image(rec.data, rec.size);
+                        if (fill_bid > 0) {
+                            sequential_bin_id_++;
+                            emit_image(fill_bid, in_cell, cell_text, para);
+                            // Skip subsequent PICTURE/OLE records for this gso
+                            sc_pending = false;
+                        } else {
+                            sc_pending = true; // Wait for child PICTURE/OLE record
+                        }
                     }
                 }
-                break;
-            }
-
-            case hwp::SHAPE_COMPONENT_PICTURE: {
-                if ((ctrl_state == IN_GSO || gso_in_cell) && hdr.size >= 15) {
-                    sc_pending_image = false;
-                    sequential_bin_id++;
-                    uint16_t bin_id = util::read_u16_le(data.data() + offset + 13);
-                    if (bin_id > 0) {
-                        if (gso_in_cell)
-                            cell_image_bin_ids.push_back(bin_id);
-                        else if (cur_para())
-                            cur_para()->image_bin_ids.push_back(bin_id);
-                    }
-                    if (!gso_in_cell) ctrl_state = NONE;
-                    gso_in_cell = false;
+            } else if (r.tag == hwp::CTRL_DATA) {
+                cur.skip();
+            } else if (r.tag == hwp::LIST_HEADER) {
+                auto lh = cur.next();
+                uint16_t lh_level = lh.level;
+                while (cur.has_next()) {
+                    auto pk = cur.peek();
+                    if (pk.level <= lh_level) break;
+                    cur.skip();
                 }
-                break;
-            }
-
-            case hwp::SHAPE_COMPONENT_OLE: {
-                if ((ctrl_state == IN_GSO || gso_in_cell) && hdr.size >= 15) {
-                    uint16_t bin_id = util::read_u16_le(data.data() + offset + 13);
-                    if (bin_id > 0) {
-                        if (gso_in_cell)
-                            cell_image_bin_ids.push_back(bin_id);
-                        else if (cur_para())
-                            cur_para()->image_bin_ids.push_back(bin_id);
-                    }
-                    if (!gso_in_cell) ctrl_state = NONE;
-                    gso_in_cell = false;
+            } else if (r.tag == hwp::CTRL_HEADER) {
+                // Flush pending image before nested control
+                if (sc_pending) {
+                    sc_pending = false;
+                    sequential_bin_id_++;
+                    emit_image(sequential_bin_id_, in_cell, cell_text, para);
                 }
-                break;
+                auto pk = cur.peek();
+                if (pk.data && pk.size >= 4) {
+                    uint32_t nested_id = util::read_u32_le(pk.data);
+                    char nc0 = (nested_id >> 24) & 0xFF;
+                    char nc1 = (nested_id >> 16) & 0xFF;
+                    char nc2 = (nested_id >> 8) & 0xFF;
+                    char nc3 = nested_id & 0xFF;
+                    std::string nested_str = {nc0, nc1, nc2, nc3};
+                    uint16_t nested_level = pk.level;
+                    cur.skip(); // consume CTRL_HEADER
+                    if (nested_str == "gso ") {
+                        read_gso(cur, nested_level, para, in_cell, cell_text);
+                    } else {
+                        skip_control(cur, nested_level);
+                    }
+                } else {
+                    cur.skip();
+                }
+            } else {
+                cur.skip();
             }
-
-            default:
-                break;
-            }
-
-            offset = record_end;
         }
 
-        // Flush any pending image at end of section
-        if (sc_pending_image) {
-            sc_pending_image = false;
-            sequential_bin_id++;
-            if (gso_in_cell || in_cell)
-                cell_image_bin_ids.push_back(sequential_bin_id);
-            else if (cur_para())
-                cur_para()->image_bin_ids.push_back(sequential_bin_id);
+        // Flush pending image at end of GSO
+        if (sc_pending) {
+            sc_pending = false;
+            sequential_bin_id_++;
+            emit_image(sequential_bin_id_, in_cell, cell_text, para);
         }
-        if (in_cell) flush_cell();
     }
 
     static bool is_hwp_printable(char16_t ch) {
@@ -968,17 +1070,29 @@ private:
 
         for (auto& cell : table.cells) {
             if (cell.row_addr < table.row_count && cell.col_addr < table.col_count) {
-                std::string content = util::escape_cell(cell.text);
-                // Append inline image references into cell text
-                for (int bin_id : cell.image_bin_ids) {
-                    std::string img_md = format_image(bin_id, chunk, image_idx);
-                    if (!img_md.empty()) {
-                        // Strip trailing newlines for inline use
+                // Resolve inline image markers (\x01 + 2-byte bin_id) before escaping
+                std::string resolved;
+                resolved.reserve(cell.text.size());
+                for (size_t i = 0; i < cell.text.size(); i++) {
+                    if (cell.text[i] == '\x01' && i + 2 < cell.text.size()) {
+                        int bid = ((unsigned char)cell.text[i+1] << 8)
+                                | (unsigned char)cell.text[i+2];
+                        i += 2;
+                        std::string img_md = format_image(bid, chunk, image_idx);
                         while (!img_md.empty() && img_md.back() == '\n')
                             img_md.pop_back();
-                        if (!content.empty()) content += " ";
-                        content += img_md;
+                        if (!resolved.empty() && resolved.back() != ' ')
+                            resolved += ' ';
+                        resolved += img_md;
+                    } else {
+                        resolved += cell.text[i];
                     }
+                }
+                std::string content = util::escape_cell(resolved);
+                // Replace \x02 line break markers with <br>
+                for (size_t p = 0; p < content.size(); p++) {
+                    if (content[p] == '\x02')
+                        content.replace(p, 1, "<br>");
                 }
                 grid[cell.row_addr][cell.col_addr] = content;
             }
