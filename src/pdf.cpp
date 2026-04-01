@@ -6143,8 +6143,11 @@ ExtractResult extract_pdf(const std::string& pdf_path, const ConvertOptions& opt
         page_indices = opts.pages;
     }
 
+    // Always extract images for markdown references; only save to disk if dir is set
     std::string image_dir;
-    if (opts.extract_images && !opts.image_output_dir.empty()) {
+    ConvertOptions img_opts = opts;
+    img_opts.extract_images = true;
+    if (!opts.image_output_dir.empty()) {
         image_dir = opts.image_output_dir;
         util::ensure_dir(image_dir);
     }
@@ -6181,7 +6184,7 @@ ExtractResult extract_pdf(const std::string& pdf_path, const ConvertOptions& opt
                 has_fonts = fd.is_dict() && !fd.dict.empty();
             }
         }
-        if (!has_fonts && !opts.extract_images) continue;
+        if (!has_fonts && !img_opts.extract_images) continue;
 
         // Parse content stream
         auto content_data = get_page_content(doc, page_obj);
@@ -6190,7 +6193,7 @@ ExtractResult extract_pdf(const std::string& pdf_path, const ConvertOptions& opt
         // Extract text lines
         bool plaintext = (opts.output_format == OutputFormat::PLAINTEXT);
         bool need_tables = opts.extract_tables && !plaintext;
-        bool need_graphics = need_tables || opts.extract_images;
+        bool need_graphics = need_tables || img_opts.extract_images;
 
         auto parse_result = parse_content_stream(doc, content_data, resources, page_h,
                                                   &font_cache, !need_graphics);
@@ -6215,7 +6218,7 @@ ExtractResult extract_pdf(const std::string& pdf_path, const ConvertOptions& opt
         }
 
         // Image extraction
-        if (opts.extract_images) {
+        if (img_opts.extract_images) {
             // Check for layered page
             bool has_regular = false, has_mask = false;
             for (auto& ip : parse_result.images) {
@@ -6231,9 +6234,9 @@ ExtractResult extract_pdf(const std::string& pdf_path, const ConvertOptions& opt
                 // Layered: render as composite
                 auto rendered = render_page_composite(doc, page_obj, parse_result,
                                                       p, page_w, page_h, image_dir);
-                if (!rendered.data.empty() || !rendered.pixels.empty()) {
+                if (!rendered.data.empty() || !rendered.pixels.empty() || !rendered.saved_path.empty()) {
                     result.all_images[p].push_back(std::move(rendered));
-                    result.all_image_y[p].push_back(page_h); // full-page composite goes to top
+                    result.all_image_y[p].push_back(page_h);
                     result.all_image_x[p].push_back(0);
                 }
             } else {
@@ -6253,7 +6256,7 @@ ExtractResult extract_pdf(const std::string& pdf_path, const ConvertOptions& opt
                 if (!parse_result.images.empty() || !parse_result.segments.empty()) {
                     auto rendered = render_page_composite(doc, page_obj, parse_result,
                                                           p, page_w, page_h, image_dir);
-                    if (!rendered.data.empty() || !rendered.pixels.empty()) {
+                    if (!rendered.data.empty() || !rendered.pixels.empty() || !rendered.saved_path.empty()) {
                         result.all_images[p].push_back(std::move(rendered));
                         result.all_image_y[p].push_back(page_h);
                         result.all_image_x[p].push_back(0);
