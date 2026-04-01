@@ -4965,6 +4965,15 @@ std::vector<ExtractedImage> extract_page_images(PdfDoc& doc, const PdfObj& page_
         }
 
         if (!img.data.empty() || !img.pixels.empty()) {
+            // Encode raw pixels to PNG for in-memory delivery
+            if (img.format == "raw" && img.data.empty() && !img.pixels.empty()) {
+                auto png = pixels_to_png(img.pixels.data(), img.width, img.height, img.components);
+                img.data.assign(png.begin(), png.end());
+                img.format = "png";
+                img.pixels.clear();
+                img.pixels.shrink_to_fit();
+            }
+
             if (!output_dir.empty()) {
                 std::string ext, path;
                 if (img.format == "jpeg") ext = ".jpg";
@@ -4974,14 +4983,7 @@ std::vector<ExtractedImage> extract_page_images(PdfDoc& doc, const PdfObj& page_
 
                 std::ofstream ofs(path, std::ios::binary);
                 if (ofs) {
-                    if (!img.data.empty()) {
-                        // JPEG/JP2 passthrough
-                        ofs.write(img.data.data(), img.data.size());
-                    } else if (!img.pixels.empty()) {
-                        // Raw pixels → PNG
-                        auto png = pixels_to_png(img.pixels.data(), img.width, img.height, img.components);
-                        ofs.write(png.data(), png.size());
-                    }
+                    ofs.write(img.data.data(), img.data.size());
                     img.saved_path = path;
                 }
             }
@@ -5581,18 +5583,17 @@ ImageData render_page_composite(PdfDoc& doc, const PdfObj& page_obj,
     img.height = rh;
     img.components = 3;
 
-    // Canvas is already RGB — move directly
-    img.pixels = std::move(canvas.pixels);
+    // Canvas is already RGB — encode to PNG for in-memory delivery
+    auto png = pixels_to_png(canvas.pixels.data(), rw, rh, 3, Z_BEST_SPEED);
+    img.format = "png";
+    img.data.assign(png.begin(), png.end());
 
     if (!output_dir.empty()) {
-        auto png = pixels_to_png(img.pixels.data(), rw, rh, 3, Z_BEST_SPEED);
-        if (!png.empty()) {
-            std::string path = output_dir + "/" + img.name + ".png";
-            std::ofstream f(path, std::ios::binary);
-            if (f) {
-                f.write(png.data(), static_cast<std::streamsize>(png.size()));
-                img.saved_path = path;
-            }
+        std::string path = output_dir + "/" + img.name + ".png";
+        std::ofstream f(path, std::ios::binary);
+        if (f) {
+            f.write(img.data.data(), static_cast<std::streamsize>(img.data.size()));
+            img.saved_path = path;
         }
     }
     return img;
