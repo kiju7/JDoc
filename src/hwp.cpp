@@ -770,11 +770,11 @@ private:
             }
             cpara.tables.clear();
 
-            // Append images as \x01 + 2-byte bin_id, then clear
+            // Append images as \x01{bid}\x01 markers, then clear
             for (int bid : cpara.image_bin_ids) {
                 out += '\x01';
-                out += (char)((bid >> 8) & 0xFF);
-                out += (char)(bid & 0xFF);
+                out += std::to_string(bid);
+                out += '\x01';
             }
             cpara.image_bin_ids.clear();
 
@@ -865,8 +865,8 @@ private:
         if (bin_id <= 0) return;
         if (in_cell) {
             cell_text += '\x01';
-            cell_text += (char)((bin_id >> 8) & 0xFF);
-            cell_text += (char)(bin_id & 0xFF);
+            cell_text += std::to_string(bin_id);
+            cell_text += '\x01';
         } else {
             para.image_bin_ids.push_back(bin_id);
         }
@@ -1070,20 +1070,24 @@ private:
 
         for (auto& cell : table.cells) {
             if (cell.row_addr < table.row_count && cell.col_addr < table.col_count) {
-                // Resolve inline image markers (\x01 + 2-byte bin_id) before escaping
+                // Resolve inline image markers (\x01{bid}\x01) before escaping
                 std::string resolved;
                 resolved.reserve(cell.text.size());
                 for (size_t i = 0; i < cell.text.size(); i++) {
-                    if (cell.text[i] == '\x01' && i + 2 < cell.text.size()) {
-                        int bid = ((unsigned char)cell.text[i+1] << 8)
-                                | (unsigned char)cell.text[i+2];
-                        i += 2;
-                        std::string img_md = format_image(bid, chunk, image_idx);
-                        while (!img_md.empty() && img_md.back() == '\n')
-                            img_md.pop_back();
-                        if (!resolved.empty() && resolved.back() != ' ')
-                            resolved += ' ';
-                        resolved += img_md;
+                    if (cell.text[i] == '\x01') {
+                        size_t end = cell.text.find('\x01', i + 1);
+                        if (end != std::string::npos) {
+                            int bid = std::atoi(cell.text.substr(i + 1, end - i - 1).c_str());
+                            i = end;
+                            if (bid > 0) {
+                                std::string img_md = format_image(bid, chunk, image_idx);
+                                while (!img_md.empty() && img_md.back() == '\n')
+                                    img_md.pop_back();
+                                if (!resolved.empty() && resolved.back() != ' ')
+                                    resolved += ' ';
+                                resolved += img_md;
+                            }
+                        }
                     } else {
                         resolved += cell.text[i];
                     }
