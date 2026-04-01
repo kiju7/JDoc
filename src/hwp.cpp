@@ -70,6 +70,7 @@ static std::vector<uint8_t> read_ole_stream(OleReader& ole,
 
 struct HWPBinDataRef {
     uint16_t type = 0;     // 0=LINK, 1=EMBEDDING, 2=STORAGE
+    uint16_t compress = 0; // 0=default(compressed), 1=compressed, 2=no compression
     uint16_t bin_data_id = 0;
     std::string extension;
 };
@@ -407,6 +408,7 @@ private:
         HWPBinDataRef ref;
         uint16_t prop = util::read_u16_le(data);
         ref.type = prop & 0x0F;  // lower 4 bits
+        ref.compress = (prop >> 4) & 0x03;  // bits 4-5: compression
 
         size_t off = 2;
         if (ref.type == 0) {
@@ -1196,17 +1198,55 @@ private:
             }
         }
 
-        filename = unified + "." + ext;
-
-        // Stream directly to file (avoids loading large images into memory)
+        // Read raw OLE stream, decompress if needed, detect format
         std::string stream_path = "BinData/" + entry->name;
-        std::string saved_path = opts_.image_output_dir + "/" + filename;
-        if (ole_) {
-            size_t written = ole_->write_stream_to_file(stream_path, saved_path);
-            if (written == 0) return "";
+        if (!ole_) return "";
+
+        auto raw = ole_->read_stream(stream_path);
+        if (raw.empty()) return "";
+
+        // Decompress if compressed (compress != 2 means compressed)
+        std::vector<uint8_t> image_data;
+        bool compressed = true;
+        if (bin_id > 0 && bin_id <= (int)doc_info_.bin_data_refs.size())
+            compressed = doc_info_.bin_data_refs[bin_id - 1].compress != 2;
+
+        if (compressed) {
+            image_data = decompress(
+                reinterpret_cast<const uint8_t*>(raw.data()), raw.size());
+            if (image_data.empty()) {
+                // Fallback: treat as uncompressed
+                image_data.assign(raw.begin(), raw.end());
+            }
         } else {
-            return "";
+            image_data.assign(raw.begin(), raw.end());
         }
+        raw.clear(); raw.shrink_to_fit();
+
+        // Detect actual format from magic bytes
+        std::string actual_fmt = util::detect_image_format(
+            image_data.data(), image_data.size());
+        if (!actual_fmt.empty()) ext = actual_fmt;
+
+        // BMP → PNG conversion
+        std::vector<char> png_data;
+        if (ext == "bmp") {
+            png_data = util::bmp_to_png(image_data.data(), image_data.size());
+            if (!png_data.empty()) ext = "png";
+        }
+
+        filename = unified + "." + (ext == "jpeg" ? "jpg" : ext);
+        std::string saved_path = opts_.image_output_dir + "/" + filename;
+        util::ensure_dir(opts_.image_output_dir);
+
+        std::ofstream ofs(saved_path, std::ios::binary);
+        if (!ofs) return "";
+        if (!png_data.empty())
+            ofs.write(png_data.data(), png_data.size());
+        else
+            ofs.write(reinterpret_cast<const char*>(image_data.data()),
+                      image_data.size());
+        ofs.close();
 
         ImageData idata;
         idata.page_number = chunk.page_number;
