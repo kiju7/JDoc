@@ -424,7 +424,7 @@ private:
                 else if (in == "hp:pic") {
                     // Picture
                     auto img = process_picture(item, chunk.page_number, image_idx);
-                    if (!img.data.empty()) {
+                    if (!img.data.empty() || !img.saved_path.empty()) {
                         chunk.images.push_back(std::move(img));
                         image_idx++;
                         para_has_content = true;
