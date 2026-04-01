@@ -15,7 +15,7 @@
 #include <memory>
 #include <set>
 #include <sstream>
-#include <iostream>
+
 
 namespace jdoc {
 
@@ -251,11 +251,6 @@ private:
                     std::string cn = child.name();
                     if (cn == "hh:heading" || cn.find("heading") != std::string::npos) {
                         ps.outline_level = child.attribute("level").as_int(0);
-                        // Also check "type" attribute
-                        std::string type = child.attribute("type").as_string("");
-                        if (type == "OUTLINE") {
-                            // level is valid
-                        }
                     }
                 }
 
@@ -372,7 +367,6 @@ private:
 
         // Process runs to collect text, tables, images
         std::string para_text;
-        bool has_table = false;
         bool para_has_content = false;
 
         for (auto run : para.children()) {
@@ -423,7 +417,6 @@ private:
                                 para_text.clear();
                             }
                             md += table_md + "\n";
-                            has_table = true;
                             para_has_content = true;
                         }
                     }
