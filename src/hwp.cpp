@@ -1209,41 +1209,41 @@ private:
         if (bin_id > 0 && bin_id <= (int)doc_info_.bin_data_refs.size())
             compressed = doc_info_.bin_data_refs[bin_id - 1].compress != 2;
 
-        // Write image: decompress, detect format, BMP→PNG, save
-        util::ensure_dir(opts_.image_output_dir);
-
-        // Decompress if needed
+        // Decompress, detect format, save to disk or hold in memory
         std::vector<uint8_t> image_data;
         if (compressed) {
             image_data = decompress(
                 reinterpret_cast<const uint8_t*>(raw.data()), raw.size());
             if (image_data.empty())
-                image_data.assign(raw.begin(), raw.end()); // fallback: raw
+                image_data.assign(raw.begin(), raw.end());
         } else {
             image_data.assign(raw.begin(), raw.end());
         }
         raw.clear(); raw.shrink_to_fit();
 
-        // Detect actual format
+        // Detect actual format from magic bytes
         std::string actual_fmt = util::detect_image_format(
             image_data.data(), image_data.size());
         if (!actual_fmt.empty()) ext = actual_fmt;
 
-        // BMP stays as BMP (PNG conversion too costly for speed)
-
         filename = unified + "." + (ext == "jpeg" ? "jpg" : ext);
-        std::string saved_path = opts_.image_output_dir + "/" + filename;
-        std::ofstream ofs(saved_path, std::ios::binary);
-        if (!ofs) return "";
-        ofs.write(reinterpret_cast<const char*>(image_data.data()),
-                  image_data.size());
-        ofs.close();
+        std::string saved_path;
+        if (!opts_.image_output_dir.empty()) {
+            util::ensure_dir(opts_.image_output_dir);
+            saved_path = opts_.image_output_dir + "/" + filename;
+            std::ofstream ofs(saved_path, std::ios::binary);
+            if (!ofs) return "";
+            ofs.write(reinterpret_cast<const char*>(image_data.data()),
+                      image_data.size());
+        }
 
         ImageData idata;
         idata.page_number = chunk.page_number;
         idata.name = unified;
         idata.format = ext;
         idata.saved_path = saved_path;
+        idata.data.assign(reinterpret_cast<const char*>(image_data.data()),
+                          reinterpret_cast<const char*>(image_data.data()) + image_data.size());
         chunk.images.push_back(std::move(idata));
 
         image_idx++;
