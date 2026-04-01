@@ -758,6 +758,10 @@ private:
             img.saved_path = util::save_image_to_file(
                 opts_.image_output_dir, save_name, img.format,
                 img.data.data(), img.data.size());
+            if (!img.saved_path.empty()) {
+                img.data.clear();
+                img.data.shrink_to_fit();
+            }
         }
 
         return img;

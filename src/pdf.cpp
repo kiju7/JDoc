@@ -4986,6 +4986,10 @@ std::vector<ExtractedImage> extract_page_images(PdfDoc& doc, const PdfObj& page_
                     ofs.write(img.data.data(), img.data.size());
                     img.saved_path = path;
                 }
+                if (!img.saved_path.empty()) {
+                    img.data.clear();
+                    img.data.shrink_to_fit();
+                }
             }
 
             ExtractedImage ei;
@@ -5594,6 +5598,10 @@ ImageData render_page_composite(PdfDoc& doc, const PdfObj& page_obj,
         if (f) {
             f.write(img.data.data(), static_cast<std::streamsize>(img.data.size()));
             img.saved_path = path;
+        }
+        if (!img.saved_path.empty()) {
+            img.data.clear();
+            img.data.shrink_to_fit();
         }
     }
     return img;

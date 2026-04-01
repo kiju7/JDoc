@@ -1321,9 +1321,15 @@ std::string DocParser::to_markdown(const ConvertOptions& opts) {
     auto images = extract_images(opts.min_image_size);
 
     if (opts.extract_images) {
-        for (auto& img : images)
-            util::save_image_to_file(opts.image_output_dir, img.name, img.format,
-                                     img.data.data(), img.data.size());
+        for (auto& img : images) {
+            img.saved_path = util::save_image_to_file(
+                opts.image_output_dir, img.name, img.format,
+                img.data.data(), img.data.size());
+            if (!img.saved_path.empty()) {
+                img.data.clear();
+                img.data.shrink_to_fit();
+            }
+        }
     }
 
     return replace_image_markers(md, images, opts.image_ref_prefix);
