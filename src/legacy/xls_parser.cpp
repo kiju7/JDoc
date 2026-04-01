@@ -863,7 +863,7 @@ std::string XlsParser::to_markdown(const ConvertOptions& opts) {
             if (opts.extract_images)
                 md += "![" + filename + "](" + opts.image_ref_prefix + filename + ")\n\n";
             else
-                md += "![" + filename + "](embedded:" + filename + ")\n\n";
+                md += "![" + filename + "](" + filename + ")\n\n";
         }
     }
 

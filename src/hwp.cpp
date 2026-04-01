@@ -1175,7 +1175,7 @@ private:
         // When images not requested, emit embedded reference without loading data
         if (!opts_.extract_images) {
             image_idx++;
-            return "![" + unified + "](embedded:" + unified + ")\n\n";
+            return "![" + unified + "](" + filename + ")\n\n";
         }
 
         // Detect format from file extension in OLE name
