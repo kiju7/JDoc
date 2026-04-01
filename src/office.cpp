@@ -165,11 +165,17 @@ std::string office_to_markdown(const std::string& file_path, ConvertOptions opts
         auto chunks = office_to_markdown_chunks(file_path, opts);
         if (chunks.size() <= 1 && !chunks.empty())
             return chunks[0].text;
+        bool has_heading = (format == DocFormat::XLSX || format == DocFormat::XLSB ||
+                            format == DocFormat::XLS);
         const char* label = section_label(format);
         std::string result;
         for (size_t i = 0; i < chunks.size(); ++i) {
-            if (i > 0)
-                result += "\n--- " + std::string(label) + " " + std::to_string(chunks[i].page_number) + " ---\n\n";
+            if (i > 0) {
+                if (has_heading)
+                    result += "\n";
+                else
+                    result += "\n--- " + std::string(label) + " " + std::to_string(chunks[i].page_number) + " ---\n\n";
+            }
             result += chunks[i].text;
         }
         return result;
