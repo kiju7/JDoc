@@ -153,6 +153,16 @@ inline std::string strip_markdown(const std::string& md) {
                 size_t pipe = line.find('|', ci);
                 if (pipe == std::string::npos || pipe >= e) pipe = e;
                 std::string cell = trim(line.substr(ci, pipe - ci));
+                // Strip bold/italic markers from cell text
+                std::string clean;
+                for (size_t k = 0; k < cell.size(); ) {
+                    if (cell[k] == '*') {
+                        while (k < cell.size() && cell[k] == '*') k++;
+                    } else {
+                        clean += cell[k++];
+                    }
+                }
+                cell = std::move(clean);
                 if (!row.empty()) row += "  ";
                 row += cell;
                 ci = pipe + 1;

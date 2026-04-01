@@ -706,7 +706,10 @@ std::string XlsParser::sheet_to_markdown(const Sheet& sheet, int sheet_num) {
 
     // Render markdown table.
     std::ostringstream out;
-    out << "--- Page " << sheet_num << " ---\n\n";
+    std::string display_name = sheet.name.empty()
+        ? ("Sheet " + std::to_string(sheet_num))
+        : sheet.name;
+    out << "## " << display_name << "\n\n";
 
     for (int r = 0; r < used_rows; ++r) {
         out << "|";
