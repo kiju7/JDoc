@@ -510,7 +510,7 @@ std::string RtfParser::to_markdown(const ConvertOptions& opts) {
             if (opts.extract_images)
                 text += "![" + filename + "](" + opts.image_ref_prefix + filename + ")\n\n";
             else
-                text += "![" + filename + "](embedded:" + filename + ")\n\n";
+                text += "![" + filename + "](" + filename + ")\n\n";
         }
     }
 

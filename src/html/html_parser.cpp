@@ -764,7 +764,7 @@ std::string HtmlParser::to_markdown(const ConvertOptions& opts) {
             if (opts.extract_images)
                 md += "![" + img.name + "](" + opts.image_ref_prefix + img.name + ")\n";
             else
-                md += "![" + img.name + "](embedded:" + img.name + ")\n";
+                md += "![" + img.name + "](" + img.name + "." + img.format + ")\n";
         }
     }
 

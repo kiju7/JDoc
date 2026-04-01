@@ -920,7 +920,7 @@ std::string XlsxParser::to_markdown(const ConvertOptions& opts) {
             if (opts.extract_images)
                 out << "![" << img.name << "](" << opts.image_ref_prefix << img.name << ")\n\n";
             else
-                out << "![" << img.name << "](embedded:" << img.name << ")\n\n";
+                out << "![" << img.name << "](" << img.name << "." << img.format << ")\n\n";
         }
     }
 

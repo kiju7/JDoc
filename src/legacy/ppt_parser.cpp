@@ -695,7 +695,7 @@ std::string PptParser::to_markdown(const ConvertOptions& opts) {
                 if (opts.extract_images)
                     md += "![" + filename + "](" + opts.image_ref_prefix + filename + ")\n\n";
                 else
-                    md += "![" + filename + "](embedded:" + filename + ")\n\n";
+                    md += "![" + filename + "](" + filename + ")\n\n";
             }
         }
     }
@@ -740,7 +740,7 @@ std::vector<PageChunk> PptParser::to_chunks(const ConvertOptions& opts) {
                 if (opts.extract_images)
                     slide_md += "![" + filename + "](" + opts.image_ref_prefix + filename + ")\n\n";
                 else
-                    slide_md += "![" + filename + "](embedded:" + filename + ")\n\n";
+                    slide_md += "![" + filename + "](" + filename + ")\n\n";
                 chunk.images.push_back(img);
             }
         }

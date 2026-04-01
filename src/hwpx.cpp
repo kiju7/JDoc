@@ -436,7 +436,7 @@ private:
                                 ? saved.saved_path.substr(slash + 1) : saved.saved_path;
                             para_text += "![" + saved.name + "](" + ref + ")";
                         } else {
-                            para_text += "![" + saved.name + "](embedded:" + saved.name + ")";
+                            para_text += "![" + saved.name + "](" + saved.name + "." + saved.format + ")";
                         }
                     }
                 }

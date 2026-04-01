@@ -5902,7 +5902,7 @@ std::string page_to_markdown(const std::vector<TextLine>& raw_lines,
     auto emit_insert = [&](const InlineInsert& ins) {
         if (ins.is_image) {
             auto& img = images[ins.idx];
-            std::string ref = "embedded:" + img.name;
+            std::string ref = img.name + "." + img.format;
             if (!img.saved_path.empty()) {
                 auto slash = img.saved_path.find_last_of('/');
                 ref = (slash != std::string::npos)
