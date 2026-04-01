@@ -132,7 +132,7 @@ inline std::string detect_image_format(const void* data, size_t size) {
     return "";
 }
 
-// Save image to disk. BMP is converted to PNG; other formats written as-is.
+// Save image to disk as-is (no format conversion).
 // Returns saved path, or empty string on failure.
 inline std::string save_image_to_file(const std::string& dir,
                                        const std::string& name,
@@ -141,26 +141,17 @@ inline std::string save_image_to_file(const std::string& dir,
     if (dir.empty() || !data || size == 0) return "";
     ensure_dir(dir);
 
-    // Use magic bytes when extension claims BMP but data disagrees
+    // Detect actual format from magic bytes when extension may be wrong
     std::string actual = format;
-    if (format == "bmp") {
-        std::string detected = detect_image_format(data, size);
-        if (!detected.empty() && detected != "bmp")
-            actual = detected;
-    }
+    std::string detected = detect_image_format(data, size);
+    if (!detected.empty()) actual = detected;
 
-    std::vector<char> png;
-    if (actual == "bmp")
-        png = bmp_to_png(data, size);
-
-    std::string ext = !png.empty() ? "png" : (actual == "jpeg" ? "jpg" : actual);
+    std::string ext = (actual == "jpeg") ? "jpg" : actual;
+    if (ext.empty()) ext = format.empty() ? "bin" : format;
     std::string path = dir + "/" + name + "." + ext;
     std::ofstream ofs(path, std::ios::binary);
     if (!ofs) return "";
-    if (!png.empty())
-        ofs.write(png.data(), png.size());
-    else
-        ofs.write(static_cast<const char*>(data), size);
+    ofs.write(static_cast<const char*>(data), size);
     return path;
 }
 

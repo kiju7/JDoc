@@ -1242,8 +1242,10 @@ private:
         idata.name = unified;
         idata.format = ext;
         idata.saved_path = saved_path;
-        idata.data.assign(reinterpret_cast<const char*>(image_data.data()),
-                          reinterpret_cast<const char*>(image_data.data()) + image_data.size());
+        if (opts_.image_output_dir.empty()) {
+            idata.data.assign(reinterpret_cast<const char*>(image_data.data()),
+                              reinterpret_cast<const char*>(image_data.data()) + image_data.size());
+        }
         chunk.images.push_back(std::move(idata));
 
         image_idx++;
