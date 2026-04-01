@@ -75,12 +75,12 @@ enum HWPTag : uint16_t {
     SHAPE_COMPONENT_ARC     = 0x51,
     SHAPE_COMPONENT_POLYGON = 0x52,
     SHAPE_COMPONENT_CURVE   = 0x53,
-    SHAPE_COMPONENT_OLE     = 0x55,
-    SHAPE_COMPONENT_PICTURE = 0x56,
-    SHAPE_COMPONENT_CONTAINER = 0x57,
-    CTRL_DATA               = 0x58,
-    EQEDIT                  = 0x59,
-    SHAPE_COMPONENT_TEXTART = 0x5B,
+    SHAPE_COMPONENT_OLE     = 0x54,
+    SHAPE_COMPONENT_PICTURE = 0x55,
+    SHAPE_COMPONENT_CONTAINER = 0x56,
+    CTRL_DATA               = 0x57,
+    EQEDIT                  = 0x58,
+    SHAPE_COMPONENT_TEXTART = 0x5A,
     MEMO_LIST               = 0x5D,
 };
 
