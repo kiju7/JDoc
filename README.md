@@ -89,19 +89,24 @@ opts.pages = [0, 1, 2]
 std::string md = jdoc::convert("input.pdf");
 std::string md = jdoc::convert("report.docx");
 
-// With options
+// Extract images to directory
 jdoc::ConvertOptions opts;
 opts.pages = {0, 1, 2};
 opts.extract_images = true;
-opts.image_output_dir = "./images";
+opts.image_output_dir = "./images";  // saved to files
 opts.min_image_size = 50;
 std::string md = jdoc::convert("input.pdf", opts);
 
-// Per-page chunks
-auto chunks = jdoc::convert_chunks("input.pdf");
+// Per-page chunks with images in memory
+opts.image_output_dir = "";  // empty = keep in memory only
+auto chunks = jdoc::convert_chunks("input.pdf", opts);
 for (auto& chunk : chunks) {
-    // chunk.text, chunk.images, chunk.tables
+    // chunk.text, chunk.tables
     // chunk.page_width, chunk.page_height, chunk.body_font_size
+    for (auto& img : chunk.images) {
+        // img.name, img.width, img.height, img.format
+        // img.data — JPEG/PNG encoded bytes
+    }
 }
 ```
 
