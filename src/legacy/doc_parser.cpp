@@ -407,6 +407,91 @@ static std::vector<PictureFcEntry> build_picture_fc_entries(
     return entries;
 }
 
+// ── CHPX bold FC range extraction (Word 97+) ────────────────────
+
+static constexpr uint16_t SPRM_C_FBOLD = 0x0835;
+
+struct BoldFcEntry { uint32_t fc_start, fc_end; };
+
+// Build sorted list of FC ranges where CHPX has sprmCFBold=1.
+static std::vector<BoldFcEntry> build_bold_fc_entries(
+    const std::vector<char>& word_doc,
+    const std::vector<char>& table_stream) {
+
+    std::vector<BoldFcEntry> entries;
+    if (word_doc.size() < 0x0102 || table_stream.empty()) return entries;
+
+    uint32_t fc_plcf = util::read_u32_le(word_doc.data() + 0x00FA);
+    uint32_t lcb_plcf = util::read_u32_le(word_doc.data() + 0x00FE);
+    if (fc_plcf == 0 || lcb_plcf < 12) return entries;
+    if (static_cast<size_t>(fc_plcf) + lcb_plcf > table_stream.size()) return entries;
+
+    uint32_t n = (lcb_plcf - 4) / 8;
+    if (n == 0 || n > 0xFFFF) return entries;
+
+    const char* plcf = table_stream.data() + fc_plcf;
+    const char* pns = plcf + (n + 1) * 4;
+
+    for (uint32_t i = 0; i < n; ++i) {
+        uint32_t pn = util::read_u32_le(pns + i * 4) & 0x003FFFFF;
+        size_t page_off = static_cast<size_t>(pn) * CHPX_PAGE_SIZE;
+        if (page_off + CHPX_PAGE_SIZE > word_doc.size()) continue;
+
+        const char* page = word_doc.data() + page_off;
+        uint8_t crun = static_cast<uint8_t>(page[CHPX_PAGE_SIZE - 1]);
+        if (crun == 0) continue;
+
+        size_t rgfc_end = static_cast<size_t>(crun + 1) * 4;
+        size_t rgb_off = rgfc_end;
+        if (rgb_off + crun > CHPX_PAGE_SIZE - 1) continue;
+
+        for (uint8_t r = 0; r < crun; ++r) {
+            uint8_t chpx_word_off = static_cast<uint8_t>(page[rgb_off + r]);
+            if (chpx_word_off == 0) continue;
+
+            size_t chpx_pos = static_cast<size_t>(chpx_word_off) * 2;
+            if (chpx_pos >= CHPX_PAGE_SIZE - 1) continue;
+
+            uint8_t cb = static_cast<uint8_t>(page[chpx_pos]);
+            if (cb == 0 || chpx_pos + 1 + cb > CHPX_PAGE_SIZE) continue;
+
+            const char* grpprl = page + chpx_pos + 1;
+            size_t pos = 0;
+            bool is_bold = false;
+
+            while (pos + 2 <= cb) {
+                uint16_t opcode = util::read_u16_le(grpprl + pos);
+                if (opcode == SPRM_C_FBOLD && pos + 3 <= cb) {
+                    is_bold = (static_cast<uint8_t>(grpprl[pos + 2]) != 0);
+                }
+                size_t sz = sprm_operand_size(opcode, grpprl + pos + 2, cb - pos - 2);
+                if (sz == 0) break;
+                pos += 2 + sz;
+            }
+
+            if (is_bold) {
+                uint32_t fc_start = util::read_u32_le(page + r * 4);
+                uint32_t fc_end = util::read_u32_le(page + (r + 1) * 4);
+                entries.push_back({fc_start, fc_end});
+            }
+        }
+    }
+
+    std::sort(entries.begin(), entries.end(),
+        [](const BoldFcEntry& a, const BoldFcEntry& b) {
+            return a.fc_start < b.fc_start;
+        });
+    return entries;
+}
+
+static bool is_bold_fc(const std::vector<BoldFcEntry>& entries, uint32_t fc) {
+    auto it = std::upper_bound(entries.begin(), entries.end(), fc,
+        [](uint32_t f, const BoldFcEntry& e) { return f < e.fc_start; });
+    if (it == entries.begin()) return false;
+    --it;
+    return fc < it->fc_end;
+}
+
 // ── PAPX paragraph property extraction (Word 97+) ───────────────
 
 static constexpr uint16_t SPRM_P_ILVL    = 0x260A;
@@ -776,6 +861,7 @@ std::string DocParser::extract_text_word8(const std::vector<char>& word_doc,
         data_stream = ole_.read_stream("Data");
     auto pic_entries = build_picture_fc_entries(word_doc, table_stream, data_stream);
     auto papx = build_papx_info(word_doc, table_stream);
+    auto bold_entries = build_bold_fc_entries(word_doc, table_stream);
     ListCounter list_counter;
     data_stream.clear();
     data_stream.shrink_to_fit();
@@ -794,6 +880,16 @@ std::string DocParser::extract_text_word8(const std::vector<char>& word_doc,
     };
 
     bool at_para_start = true; // first paragraph
+    bool in_bold = false;
+
+    // Helper: update bold state, emitting ** markers at transitions.
+    auto update_bold = [&](uint32_t fc) {
+        bool bold_now = is_bold_fc(bold_entries, fc);
+        if (bold_now != in_bold) {
+            result.append("**");
+            in_bold = bold_now;
+        }
+    };
 
     for (uint32_t i = 0; i < n; ++i) {
         uint32_t char_count = cps[i + 1] - cps[i];
@@ -823,6 +919,7 @@ std::string DocParser::extract_text_word8(const std::vector<char>& word_doc,
 
                 // DBCS lead byte check.
                 if (is_korean && util::is_cp949_lead(ch) && pos + 1 < end) {
+                    update_bold(fc_base + local_off);
                     uint8_t trail = static_cast<uint8_t>(word_doc[pos + 1]);
                     result += util::cp949_to_utf8(ch, trail);
                     pos += 2;
@@ -830,6 +927,7 @@ std::string DocParser::extract_text_word8(const std::vector<char>& word_doc,
                     continue;
                 }
                 if (is_japanese && util::is_cp932_lead(ch) && pos + 1 < end) {
+                    update_bold(fc_base + local_off);
                     uint8_t trail = static_cast<uint8_t>(word_doc[pos + 1]);
                     result += util::cp932_to_utf8(ch, trail);
                     pos += 2;
@@ -837,7 +935,10 @@ std::string DocParser::extract_text_word8(const std::vector<char>& word_doc,
                     continue;
                 }
 
-                if (ch == 0x0D || ch == 0x0A || ch == 0x07) at_para_start = true;
+                if (ch == 0x0D || ch == 0x0A || ch == 0x07) {
+                    if (in_bold) { result.append("**"); in_bold = false; }
+                    at_para_start = true;
+                }
 
                 // Cell mark: TTP = row end, else = cell separator.
                 if (ch == 0x07) {
@@ -866,6 +967,8 @@ std::string DocParser::extract_text_word8(const std::vector<char>& word_doc,
 
                 bool is_pic = (ch == 0x01) &&
                     is_picture_fc(pic_entries, fc_base + local_off);
+                if (ch >= 0x20 && !is_pic)
+                    update_bold(fc_base + local_off);
                 process_char(ch, result, is_pic);
                 pos++;
                 local_off++;
@@ -888,6 +991,7 @@ std::string DocParser::extract_text_word8(const std::vector<char>& word_doc,
                 if (ch >= 0xD800 && ch <= 0xDBFF && j + 1 < char_count) {
                     uint16_t low = util::read_u16_le(src + (j + 1) * 2);
                     if (low >= 0xDC00 && low <= 0xDFFF) {
+                        update_bold(fc_base + j * 2);
                         uint32_t cp = 0x10000
                             + ((static_cast<uint32_t>(ch - 0xD800) << 10)
                                | (low - 0xDC00));
@@ -897,7 +1001,10 @@ std::string DocParser::extract_text_word8(const std::vector<char>& word_doc,
                     }
                 }
 
-                if (ch == 0x0D || ch == 0x0A || ch == 0x07) at_para_start = true;
+                if (ch == 0x0D || ch == 0x0A || ch == 0x07) {
+                    if (in_bold) { result.append("**"); in_bold = false; }
+                    at_para_start = true;
+                }
                 if (!list_counter.has_korean && ch >= 0xAC00 && ch <= 0xD7A3)
                     list_counter.has_korean = true;
 
@@ -923,11 +1030,14 @@ std::string DocParser::extract_text_word8(const std::vector<char>& word_doc,
 
                 bool is_pic = (ch == 0x01) &&
                     is_picture_fc(pic_entries, fc_base + j * 2);
+                if (ch >= 0x20 && !is_pic)
+                    update_bold(fc_base + j * 2);
                 process_char(ch, result, is_pic);
             }
         }
     }
 
+    if (in_bold) result.append("**");
     return result;
 }
 
