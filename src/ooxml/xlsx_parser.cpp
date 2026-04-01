@@ -149,6 +149,20 @@ void XlsxParser::parse_styles() {
     pugi::xml_document doc;
     if (!doc.load_buffer(data.data(), data.size(), pugi::parse_default | pugi::parse_ws_pcdata)) return;
 
+    // Parse fonts: <fonts><font><b/> means bold
+    std::vector<pugi::xml_node> fonts_nodes;
+    xml_find_all(doc, "fonts", fonts_nodes);
+    if (!fonts_nodes.empty()) {
+        for (auto font = fonts_nodes[0].first_child(); font; font = font.next_sibling()) {
+            const char* fname = font.name();
+            const char* fcolon = strchr(fname, ':');
+            const char* flocal = fcolon ? fcolon + 1 : fname;
+            if (strcmp(flocal, "font") != 0) continue;
+            bool bold = xml_child(font, "b") ? true : false;
+            font_bold_.push_back(bold);
+        }
+    }
+
     // Parse custom number formats: <numFmts><numFmt numFmtId="..." formatCode="..."/>
     std::vector<pugi::xml_node> fmt_nodes;
     xml_find_all(doc, "numFmt", fmt_nodes);
@@ -160,7 +174,7 @@ void XlsxParser::parse_styles() {
         }
     }
 
-    // Parse cell formats: <cellXfs><xf numFmtId="..."/>
+    // Parse cell formats: <cellXfs><xf numFmtId="..." fontId="..."/>
     std::vector<pugi::xml_node> xf_nodes;
     xml_find_all(doc, "xf", xf_nodes);
 
@@ -179,6 +193,9 @@ void XlsxParser::parse_styles() {
 
             const char* fmt_id = xml_attr(xf, "numFmtId");
             xf_num_fmt_ids_.push_back(fmt_id[0] ? std::atoi(fmt_id) : 0);
+
+            const char* font_id = xml_attr(xf, "fontId");
+            xf_font_ids_.push_back(font_id[0] ? std::atoi(font_id) : 0);
         }
     }
 }
@@ -421,6 +438,15 @@ std::string XlsxParser::format_number(const std::string& raw_value,
     return raw_value;
 }
 
+bool XlsxParser::is_bold_style(int style_idx) const {
+    if (style_idx < 0 || style_idx >= static_cast<int>(xf_font_ids_.size()))
+        return false;
+    int font_id = xf_font_ids_[style_idx];
+    if (font_id < 0 || font_id >= static_cast<int>(font_bold_.size()))
+        return false;
+    return font_bold_[font_id];
+}
+
 // ── Cell reference parsing ──────────────────────────────
 
 int XlsxParser::column_to_index(const std::string& col) {
@@ -641,7 +667,8 @@ XlsxParser::SheetData XlsxParser::parse_sheet(const SheetInfo& info) {
                     if (ch == '|') ch = '/';
                     if (ch == '\n') ch = ' ';
                 }
-                sheet.cells[row][col] = value;
+                bool bold = is_bold_style(style_idx);
+                sheet.cells[row][col] = {value, bold};
                 sheet.max_row = std::max(sheet.max_row, row);
                 sheet.max_col = std::max(sheet.max_col, col);
             }
@@ -664,18 +691,22 @@ std::string XlsxParser::format_sheet_as_table(const SheetData& sheet,
 
     std::ostringstream out;
 
+    // Helper: look up cell value with bold markers applied.
+    auto get_cell = [&](int r, int c) -> std::string {
+        auto row_it = sheet.cells.find(r);
+        if (row_it == sheet.cells.end()) return "";
+        auto col_it = row_it->second.find(c);
+        if (col_it == row_it->second.end()) return "";
+        std::string val = col_it->second.value;
+        if (!val.empty() && col_it->second.bold)
+            val = "**" + val + "**";
+        return val;
+    };
+
     // Header row (row 0)
     out << "|";
     for (int c = 0; c < total_cols; ++c) {
-        auto row_it = sheet.cells.find(0);
-        std::string cell;
-        if (row_it != sheet.cells.end()) {
-            auto col_it = row_it->second.find(c);
-            if (col_it != row_it->second.end()) {
-                cell = col_it->second;
-            }
-        }
-        out << " " << cell << " |";
+        out << " " << get_cell(0, c) << " |";
     }
     out << "\n";
 
@@ -690,15 +721,7 @@ std::string XlsxParser::format_sheet_as_table(const SheetData& sheet,
     for (int r = 1; r < display_rows; ++r) {
         out << "|";
         for (int c = 0; c < total_cols; ++c) {
-            auto row_it = sheet.cells.find(r);
-            std::string cell;
-            if (row_it != sheet.cells.end()) {
-                auto col_it = row_it->second.find(c);
-                if (col_it != row_it->second.end()) {
-                    cell = col_it->second;
-                }
-            }
-            out << " " << cell << " |";
+            out << " " << get_cell(r, c) << " |";
         }
         out << "\n";
     }
@@ -959,7 +982,10 @@ std::vector<PageChunk> XlsxParser::to_chunks(
                         if (row_it != sheet.cells.end()) {
                             auto col_it = row_it->second.find(c);
                             if (col_it != row_it->second.end()) {
-                                row.push_back(col_it->second);
+                                std::string val = col_it->second.value;
+                                if (!val.empty() && col_it->second.bold)
+                                    val = "**" + val + "**";
+                                row.push_back(std::move(val));
                                 continue;
                             }
                         }

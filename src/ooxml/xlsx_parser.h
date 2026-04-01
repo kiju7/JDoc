@@ -36,6 +36,10 @@ private:
 
     // Number format: style index (xf) -> numFmtId
     std::vector<int> xf_num_fmt_ids_;
+    // Font index per xf entry (for bold/italic lookup)
+    std::vector<int> xf_font_ids_;
+    // Per-font bold flag
+    std::vector<bool> font_bold_;
     // Custom number formats: numFmtId -> formatCode
     std::map<int, std::string> custom_num_fmts_;
 
@@ -52,6 +56,9 @@ private:
     // Format a numeric cell value based on style index
     std::string format_number(const std::string& raw_value, int style_idx) const;
 
+    // Check if a style index references a bold font
+    bool is_bold_style(int style_idx) const;
+
     // Excel serial date -> "YYYY-MM-DD"
     static std::string serial_to_date(double serial);
     // Excel serial time -> "HH:MM:SS"
@@ -59,10 +66,15 @@ private:
     // Detect if a numFmtId is a date/time format
     static bool is_date_format(int fmt_id, const std::string& fmt_code);
 
+    struct CellInfo {
+        std::string value;
+        bool bold = false;
+    };
+
     struct SheetData {
         std::string name;
-        // Sparse grid: row -> col -> value
-        std::map<int, std::map<int, std::string>> cells;
+        // Sparse grid: row -> col -> cell
+        std::map<int, std::map<int, CellInfo>> cells;
         int max_row = 0;
         int max_col = 0;
     };
