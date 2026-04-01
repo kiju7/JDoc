@@ -1198,54 +1198,45 @@ private:
             }
         }
 
-        // Read raw OLE stream, decompress if needed, detect format
+        // Read raw OLE stream
         std::string stream_path = "BinData/" + entry->name;
         if (!ole_) return "";
 
         auto raw = ole_->read_stream(stream_path);
         if (raw.empty()) return "";
 
-        // Decompress if compressed (compress != 2 means compressed)
-        std::vector<uint8_t> image_data;
         bool compressed = true;
         if (bin_id > 0 && bin_id <= (int)doc_info_.bin_data_refs.size())
             compressed = doc_info_.bin_data_refs[bin_id - 1].compress != 2;
 
+        // Write image: decompress, detect format, BMP→PNG, save
+        util::ensure_dir(opts_.image_output_dir);
+
+        // Decompress if needed
+        std::vector<uint8_t> image_data;
         if (compressed) {
             image_data = decompress(
                 reinterpret_cast<const uint8_t*>(raw.data()), raw.size());
-            if (image_data.empty()) {
-                // Fallback: treat as uncompressed
-                image_data.assign(raw.begin(), raw.end());
-            }
+            if (image_data.empty())
+                image_data.assign(raw.begin(), raw.end()); // fallback: raw
         } else {
             image_data.assign(raw.begin(), raw.end());
         }
         raw.clear(); raw.shrink_to_fit();
 
-        // Detect actual format from magic bytes
+        // Detect actual format
         std::string actual_fmt = util::detect_image_format(
             image_data.data(), image_data.size());
         if (!actual_fmt.empty()) ext = actual_fmt;
 
-        // BMP → PNG conversion
-        std::vector<char> png_data;
-        if (ext == "bmp") {
-            png_data = util::bmp_to_png(image_data.data(), image_data.size());
-            if (!png_data.empty()) ext = "png";
-        }
+        // BMP stays as BMP (PNG conversion too costly for speed)
 
         filename = unified + "." + (ext == "jpeg" ? "jpg" : ext);
         std::string saved_path = opts_.image_output_dir + "/" + filename;
-        util::ensure_dir(opts_.image_output_dir);
-
         std::ofstream ofs(saved_path, std::ios::binary);
         if (!ofs) return "";
-        if (!png_data.empty())
-            ofs.write(png_data.data(), png_data.size());
-        else
-            ofs.write(reinterpret_cast<const char*>(image_data.data()),
-                      image_data.size());
+        ofs.write(reinterpret_cast<const char*>(image_data.data()),
+                  image_data.size());
         ofs.close();
 
         ImageData idata;
