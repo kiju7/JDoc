@@ -558,66 +558,86 @@ private:
     // ── Table processing ────────────────────────────────────
     std::string process_table(pugi::xml_node tbl,
                               int page_number = 1, int* p_image_idx = nullptr) {
-        std::vector<std::vector<std::string>> rows;
         std::vector<pugi::xml_node> table_pics;
 
+        int declared_rows = tbl.attribute("rowCnt").as_int(0);
         int declared_cols = tbl.attribute("colCnt").as_int(0);
+
+        // First pass: collect cells with their span info
+        struct CellInfo {
+            std::string text;
+            int col_span = 1;
+            int row_span = 1;
+        };
+        std::vector<std::vector<CellInfo>> raw_rows;
 
         for (auto tr : tbl.children()) {
             if (std::string(tr.name()) != "hp:tr") continue;
-
-            std::vector<std::string> row;
+            std::vector<CellInfo> row;
             for (auto tc : tr.children()) {
                 if (std::string(tc.name()) != "hp:tc") continue;
-
-                // Extract cell text from subList -> paragraphs
+                CellInfo ci;
                 std::string cell_text;
                 extract_cell_text(tc, cell_text, &table_pics);
-                row.push_back(util::escape_cell(cell_text));
-
-                // Handle colSpan: add empty cells for spanned columns
+                ci.text = util::escape_cell(cell_text);
                 auto span_node = tc.child("hp:cellSpan");
-                int col_span = span_node.attribute("colSpan").as_int(1);
-                for (int s = 1; s < col_span; s++) {
-                    row.push_back("");
+                ci.col_span = span_node.attribute("colSpan").as_int(1);
+                ci.row_span = span_node.attribute("rowSpan").as_int(1);
+                row.push_back(std::move(ci));
+            }
+            if (!row.empty()) raw_rows.push_back(std::move(row));
+        }
+
+        if (raw_rows.empty()) return "";
+
+        // Determine grid size
+        int num_rows = declared_rows > 0 ? declared_rows : (int)raw_rows.size();
+        int num_cols = declared_cols;
+        if (num_cols <= 0) {
+            for (auto& row : raw_rows) {
+                int w = 0;
+                for (auto& ci : row) w += ci.col_span;
+                if (w > num_cols) num_cols = w;
+            }
+        }
+        if (num_cols <= 0) num_cols = 1;
+
+        // Build grid with span tracking
+        std::vector<std::vector<std::string>> grid(num_rows,
+            std::vector<std::string>(num_cols));
+        // occupied[r][c] = true if cell is covered by a span from above/left
+        std::vector<std::vector<bool>> occupied(num_rows,
+            std::vector<bool>(num_cols, false));
+
+        for (int ri = 0; ri < (int)raw_rows.size() && ri < num_rows; ri++) {
+            int ci_idx = 0; // index into raw_rows[ri]
+            for (int c = 0; c < num_cols && ci_idx < (int)raw_rows[ri].size(); c++) {
+                if (occupied[ri][c]) continue;
+                auto& ci = raw_rows[ri][ci_idx++];
+                grid[ri][c] = ci.text;
+                // Mark spanned cells as occupied
+                for (int dr = 0; dr < ci.row_span && ri + dr < num_rows; dr++) {
+                    for (int dc = 0; dc < ci.col_span && c + dc < num_cols; dc++) {
+                        if (dr == 0 && dc == 0) continue;
+                        occupied[ri + dr][c + dc] = true;
+                    }
                 }
             }
-
-            if (!row.empty()) {
-                rows.push_back(std::move(row));
-            }
         }
 
-        if (rows.empty()) return "";
-
-        // Build markdown table
-        // Normalize column count (use declared colCnt or max actual)
-        size_t max_cols = declared_cols > 0 ? (size_t)declared_cols : 0;
-        for (auto& r : rows) max_cols = std::max(max_cols, r.size());
-        for (auto& r : rows) r.resize(max_cols, "");
-
+        // Render markdown table
         std::string md;
-        // Header row
-        md += "|";
-        for (auto& cell : rows[0]) {
-            md += " " + cell + " |";
-        }
-        md += "\n";
-
-        // Separator
-        md += "|";
-        for (size_t i = 0; i < max_cols; i++) {
-            md += " --- |";
-        }
-        md += "\n";
-
-        // Data rows
-        for (size_t i = 1; i < rows.size(); i++) {
+        for (int r = 0; r < num_rows; r++) {
             md += "|";
-            for (auto& cell : rows[i]) {
-                md += " " + cell + " |";
+            for (int c = 0; c < num_cols; c++) {
+                md += " " + grid[r][c] + " |";
             }
             md += "\n";
+            if (r == 0) {
+                md += "|";
+                for (int c = 0; c < num_cols; c++) md += " --- |";
+                md += "\n";
+            }
         }
 
         // Emit images found in table cells
