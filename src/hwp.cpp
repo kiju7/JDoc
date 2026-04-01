@@ -15,7 +15,7 @@
 #include <map>
 #include <sstream>
 #include <fstream>
-#include <iostream>
+
 #include <cstring>
 #include <memory>
 
@@ -322,9 +322,6 @@ private:
         hwp::FaceNameInfo fi;
         fi.id = doc_info_.face_names.size();
 
-        // Property byte at offset 0
-        // uint8_t property = data[0];
-
         // Name string: uint16 length (in chars), then UTF-16LE chars
         // Starting at offset 2
         size_t off = 2;
@@ -495,9 +492,6 @@ private:
 
         std::map<int, int> size_counts;
         int image_idx = 0;
-
-        // Track control index per paragraph for table/image matching
-        size_t ctrl_record_idx = 0;
 
         for (auto& para : paragraphs) {
             std::string para_md = format_paragraph(para, chunk, size_counts, image_idx);
@@ -788,10 +782,8 @@ private:
             }
             txt = util::trim(txt);
             if (!txt.empty()) {
-                if (!out.empty() && out.back() != '\x02') {
-                    // Add separator between paragraphs
-                    if (!out.empty()) out += ' ';
-                }
+                if (!out.empty() && out.back() != '\x02')
+                    out += ' ';
                 out += txt;
             }
         }
@@ -1346,10 +1338,6 @@ private:
             }
         }
 
-        text = util::trim(text);
-        if (text.empty()) return result;
-
-        while (!text.empty() && text.back() == '\n') text.pop_back();
         text = util::trim(text);
         if (text.empty()) return result;
 
