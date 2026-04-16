@@ -6,6 +6,10 @@
 #include <pybind11/stl.h>
 
 #include "jdoc/jdoc.h"
+#include "jdoc/pdf.h"
+#include "jdoc/office.h"
+#include "jdoc/hwp.h"
+#include "jdoc/hwpx.h"
 #include "common/file_utils.h"
 
 #include <cstring>
@@ -78,6 +82,7 @@ PYBIND11_MODULE(_jdoc, m) {
         .value("UNKNOWN", jdoc::DocFormat::UNKNOWN)
         .value("DOCX", jdoc::DocFormat::DOCX)
         .value("XLSX", jdoc::DocFormat::XLSX)
+        .value("XLSB", jdoc::DocFormat::XLSB)
         .value("PPTX", jdoc::DocFormat::PPTX)
         .value("DOC", jdoc::DocFormat::DOC)
         .value("XLS", jdoc::DocFormat::XLS)
