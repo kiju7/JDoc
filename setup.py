@@ -20,9 +20,11 @@ class CMakeBuild(build_ext):
         extdir = os.fspath(Path(self.get_ext_fullpath(ext.name)).parent.resolve())
         cfg = "Release"
 
+        import pybind11
         cmake_args = [
             f"-DCMAKE_LIBRARY_OUTPUT_DIRECTORY={extdir}",
             f"-DPYTHON_EXECUTABLE={sys.executable}",
+            f"-Dpybind11_DIR={pybind11.get_cmake_dir()}",
             f"-DCMAKE_BUILD_TYPE={cfg}",
             "-DBUILD_PYTHON=ON",
         ]
