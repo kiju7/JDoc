@@ -17,22 +17,27 @@ C++17 document-to-Markdown converter. No heavy dependencies — just zlib, libjp
 - **Page chunking** — per-page output with metadata for RAG pipelines
 - **Multiple APIs** — CLI, Python (pybind11), C, C++
 
-## Build
+## Install
+
+System deps (one-time, needed for both C++ and Python builds):
 
 ```bash
-# Install dependencies
-# Ubuntu/Debian: sudo apt install cmake build-essential zlib1g-dev libjpeg-dev
-# macOS:         brew install cmake libjpeg-turbo
-# RHEL/Fedora:   sudo dnf install cmake gcc-c++ zlib-devel libjpeg-turbo-devel
-
-mkdir build && cd build
-cmake .. -DCMAKE_BUILD_TYPE=Release
-cmake --build . --parallel
+# Ubuntu/Debian
+sudo apt install cmake build-essential zlib1g-dev libjpeg-dev
+# macOS
+brew install cmake libjpeg-turbo
+# RHEL/Fedora
+sudo dnf install cmake gcc-c++ zlib-devel libjpeg-turbo-devel
 ```
 
-Python:
+Then build:
+
 ```bash
-pip install pybind11 && pip install .
+# Python
+pip install .
+
+# C++
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j
 ```
 
 ## Usage
