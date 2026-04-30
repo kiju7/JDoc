@@ -2,6 +2,7 @@
 // jdoc - Shared data types for all document converters
 // License: MIT
 
+#include <cstdint>
 #include <string>
 #include <vector>
 
