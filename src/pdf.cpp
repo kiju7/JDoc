@@ -341,14 +341,23 @@ std::vector<uint8_t> decode_flate(const uint8_t* src, size_t src_len) {
     do {
         zs.next_out = buf;
         zs.avail_out = sizeof(buf);
+        uInt prev_in = zs.avail_in;
         ret = inflate(&zs, Z_NO_FLUSH);
-        if (ret == Z_STREAM_ERROR || ret == Z_DATA_ERROR || ret == Z_MEM_ERROR) {
+        size_t have = sizeof(buf) - zs.avail_out;
+        out.insert(out.end(), buf, buf + have);
+        if (ret == Z_STREAM_END) break;
+        if (ret == Z_STREAM_ERROR || ret == Z_DATA_ERROR || ret == Z_MEM_ERROR
+            || ret == Z_NEED_DICT) {
             inflateEnd(&zs);
             return out; // return partial
         }
-        size_t have = sizeof(buf) - zs.avail_out;
-        out.insert(out.end(), buf, buf + have);
-    } while (ret != Z_STREAM_END);
+        // Z_BUF_ERROR or Z_OK with no progress (e.g. truncated stream missing
+        // adler32 trailer) — bail out instead of looping forever.
+        if (have == 0 && zs.avail_in == prev_in) {
+            inflateEnd(&zs);
+            return out;
+        }
+    } while (true);
     inflateEnd(&zs);
     return out;
 }
@@ -934,6 +943,27 @@ void PdfDoc::rebuild_xref() {
                 trailer = lex.parse_object();
                 break;
             }
+        }
+    }
+
+    // If no trailer or trailer lacks /Root (e.g. file truncated past xref/trailer/%%EOF),
+    // synthesize one by scanning reconstructed objects for /Type /Catalog.
+    if (trailer.is_none() || !trailer.has("Root")) {
+        int catalog_num = -1, catalog_gen = 0;
+        for (auto& [num, entry] : xref) {
+            if (!entry.in_use || entry.offset <= 0) continue;
+            PdfObj obj = get_obj(num);
+            if (!obj.is_dict()) continue;
+            auto& t = obj.get("Type");
+            if (t.is_name() && t.str_val == "Catalog") {
+                catalog_num = num;
+                catalog_gen = entry.gen;
+                break;
+            }
+        }
+        if (catalog_num >= 0) {
+            if (trailer.is_none()) trailer = PdfObj::make_dict();
+            trailer.dict.push_back({"Root", PdfObj::make_ref(catalog_num, catalog_gen)});
         }
     }
 }
