@@ -4547,7 +4547,7 @@ std::vector<TableData> detect_text_tables_v2(const PageCharCache& cache,
     if (rows.size() < 3) return {};
 
     // multi-cell: at least one gap ≥ cell_merge_gap
-    double cell_merge_gap = std::max(median_fs * 1.2, 12.0);
+    double cell_merge_gap = std::max(median_fs * 0.8, 8.0);
     for (auto& r : rows) {
         r.is_multi_cell = row_is_multi_cell(r, cell_merge_gap);
     }
