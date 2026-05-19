@@ -3979,7 +3979,7 @@ static std::vector<double> infer_columns_in_band(
 
     double x_lo = band.x_min, x_hi = band.x_max;
     if (x_hi - x_lo < 30) return {};
-    double bin_w = std::max(median_fs * 0.3, 1.5);
+    double bin_w = std::max(median_fs * 0.15, 1.0);
     int n_bins = std::max(8, (int)std::ceil((x_hi - x_lo) / bin_w));
     bin_w = (x_hi - x_lo) / n_bins;
 
@@ -4009,7 +4009,7 @@ static std::vector<double> infer_columns_in_band(
     double empty_thresh_frac = 0.30;
     int empty_max = (int)std::floor(total_mc * empty_thresh_frac);
 
-    double col_gap_min = std::max(median_fs * 0.7, 7.0);
+    double col_gap_min = std::max(median_fs * 0.4, 3.0);
 
     // sweep for runs of empty bins inside [x_lo+, x_hi-]
     std::vector<std::pair<double,double>> empty_runs;   // (start_x, end_x)
@@ -4045,21 +4045,31 @@ static std::vector<double> infer_columns_in_band(
     }
     if (col_edges.empty()) return {};
 
-    // Validate: for each candidate boundary, ≥70% of multi-cell rows must have
-    // cell boundaries that "straddle" it (chars left of it and chars right of it).
+    // Validate: for each candidate boundary, ≥70% of multi-cell rows that
+    // overlap a neighborhood of the boundary must "straddle" it (chars on
+    // both sides). Rows that have no chars near the boundary are ignored — a
+    // row of body text on the opposite side of the page does not invalidate
+    // a column boundary inside a data table.
     std::vector<double> kept;
+    double neigh = std::max(median_fs * 6.0, 60.0);
     for (double e : col_edges) {
         int agree = 0;
+        int relevant = 0;
         for (size_t ri : mc) {
             bool has_left = false, has_right = false;
+            bool near = false;
             for (auto& cr : rows[ri].char_ranges) {
                 if (cr.second <= e) has_left = true;
                 else if (cr.first >= e) has_right = true;
-                if (has_left && has_right) break;
+                if (cr.first <= e + neigh && cr.second >= e - neigh) near = true;
+                if (has_left && has_right && near) break;
             }
+            if (!near) continue;
+            relevant++;
             if (has_left && has_right) agree++;
         }
-        if (agree >= (int)std::ceil(total_mc * 0.70)) kept.push_back(e);
+        int needed = std::max(2, (int)std::ceil(relevant * 0.70));
+        if (relevant >= 2 && agree >= needed) kept.push_back(e);
     }
     if (kept.empty()) return {};
 
@@ -4071,6 +4081,9 @@ static std::vector<double> infer_columns_in_band(
 }
 
 // S3: build the table from a band + columns.
+// For each row, snap each inner column boundary to the nearest natural gap
+// in that row (so we don't split words). Falls back to the global boundary if
+// no usable gap is nearby.
 static TableData build_table_from_band(
         const std::vector<TextRow>& rows, const YBand& band,
         const std::vector<double>& col_bounds,
@@ -4085,40 +4098,85 @@ static TableData build_table_from_band(
     table.y0 = band.y_bot;
     table.y1 = band.y_top;
 
+    double word_gap   = std::max(median_fs * 0.15, 1.2);
+    double snap_tol   = std::max(median_fs * 2.0, 15.0);
+    double min_split_gap = std::max(median_fs * 0.5, 4.0);
+
     for (size_t k = band.first_row; k <= band.last_row; k++) {
         const auto& tr = rows[k];
-        // gather chars sorted by x
+        // gather chars sorted by x (use char_indices into the per-page chars[])
         std::vector<size_t> ci = tr.char_indices;
         std::sort(ci.begin(), ci.end(), [&](size_t a, size_t b) {
             return chars[a].x < chars[b].x;
         });
 
-        // Place chars into columns. For each consecutive pair in same column,
-        // recover word-gap spaces if gap ≥ median_fs * 0.35.
+        // Find natural gap midpoints in this row (gaps between consecutive chars
+        // ≥ min_split_gap), used for snapping column boundaries.
+        std::vector<std::pair<double,double>> gap_runs;   // (gap_start, gap_end)
+        for (size_t i = 1; i < ci.size(); i++) {
+            double prev_r = chars[ci[i-1]].right;
+            double cur_l  = chars[ci[i]].left;
+            if (cur_l - prev_r >= min_split_gap) {
+                gap_runs.push_back({prev_r, cur_l});
+            }
+        }
+
+        // For each inner boundary, snap to nearest gap midpoint within snap_tol.
+        std::vector<double> row_bounds(col_bounds.size());
+        row_bounds.front() = col_bounds.front();
+        row_bounds.back()  = col_bounds.back();
+        for (int c = 1; c < (int)col_bounds.size() - 1; c++) {
+            double e = col_bounds[c];
+            double best = e;
+            double best_d = 1e9;
+            for (auto& g : gap_runs) {
+                double gm = (g.first + g.second) / 2.0;
+                double d = std::abs(gm - e);
+                if (d < best_d && d <= snap_tol) {
+                    best_d = d;
+                    best = gm;
+                }
+            }
+            row_bounds[c] = best;
+        }
+        // Ensure monotonic
+        for (int c = 1; c < (int)row_bounds.size(); c++) {
+            if (row_bounds[c] < row_bounds[c-1] + 0.1)
+                row_bounds[c] = row_bounds[c-1] + 0.1;
+        }
+
         std::vector<std::string> cells(n_cols);
         std::vector<double> last_right(n_cols, -1e9);
 
-        double word_gap = std::max(median_fs * 0.35, 2.5);
-
         for (size_t idx : ci) {
             const auto& ch = chars[idx];
-            double cx = ch.x;
-            // Assign to a column: by cx between col_bounds[c] and col_bounds[c+1]
+            double cmid = (ch.left + ch.right) / 2.0;
             int col = -1;
             for (int c = 0; c < n_cols; c++) {
-                if (cx >= col_bounds[c] - 1.0 && cx <= col_bounds[c+1] + 1.0) {
+                // Use strict less-than-or-equal on the right edge so chars that
+                // sit exactly on a column boundary fall into the LEFT column —
+                // this avoids the first letter of a word being pushed across
+                // the boundary in some rows when boundaries snap tightly.
+                double lo = row_bounds[c] - 0.5;
+                double hi = (c == n_cols - 1) ? row_bounds[c+1] + 1.0
+                                              : row_bounds[c+1];
+                if (cmid >= lo && cmid < hi) {
                     col = c;
                     break;
                 }
             }
-            if (col < 0) continue;
+            if (col < 0) {
+                // fall back: leftmost or rightmost
+                if (cmid < row_bounds.front()) col = 0;
+                else col = n_cols - 1;
+            }
             if (!cells[col].empty() && (ch.left - last_right[col]) >= word_gap)
                 cells[col] += ' ';
             util::append_utf8(cells[col], ch.unicode);
             last_right[col] = ch.right;
         }
 
-        // trim each cell
+        // trim
         for (auto& c : cells) {
             size_t s = c.find_first_not_of(" \t");
             size_t e = c.find_last_not_of(" \t");
@@ -4130,9 +4188,71 @@ static TableData build_table_from_band(
     return table;
 }
 
+// Strip leading/trailing prose columns: if the leftmost or rightmost column
+// has very long cells (avg > 40, many > 30 chars) while ≥2 other columns are
+// short numeric-style (avg < 12), drop the prose column. Body text alongside
+// a real table.
+static void strip_prose_columns(TableData& table) {
+    while (!table.rows.empty() && !table.rows[0].empty()) {
+        int n_cols = (int)table.rows[0].size();
+        if (n_cols < 3) return;
+        auto col_stats = [&](int c) -> std::tuple<double,int,int> {
+            double sum = 0;
+            int cnt = 0;
+            int long_n = 0;
+            int total_rows = (int)table.rows.size();
+            for (auto& row : table.rows) {
+                if (c >= (int)row.size()) continue;
+                if (row[c].empty()) continue;
+                sum += row[c].size();
+                cnt++;
+                if (row[c].size() > 30) long_n++;
+            }
+            double avg = cnt > 0 ? sum / cnt : 0.0;
+            return {avg, long_n, cnt > 0 ? (cnt * 100 / total_rows) : 0};
+        };
+
+        auto [avg_first, long_first, fill_first] = col_stats(0);
+        auto [avg_last, long_last, fill_last]    = col_stats(n_cols - 1);
+
+        // Strip a prose edge column iff it is significantly longer (avg > 2x)
+        // than any non-edge column, and contains many cells > 30 chars.
+        double max_other_avg = 0;
+        for (int c = 1; c < n_cols - 1; c++) {
+            auto [a, ln, fil] = col_stats(c);
+            if (a > max_other_avg) max_other_avg = a;
+        }
+        // also include the opposite edge
+        // (so we don't strip a "long left column" if right side is also long)
+        {
+            auto [a_opp, ln, fil] = col_stats(n_cols - 1);
+            // not used directly but kept for symmetry
+            (void)a_opp; (void)ln; (void)fil;
+        }
+
+        bool stripped = false;
+        // Left edge prose
+        if (avg_first > 35 && long_first >= 3 && fill_first >= 50 &&
+            max_other_avg > 0 && avg_first > max_other_avg * 1.8) {
+            for (auto& row : table.rows) if (!row.empty()) row.erase(row.begin());
+            stripped = true;
+        }
+        // Right edge prose (recompute n_cols if changed)
+        else if (avg_last > 35 && long_last >= 3 && fill_last >= 50 &&
+                 max_other_avg > 0 && avg_last > max_other_avg * 1.8) {
+            for (auto& row : table.rows) if (!row.empty()) row.pop_back();
+            stripped = true;
+        }
+        if (!stripped) break;
+    }
+}
+
 // S4: rejection / cleanup heuristics.
 // Returns true if the table is acceptable (kept).
 static bool accept_table(TableData& table) {
+    if (table.rows.empty()) return false;
+    // pre-step: strip body-text columns adjacent to the table
+    strip_prose_columns(table);
     if (table.rows.empty()) return false;
     int n_cols = (int)table.rows[0].size();
     if (n_cols < 2) return false;
@@ -4164,6 +4284,37 @@ static bool accept_table(TableData& table) {
         }
     }
     if ((int)table.rows.size() < 2) return false;
+
+    // Reject tables with too many empty cells (likely a degenerate band).
+    {
+        int total = 0, empty_n = 0;
+        for (auto& row : table.rows) {
+            for (auto& c : row) {
+                total++;
+                if (c.empty()) empty_n++;
+            }
+        }
+        if (total > 0 && empty_n > total * 0.65) return false;
+    }
+
+    // Reject tables where most cells consist only of non-ASCII junk characters.
+    {
+        int total = 0, junk = 0;
+        for (auto& row : table.rows) {
+            for (auto& c : row) {
+                if (c.empty()) continue;
+                total++;
+                int letters = 0, digits = 0;
+                for (char ch : c) {
+                    if ((ch >= 'a' && ch <= 'z') ||
+                        (ch >= 'A' && ch <= 'Z')) letters++;
+                    else if (ch >= '0' && ch <= '9') digits++;
+                }
+                if (letters + digits == 0) junk++;
+            }
+        }
+        if (total >= 4 && junk >= total * 0.4) return false;
+    }
 
     // --- list / prose rejection heuristics (mirrored from v1, tightened) ---
     auto is_lower_or_multibyte = [](unsigned char c) -> bool {
@@ -4203,12 +4354,20 @@ static bool accept_table(TableData& table) {
         int checked_rows = 0;
         int filler_cells = 0;
         int total_cells = 0;
+        int hyphen_end_cells = 0;
         for (auto& row : table.rows) {
             if ((int)row.size() < n_cols) continue;
             for (auto& cell : row) {
                 if (cell.empty()) continue;
                 total_cells++;
                 if (is_filler_only(cell)) filler_cells++;
+                // hyphen-wrap: cell ends with '-' preceded by a letter (text wrap)
+                if (cell.size() >= 2 && cell.back() == '-') {
+                    unsigned char prev = (unsigned char)cell[cell.size() - 2];
+                    if ((prev >= 'a' && prev <= 'z') ||
+                        (prev >= 'A' && prev <= 'Z') || prev >= 0x80)
+                        hyphen_end_cells++;
+                }
             }
             int pairs_checked = 0, pairs_continued = 0;
             for (int c = 0; c + 1 < n_cols; c++) {
@@ -4225,8 +4384,23 @@ static bool accept_table(TableData& table) {
         double ct = (n_cols == 2) ? 0.15 : 0.30;
         if (checked_rows >= 2 && continuation_rows >= checked_rows * ct)
             return false;
-        if (total_cells > 0 && filler_cells >= total_cells * 0.20)
+        if (total_cells > 0 && filler_cells >= total_cells * 0.35)
             return false;
+        // Hyphen-wrap rejection: prose tends to break words at line ends.
+        // Skip this when the table is clearly numeric (>= 30% cells have digits)
+        // so that real tables surrounded by prose aren't lost.
+        {
+            int has_digits = 0;
+            for (auto& row : table.rows)
+                for (auto& c : row) {
+                    if (c.empty()) continue;
+                    for (char ch : c) if (ch >= '0' && ch <= '9') { has_digits++; break; }
+                }
+            bool numeric_table = total_cells > 0 && has_digits >= total_cells * 0.30;
+            if (!numeric_table && total_cells >= 4 &&
+                hyphen_end_cells >= total_cells * 0.20)
+                return false;
+        }
     }
 
     // 2-column body-text heuristic
