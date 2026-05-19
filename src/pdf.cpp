@@ -3847,13 +3847,12 @@ std::vector<TableData> detect_tables(const std::vector<PdfLineSegment>& lines,
 //  S4. rejection: list-like, caption, continuation, numeric-cell ratio
 namespace text_tables {
 
-struct CharInfo { double x, y, left, right, top, bot; int idx; unsigned int unicode; };
+struct CharInfo { double x, y, left, right, top, bot; unsigned int unicode; };
 
 struct TextRow {
     double y_center;
     double y_top, y_bot;
     std::vector<std::pair<double,double>> char_ranges;   // per-char [left,right]
-    std::vector<std::pair<double,double>> spans;         // merged cell ranges
     std::vector<size_t> char_indices;                    // indices into chars
     double x_min, x_max;
     bool is_multi_cell;
@@ -3864,7 +3863,6 @@ struct YBand {
     size_t last_row;      // inclusive
     double y_top, y_bot;
     double x_min, x_max;
-    int multi_cell_count;
 };
 
 // helper: is a row "multi-cell" given a cell-merge gap (≥ gap → multi-cell)
@@ -3877,26 +3875,6 @@ static bool row_is_multi_cell(const TextRow& tr, double cell_merge_gap) {
             return true;
     }
     return false;
-}
-
-// Merge with a given gap to produce cell spans.
-static std::vector<std::pair<double,double>> merge_with_gap(
-        const std::vector<std::pair<double,double>>& ranges, double cell_gap) {
-    if (ranges.empty()) return {};
-    auto sorted = ranges;
-    std::sort(sorted.begin(), sorted.end());
-    std::vector<std::pair<double,double>> out;
-    auto cur = sorted[0];
-    for (size_t i = 1; i < sorted.size(); i++) {
-        if (sorted[i].first - cur.second < cell_gap) {
-            cur.second = std::max(cur.second, sorted[i].second);
-        } else {
-            out.push_back(cur);
-            cur = sorted[i];
-        }
-    }
-    out.push_back(cur);
-    return out;
 }
 
 // S1: find y-bands of consecutive multi-cell rows (with bounded 1-cell rows)
@@ -3945,7 +3923,6 @@ static std::vector<YBand> find_y_bands(const std::vector<TextRow>& rows) {
                 b.y_top = std::max(b.y_top, rows[k].y_top);
                 b.y_bot = std::min(b.y_bot, rows[k].y_bot);
             }
-            b.multi_cell_count = multi;
 
             // x extent from multi-cell rows in the band
             double xl = 1e18, xr = -1e18;
@@ -4176,13 +4153,7 @@ static TableData build_table_from_band(
             last_right[col] = ch.right;
         }
 
-        // trim
-        for (auto& c : cells) {
-            size_t s = c.find_first_not_of(" \t");
-            size_t e = c.find_last_not_of(" \t");
-            if (s != std::string::npos) c = c.substr(s, e - s + 1);
-            else c.clear();
-        }
+        for (auto& c : cells) c = util::trim(c);
         table.rows.push_back(std::move(cells));
     }
     return table;
@@ -4221,13 +4192,6 @@ static void strip_prose_columns(TableData& table) {
         for (int c = 1; c < n_cols - 1; c++) {
             auto [a, ln, fil] = col_stats(c);
             if (a > max_other_avg) max_other_avg = a;
-        }
-        // also include the opposite edge
-        // (so we don't strip a "long left column" if right side is also long)
-        {
-            auto [a_opp, ln, fil] = col_stats(n_cols - 1);
-            // not used directly but kept for symmetry
-            (void)a_opp; (void)ln; (void)fil;
         }
 
         bool stripped = false;
@@ -4483,12 +4447,11 @@ std::vector<TableData> detect_text_tables(const PageCharCache& cache,
 
     std::vector<CharInfo> chars;
     chars.reserve(cache.chars.size());
-    for (size_t i = 0; i < cache.chars.size(); i++) {
-        auto& ch = cache.chars[i];
+    for (auto& ch : cache.chars) {
         if (ch.unicode == ' ' || ch.unicode == '\t' || ch.unicode == 0xA0) continue;
         if (ch.x < 0 || ch.x > page_width || ch.y < 0 || ch.y > page_height) continue;
         chars.push_back({ch.x, ch.y, ch.left, ch.right, ch.top, ch.bot,
-                         (int)i, ch.unicode});
+                         ch.unicode});
     }
     if (chars.size() < 10) return {};
 
@@ -4520,6 +4483,14 @@ std::vector<TableData> detect_text_tables(const PageCharCache& cache,
         cur.y_bot = chars[0].bot;
         cur.char_ranges.push_back({chars[0].left, chars[0].right});
         cur.char_indices.push_back(0);
+        auto finalize_row = [](TextRow& r) {
+            r.x_min = 1e18;
+            r.x_max = -1e18;
+            for (auto& cr : r.char_ranges) {
+                if (cr.first < r.x_min) r.x_min = cr.first;
+                if (cr.second > r.x_max) r.x_max = cr.second;
+            }
+        };
         for (size_t i = 1; i < chars.size(); i++) {
             if (std::abs(chars[i].y - cur.y_center) < std::max(median_fs * 0.4, 3.0)) {
                 cur.char_ranges.push_back({chars[i].left, chars[i].right});
@@ -4530,12 +4501,7 @@ std::vector<TableData> detect_text_tables(const PageCharCache& cache,
                                 chars[i].y) / cur.char_ranges.size();
             } else {
                 if (!cur.char_ranges.empty()) {
-                    auto rgs = cur.char_ranges;
-                    cur.spans = merge_char_ranges(rgs);
-                    if (!cur.spans.empty()) {
-                        cur.x_min = cur.spans.front().first;
-                        cur.x_max = cur.spans.back().second;
-                    }
+                    finalize_row(cur);
                     rows.push_back(std::move(cur));
                 }
                 cur = TextRow();
@@ -4547,12 +4513,7 @@ std::vector<TableData> detect_text_tables(const PageCharCache& cache,
             }
         }
         if (!cur.char_ranges.empty()) {
-            auto rgs = cur.char_ranges;
-            cur.spans = merge_char_ranges(rgs);
-            if (!cur.spans.empty()) {
-                cur.x_min = cur.spans.front().first;
-                cur.x_max = cur.spans.back().second;
-            }
+            finalize_row(cur);
             rows.push_back(std::move(cur));
         }
     }
