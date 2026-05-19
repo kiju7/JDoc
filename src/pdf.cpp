@@ -4267,7 +4267,11 @@ static bool accept_table(TableData& table) {
         for (auto& c : row) if (!c.empty()) filled++;
         if (filled >= 2) meaningful++;
     }
-    int min_rows = (n_cols == 2) ? 4 : 2;
+    // Three rows is the minimum for a real multi-column table — anything
+    // smaller is almost always a stray body paragraph that happened to
+    // have a short token in a column-like position. (2-col tables stay at 4
+    // because key-value lists are easy to mistake otherwise.)
+    int min_rows = (n_cols == 2) ? 4 : 3;
     if (meaningful < min_rows) return false;
 
     // Merge continuation rows: row with a single filled cell in column c, after
