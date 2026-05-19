@@ -13,6 +13,7 @@
 #include <cassert>
 #include <cmath>
 #include <csetjmp>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <functional>
@@ -3836,6 +3837,584 @@ std::vector<TableData> detect_tables(const std::vector<PdfLineSegment>& lines,
 
 // ── Pure text-based table detection ──────────────────────
 
+// ─── v2 (column-first) ──────────────────────────────────────────────
+// Gated behind JDOC_TABLE_V2=1.
+//
+// Algorithm overview (see bench/TABLE_DETECTION_REDESIGN.md):
+//  S1. group chars into rows; find "y-bands" = runs of multi-cell rows
+//      (allow 1-cell rows interleaved; split when ≥N consecutive 1-cell rows)
+//  S2. inside each band, build an x histogram of char ranges from multi-cell
+//      rows; locate consecutive bins that are empty in ≥70% of those rows
+//      and wider than max(median_fs*0.7, 7.0) → column boundary
+//  S3. assign chars of each row to columns; word-gap based space recovery
+//  S4. rejection: list-like, caption, continuation, numeric-cell ratio
+namespace v2 {
+
+struct CharInfo { double x, y, left, right, top, bot; int idx; unsigned int unicode; };
+
+struct TextRow {
+    double y_center;
+    double y_top, y_bot;
+    std::vector<std::pair<double,double>> char_ranges;   // per-char [left,right]
+    std::vector<std::pair<double,double>> spans;         // merged cell ranges
+    std::vector<size_t> char_indices;                    // indices into chars
+    double x_min, x_max;
+    bool is_multi_cell;
+};
+
+struct YBand {
+    size_t first_row;     // inclusive
+    size_t last_row;      // inclusive
+    double y_top, y_bot;
+    double x_min, x_max;
+    int multi_cell_count;
+};
+
+// helper: is a row "multi-cell" given a cell-merge gap (≥ gap → multi-cell)
+static bool row_is_multi_cell(const TextRow& tr, double cell_merge_gap) {
+    if (tr.char_ranges.size() < 2) return false;
+    auto sorted = tr.char_ranges;
+    std::sort(sorted.begin(), sorted.end());
+    for (size_t i = 1; i < sorted.size(); i++) {
+        if (sorted[i].first - sorted[i-1].second >= cell_merge_gap)
+            return true;
+    }
+    return false;
+}
+
+// Merge with a given gap to produce cell spans.
+static std::vector<std::pair<double,double>> merge_with_gap(
+        const std::vector<std::pair<double,double>>& ranges, double cell_gap) {
+    if (ranges.empty()) return {};
+    auto sorted = ranges;
+    std::sort(sorted.begin(), sorted.end());
+    std::vector<std::pair<double,double>> out;
+    auto cur = sorted[0];
+    for (size_t i = 1; i < sorted.size(); i++) {
+        if (sorted[i].first - cur.second < cell_gap) {
+            cur.second = std::max(cur.second, sorted[i].second);
+        } else {
+            out.push_back(cur);
+            cur = sorted[i];
+        }
+    }
+    out.push_back(cur);
+    return out;
+}
+
+// S1: find y-bands of consecutive multi-cell rows (with bounded 1-cell rows)
+static std::vector<YBand> find_y_bands(const std::vector<TextRow>& rows) {
+    std::vector<YBand> bands;
+    const int kMaxSingleRunInside = 2;   // ≥3 consecutive 1-cell rows splits a band
+
+    size_t i = 0;
+    while (i < rows.size()) {
+        // find next multi-cell row
+        while (i < rows.size() && !rows[i].is_multi_cell) i++;
+        if (i >= rows.size()) break;
+
+        size_t band_start = i;
+        size_t band_end = i;          // last multi-cell row in band
+        int multi = 1;
+        int single_run = 0;
+        size_t j = i + 1;
+        while (j < rows.size()) {
+            // y-gap sanity: if the row is too far below the previous tracked row, stop
+            const auto& prev = rows[(band_end > i) ? band_end : i];
+            double vgap = std::abs(prev.y_bot - rows[j].y_top);
+            // Use the typical line spacing as a guard; allow up to 3x font-size
+            double fs_guard = std::max(prev.y_top - prev.y_bot, 8.0) * 3.5;
+            if (vgap > fs_guard) break;
+
+            if (rows[j].is_multi_cell) {
+                band_end = j;
+                multi++;
+                single_run = 0;
+            } else {
+                single_run++;
+                if (single_run > kMaxSingleRunInside) break;
+            }
+            j++;
+        }
+
+        if (multi >= 2) {
+            YBand b;
+            b.first_row = band_start;
+            b.last_row  = band_end;
+            b.y_top = rows[band_start].y_top;
+            b.y_bot = rows[band_end].y_bot;
+            // include any 1-cell rows that sit between band_start and band_end
+            for (size_t k = band_start; k <= band_end; k++) {
+                b.y_top = std::max(b.y_top, rows[k].y_top);
+                b.y_bot = std::min(b.y_bot, rows[k].y_bot);
+            }
+            b.multi_cell_count = multi;
+
+            // x extent from multi-cell rows in the band
+            double xl = 1e18, xr = -1e18;
+            for (size_t k = band_start; k <= band_end; k++) {
+                if (!rows[k].is_multi_cell) continue;
+                xl = std::min(xl, rows[k].x_min);
+                xr = std::max(xr, rows[k].x_max);
+            }
+            b.x_min = xl;
+            b.x_max = xr;
+            bands.push_back(b);
+        }
+        i = (band_end >= i) ? (band_end + 1) : (i + 1);
+    }
+    return bands;
+}
+
+// S2: column boundaries inside a band by x-bin histogram of multi-cell rows.
+//   Returns boundaries (left, inner col-edges, right) — empty on failure.
+static std::vector<double> infer_columns_in_band(
+        const std::vector<TextRow>& rows, const YBand& band,
+        double median_fs) {
+    // Collect multi-cell rows in the band
+    std::vector<size_t> mc;
+    for (size_t k = band.first_row; k <= band.last_row; k++)
+        if (rows[k].is_multi_cell) mc.push_back(k);
+    if (mc.size() < 2) return {};
+
+    double x_lo = band.x_min, x_hi = band.x_max;
+    if (x_hi - x_lo < 30) return {};
+    double bin_w = std::max(median_fs * 0.3, 1.5);
+    int n_bins = std::max(8, (int)std::ceil((x_hi - x_lo) / bin_w));
+    bin_w = (x_hi - x_lo) / n_bins;
+
+    // hit_count[b] = number of multi-cell rows that have a char overlapping bin b
+    std::vector<int> hit_count(n_bins, 0);
+
+    auto bin_idx = [&](double x) -> int {
+        int b = (int)std::floor((x - x_lo) / bin_w);
+        if (b < 0) b = 0;
+        if (b >= n_bins) b = n_bins - 1;
+        return b;
+    };
+
+    for (size_t ri : mc) {
+        // mark bins covered by any char range in this row
+        std::vector<bool> row_hit(n_bins, false);
+        for (auto& cr : rows[ri].char_ranges) {
+            int b0 = bin_idx(cr.first);
+            int b1 = bin_idx(cr.second);
+            for (int b = b0; b <= b1; b++) row_hit[b] = true;
+        }
+        for (int b = 0; b < n_bins; b++) if (row_hit[b]) hit_count[b]++;
+    }
+
+    int total_mc = (int)mc.size();
+    // empty bin: ≤ 30% of multi-cell rows have a char there
+    double empty_thresh_frac = 0.30;
+    int empty_max = (int)std::floor(total_mc * empty_thresh_frac);
+
+    double col_gap_min = std::max(median_fs * 0.7, 7.0);
+
+    // sweep for runs of empty bins inside [x_lo+, x_hi-]
+    std::vector<std::pair<double,double>> empty_runs;   // (start_x, end_x)
+    int run_start = -1;
+    for (int b = 0; b < n_bins; b++) {
+        bool is_empty = hit_count[b] <= empty_max;
+        if (is_empty) {
+            if (run_start < 0) run_start = b;
+        } else {
+            if (run_start >= 0) {
+                double sx = x_lo + run_start * bin_w;
+                double ex = x_lo + b * bin_w;
+                empty_runs.push_back({sx, ex});
+                run_start = -1;
+            }
+        }
+    }
+    if (run_start >= 0) {
+        double sx = x_lo + run_start * bin_w;
+        double ex = x_lo + n_bins * bin_w;
+        empty_runs.push_back({sx, ex});
+    }
+
+    std::vector<double> col_edges;
+    for (auto& run : empty_runs) {
+        double width = run.second - run.first;
+        if (width < col_gap_min) continue;
+        double mid = (run.first + run.second) / 2.0;
+        // skip runs hugging the band edges (those are just margins)
+        if (mid <= x_lo + 2.0) continue;
+        if (mid >= x_hi - 2.0) continue;
+        col_edges.push_back(mid);
+    }
+    if (col_edges.empty()) return {};
+
+    // Validate: for each candidate boundary, ≥70% of multi-cell rows must have
+    // cell boundaries that "straddle" it (chars left of it and chars right of it).
+    std::vector<double> kept;
+    for (double e : col_edges) {
+        int agree = 0;
+        for (size_t ri : mc) {
+            bool has_left = false, has_right = false;
+            for (auto& cr : rows[ri].char_ranges) {
+                if (cr.second <= e) has_left = true;
+                else if (cr.first >= e) has_right = true;
+                if (has_left && has_right) break;
+            }
+            if (has_left && has_right) agree++;
+        }
+        if (agree >= (int)std::ceil(total_mc * 0.70)) kept.push_back(e);
+    }
+    if (kept.empty()) return {};
+
+    std::vector<double> bounds;
+    bounds.push_back(x_lo);
+    for (double e : kept) bounds.push_back(e);
+    bounds.push_back(x_hi);
+    return bounds;
+}
+
+// S3: build the table from a band + columns.
+static TableData build_table_from_band(
+        const std::vector<TextRow>& rows, const YBand& band,
+        const std::vector<double>& col_bounds,
+        const std::vector<CharInfo>& chars,
+        double median_fs) {
+    TableData table;
+    int n_cols = (int)col_bounds.size() - 1;
+    if (n_cols < 2) return table;
+
+    table.x0 = col_bounds.front();
+    table.x1 = col_bounds.back();
+    table.y0 = band.y_bot;
+    table.y1 = band.y_top;
+
+    for (size_t k = band.first_row; k <= band.last_row; k++) {
+        const auto& tr = rows[k];
+        // gather chars sorted by x
+        std::vector<size_t> ci = tr.char_indices;
+        std::sort(ci.begin(), ci.end(), [&](size_t a, size_t b) {
+            return chars[a].x < chars[b].x;
+        });
+
+        // Place chars into columns. For each consecutive pair in same column,
+        // recover word-gap spaces if gap ≥ median_fs * 0.35.
+        std::vector<std::string> cells(n_cols);
+        std::vector<double> last_right(n_cols, -1e9);
+
+        double word_gap = std::max(median_fs * 0.35, 2.5);
+
+        for (size_t idx : ci) {
+            const auto& ch = chars[idx];
+            double cx = ch.x;
+            // Assign to a column: by cx between col_bounds[c] and col_bounds[c+1]
+            int col = -1;
+            for (int c = 0; c < n_cols; c++) {
+                if (cx >= col_bounds[c] - 1.0 && cx <= col_bounds[c+1] + 1.0) {
+                    col = c;
+                    break;
+                }
+            }
+            if (col < 0) continue;
+            if (!cells[col].empty() && (ch.left - last_right[col]) >= word_gap)
+                cells[col] += ' ';
+            util::append_utf8(cells[col], ch.unicode);
+            last_right[col] = ch.right;
+        }
+
+        // trim each cell
+        for (auto& c : cells) {
+            size_t s = c.find_first_not_of(" \t");
+            size_t e = c.find_last_not_of(" \t");
+            if (s != std::string::npos) c = c.substr(s, e - s + 1);
+            else c.clear();
+        }
+        table.rows.push_back(std::move(cells));
+    }
+    return table;
+}
+
+// S4: rejection / cleanup heuristics.
+// Returns true if the table is acceptable (kept).
+static bool accept_table(TableData& table) {
+    if (table.rows.empty()) return false;
+    int n_cols = (int)table.rows[0].size();
+    if (n_cols < 2) return false;
+
+    // count rows with ≥2 filled cells
+    int meaningful = 0;
+    for (auto& row : table.rows) {
+        int filled = 0;
+        for (auto& c : row) if (!c.empty()) filled++;
+        if (filled >= 2) meaningful++;
+    }
+    int min_rows = (n_cols == 2) ? 4 : 2;
+    if (meaningful < min_rows) return false;
+
+    // Merge continuation rows: row with a single filled cell in column c, after
+    // a row whose column c was already filled → join with " " in same cell.
+    for (size_t r = 1; r < table.rows.size(); r++) {
+        int filled = 0;
+        int filled_col = -1;
+        for (int c = 0; c < n_cols; c++) {
+            if (!table.rows[r][c].empty()) { filled++; filled_col = c; }
+        }
+        if (filled == 1 && filled_col >= 0 && r > 0 &&
+            !table.rows[r-1][filled_col].empty()) {
+            table.rows[r-1][filled_col] += " ";
+            table.rows[r-1][filled_col] += table.rows[r][filled_col];
+            table.rows.erase(table.rows.begin() + r);
+            r--;
+        }
+    }
+    if ((int)table.rows.size() < 2) return false;
+
+    // --- list / prose rejection heuristics (mirrored from v1, tightened) ---
+    auto is_lower_or_multibyte = [](unsigned char c) -> bool {
+        return (c >= 'a' && c <= 'z') || c >= 0x80;
+    };
+    auto is_filler_only = [](const std::string& s) -> bool {
+        for (char c : s)
+            if (c != '.' && c != ',' && c != ' ' && c != '\t' &&
+                c != ';' && c != ':' && c != '-')
+                return false;
+        return !s.empty();
+    };
+
+    // numbered-list detection (1) 2) 3) etc)
+    {
+        int marker_rows = 0, content_rows = 0;
+        for (auto& row : table.rows) {
+            bool has_content = false;
+            for (auto& c : row) if (!c.empty()) { has_content = true; break; }
+            if (!has_content) continue;
+            content_rows++;
+            std::string first;
+            for (auto& c : row) if (!c.empty()) { first = c; break; }
+            if (!first.empty() && first[0] >= '0' && first[0] <= '9') {
+                for (size_t k = 1; k < first.size() && k < 4; k++) {
+                    if (first[k] == ')') { marker_rows++; break; }
+                    if (first[k] < '0' || first[k] > '9') break;
+                }
+            }
+        }
+        if (content_rows >= 2 && marker_rows >= content_rows * 0.6) return false;
+    }
+
+    // continuation rows (lower-letter ↔ lower-letter across column boundary)
+    {
+        int continuation_rows = 0;
+        int checked_rows = 0;
+        int filler_cells = 0;
+        int total_cells = 0;
+        for (auto& row : table.rows) {
+            if ((int)row.size() < n_cols) continue;
+            for (auto& cell : row) {
+                if (cell.empty()) continue;
+                total_cells++;
+                if (is_filler_only(cell)) filler_cells++;
+            }
+            int pairs_checked = 0, pairs_continued = 0;
+            for (int c = 0; c + 1 < n_cols; c++) {
+                if (row[c].empty() || row[c+1].empty()) continue;
+                pairs_checked++;
+                if (is_lower_or_multibyte((unsigned char)row[c].back()) &&
+                    is_lower_or_multibyte((unsigned char)row[c+1][0]))
+                    pairs_continued++;
+            }
+            if (pairs_checked > 0 && pairs_continued > pairs_checked / 2)
+                continuation_rows++;
+            checked_rows++;
+        }
+        double ct = (n_cols == 2) ? 0.15 : 0.30;
+        if (checked_rows >= 2 && continuation_rows >= checked_rows * ct)
+            return false;
+        if (total_cells > 0 && filler_cells >= total_cells * 0.20)
+            return false;
+    }
+
+    // 2-column body-text heuristic
+    if (n_cols <= 3) {
+        int total_rows = 0;
+        double sum_first = 0, sum_second = 0;
+        int unbalanced = 0;
+        for (auto& row : table.rows) {
+            if (row.empty() || row[0].empty()) continue;
+            total_rows++;
+            sum_first += row[0].size();
+            if (n_cols >= 2 && row.size() >= 2) sum_second += row[1].size();
+            if (n_cols == 2 && row.size() >= 2 && !row[1].empty() &&
+                row[0].size() > row[1].size() * 5) unbalanced++;
+        }
+        if (total_rows >= 3) {
+            double avg_first = sum_first / total_rows;
+            double avg_second = (n_cols >= 2) ? sum_second / total_rows : 0;
+            if (avg_first > 30 && avg_second > 0 && avg_first > avg_second * 2.5)
+                return false;
+            if (n_cols == 2 && avg_first > 30 && avg_second > 30)
+                return false;
+            if (unbalanced >= total_rows * 0.4) return false;
+        }
+    }
+
+    // --- S5: numeric-cell ratio sanity check for narrow tables ---
+    // If table has very few "tabular" cues (numbers, short tokens), reject.
+    {
+        int data_cells = 0;
+        int numeric_cells = 0;
+        int short_cells = 0;
+        for (auto& row : table.rows) {
+            for (auto& c : row) {
+                if (c.empty()) continue;
+                data_cells++;
+                bool has_digit = false;
+                for (char ch : c) {
+                    if (ch >= '0' && ch <= '9') { has_digit = true; break; }
+                }
+                if (has_digit) numeric_cells++;
+                if (c.size() <= 8) short_cells++;
+            }
+        }
+        // require some tabularity for tables that are mostly text
+        if (data_cells >= 6 && numeric_cells == 0 && n_cols >= 2) {
+            // Look at column 0 specifically — is the rest of the row mostly free of
+            // numbers? If so and the cells are long, this is likely prose.
+            int long_cells = 0;
+            for (auto& row : table.rows)
+                for (auto& c : row) if (c.size() > 30) long_cells++;
+            if (long_cells >= data_cells * 0.3) return false;
+        }
+    }
+
+    trim_table(table);
+    if (table.rows.empty()) return false;
+    return true;
+}
+
+} // namespace v2
+
+std::vector<TableData> detect_text_tables_v2(const PageCharCache& cache,
+                                              const std::vector<TableData>& existing_tables,
+                                              double page_width, double page_height) {
+    using namespace v2;
+    if (cache.chars.size() < 10) return {};
+
+    std::vector<CharInfo> chars;
+    chars.reserve(cache.chars.size());
+    for (size_t i = 0; i < cache.chars.size(); i++) {
+        auto& ch = cache.chars[i];
+        if (ch.unicode == ' ' || ch.unicode == '\t' || ch.unicode == 0xA0) continue;
+        if (ch.x < 0 || ch.x > page_width || ch.y < 0 || ch.y > page_height) continue;
+        chars.push_back({ch.x, ch.y, ch.left, ch.right, ch.top, ch.bot,
+                         (int)i, ch.unicode});
+    }
+    if (chars.size() < 10) return {};
+
+    // sort top-to-bottom (y descending in PDF coords)
+    std::sort(chars.begin(), chars.end(), [](const CharInfo& a, const CharInfo& b) {
+        return a.y > b.y;
+    });
+
+    // median font size (top-bot)
+    std::vector<double> fsizes;
+    fsizes.reserve(chars.size());
+    for (auto& ch : chars) {
+        double h = ch.top - ch.bot;
+        if (h > 0) fsizes.push_back(h);
+    }
+    double median_fs = 10.0;
+    if (!fsizes.empty()) {
+        std::nth_element(fsizes.begin(), fsizes.begin() + fsizes.size() / 2,
+                         fsizes.end());
+        median_fs = fsizes[fsizes.size() / 2];
+    }
+
+    // build TextRows
+    std::vector<TextRow> rows;
+    {
+        TextRow cur;
+        cur.y_center = chars[0].y;
+        cur.y_top = chars[0].top;
+        cur.y_bot = chars[0].bot;
+        cur.char_ranges.push_back({chars[0].left, chars[0].right});
+        cur.char_indices.push_back(0);
+        for (size_t i = 1; i < chars.size(); i++) {
+            if (std::abs(chars[i].y - cur.y_center) < std::max(median_fs * 0.4, 3.0)) {
+                cur.char_ranges.push_back({chars[i].left, chars[i].right});
+                cur.char_indices.push_back(i);
+                cur.y_top = std::max(cur.y_top, chars[i].top);
+                cur.y_bot = std::min(cur.y_bot, chars[i].bot);
+                cur.y_center = (cur.y_center * (cur.char_ranges.size() - 1) +
+                                chars[i].y) / cur.char_ranges.size();
+            } else {
+                if (!cur.char_ranges.empty()) {
+                    auto rgs = cur.char_ranges;
+                    cur.spans = merge_char_ranges(rgs);
+                    if (!cur.spans.empty()) {
+                        cur.x_min = cur.spans.front().first;
+                        cur.x_max = cur.spans.back().second;
+                    }
+                    rows.push_back(std::move(cur));
+                }
+                cur = TextRow();
+                cur.y_center = chars[i].y;
+                cur.y_top = chars[i].top;
+                cur.y_bot = chars[i].bot;
+                cur.char_ranges.push_back({chars[i].left, chars[i].right});
+                cur.char_indices.push_back(i);
+            }
+        }
+        if (!cur.char_ranges.empty()) {
+            auto rgs = cur.char_ranges;
+            cur.spans = merge_char_ranges(rgs);
+            if (!cur.spans.empty()) {
+                cur.x_min = cur.spans.front().first;
+                cur.x_max = cur.spans.back().second;
+            }
+            rows.push_back(std::move(cur));
+        }
+    }
+    if (rows.size() < 3) return {};
+
+    // multi-cell: at least one gap ≥ cell_merge_gap
+    double cell_merge_gap = std::max(median_fs * 1.2, 12.0);
+    for (auto& r : rows) {
+        r.is_multi_cell = row_is_multi_cell(r, cell_merge_gap);
+    }
+
+    // drop rows entirely inside an existing line-based table
+    auto row_in_existing = [&](const TextRow& r) {
+        for (auto& t : existing_tables) {
+            double tb = std::min(t.y0, t.y1) - 5.0;
+            double tt = std::max(t.y0, t.y1) + 5.0;
+            if (r.y_center >= tb && r.y_center <= tt) return true;
+        }
+        return false;
+    };
+    for (auto& r : rows) {
+        if (row_in_existing(r)) {
+            r.is_multi_cell = false;
+        }
+    }
+
+    // S1: find y-bands
+    auto bands = find_y_bands(rows);
+    if (bands.empty()) return {};
+
+    std::vector<TableData> result;
+    for (auto& band : bands) {
+        // S2: infer columns
+        auto bounds = infer_columns_in_band(rows, band, median_fs);
+        if (bounds.size() < 3) continue;        // need ≥1 inner boundary
+
+        // S3: build cells
+        TableData table = build_table_from_band(rows, band, bounds, chars,
+                                                median_fs);
+
+        // S4-S5: rejection
+        if (!accept_table(table)) continue;
+
+        result.push_back(std::move(table));
+    }
+    return result;
+}
+
 std::vector<TableData> detect_text_tables(const PageCharCache& cache,
                                            const std::vector<TableData>& existing_tables,
                                            double page_width, double page_height,
@@ -6487,9 +7066,12 @@ ExtractResult extract_pdf(const std::string& pdf_path, const ConvertOptions& opt
             result.all_tables[p] = detect_tables(parse_result.segments, cache,
                 page_w, page_h);
             int line_table_count = (int)result.all_tables[p].size();
-            auto text_tables = detect_text_tables(cache,
-                result.all_tables[p], page_w, page_h,
-                result.col_boundaries[p]);
+            const char* v2_env = std::getenv("JDOC_TABLE_V2");
+            bool use_v2 = (v2_env && v2_env[0] == '1');
+            auto text_tables = use_v2
+                ? detect_text_tables_v2(cache, result.all_tables[p], page_w, page_h)
+                : detect_text_tables(cache, result.all_tables[p], page_w, page_h,
+                    result.col_boundaries[p]);
             for (auto& tt : text_tables)
                 result.all_tables[p].push_back(std::move(tt));
             (void)line_table_count; // for debugging
