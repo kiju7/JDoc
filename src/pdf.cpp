@@ -2379,6 +2379,7 @@ struct PageCharCache {
     struct CharInfo {
         double x, y;
         double left, right, top, bot;
+        double font_size;
         unsigned int unicode;
     };
     std::vector<CharInfo> chars;
@@ -2388,7 +2389,7 @@ struct PageCharCache {
         chars.reserve(text_chars.size());
         for (auto& tc : text_chars) {
             if (tc.unicode == 0 || tc.unicode == '\r' || tc.unicode == '\n' || tc.unicode == 0xFFFD) continue;
-            chars.push_back({tc.x, tc.y, tc.left, tc.right, tc.top, tc.bot, tc.unicode});
+            chars.push_back({tc.x, tc.y, tc.left, tc.right, tc.top, tc.bot, tc.font_size, tc.unicode});
         }
         y_sorted.resize(chars.size());
         for (size_t i = 0; i < chars.size(); i++) y_sorted[i] = i;
@@ -2404,20 +2405,60 @@ struct PageCharCache {
             [this](size_t idx, double val) { return chars[idx].y < val; });
         auto hi_it = std::upper_bound(lo_it, y_sorted.end(), y_hi,
             [this](double val, size_t idx) { return val < chars[idx].y; });
+        // Include a char if its horizontal center falls inside [left, right).
+        // Outer cell edges get a small extra tolerance so glyphs that touch
+        // the column boundary line are not dropped.
         std::vector<size_t> matches;
         for (auto it = lo_it; it != hi_it; ++it) {
             auto& ch = chars[*it];
-            if (ch.x >= left + 0.5 && ch.x <= right - 0.5)
+            double cx = (ch.left + ch.right) * 0.5;
+            if (cx >= left - 1.0 && cx < right + 1.0)
                 matches.push_back(*it);
         }
-        std::sort(matches.begin(), matches.end());
+        // Sort by reading order: top-to-bottom, then left-to-right.
+        // Single-row cells will fall through to a stable left-to-right order;
+        // multi-row cells (merged) read top-to-bottom.
+        std::sort(matches.begin(), matches.end(), [this](size_t a, size_t b) {
+            const auto& ca = chars[a];
+            const auto& cb = chars[b];
+            double y_tol = std::max(ca.font_size, cb.font_size) * 0.4;
+            if (y_tol < 2.0) y_tol = 2.0;
+            if (std::abs(ca.y - cb.y) > y_tol) return ca.y > cb.y;
+            return ca.left < cb.left;
+        });
         std::string text;
+        double prev_right = -1e9;
+        double prev_y = 0.0;
+        double prev_fs = 12.0;
+        bool first = true;
         for (size_t idx : matches) {
             auto& ch = chars[idx];
-            if (ch.unicode == ' ' || ch.unicode == 0xA0)
-                text += ' ';
-            else
+            double fs = ch.font_size > 1.0 ? ch.font_size : 12.0;
+            if (!first) {
+                double y_tol = std::max(prev_fs, fs) * 0.4;
+                if (y_tol < 2.0) y_tol = 2.0;
+                bool new_row = std::abs(ch.y - prev_y) > y_tol;
+                if (new_row) {
+                    if (!text.empty() && text.back() != ' ') text += ' ';
+                } else {
+                    // Insert a space when the positional gap exceeds the
+                    // word-spacing threshold used by chars_to_lines.
+                    double gap = ch.left - prev_right;
+                    double word_gap = fs * 0.15;
+                    if (word_gap < 1.0) word_gap = 1.0;
+                    if (ch.unicode == ' ' || ch.unicode == 0xA0) {
+                        if (!text.empty() && text.back() != ' ') text += ' ';
+                    } else if (gap > word_gap && !text.empty() && text.back() != ' ') {
+                        text += ' ';
+                    }
+                }
+            }
+            if (ch.unicode != ' ' && ch.unicode != 0xA0)
                 util::append_utf8(text, ch.unicode);
+            prev_right = ch.right;
+            prev_y = ch.y;
+            prev_fs = fs;
+            first = false;
         }
         size_t s = text.find_first_not_of(" ");
         size_t e = text.find_last_not_of(" ");
@@ -2617,6 +2658,32 @@ std::vector<TextLine> chars_to_lines(const std::vector<TextChar>& chars,
         prev_right = -1e9;
     };
 
+    // Column-gutter gap threshold: large enough to skip word spaces (~0.15×fs)
+    // but small enough to catch tight body-text gutters (~1.2×fs).
+    double col_gap_thresh = std::max(median_fs * 1.2, 8.0);
+
+    // Peek-ahead helper: count distinct span clusters in the chars of the
+    // current y-row that lie strictly to the right of col_boundary, starting
+    // from index start. Two chars belong to the same cluster if their gap is
+    // smaller than col_gap_thresh (same as the split threshold below).
+    auto right_clusters = [&](size_t start, double cur_y_val) -> int {
+        if (col_boundary <= 0) return 0;
+        int clusters = 0;
+        double last_right = -1e9;
+        for (size_t k = start; k < idx.size(); k++) {
+            auto& c = chars[idx[k]];
+            if (std::abs(c.y - cur_y_val) > y_tol) break;
+            if (c.unicode == ' ' || c.unicode == 0xA0) continue;
+            if (c.left <= col_boundary) continue;
+            if (last_right < -1e8 || c.left - last_right > col_gap_thresh) {
+                clusters++;
+                if (clusters >= 2) return clusters;
+            }
+            last_right = std::max(last_right, (double)c.right);
+        }
+        return clusters;
+    };
+
     for (size_t ii = 0; ii < idx.size(); ii++) {
         auto& ch = chars[idx[ii]];
         if (std::abs(ch.y - cur_y) > y_tol) {
@@ -2624,13 +2691,22 @@ std::vector<TextLine> chars_to_lines(const std::vector<TextChar>& chars,
             cur_y = ch.y;
         }
 
-        // Split line at column boundary when a large gap crosses it
+        // Split line at column boundary when a large gap crosses it.
+        // Skip the split when the right side has multiple distinct cell
+        // clusters — that signals a wide table row spanning the page, not
+        // two body-text columns sharing a y coordinate. A *very* wide gap
+        // (≥ 2×median_fs, ~20pt for 10pt body text) is always treated as a
+        // page-gutter split, even when both sides have cell-like content,
+        // so two tables sitting side-by-side at the same y get separated.
         if (col_boundary > 0 && !cur.text.empty() && prev_right > -1e8) {
             double gap = ch.left - prev_right;
-            if (gap > median_fs * 1.5 &&
+            if (gap > col_gap_thresh &&
                 prev_right < col_boundary && ch.left > col_boundary) {
-                flush();
-                cur_y = ch.y;
+                bool gutter = gap > std::max(median_fs * 2.0, 18.0);
+                if (gutter || right_clusters(ii, cur_y) < 2) {
+                    flush();
+                    cur_y = ch.y;
+                }
             }
         }
 
@@ -3762,7 +3838,8 @@ std::vector<TableData> detect_tables(const std::vector<PdfLineSegment>& lines,
 
 std::vector<TableData> detect_text_tables(const PageCharCache& cache,
                                            const std::vector<TableData>& existing_tables,
-                                           double page_width, double page_height) {
+                                           double page_width, double page_height,
+                                           double col_boundary = 0) {
     if (cache.chars.size() < 10) return {};
 
     struct CharInfo { double x, y, left, right, top, bot; int idx; unsigned int unicode; };
@@ -3816,7 +3893,92 @@ std::vector<TableData> detect_text_tables(const PageCharCache& cache,
         if (!cur.char_ranges.empty()) text_rows.push_back(std::move(cur));
     }
 
+    // When a page column boundary is known, split rows that mix table cells
+    // on one side with a single paragraph span on the other side. We keep
+    // wide spanning rows (multiple cells on both sides) intact so a table
+    // that spans the page is still detected as one table.
+    if (col_boundary > 0 && !text_rows.empty()) {
+        auto cluster_count = [](std::vector<std::pair<double,double>>& ranges) -> int {
+            if (ranges.empty()) return 0;
+            std::sort(ranges.begin(), ranges.end());
+            int n = 1;
+            double last_right = ranges[0].second;
+            for (size_t i = 1; i < ranges.size(); i++) {
+                if (ranges[i].first - last_right > 8.0) n++;
+                last_right = std::max(last_right, ranges[i].second);
+            }
+            return n;
+        };
+
+        std::vector<TextRow> rebuilt;
+        rebuilt.reserve(text_rows.size());
+        for (auto& tr : text_rows) {
+            std::vector<std::pair<double,double>> left_r, right_r;
+            std::vector<size_t> left_ci, right_ci;
+            for (size_t k = 0; k < tr.char_ranges.size(); k++) {
+                double cx = (tr.char_ranges[k].first + tr.char_ranges[k].second) * 0.5;
+                if (cx < col_boundary) {
+                    left_r.push_back(tr.char_ranges[k]);
+                    left_ci.push_back(tr.char_indices[k]);
+                } else {
+                    right_r.push_back(tr.char_ranges[k]);
+                    right_ci.push_back(tr.char_indices[k]);
+                }
+            }
+            if (left_r.empty() || right_r.empty()) {
+                rebuilt.push_back(std::move(tr));
+                continue;
+            }
+            int lc = cluster_count(left_r);
+            int rc = cluster_count(right_r);
+            // Keep the row whole when BOTH sides have multiple cells —
+            // that signals a wide table row spanning the page (e.g. GLUE
+            // results table). Otherwise treat the row as two band-local
+            // rows so that body-text 2-column layouts and table-on-one-side
+            // layouts don't merge content from the opposite band.
+            bool wide_table_row = (lc >= 2 && rc >= 2);
+            if (wide_table_row) {
+                rebuilt.push_back(std::move(tr));
+                continue;
+            }
+            TextRow lrow, rrow;
+            lrow.y_center = tr.y_center;
+            lrow.y_top = tr.y_top;
+            lrow.y_bot = tr.y_bot;
+            lrow.char_ranges = std::move(left_r);
+            lrow.char_indices = std::move(left_ci);
+            rrow.y_center = tr.y_center;
+            rrow.y_top = tr.y_top;
+            rrow.y_bot = tr.y_bot;
+            rrow.char_ranges = std::move(right_r);
+            rrow.char_indices = std::move(right_ci);
+            rebuilt.push_back(std::move(lrow));
+            rebuilt.push_back(std::move(rrow));
+        }
+        text_rows = std::move(rebuilt);
+    }
+
     if (text_rows.size() < 3) return {};
+
+    // Median font size, used to scale gap thresholds for column detection.
+    // Fixed pt thresholds (e.g. 20pt) over-fit to body-text PDFs and miss
+    // tightly typeset tables in academic papers.
+    double median_fs = 12.0;
+    {
+        std::vector<double> fs;
+        fs.reserve(cache.chars.size());
+        for (auto& c : cache.chars)
+            if (c.font_size > 1.0) fs.push_back(c.font_size);
+        if (!fs.empty()) {
+            std::sort(fs.begin(), fs.end());
+            median_fs = fs[fs.size() / 2];
+        }
+    }
+    // cell_merge_gap: chars closer than this are treated as the same cell.
+    //   Picked just above a typical body-text word-space (~0.4×fs) so
+    //   prose merges into one cell. Inter-cell padding in academic tables
+    //   is typically wider than this, giving us a multi-cell row.
+    double cell_merge_gap = std::max(median_fs * 0.7, 7.0);
 
     auto row_in_existing_table = [&](const TextRow& row) -> bool {
         for (auto& t : existing_tables) {
@@ -3884,12 +4046,20 @@ std::vector<TableData> detect_text_tables(const PageCharCache& cache,
             if (y_gap > 40.0) break;
 
             if (rs.spans.size() == 1) {
+                double sp_w = rs.spans[0].second - rs.spans[0].first;
+                double ref_w = ref_xmax - ref_xmin;
                 double sp_mid = (rs.spans[0].first + rs.spans[0].second) / 2.0;
-                if (sp_mid >= ref_xmin - 5 && sp_mid <= ref_xmax + 5) {
+                // Only group a single-span row if its content is clearly a
+                // table-internal label (much narrower than the table) and
+                // sits within the table's x range. Full-line prose (whether
+                // from a single-column page or one half of a two-column
+                // page) won't satisfy the width check, keeping it out.
+                bool inside = sp_mid >= ref_xmin - 5 && sp_mid <= ref_xmax + 5;
+                bool narrow = ref_w <= 0 || sp_w < ref_w * 0.4;
+                if (inside && narrow) {
                     group_indices.push_back(j);
                     continue;
                 }
-                // Skip rows whose center is outside the table region
                 continue;
             }
 
@@ -3929,18 +4099,41 @@ std::vector<TableData> detect_text_tables(const PageCharCache& cache,
 
         if (group_indices.size() < 3) { start++; continue; }
 
+        // For each row, group chars into cells using cell_merge_gap, then
+        // collect cell-gap midpoints. Word-internal kerning merges into the
+        // same cell; inter-cell padding (even just a few points) separates
+        // cells. The across-row clustering below filters out cells that
+        // don't repeat at the same x — body text never aligns the same way
+        // across multiple rows.
         std::vector<double> all_gaps;
         int multi_span_rows = 0;
         for (auto idx : group_indices) {
             auto& rs = row_spans[idx];
-            if (rs.spans.size() < 2) continue;
-            multi_span_rows++;
-            for (size_t s = 1; s < rs.spans.size(); s++) {
-                double gap_width = rs.spans[s].first - rs.spans[s-1].second;
-                if (gap_width >= 20.0) {
-                    double gap_mid = (rs.spans[s-1].second + rs.spans[s].first) / 2.0;
-                    all_gaps.push_back(gap_mid);
+            std::vector<std::pair<double,double>> char_ranges;
+            char_ranges.reserve(rs.char_indices.size());
+            for (size_t ci : rs.char_indices) {
+                auto& c = chars[ci];
+                char_ranges.push_back({c.left, c.right});
+            }
+            std::sort(char_ranges.begin(), char_ranges.end());
+            if (char_ranges.empty()) continue;
+            std::vector<std::pair<double,double>> cells;
+            double cur_l = char_ranges[0].first;
+            double cur_r = char_ranges[0].second;
+            for (size_t s = 1; s < char_ranges.size(); s++) {
+                if (char_ranges[s].first - cur_r > cell_merge_gap) {
+                    cells.push_back({cur_l, cur_r});
+                    cur_l = char_ranges[s].first;
+                    cur_r = char_ranges[s].second;
+                } else {
+                    cur_r = std::max(cur_r, char_ranges[s].second);
                 }
+            }
+            cells.push_back({cur_l, cur_r});
+            if (cells.size() >= 2) multi_span_rows++;
+            for (size_t s = 1; s < cells.size(); s++) {
+                double gap_mid = (cells[s-1].second + cells[s].first) / 2.0;
+                all_gaps.push_back(gap_mid);
             }
         }
 
@@ -3995,6 +4188,10 @@ std::vector<TableData> detect_text_tables(const PageCharCache& cache,
                 return chars[a].x < chars[b].x;
             });
 
+            // Track per-column last x-right so we can insert word-spaces when
+            // chars within a cell are separated by a positional gap (PDFs
+            // often omit literal spaces and rely on glyph positions).
+            std::vector<double> col_last_right(n_cols, -1e9);
             for (size_t ci : sorted_ci) {
                 auto& ch = chars[ci];
                 int col = -1;
@@ -4005,7 +4202,17 @@ std::vector<TableData> detect_text_tables(const PageCharCache& cache,
                     }
                 }
                 if (col < 0) continue;
+                double fs = cache.chars[ch.idx].font_size;
+                if (fs < 1.0) fs = 12.0;
+                double word_gap = fs * 0.15;
+                if (word_gap < 1.0) word_gap = 1.0;
+                if (col_last_right[col] > -1e8) {
+                    double gap = ch.left - col_last_right[col];
+                    if (gap > word_gap && !row[col].empty() && row[col].back() != ' ')
+                        row[col] += ' ';
+                }
                 util::append_utf8(row[col], ch.unicode);
+                col_last_right[col] = ch.right;
             }
 
             for (int c = 0; c < n_cols; c++) {
@@ -4018,6 +4225,40 @@ std::vector<TableData> detect_text_tables(const PageCharCache& cache,
             }
             table.rows.push_back(std::move(row));
         }
+
+        // Trim trailing rows that look like prose bleeding into the table —
+        // typically the caption or surrounding body text that the row
+        // grouper swept up. A row is bled-in if at least 25% of its cell
+        // pairs are lowercase→lowercase joints (mid-word splits).
+        auto _row_pair_score = [&](const std::vector<std::string>& row,
+                                   int& pc, int& pn) {
+            pc = 0; pn = 0;
+            if ((int)row.size() < n_cols) return;
+            for (int c = 0; c + 1 < n_cols; c++) {
+                if (row[c].empty() || row[c+1].empty()) continue;
+                unsigned char ll_c = (unsigned char)row[c].back();
+                unsigned char rf_c = (unsigned char)row[c+1][0];
+                pc++;
+                bool ll = (ll_c >= 'a' && ll_c <= 'z') || ll_c >= 0x80;
+                bool rf = (rf_c >= 'a' && rf_c <= 'z') || rf_c >= 0x80;
+                if (ll && rf) pn++;
+            }
+        };
+        // Trim from both ends: paragraph text often gets swept into the
+        // group above (intro paragraph) and below (caption).
+        while (!table.rows.empty()) {
+            int pc = 0, pn = 0;
+            _row_pair_score(table.rows.back(), pc, pn);
+            if (pc < 2 || pn * 4 < pc) break;
+            table.rows.pop_back();
+        }
+        while (!table.rows.empty()) {
+            int pc = 0, pn = 0;
+            _row_pair_score(table.rows.front(), pc, pn);
+            if (pc < 2 || pn * 4 < pc) break;
+            table.rows.erase(table.rows.begin());
+        }
+        if (table.rows.size() < 3) { start = group_indices.back() + 1; continue; }
 
         // Early reject: check text continuity across columns
         {
@@ -4073,7 +4314,7 @@ std::vector<TableData> detect_text_tables(const PageCharCache& cache,
         }
 
         int min_rows = (n_cols == 2) ? 5 : 3;
-        if (meaningful_rows >= min_rows && n_cols <= 4) {
+        if (meaningful_rows >= min_rows) {
             bool looks_like_list = false;
 
             {
@@ -4167,6 +4408,12 @@ std::vector<TableData> detect_text_tables(const PageCharCache& cache,
                 int total_cells = 0;
                 int checked_rows = 0;
 
+                auto is_continuation_row = [&](const std::vector<std::string>& row) -> bool {
+                    int pc = 0, pn = 0;
+                    _row_pair_score(row, pc, pn);
+                    return pc > 0 && pn > pc / 2;
+                };
+
                 for (auto& row : table.rows) {
                     if ((int)row.size() < n_cols) continue;
 
@@ -4176,23 +4423,7 @@ std::vector<TableData> detect_text_tables(const PageCharCache& cache,
                         if (is_filler_only(cell)) filler_cells++;
                     }
 
-                    bool row_is_continuation = false;
-                    int pairs_checked = 0;
-                    int pairs_continued = 0;
-                    for (int c = 0; c + 1 < n_cols; c++) {
-                        if (row[c].empty() || row[c+1].empty()) continue;
-                        unsigned char left_last = (unsigned char)row[c].back();
-                        unsigned char right_first = (unsigned char)row[c+1][0];
-                        pairs_checked++;
-                        bool ll = (left_last >= 'a' && left_last <= 'z') || left_last >= 0x80;
-                        bool rf = (right_first >= 'a' && right_first <= 'z') || right_first >= 0x80;
-                        if (ll && rf)
-                            pairs_continued++;
-                    }
-                    if (pairs_checked > 0 && pairs_continued > pairs_checked / 2)
-                        row_is_continuation = true;
-
-                    if (row_is_continuation) continuation_rows++;
+                    if (is_continuation_row(row)) continuation_rows++;
                     checked_rows++;
                 }
 
@@ -4200,18 +4431,34 @@ std::vector<TableData> detect_text_tables(const PageCharCache& cache,
                 if (checked_rows >= 2 && continuation_rows >= checked_rows * ct)
                     looks_like_list = true;
 
-                if (!looks_like_list && n_cols >= 3) {
-                    int tiny_cells = 0;
-                    int non_empty_cells = 0;
-                    for (auto& row : table.rows) {
-                        for (auto& cell : row) {
-                            if (cell.empty()) continue;
-                            if (is_filler_only(cell)) continue;
-                            non_empty_cells++;
-                            if (cell.size() <= 6) tiny_cells++;
+                // Only flag a candidate as a list when the FIRST column has
+                // mostly tiny non-numeric entries — that is the signature
+                // of an ordered list (e.g. "a) ", "1) ") miscolumnised, not
+                // of a real metric table whose header just happens to use
+                // short labels (QNLI, MRPC, EM, F1, etc).
+                if (!looks_like_list && n_cols >= 3 && n_cols <= 4) {
+                    auto is_numeric_cell = [](const std::string& s) -> bool {
+                        if (s.empty()) return false;
+                        bool has_digit = false;
+                        for (char c : s) {
+                            unsigned char uc = (unsigned char)c;
+                            if (uc >= '0' && uc <= '9') { has_digit = true; continue; }
+                            if (uc == '.' || uc == ',' || uc == '-' || uc == '+' ||
+                                uc == '/' || uc == '%' || uc == ' ' || uc == '\t')
+                                continue;
+                            return false;
                         }
+                        return has_digit;
+                    };
+                    int tiny_first = 0, first_filled = 0;
+                    for (auto& row : table.rows) {
+                        if (row.empty() || row[0].empty()) continue;
+                        if (is_filler_only(row[0])) continue;
+                        if (is_numeric_cell(row[0])) continue;
+                        first_filled++;
+                        if (row[0].size() <= 4) tiny_first++;
                     }
-                    if (non_empty_cells >= 4 && tiny_cells >= non_empty_cells * 0.4)
+                    if (first_filled >= 3 && tiny_first >= first_filled * 0.7)
                         looks_like_list = true;
                 }
 
@@ -6241,7 +6488,8 @@ ExtractResult extract_pdf(const std::string& pdf_path, const ConvertOptions& opt
                 page_w, page_h);
             int line_table_count = (int)result.all_tables[p].size();
             auto text_tables = detect_text_tables(cache,
-                result.all_tables[p], page_w, page_h);
+                result.all_tables[p], page_w, page_h,
+                result.col_boundaries[p]);
             for (auto& tt : text_tables)
                 result.all_tables[p].push_back(std::move(tt));
             (void)line_table_count; // for debugging
