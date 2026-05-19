@@ -4431,7 +4431,9 @@ static bool accept_table(TableData& table) {
     }
 
     // --- S5: numeric-cell ratio sanity check for narrow tables ---
-    // If table has very few "tabular" cues (numbers, short tokens), reject.
+    // If table has very few "tabular" cues (numbers, short tokens), reject —
+    // *unless* col 0 is consistently a short label and the rest is description
+    // (a definitions table).
     {
         int data_cells = 0;
         int numeric_cells = 0;
@@ -4448,14 +4450,20 @@ static bool accept_table(TableData& table) {
                 if (c.size() <= 8) short_cells++;
             }
         }
-        // require some tabularity for tables that are mostly text
         if (data_cells >= 6 && numeric_cells == 0 && n_cols >= 2) {
-            // Look at column 0 specifically — is the rest of the row mostly free of
-            // numbers? If so and the cells are long, this is likely prose.
             int long_cells = 0;
-            for (auto& row : table.rows)
+            int short_col0 = 0, col0_filled = 0;
+            for (auto& row : table.rows) {
                 for (auto& c : row) if (c.size() > 30) long_cells++;
-            if (long_cells >= data_cells * 0.3) return false;
+                if (!row.empty() && !row[0].empty()) {
+                    col0_filled++;
+                    if (row[0].size() <= 20) short_col0++;
+                }
+            }
+            // definitions table: col 0 short labels in ≥70% of rows
+            bool is_definitions = col0_filled >= 3 &&
+                                  short_col0 >= col0_filled * 0.70;
+            if (!is_definitions && long_cells >= data_cells * 0.3) return false;
         }
     }
 
