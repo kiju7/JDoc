@@ -4005,8 +4005,11 @@ static std::vector<double> infer_columns_in_band(
     }
 
     int total_mc = (int)mc.size();
-    // empty bin: ≤ 30% of multi-cell rows have a char there
-    double empty_thresh_frac = 0.30;
+    // empty bin: ≤ 40% of multi-cell rows have a char there. A bin still has
+    // to be a *gap* — adjacent occupied bins on both sides — to be a column
+    // boundary, so a slightly looser empty threshold helps catch tables where
+    // not every row has every column populated.
+    double empty_thresh_frac = 0.40;
     int empty_max = (int)std::floor(total_mc * empty_thresh_frac);
 
     double col_gap_min = std::max(median_fs * 0.4, 3.0);
