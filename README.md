@@ -1,25 +1,25 @@
 # JDoc
 
-C++17 document-to-Markdown converter. No heavy dependencies — just zlib, libjpeg-turbo, and pugixml.
+C++17 기반 문서 → 마크다운 변환기. 무거운 의존성 없이 zlib, libjpeg-turbo, pugixml만 사용합니다.
 
-**Supported formats:** PDF, DOCX, XLSX, XLSB, PPTX, DOC, XLS, PPT, RTF, HTML, HWP, HWPX, TXT
+**지원 포맷:** PDF, DOCX, XLSX, XLSB, PPTX, DOC, XLS, PPT, RTF, HTML, HWP, HWPX, TXT
 
-## Key Features
+## 주요 특징
 
-- **Custom PDF parser** — no PDFium/Poppler, fully thread-safe with no global state
-- **Heading detection** — font size ratio analysis (H1–H4)
-- **Table extraction** — line-based grid + borderless text table detection
-- **Image extraction** — JPEG passthrough, 200 DPI vector rendering, CCITTFax G3/G4, min-size filtering
-- **Encrypted PDF** — RC4 Standard Security Handler (40/128-bit)
-- **Malformed PDF recovery** — xref rebuild, stream length recovery
-- **Korean document support** — HWP/HWPX with full table, image, heading support
-- **CJK encodings** — CP949, CP932, CMap-based Unicode mapping
-- **Page chunking** — per-page output with metadata for RAG pipelines
-- **Multiple APIs** — CLI, Python (pybind11), C, C++
+- **자체 구현 PDF 파서** — PDFium/Poppler 미사용, 전역 상태 없는 완전한 스레드 안전
+- **제목(헤딩) 감지** — 폰트 크기 비율 분석 + 굵은 글씨·절 번호 패턴 인식 (H1–H5)
+- **표 추출** — 괘선 기반 그리드 + 무괘선 텍스트 표 감지
+- **이미지 추출** — JPEG 패스스루, 150 DPI 벡터 렌더링, CCITTFax G3/G4, 최소 크기 필터
+- **한글 문서 지원** — HWP/HWPX 표·이미지·제목 완전 지원, HWP로 생성된 PDF 대응(Type3 폰트, 렌더 모드 기반 굵은 글씨 인식)
+- **암호화 PDF** — RC4 표준 보안 핸들러 (40/128비트)
+- **손상 PDF 복구** — xref 재구축, 스트림 길이 복구
+- **CJK 인코딩** — CP949, CP932, CMap 기반 유니코드 매핑
+- **페이지 청킹** — RAG 파이프라인용 페이지별 출력(메타데이터 포함)
+- **다양한 API** — CLI, Python (pybind11), C, C++
 
-## Install
+## 설치
 
-System deps (one-time, needed for both C++ and Python builds):
+시스템 의존성 (최초 1회, C++/Python 빌드 공통):
 
 ```bash
 # Ubuntu/Debian
@@ -30,7 +30,7 @@ brew install cmake libjpeg-turbo
 sudo dnf install cmake gcc-c++ zlib-devel libjpeg-turbo-devel
 ```
 
-Then build:
+빌드:
 
 ```bash
 # Python
@@ -40,19 +40,19 @@ pip install .
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j
 ```
 
-## Usage
+## 사용법
 
 ### CLI
 
 ```bash
-jdoc input.pdf                              # Markdown to stdout
-jdoc input.pdf output.md                    # Save to file
-jdoc input.docx --plaintext                 # Plain text output
-jdoc input.pdf --pages 0,1,2                # Select pages (0-based)
-jdoc input.pdf --chunks                     # Per-page output
-jdoc input.pdf --images ./imgs              # Extract images
-jdoc input.pdf --images ./imgs --min-image-size 100   # Skip images < 100px
-jdoc input.pdf --images ./imgs --min-image-size 0     # Extract all images
+jdoc input.pdf                              # 마크다운을 stdout으로 출력
+jdoc input.pdf output.md                    # 파일로 저장
+jdoc input.docx --plaintext                 # 일반 텍스트 출력
+jdoc input.pdf --pages 0,1,2                # 페이지 선택 (0부터 시작)
+jdoc input.pdf --chunks                     # 페이지별 출력
+jdoc input.pdf --images ./imgs              # 이미지 추출
+jdoc input.pdf --images ./imgs --min-image-size 100   # 100px 미만 이미지 제외
+jdoc input.pdf --images ./imgs --min-image-size 0     # 모든 이미지 추출
 ```
 
 ### Python
@@ -60,24 +60,24 @@ jdoc input.pdf --images ./imgs --min-image-size 0     # Extract all images
 ```python
 import jdoc
 
-# Convert to Markdown
+# 마크다운으로 변환
 text = jdoc.convert("document.pdf")
 text = jdoc.convert("report.docx", format="text", pages=[0, 1])
 
-# Per-page chunks with images
+# 이미지 포함 페이지별 청크
 pages = jdoc.convert_pages("document.pdf", extract_images=True)
 for page in pages:
     print(page.text)
     for img in page.images:
         print(f"  {img.name} {img.width}x{img.height} {img.format}")
-        # img.data  — JPEG/PNG bytes
-        # img.pixels — raw RGB buffer (width * height * components)
+        # img.data   — JPEG/PNG 바이트
+        # img.pixels — 원시 RGB 버퍼 (width * height * components)
 
-# Image size filtering
-text = jdoc.convert("doc.pdf", extract_images=True, min_image_size=100)  # skip < 100px
-text = jdoc.convert("doc.pdf", extract_images=True, min_image_size=0)    # no filter
+# 이미지 크기 필터
+text = jdoc.convert("doc.pdf", extract_images=True, min_image_size=100)  # 100px 미만 제외
+text = jdoc.convert("doc.pdf", extract_images=True, min_image_size=0)    # 필터 없음
 
-# ConvertOptions for full control
+# ConvertOptions로 세부 제어
 opts = jdoc.ConvertOptions()
 opts.extract_images = True
 opts.image_output_dir = "./images"
@@ -90,27 +90,27 @@ opts.pages = [0, 1, 2]
 ```cpp
 #include <jdoc/jdoc.h>
 
-// Auto-detects format (PDF, DOCX, XLSX, PPTX, HWP, etc.)
+// 포맷 자동 감지 (PDF, DOCX, XLSX, PPTX, HWP 등)
 std::string md = jdoc::convert("input.pdf");
 std::string md = jdoc::convert("report.docx");
 
-// Extract images to directory
+// 이미지를 디렉터리로 추출
 jdoc::ConvertOptions opts;
 opts.pages = {0, 1, 2};
 opts.extract_images = true;
-opts.image_output_dir = "./images";  // saved to files
+opts.image_output_dir = "./images";  // 파일로 저장
 opts.min_image_size = 50;
 std::string md = jdoc::convert("input.pdf", opts);
 
-// Per-page chunks with images in memory
-opts.image_output_dir = "";  // empty = keep in memory only
+// 이미지를 메모리에 유지한 페이지별 청크
+opts.image_output_dir = "";  // 빈 문자열 = 메모리에만 유지
 auto chunks = jdoc::convert_chunks("input.pdf", opts);
 for (auto& chunk : chunks) {
     // chunk.text, chunk.tables
     // chunk.page_width, chunk.page_height, chunk.body_font_size
     for (auto& img : chunk.images) {
         // img.name, img.width, img.height, img.format
-        // img.data — JPEG/PNG encoded bytes
+        // img.data — JPEG/PNG 인코딩된 바이트
     }
 }
 ```
@@ -128,15 +128,15 @@ target_link_libraries(your_app PRIVATE jdoc_all)
 
 char err[256];
 
-// Simple text conversion
+// 단순 텍스트 변환
 char* text = jdoc_convert("input.pdf", NULL, err, sizeof(err));
-// use text...
+// text 사용...
 jdoc_free_string(text);
 
-// Per-page chunks with images
+// 이미지 포함 페이지별 청크
 JDocOptions opts = jdoc_default_options();
 opts.extract_images = 1;
-opts.image_output_dir = "./images";  // NULL = keep in memory only
+opts.image_output_dir = "./images";  // NULL = 메모리에만 유지
 
 int page_count;
 JDocPage* pages = jdoc_convert_pages("input.pdf", &opts, &page_count, err, sizeof(err));
@@ -145,41 +145,41 @@ for (int i = 0; i < page_count; i++) {
     for (int j = 0; j < pages[i].image_count; j++) {
         JDocImage* img = &pages[i].images[j];
         // img->name, img->width, img->height, img->format
-        // img->data (raw bytes), img->data_size
-        // img->saved_path (when image_output_dir is set)
+        // img->data (원시 바이트), img->data_size
+        // img->saved_path (image_output_dir 설정 시)
     }
 }
 jdoc_free_pages(pages, page_count);
 ```
 
-## Format Support
+## 포맷별 지원 범위
 
-| Feature | PDF | DOCX | DOC | XLSX/XLSB | XLS | PPTX | PPT | HWP/HWPX | RTF | HTML | TXT |
+| 기능 | PDF | DOCX | DOC | XLSX/XLSB | XLS | PPTX | PPT | HWP/HWPX | RTF | HTML | TXT |
 |---|---|---|---|---|---|---|---|---|---|---|---|
-| Text | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| Headings | ✓ | ✓ | ✓ | | | ✓ | ✓ | ✓ | | | |
-| Bold/Italic | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | |
-| Tables | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | | ✓ | ✓ | ✓ | |
-| Images | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | |
-| Lists | | ✓ | ✓ | | | | | | | ✓ | |
-| Links | ✓ | ✓ | ✓ | | | | | | | ✓ | |
-| Annotations | ✓ | | | | | | | | | | |
-| Charts/SmartArt | | | | | | ✓ | | | | | |
-| Speaker Notes | | | | | | ✓ | ✓ | | | | |
+| 텍스트 | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| 제목 | ✓ | ✓ | ✓ | | | ✓ | ✓ | ✓ | | | |
+| 굵게/기울임 | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | |
+| 표 | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | | ✓ | ✓ | ✓ | |
+| 이미지 | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | |
+| 목록 | | ✓ | ✓ | | | | | | | ✓ | |
+| 링크 | ✓ | ✓ | ✓ | | | | | | | ✓ | |
+| 주석 | ✓ | | | | | | | | | | |
+| 차트/SmartArt | | | | | | ✓ | | | | | |
+| 발표자 노트 | | | | | | ✓ | ✓ | | | | |
 
-## Dependencies
+## 의존성
 
-| Library | License | Role |
+| 라이브러리 | 라이선스 | 역할 |
 |---|---|---|
-| zlib | zlib | Compression (FlateDecode, PNG) |
-| libjpeg-turbo | IJG/BSD | JPEG decode for PDF images |
-| pugixml | MIT | XML parsing (bundled) |
-| pybind11 | BSD-3 | Python bindings (optional) |
+| zlib | zlib | 압축 (FlateDecode, PNG) |
+| libjpeg-turbo | IJG/BSD | PDF 이미지 JPEG 디코딩 |
+| pugixml | MIT | XML 파싱 (번들 포함) |
+| pybind11 | BSD-3 | Python 바인딩 (선택) |
 
-## Platforms
+## 지원 플랫폼
 
 Linux (x64), macOS (arm64/x64), Windows (x64)
 
-## License
+## 라이선스
 
 MIT
