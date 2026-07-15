@@ -1318,6 +1318,9 @@ struct PdfFont {
     bool is_italic = false;
     bool is_identity = false;    // Identity-H/V (CID font)
     bool is_type0 = false;       // Type0 composite font
+    bool is_type3 = false;       // Type3 font (1-byte codes, FontMatrix glyph space)
+    bool is_dingbat = false;     // symbol font (Wingdings etc.) — letters are glyph codes, not text
+    double glyph_space_scale = 0.001; // glyph-space→text-space width factor (FontMatrix[0] for Type3)
     std::unordered_map<uint32_t, uint32_t> to_unicode;  // char code → Unicode
     std::unordered_map<uint32_t, uint32_t> cid_to_unicode; // CID → Unicode from ToUnicode
     const uint32_t* encoding_table = nullptr; // WinAnsi, MacRoman, etc.
@@ -1338,7 +1341,13 @@ struct PdfFont {
     uint32_t decode_char(uint32_t code) const {
         // 1. ToUnicode CMap lookup
         auto tu = to_unicode.find(code);
-        if (tu != to_unicode.end()) return tu->second;
+        if (tu != to_unicode.end()) {
+            uint32_t u = tu->second;
+            // Symbol fonts (Wingdings...): a "letter" mapping is really the
+            // source glyph code (e.g. ž for a list bullet) — emit a bullet.
+            if (is_dingbat && u > 0x20 && u < 0x2000) return 0x2022; // •
+            return u;
+        }
 
         // 2. CID fonts (Identity-H/V)
         if (is_identity || is_type0) {
@@ -1530,6 +1539,9 @@ PdfFont load_font(PdfDoc& doc, const PdfObj& font_ref) {
                        lower.find("-medi") != std::string::npos;
         font.is_italic = lower.find("italic") != std::string::npos ||
                          lower.find("oblique") != std::string::npos;
+        font.is_dingbat = lower.find("wingdings") != std::string::npos ||
+                          lower.find("webdings") != std::string::npos ||
+                          lower.find("dingbat") != std::string::npos;
     }
 
     // Also check FontDescriptor flags
@@ -1553,6 +1565,16 @@ PdfFont load_font(PdfDoc& doc, const PdfObj& font_ref) {
         for (size_t i = 0; i < widths_arr.arr.size(); i++) {
             double w = widths_arr.arr[i].as_num();
             font.widths[static_cast<uint32_t>(first_char + i)] = w;
+        }
+    }
+
+    if (font_type == "Type3") {
+        font.is_type3 = true;
+        // Glyph space is defined by FontMatrix (not the fixed 1/1000 of other fonts)
+        auto fm = doc.resolve(fobj.get("FontMatrix"));
+        if (fm.is_arr() && fm.arr.size() >= 4) {
+            double a = fm.arr[0].as_num();
+            if (a > 0) font.glyph_space_scale = a;
         }
     }
 
@@ -1615,6 +1637,11 @@ PdfFont load_font(PdfDoc& doc, const PdfObj& font_ref) {
     auto& tu = fobj.get("ToUnicode");
     if (!tu.is_none()) parse_tounicode_cmap(doc, tu, font);
 
+    // Simple fonts always use 1-byte codes regardless of the ToUnicode CMap's
+    // codespacerange (HWP exports Type3 fonts with a <0000><FFFF> codespace,
+    // which must not switch string decoding to 2-byte).
+    if (font.is_type3) font.cmap_code_bytes = 1;
+
     // Encoding
     auto& enc_obj = fobj.get("Encoding");
     if (enc_obj.is_name()) {
@@ -1666,6 +1693,7 @@ struct GfxState {
     double h_scaling = 100;
     double text_rise = 0;
     double text_leading = 0;
+    int render_mode = 0;   // Tr: 2/6 = fill+stroke (faux bold in HWP exports)
     PdfFont* font = nullptr;
 
     // Graphics state for paths
@@ -2032,6 +2060,8 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
                 gs.h_scaling = pop_num(0);
             } else if (tok_eq("Ts")) {
                 gs.text_rise = pop_num(0);
+            } else if (tok_eq("Tr")) {
+                gs.render_mode = static_cast<int>(pop_num(0));
             }
 
             // ── Text Show ──
@@ -2054,6 +2084,7 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
                     auto& s = operands.back().str_val;
                     double fs = gs.font_size;
                     double h_scale = gs.h_scaling / 100.0;
+                    double gw_scale = (gs.font && gs.font->is_type3) ? gs.font->glyph_space_scale : 0.001;
 
                     bool use_2byte = gs.font && (gs.font->is_identity || gs.font->is_type0);
                     if (gs.font && gs.font->cmap_code_bytes == 1) use_2byte = false;
@@ -2071,6 +2102,8 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
 
                         uint32_t unicode = gs.font ? gs.font->decode_char(code) : code;
                         if (unicode == 0 || unicode == 0xFFFD) continue;
+                        // Private Use Area: unmappable glyphs (e.g. HWP equation fonts) — no text value
+                        if ((unicode >= 0xE000 && unicode <= 0xF8FF) || unicode >= 0xFFFE) continue;
 
                         // Recompute rendering matrix for each char (text_mat changes with advances)
                         double trm[6];
@@ -2083,7 +2116,7 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
                         if (std::abs(final_mat[1]) > std::abs(final_mat[0]) * 2) {
                             double glyph_w_skip = gs.font ? gs.font->get_width(code) : 0;
                             if (glyph_w_skip <= 0) glyph_w_skip = 600;
-                            double adv = glyph_w_skip / 1000.0 * fs * h_scale + gs.char_spacing;
+                            double adv = glyph_w_skip * gw_scale * fs * h_scale + gs.char_spacing;
                             if (unicode == ' ') adv += gs.word_spacing;
                             gs.text_mat[4] += adv * gs.text_mat[0];
                             gs.text_mat[5] += adv * gs.text_mat[1];
@@ -2096,12 +2129,12 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
                         double glyph_w = gs.font ? gs.font->get_width(code) : 0;
                         if (glyph_w <= 0) glyph_w = (gs.font && (gs.font->is_identity || gs.font->is_type0)) ? 1000 : 600;
                         // char_w in text space (used for text matrix advance)
-                        double char_w_ts = glyph_w / 1000.0 * fs * h_scale;
+                        double char_w_ts = glyph_w * gw_scale * fs * h_scale;
                         // char_w in page space (for bounding box)
                         double gx2, gy2;
-                        transform_point(final_mat, glyph_w / 1000.0, 0, gx2, gy2);
+                        transform_point(final_mat, glyph_w * gw_scale, 0, gx2, gy2);
                         double char_w = std::abs(gx2 - gx);
-                        if (char_w < 0.1) char_w = std::abs(final_mat[0]) * glyph_w / 1000.0;
+                        if (char_w < 0.1) char_w = std::abs(final_mat[0]) * glyph_w * gw_scale;
                         double char_h = std::abs(final_mat[3]);
                         if (char_h < 1) char_h = std::abs(final_mat[0]);
 
@@ -2128,7 +2161,8 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
                         tc.bot = gy - char_h * 0.2;
                         tc.font_size = char_h;
                         tc.unicode = unicode;
-                        tc.is_bold = gs.font ? gs.font->is_bold : false;
+                        tc.is_bold = (gs.font && gs.font->is_bold) ||
+                                     gs.render_mode == 2 || gs.render_mode == 6;
                         tc.is_italic = gs.font ? gs.font->is_italic : false;
                         result.chars.push_back(tc);
                     }
@@ -2138,6 +2172,7 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
                     auto& arr = operands.back().arr;
                     double fs = gs.font_size;
                     double h_scale = gs.h_scaling / 100.0;
+                    double gw_scale = (gs.font && gs.font->is_type3) ? gs.font->glyph_space_scale : 0.001;
                     bool use_2byte = gs.font && (gs.font->is_identity || gs.font->is_type0);
                     if (gs.font && gs.font->cmap_code_bytes == 1) use_2byte = false;
                     if (gs.font && gs.font->cmap_code_bytes == 2) use_2byte = true;
@@ -2163,6 +2198,8 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
 
                                 uint32_t unicode = gs.font ? gs.font->decode_char(code) : code;
                                 if (unicode == 0 || unicode == 0xFFFD) continue;
+                                // Private Use Area: unmappable glyphs (e.g. HWP equation fonts) — no text value
+                                if ((unicode >= 0xE000 && unicode <= 0xF8FF) || unicode >= 0xFFFE) continue;
 
                                 double trm[6];
                                 double scale_mat[6] = {fs * h_scale, 0, 0, fs, 0, gs.text_rise};
@@ -2172,7 +2209,7 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
 
                                 double glyph_w = gs.font ? gs.font->get_width(code) : 0;
                                 if (glyph_w <= 0) glyph_w = (gs.font && (gs.font->is_identity || gs.font->is_type0)) ? 1000 : 600;
-                                double char_w_ts = glyph_w / 1000.0 * fs * h_scale;
+                                double char_w_ts = glyph_w * gw_scale * fs * h_scale;
 
                                 double advance = char_w_ts + gs.char_spacing;
                                 if (unicode == ' ') advance += gs.word_spacing;
@@ -2187,9 +2224,9 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
                                 transform_point(final_mat, 0, 0, gx, gy);
 
                                 double gx2, gy2;
-                                transform_point(final_mat, glyph_w / 1000.0, 0, gx2, gy2);
+                                transform_point(final_mat, glyph_w * gw_scale, 0, gx2, gy2);
                                 double char_w = std::abs(gx2 - gx);
-                                if (char_w < 0.1) char_w = std::abs(final_mat[0]) * glyph_w / 1000.0;
+                                if (char_w < 0.1) char_w = std::abs(final_mat[0]) * glyph_w * gw_scale;
                                 double char_h = std::abs(final_mat[3]);
                                 if (char_h < 1) char_h = std::abs(final_mat[0]);
 
@@ -2207,7 +2244,8 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
                                 tc.bot = gy - char_h * 0.2;
                                 tc.font_size = char_h;
                                 tc.unicode = unicode;
-                                tc.is_bold = gs.font ? gs.font->is_bold : false;
+                                tc.is_bold = (gs.font && gs.font->is_bold) ||
+                                             gs.render_mode == 2 || gs.render_mode == 6;
                                 tc.is_italic = gs.font ? gs.font->is_italic : false;
                                 result.chars.push_back(tc);
                             }
@@ -3828,8 +3866,44 @@ std::vector<TableData> detect_tables(const std::vector<PdfLineSegment>& lines,
     std::vector<TableData> result;
     for (auto& group : final_groups) {
         TableData t = build_table(group, h_lines, v_lines, cache);
-        if (!t.rows.empty()) {
-            result.push_back(std::move(t));
+        if (t.rows.empty()) continue;
+        // Reject grids that swallowed page prose (stacked separate tables
+        // bridged across body text): no real cell holds a whole paragraph.
+        // Rejecting lets the band's lines flow back as normal text.
+        size_t max_cell = 0;
+        for (auto& row : t.rows)
+            for (auto& c : row)
+                if (c.size() > max_cell) max_cell = c.size();
+        if (max_cell > 300) continue;
+        result.push_back(std::move(t));
+    }
+
+    // Detach a trailing caption row ("표 4.2 ...", "그림 ...") that was
+    // absorbed when stacked tables were bridged across the caption line;
+    // it belongs to the table directly below as its title.
+    for (auto& t : result) {
+        if (t.rows.size() < 2) continue;
+        auto& last = t.rows.back();
+        int filled = 0;
+        std::string text;
+        for (auto& c : last)
+            if (!c.empty()) { filled++; text = c; }
+        if (filled != 1 || text.size() < 8) continue;
+        bool is_caption = text.rfind("\xED\x91\x9C ", 0) == 0 ||          // "표 "
+                          text.rfind("\xEA\xB7\xB8\xEB\xA6\xBC ", 0) == 0; // "그림 "
+        if (!is_caption) continue;
+        double bottom = std::min(t.y0, t.y1);
+        TableData* below = nullptr;
+        for (auto& u : result) {
+            if (&u == &t) continue;
+            double utop = std::max(u.y0, u.y1);
+            if (utop <= bottom + 5.0 &&
+                (!below || utop > std::max(below->y0, below->y1)))
+                below = &u;
+        }
+        if (below && below->title.empty()) {
+            below->title = text;
+            t.rows.pop_back();
         }
     }
     return result;
@@ -4164,6 +4238,7 @@ static TableData build_table_from_band(
 // short numeric-style (avg < 12), drop the prose column. Body text alongside
 // a real table.
 static void strip_prose_columns(TableData& table) {
+    size_t stripped_bytes = 0;
     while (!table.rows.empty() && !table.rows[0].empty()) {
         int n_cols = (int)table.rows[0].size();
         if (n_cols < 3) return;
@@ -4198,16 +4273,34 @@ static void strip_prose_columns(TableData& table) {
         // Left edge prose
         if (avg_first > 35 && long_first >= 3 && fill_first >= 50 &&
             max_other_avg > 0 && avg_first > max_other_avg * 1.8) {
-            for (auto& row : table.rows) if (!row.empty()) row.erase(row.begin());
+            for (auto& row : table.rows)
+                if (!row.empty()) {
+                    stripped_bytes += row.front().size();
+                    row.erase(row.begin());
+                }
             stripped = true;
         }
         // Right edge prose (recompute n_cols if changed)
         else if (avg_last > 35 && long_last >= 3 && fill_last >= 50 &&
                  max_other_avg > 0 && avg_last > max_other_avg * 1.8) {
-            for (auto& row : table.rows) if (!row.empty()) row.pop_back();
+            for (auto& row : table.rows)
+                if (!row.empty()) {
+                    stripped_bytes += row.back().size();
+                    row.pop_back();
+                }
             stripped = true;
         }
         if (!stripped) break;
+    }
+
+    // If the stripped prose held the majority of the band's text, this was
+    // never a table with body text beside it — it was prose with a column-ish
+    // fringe. Reject outright so the text flows back as normal lines.
+    if (stripped_bytes > 0) {
+        size_t kept_bytes = 0;
+        for (auto& row : table.rows)
+            for (auto& c : row) kept_bytes += c.size();
+        if (stripped_bytes > kept_bytes) table.rows.clear();
     }
 }
 
@@ -4263,6 +4356,22 @@ static bool accept_table(TableData& table) {
             }
         }
         if (total > 0 && empty_n > total * 0.65) return false;
+    }
+
+    // Reject tables whose cells hold whole sentences — a band of prose that
+    // was force-fit into a grid (real table cells are short values/labels).
+    {
+        size_t sum = 0, filled = 0, max_cell = 0;
+        for (auto& row : table.rows) {
+            for (auto& c : row) {
+                if (c.empty()) continue;
+                filled++;
+                sum += c.size();
+                if (c.size() > max_cell) max_cell = c.size();
+            }
+        }
+        if (max_cell > 250) return false;
+        if (filled >= 4 && sum > filled * 60) return false;
     }
 
     // Reject tables where most cells consist only of non-ASCII junk characters.
@@ -4546,6 +4655,29 @@ std::vector<TableData> detect_text_tables(const PageCharCache& cache,
 
     std::vector<TableData> result;
     for (auto& band : bands) {
+        // Bibliography bands ("[1] Author, ..." reference lists) are justified
+        // prose whose stretched word gaps mimic columns — never tables.
+        {
+            bool has_biblio_row = false;
+            for (size_t k = band.first_row; k <= band.last_row && !has_biblio_row; k++) {
+                const auto& tr = rows[k];
+                size_t first_idx = SIZE_MAX, second_idx = SIZE_MAX;
+                for (size_t idx : tr.char_indices) {
+                    if (first_idx == SIZE_MAX || chars[idx].x < chars[first_idx].x) {
+                        second_idx = first_idx;
+                        first_idx = idx;
+                    } else if (second_idx == SIZE_MAX || chars[idx].x < chars[second_idx].x) {
+                        second_idx = idx;
+                    }
+                }
+                if (first_idx != SIZE_MAX && second_idx != SIZE_MAX &&
+                    chars[first_idx].unicode == '[' &&
+                    chars[second_idx].unicode >= '0' && chars[second_idx].unicode <= '9')
+                    has_biblio_row = true;
+            }
+            if (has_biblio_row) continue;
+        }
+
         // S2: infer columns
         auto bounds = infer_columns_in_band(rows, band, median_fs);
         if (bounds.size() < 3) continue;        // need ≥1 inner boundary
@@ -6186,6 +6318,56 @@ std::vector<TextLine> merge_colinear_lines(const std::vector<TextLine>& lines) {
     return merged;
 }
 
+// Standalone page-number footer lines: "- 3 -", "- ⅰ -", "- iv -"
+static bool is_page_number_footer(const std::string& text) {
+    std::string s;
+    for (char c : text)
+        if (c != ' ' && c != '\t') s += c;
+    if (s.size() < 3 || s.front() != '-' || s.back() != '-') return false;
+    std::string mid = s.substr(1, s.size() - 2);
+    if (mid.empty() || mid.size() > 12) return false;
+
+    bool all_digits = true;
+    for (char c : mid)
+        if (!std::isdigit(static_cast<unsigned char>(c))) { all_digits = false; break; }
+    if (all_digits) return true;
+
+    bool all_roman = true;
+    for (char c : mid) {
+        char lc = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        if (std::string("ivxlcdm").find(lc) == std::string::npos) { all_roman = false; break; }
+    }
+    if (all_roman) return true;
+
+    // Unicode roman numerals U+2160–217F (UTF-8: E2 85 A0..BF)
+    if (mid.size() % 3 == 0) {
+        bool all_uroman = true;
+        for (size_t i = 0; i + 2 < mid.size() + 1; i += 3) {
+            if (static_cast<unsigned char>(mid[i]) != 0xE2 ||
+                static_cast<unsigned char>(mid[i + 1]) != 0x85 ||
+                static_cast<unsigned char>(mid[i + 2]) < 0xA0) { all_uroman = false; break; }
+        }
+        if (all_uroman) return true;
+    }
+    return false;
+}
+
+// Depth of a leading section number: "2.1 ..." → 2, "4.2.1 ..." → 3, else 0
+static int section_number_depth(const std::string& text) {
+    size_t i = 0;
+    int depth = 0;
+    while (i < text.size()) {
+        size_t start = i;
+        while (i < text.size() && std::isdigit(static_cast<unsigned char>(text[i]))) i++;
+        if (i == start) return 0;
+        depth++;
+        if (i < text.size() && text[i] == '.') { i++; continue; }
+        break;
+    }
+    if (i >= text.size() || (text[i] != ' ' && text[i] != '\t')) return 0;
+    return depth;
+}
+
 std::string page_to_markdown(const std::vector<TextLine>& raw_lines,
                               const FontStats& stats,
                               const std::vector<ImageData>& images,
@@ -6200,6 +6382,11 @@ std::string page_to_markdown(const std::vector<TextLine>& raw_lines,
     bool has_columns = false;
     for (auto& l : lines)
         if (l.is_column_split) { has_columns = true; break; }
+
+    // Bottom-most text line Y (page-number footers live there)
+    double bottom_y = 1e9;
+    for (auto& l : lines)
+        if (l.y_center < bottom_y) bottom_y = l.y_center;
 
     std::string md;
     md.reserve(lines.size() * 80);
@@ -6301,10 +6488,20 @@ std::string page_to_markdown(const std::vector<TextLine>& raw_lines,
             if (only_filler) continue;
         }
 
+        // Drop standalone page-number footers ("- 3 -") at the page bottom
+        if ((i + 2 >= lines.size() || l.y_center <= bottom_y + 5.0) &&
+            is_page_number_footer(l.text)) continue;
+
         int hlevel = stats.heading_level(l.font_size, l.is_bold);
 
         if (hlevel >= 3 && !l.is_bold && l.text.size() > 60)
             hlevel = 0;
+
+        // Bold numbered section headings at body size ("2.1 ...", "4.2.1 ...")
+        if (hlevel == 0 && l.is_bold && l.text.size() < 120) {
+            int depth = section_number_depth(l.text);
+            if (depth >= 2) hlevel = std::min(depth + 2, 6);
+        }
 
         if (hlevel > 0) {
             if (i > 0) md += '\n';
