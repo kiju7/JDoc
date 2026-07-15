@@ -62,6 +62,7 @@ struct PdfObj {
     const uint8_t* stream_ptr = nullptr;  // zero-copy: points into file data
     size_t stream_len = 0;
     int ref_num = 0, ref_gen = 0;
+    int src_num = -1, src_gen = 0;  // owning object number (decryption key input)
 
     bool is_none() const { return type == ObjType::NONE; }
     bool is_int()  const { return type == ObjType::INT; }
@@ -695,10 +696,10 @@ struct PdfCrypt {
         buf[key_len + 2] = static_cast<uint8_t>((obj_num >> 16) & 0xFF);
         buf[key_len + 3] = static_cast<uint8_t>(gen_num & 0xFF);
         buf[key_len + 4] = static_cast<uint8_t>((gen_num >> 8) & 0xFF);
-        int eff_len = key_len + 5;
-        if (eff_len > 16) eff_len = 16;
         uint8_t hash[16];
-        pdf_md5(buf, eff_len, hash);
+        pdf_md5(buf, key_len + 5, hash);   // hash all key_len+5 bytes (spec Alg.1)
+        int eff_len = key_len + 5;
+        if (eff_len > 16) eff_len = 16;    // key is clamped, not the hash input
         std::memcpy(out_key, hash, eff_len);
         *out_len = eff_len;
     }
@@ -947,12 +948,27 @@ void PdfDoc::rebuild_xref() {
         }
     }
 
+    // Expand object streams found by the scan: pages/catalog of PDF 1.5+
+    // files live inside compressed ObjStm containers, invisible to the
+    // "N 0 obj" scan above.
+    {
+        std::vector<int> stm_nums;
+        for (auto& [num, entry] : xref) {
+            if (!entry.in_use || entry.offset <= 0) continue;
+            PdfObj obj = get_obj(num);
+            if (!obj.is_stream()) continue;
+            auto& t = obj.get("Type");
+            if (t.is_name() && t.str_val == "ObjStm") stm_nums.push_back(num);
+        }
+        for (int num : stm_nums) parse_obj_stream(num);
+    }
+
     // If no trailer or trailer lacks /Root (e.g. file truncated past xref/trailer/%%EOF),
     // synthesize one by scanning reconstructed objects for /Type /Catalog.
     if (trailer.is_none() || !trailer.has("Root")) {
         int catalog_num = -1, catalog_gen = 0;
         for (auto& [num, entry] : xref) {
-            if (!entry.in_use || entry.offset <= 0) continue;
+            if (!entry.in_use || (entry.offset <= 0 && entry.stream_obj < 0)) continue;
             PdfObj obj = get_obj(num);
             if (!obj.is_dict()) continue;
             auto& t = obj.get("Type");
@@ -1090,6 +1106,8 @@ PdfObj PdfDoc::get_obj(int num) {
         }
     }
 
+    obj.src_num = num;
+    obj.src_gen = entry.gen;
     obj_cache[num] = std::move(obj);
     return obj_cache[num];
 }
@@ -1114,7 +1132,17 @@ void PdfDoc::parse_obj_stream(int stream_num) {
         entries.push_back({std::atoi(num_tok.c_str()), std::atoi(off_tok.c_str())});
     }
 
+    int idx = 0;
     for (auto& [obj_num, obj_off] : entries) {
+        int cur_idx = idx++;
+        // Register in xref if absent (rebuilt files lack type-2 entries)
+        if (xref.find(obj_num) == xref.end()) {
+            XrefEntry e;
+            e.in_use = true;
+            e.stream_obj = stream_num;
+            e.stream_idx = cur_idx;
+            xref[obj_num] = e;
+        }
         if (obj_cache.find(obj_num) != obj_cache.end()) continue;
         size_t abs_off = static_cast<size_t>(first + obj_off);
         if (abs_off >= decoded.size()) continue;
@@ -1130,6 +1158,12 @@ PdfObj PdfDoc::resolve(const PdfObj& obj) {
 
 std::vector<uint8_t> PdfDoc::decode_stream(const PdfObj& obj, int obj_num, int gen_num) {
     if (!obj.is_stream()) return {};
+    // Callers rarely pass the owning object number — recover it from the
+    // object itself so encrypted streams actually get decrypted.
+    if (obj_num < 0 && obj.src_num >= 0) {
+        obj_num = obj.src_num;
+        gen_num = obj.src_gen;
+    }
     // Use zero-copy pointer if available, otherwise use stored data
     std::vector<uint8_t> result;
     if (obj.stream_ptr && obj.stream_len > 0) {
@@ -6627,8 +6661,6 @@ ExtractResult extract_pdf(const std::string& pdf_path, const ConvertOptions& opt
     // Get page tree
     auto root = doc.resolve(doc.trailer.get("Root"));
     auto pages = doc.resolve(root.get("Pages"));
-    if (!pages.is_dict())
-        throw std::runtime_error("Invalid PDF page tree: " + pdf_path);
 
     // Collect all page objects
     std::vector<PdfObj> page_objs;
@@ -6649,7 +6681,23 @@ ExtractResult extract_pdf(const std::string& pdf_path, const ConvertOptions& opt
             for (auto& kid : kids.arr) collect_pages(kid);
         }
     };
-    collect_pages(pages);
+    if (pages.is_dict()) collect_pages(pages);
+
+    // Recovery: page tree missing or broken (truncated PDFs) — scan every
+    // known object for /Type /Page and use them in object-number order.
+    if (page_objs.empty()) {
+        for (auto& [num, e] : doc.xref) {
+            PdfObj obj = doc.get_obj(num);
+            if (!obj.is_dict()) continue;
+            auto& type = obj.get("Type");
+            if (type.is_name() && type.str_val == "Page") {
+                page_objs.push_back(obj);
+                page_obj_nums.push_back(num);
+            }
+        }
+    }
+    if (page_objs.empty())
+        throw std::runtime_error("Invalid PDF page tree: " + pdf_path);
 
     int tp = static_cast<int>(page_objs.size());
     result.total_pages = tp;
