@@ -1792,7 +1792,9 @@ struct ContentParseResult {
 ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>& stream,
                                          const PdfObj& resources, double page_height,
                                          std::unordered_map<int, PdfFont>* font_cache = nullptr,
-                                         bool skip_graphics = false) {
+                                         bool skip_graphics = false,
+                                         const double* initial_ctm = nullptr,
+                                         int depth = 0) {
     ContentParseResult result;
 
     // Load fonts from resources, using cross-page cache when available
@@ -1820,6 +1822,7 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
 
     std::vector<GfxState> state_stack;
     GfxState gs;
+    if (initial_ctm) std::memcpy(gs.ctm, initial_ctm, sizeof(gs.ctm));
     std::vector<PathPoint> current_path;
 
     PdfLexer lex(stream.data(), stream.size());
@@ -2416,14 +2419,46 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
                     auto xd = doc.resolve(xobjects);
                     if (xd.is_dict()) {
                         auto& xref = xd.get(xname);
-                        ImagePlacement ip;
-                        ip.xobj_name = xname;
-                        if (xref.is_ref()) ip.xobj_ref = xref.ref_num;
-                        std::memcpy(ip.ctm, gs.ctm, sizeof(gs.ctm));
-                        ip.fill_r = gs.fill_r;
-                        ip.fill_g = gs.fill_g;
-                        ip.fill_b = gs.fill_b;
-                        result.images.push_back(ip);
+                        auto xobj = doc.resolve(xref);
+                        auto& subtype = xobj.get("Subtype");
+                        bool is_form = subtype.is_name() && subtype.str_val == "Form";
+                        if (is_form && depth < 8) {
+                            // Form XObject: parse its content stream so text and
+                            // vectors nested inside charts/figures are not lost.
+                            auto form_stream = doc.decode_stream(xobj);
+                            if (!form_stream.empty()) {
+                                double form_ctm[6];
+                                std::memcpy(form_ctm, gs.ctm, sizeof(form_ctm));
+                                auto& mtx = xobj.get("Matrix");
+                                if (mtx.is_arr() && mtx.arr.size() >= 6) {
+                                    double fm[6];
+                                    for (int k = 0; k < 6; k++) fm[k] = mtx.arr[k].as_num();
+                                    mat_multiply(form_ctm, fm, gs.ctm);
+                                }
+                                auto& form_res = xobj.get("Resources");
+                                const PdfObj& sub_res = form_res.is_none() ? res : form_res;
+                                auto sub = parse_content_stream(
+                                    doc, form_stream, sub_res, page_height,
+                                    font_cache, skip_graphics, form_ctm, depth + 1);
+                                result.chars.insert(result.chars.end(),
+                                    sub.chars.begin(), sub.chars.end());
+                                result.segments.insert(result.segments.end(),
+                                    sub.segments.begin(), sub.segments.end());
+                                result.images.insert(result.images.end(),
+                                    sub.images.begin(), sub.images.end());
+                                result.paths.insert(result.paths.end(),
+                                    sub.paths.begin(), sub.paths.end());
+                            }
+                        } else {
+                            ImagePlacement ip;
+                            ip.xobj_name = xname;
+                            if (xref.is_ref()) ip.xobj_ref = xref.ref_num;
+                            std::memcpy(ip.ctm, gs.ctm, sizeof(gs.ctm));
+                            ip.fill_r = gs.fill_r;
+                            ip.fill_g = gs.fill_g;
+                            ip.fill_b = gs.fill_b;
+                            result.images.push_back(ip);
+                        }
                     }
                 }
             }
