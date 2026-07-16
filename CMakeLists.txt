@@ -150,6 +150,14 @@ add_executable(test_office test/test_office.cpp)
 target_link_libraries(test_office PRIVATE jdoc_office)
 target_include_directories(test_office PRIVATE include src)
 
+add_executable(test_archive test/test_archive.cpp)
+target_link_libraries(test_archive PRIVATE jdoc_all ZLIB::ZLIB)
+target_include_directories(test_archive PRIVATE include src)
+
+add_executable(bench_convert test/bench_convert.cpp)
+target_link_libraries(bench_convert PRIVATE jdoc_all)
+target_include_directories(bench_convert PRIVATE include)
+
 # ── Python bindings (pybind11) ────────────────────────────────
 
 option(BUILD_PYTHON "Build Python bindings" OFF)

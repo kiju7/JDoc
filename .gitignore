@@ -10,3 +10,4 @@ __pycache__/
 *.egg-info/
 dist/
 .eggs/
+test_archive_tmp/
