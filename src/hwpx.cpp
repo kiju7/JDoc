@@ -42,6 +42,13 @@ public:
             throw std::runtime_error("Cannot open HWPX file: " + path);
     }
 
+    HWPXParser(const uint8_t* data, size_t size, ConvertOptions opts)
+        : opts_(std::move(opts)) {
+        zip_ = std::make_unique<ZipReader>(data, size);
+        if (!zip_->is_open())
+            throw std::runtime_error("Cannot open HWPX data (not a valid zip)");
+    }
+
     bool parse() {
         // 1. Verify mimetype
         auto mime_data = zip_->read_entry("mimetype");
@@ -783,8 +790,8 @@ private:
 
 // ── Public API ──────────────────────────────────────────────
 
-std::string hwpx_to_markdown(const std::string& hwpx_path, ConvertOptions opts) {
-    HWPXParser parser(hwpx_path, opts);
+static std::string hwpx_chunks_to_markdown(HWPXParser& parser,
+                                           const ConvertOptions& opts) {
     parser.parse();
     auto chunks = parser.convert_chunks();
 
@@ -799,6 +806,17 @@ std::string hwpx_to_markdown(const std::string& hwpx_path, ConvertOptions opts) 
             result += chunks[i].text;
     }
     return result;
+}
+
+std::string hwpx_to_markdown(const std::string& hwpx_path, ConvertOptions opts) {
+    HWPXParser parser(hwpx_path, opts);
+    return hwpx_chunks_to_markdown(parser, opts);
+}
+
+std::string hwpx_to_markdown_mem(const uint8_t* data, size_t size,
+                                 ConvertOptions opts) {
+    HWPXParser parser(data, size, opts);
+    return hwpx_chunks_to_markdown(parser, opts);
 }
 
 std::vector<PageChunk> hwpx_to_markdown_chunks(const std::string& hwpx_path,

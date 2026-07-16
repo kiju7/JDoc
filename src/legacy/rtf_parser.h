@@ -14,6 +14,7 @@ namespace jdoc {
 class RtfParser {
 public:
     explicit RtfParser(const std::string& file_path);
+    RtfParser(const char* data, size_t size);   // parse from memory
 
     // Convert the document to a markdown string.
     std::string to_markdown(const ConvertOptions& opts);

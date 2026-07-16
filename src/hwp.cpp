@@ -129,8 +129,14 @@ public:
     HWPParser(const std::string& path, ConvertOptions opts)
         : opts_(std::move(opts)), path_(path) {}
 
+    HWPParser(const uint8_t* data, size_t size, ConvertOptions opts)
+        : opts_(std::move(opts)), mem_data_(data), mem_size_(size) {}
+
     bool parse() {
-        ole_ = std::make_unique<OleReader>(path_);
+        if (mem_data_)
+            ole_ = std::make_unique<OleReader>(mem_data_, mem_size_);
+        else
+            ole_ = std::make_unique<OleReader>(path_);
         if (!ole_->is_open()) {
             throw std::runtime_error("Not a valid HWP file (OLE2 open failed)");
         }
@@ -197,6 +203,8 @@ public:
 private:
     ConvertOptions opts_;
     std::string path_;
+    const uint8_t* mem_data_ = nullptr;
+    size_t mem_size_ = 0;
     std::unique_ptr<OleReader> ole_;
 
     bool compressed_ = true;
@@ -1374,8 +1382,8 @@ private:
 
 // ── Public API ──────────────────────────────────────────────
 
-std::string hwp_to_markdown(const std::string& hwp_path, ConvertOptions opts) {
-    HWPParser parser(hwp_path, opts);
+static std::string hwp_chunks_to_markdown(HWPParser& parser,
+                                          const ConvertOptions& opts) {
     parser.parse();
     auto chunks = parser.convert_chunks();
 
@@ -1390,6 +1398,17 @@ std::string hwp_to_markdown(const std::string& hwp_path, ConvertOptions opts) {
             result += chunks[i].text;
     }
     return result;
+}
+
+std::string hwp_to_markdown(const std::string& hwp_path, ConvertOptions opts) {
+    HWPParser parser(hwp_path, opts);
+    return hwp_chunks_to_markdown(parser, opts);
+}
+
+std::string hwp_to_markdown_mem(const uint8_t* data, size_t size,
+                                ConvertOptions opts) {
+    HWPParser parser(data, size, opts);
+    return hwp_chunks_to_markdown(parser, opts);
 }
 
 std::vector<PageChunk> hwp_to_markdown_chunks(const std::string& hwp_path,

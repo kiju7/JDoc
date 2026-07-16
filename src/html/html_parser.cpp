@@ -24,6 +24,9 @@ HtmlParser::HtmlParser(const std::string& file_path) : file_path_(file_path) {
     ifs.read(&raw_html_[0], size);
 }
 
+HtmlParser::HtmlParser(const char* data, size_t size)
+    : raw_html_(data, size) {}
+
 // ── HTML entity decoding ─────────────────────────────────
 
 std::string HtmlParser::decode_entities(const std::string& text) {

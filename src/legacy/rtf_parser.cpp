@@ -72,6 +72,9 @@ RtfParser::RtfParser(const std::string& file_path) : file_path_(file_path) {
     ifs.read(raw_data_.data(), size);
 }
 
+RtfParser::RtfParser(const char* data, size_t size)
+    : raw_data_(data, data + size) {}
+
 // ---------- parser -----------------------------------------------------------
 
 void RtfParser::parse(std::string& out_text, std::vector<PictImage>& out_images) {

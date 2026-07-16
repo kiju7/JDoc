@@ -12,6 +12,7 @@ namespace jdoc {
 class HtmlParser {
 public:
     explicit HtmlParser(const std::string& file_path);
+    HtmlParser(const char* data, size_t size);   // parse from memory
 
     std::string to_markdown(const ConvertOptions& opts);
     std::vector<PageChunk> to_chunks(const ConvertOptions& opts);

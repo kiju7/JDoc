@@ -6833,27 +6833,17 @@ std::vector<uint8_t> get_page_content(PdfDoc& doc, const PdfObj& page_obj) {
     return {};
 }
 
-ExtractResult extract_pdf(const std::string& pdf_path, const ConvertOptions& opts) {
+// Extract from an in-memory buffer; pdf_path is used for error messages only.
+static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
+                                        const std::string& pdf_path,
+                                        const ConvertOptions& opts) {
     ExtractResult result;
 
-    // Read file
-    std::ifstream file(pdf_path, std::ios::binary | std::ios::ate);
-    if (!file) throw std::runtime_error("Cannot open PDF: " + pdf_path);
-
-    std::streamsize fsize = file.tellg();
-    if (fsize <= 0) throw std::runtime_error("Empty PDF file: " + pdf_path);
-    file.seekg(0, std::ios::beg);
-
-    std::vector<uint8_t> file_data(static_cast<size_t>(fsize));
-    if (!file.read(reinterpret_cast<char*>(file_data.data()), fsize))
-        throw std::runtime_error("Cannot read PDF: " + pdf_path);
-    file.close();
-
     // Check PDF header
-    if (fsize < 5 || std::memcmp(file_data.data(), "%PDF-", 5) != 0)
+    if (size < 5 || std::memcmp(data, "%PDF-", 5) != 0)
         throw std::runtime_error("Not a valid PDF file: " + pdf_path);
 
-    PdfDoc doc(file_data.data(), file_data.size());
+    PdfDoc doc(data, size);
     if (!doc.parse())
         throw std::runtime_error("Failed to parse PDF structure: " + pdf_path);
 
@@ -7080,6 +7070,22 @@ ExtractResult extract_pdf(const std::string& pdf_path, const ConvertOptions& opt
     return result;
 }
 
+static ExtractResult extract_pdf(const std::string& pdf_path, const ConvertOptions& opts) {
+    std::ifstream file(pdf_path, std::ios::binary | std::ios::ate);
+    if (!file) throw std::runtime_error("Cannot open PDF: " + pdf_path);
+
+    std::streamsize fsize = file.tellg();
+    if (fsize <= 0) throw std::runtime_error("Empty PDF file: " + pdf_path);
+    file.seekg(0, std::ios::beg);
+
+    std::vector<uint8_t> file_data(static_cast<size_t>(fsize));
+    if (!file.read(reinterpret_cast<char*>(file_data.data()), fsize))
+        throw std::runtime_error("Cannot read PDF: " + pdf_path);
+    file.close();
+
+    return extract_pdf_buffer(file_data.data(), file_data.size(), pdf_path, opts);
+}
+
 } // anonymous namespace
 
 // ── Public API ───────────────────────────────────────────
@@ -7107,9 +7113,7 @@ static std::string format_bookmarks(const std::vector<BookmarkEntry>& bookmarks,
     return out;
 }
 
-std::string pdf_to_markdown(const std::string& pdf_path, ConvertOptions opts) {
-    auto r = extract_pdf(pdf_path, opts);
-
+static std::string result_to_markdown(ExtractResult& r, const ConvertOptions& opts) {
     std::vector<int> page_indices;
     if (opts.pages.empty()) {
         for (int i = 0; i < r.total_pages; i++) page_indices.push_back(i);
@@ -7145,10 +7149,8 @@ std::string pdf_to_markdown(const std::string& pdf_path, ConvertOptions opts) {
     return full_md;
 }
 
-std::vector<PageChunk> pdf_to_markdown_chunks(const std::string& pdf_path,
-                                           ConvertOptions opts) {
-    auto r = extract_pdf(pdf_path, opts);
-
+static std::vector<PageChunk> result_to_chunks(ExtractResult& r,
+                                               const ConvertOptions& opts) {
     std::vector<int> page_indices;
     if (opts.pages.empty()) {
         for (int i = 0; i < r.total_pages; i++) page_indices.push_back(i);
@@ -7180,6 +7182,29 @@ std::vector<PageChunk> pdf_to_markdown_chunks(const std::string& pdf_path,
         chunks.push_back(std::move(chunk));
     }
     return chunks;
+}
+
+std::string pdf_to_markdown(const std::string& pdf_path, ConvertOptions opts) {
+    auto r = extract_pdf(pdf_path, opts);
+    return result_to_markdown(r, opts);
+}
+
+std::vector<PageChunk> pdf_to_markdown_chunks(const std::string& pdf_path,
+                                              ConvertOptions opts) {
+    auto r = extract_pdf(pdf_path, opts);
+    return result_to_chunks(r, opts);
+}
+
+std::string pdf_to_markdown_mem(const uint8_t* data, size_t size,
+                                ConvertOptions opts) {
+    auto r = extract_pdf_buffer(data, size, "<memory>", opts);
+    return result_to_markdown(r, opts);
+}
+
+std::vector<PageChunk> pdf_to_markdown_chunks_mem(const uint8_t* data, size_t size,
+                                                  ConvertOptions opts) {
+    auto r = extract_pdf_buffer(data, size, "<memory>", opts);
+    return result_to_chunks(r, opts);
 }
 
 } // namespace jdoc

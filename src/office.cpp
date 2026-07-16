@@ -18,6 +18,7 @@
 #include <fstream>
 #include <cstring>
 #include <algorithm>
+#include <memory>
 #include <stdexcept>
 
 namespace jdoc {
@@ -136,6 +137,87 @@ DocFormat detect_office_format(const std::string& file_path) {
     return DocFormat::UNKNOWN;
 }
 
+DocFormat detect_office_format_mem(const uint8_t* data, size_t size,
+                                   const std::string& name_hint) {
+    if (!data || size < 8) return DocFormat::UNKNOWN;
+    std::string ext = lowercase_ext(name_hint);
+
+    // ZIP magic: PK\x03\x04
+    static const unsigned char ZIP_MAGIC[] = {0x50, 0x4B, 0x03, 0x04};
+    if (memcmp(data, ZIP_MAGIC, 4) == 0) {
+        if (ext == ".docx") return DocFormat::DOCX;
+        if (ext == ".xlsx") return DocFormat::XLSX;
+        if (ext == ".xlsb") return DocFormat::XLSB;
+        if (ext == ".pptx") return DocFormat::PPTX;
+
+        ZipReader zip(data, size);
+        if (zip.is_open()) {
+            auto ct = zip.read_entry("[Content_Types].xml");
+            if (!ct.empty()) {
+                std::string content(ct.begin(), ct.end());
+                if (content.find("wordprocessingml") != std::string::npos)
+                    return DocFormat::DOCX;
+                if (content.find("spreadsheetml") != std::string::npos) {
+                    if (content.find("binaryFormat") != std::string::npos ||
+                        zip.has_entry("xl/workbook.bin"))
+                        return DocFormat::XLSB;
+                    return DocFormat::XLSX;
+                }
+                if (content.find("presentationml") != std::string::npos)
+                    return DocFormat::PPTX;
+            }
+        }
+        return DocFormat::UNKNOWN;
+    }
+
+    // OLE magic: D0 CF 11 E0 A1 B1 1A E1
+    static const unsigned char OLE_MAGIC[] = {0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1};
+    if (memcmp(data, OLE_MAGIC, 8) == 0) {
+        if (ext == ".doc") return DocFormat::DOC;
+        if (ext == ".xls") return DocFormat::XLS;
+        if (ext == ".ppt") return DocFormat::PPT;
+
+        OleReader ole(data, size);
+        if (ole.is_open()) {
+            // HWP check: skip it here, let the main dispatcher handle HWP
+            if (ole.has_stream("FileHeader")) return DocFormat::UNKNOWN;
+            if (ole.has_stream("WordDocument")) return DocFormat::DOC;
+            if (ole.has_stream("Workbook") || ole.has_stream("Book"))
+                return DocFormat::XLS;
+            if (ole.has_stream("PowerPoint Document")) return DocFormat::PPT;
+        }
+        return DocFormat::UNKNOWN;
+    }
+
+    // RTF magic: {\rtf
+    if (data[0] == '{' && data[1] == '\\' && data[2] == 'r' &&
+        data[3] == 't' && data[4] == 'f')
+        return DocFormat::RTF;
+
+    if (ext == ".html" || ext == ".htm") return DocFormat::HTML;
+
+    if (data[0] == '<') {
+        size_t n = size < 256 ? size : 256;
+        std::string lower;
+        for (size_t i = 0; i < n; i++)
+            lower += std::tolower(data[i]);
+        if (lower.find("<!doctype html") != std::string::npos ||
+            lower.find("<html") != std::string::npos)
+            return DocFormat::HTML;
+    }
+
+    if (ext == ".docx") return DocFormat::DOCX;
+    if (ext == ".xlsx") return DocFormat::XLSX;
+    if (ext == ".xlsb") return DocFormat::XLSB;
+    if (ext == ".pptx") return DocFormat::PPTX;
+    if (ext == ".doc")  return DocFormat::DOC;
+    if (ext == ".xls")  return DocFormat::XLS;
+    if (ext == ".ppt")  return DocFormat::PPT;
+    if (ext == ".rtf")  return DocFormat::RTF;
+
+    return DocFormat::UNKNOWN;
+}
+
 const char* format_name(DocFormat fmt) {
     switch (fmt) {
         case DocFormat::DOCX: return "DOCX";
@@ -158,11 +240,111 @@ static const char* section_label(DocFormat /*fmt*/) {
     return "Page";
 }
 
-std::string office_to_markdown(const std::string& file_path, ConvertOptions opts) {
-    auto format = detect_office_format(file_path);
+// Document input: a file path or an in-memory buffer (archive members).
+namespace {
+struct DocInput {
+    const std::string* path = nullptr;
+    const uint8_t* data = nullptr;
+    size_t size = 0;
+
+    std::string display() const { return path ? *path : "<memory>"; }
+
+    std::unique_ptr<ZipReader> open_zip() const {
+        return path ? std::make_unique<ZipReader>(*path)
+                    : std::make_unique<ZipReader>(data, size);
+    }
+    std::unique_ptr<OleReader> open_ole() const {
+        return path ? std::make_unique<OleReader>(*path)
+                    : std::make_unique<OleReader>(data, size);
+    }
+};
+} // anonymous namespace
+
+// Run fn with a parser constructed for the detected format.
+// fn is invoked as fn(parser) and its return value is passed through.
+template <typename Fn>
+static auto with_office_parser(DocFormat format, const DocInput& in, Fn&& fn) {
+    switch (format) {
+    case DocFormat::DOCX: {
+        auto zip = in.open_zip();
+        if (!zip->is_open()) throw std::runtime_error("Cannot open DOCX file: " + in.display());
+        DocxParser parser(*zip);
+        return fn(parser);
+    }
+    case DocFormat::PPTX: {
+        auto zip = in.open_zip();
+        if (!zip->is_open()) throw std::runtime_error("Cannot open PPTX file: " + in.display());
+        PptxParser parser(*zip);
+        return fn(parser);
+    }
+    case DocFormat::XLSX: {
+        auto zip = in.open_zip();
+        if (!zip->is_open()) throw std::runtime_error("Cannot open XLSX file: " + in.display());
+        XlsxParser parser(*zip);
+        return fn(parser);
+    }
+    case DocFormat::XLSB: {
+        auto zip = in.open_zip();
+        if (!zip->is_open()) throw std::runtime_error("Cannot open XLSB file: " + in.display());
+        XlsbParser parser(*zip);
+        return fn(parser);
+    }
+    case DocFormat::DOC: {
+        auto ole = in.open_ole();
+        if (!ole->is_open()) throw std::runtime_error("Cannot open DOC file: " + in.display());
+        DocParser parser(*ole);
+        return fn(parser);
+    }
+    case DocFormat::XLS: {
+        auto ole = in.open_ole();
+        if (!ole->is_open()) throw std::runtime_error("Cannot open XLS file: " + in.display());
+        XlsParser parser(*ole);
+        return fn(parser);
+    }
+    case DocFormat::PPT: {
+        auto ole = in.open_ole();
+        if (!ole->is_open()) throw std::runtime_error("Cannot open PPT file: " + in.display());
+        PptParser parser(*ole);
+        return fn(parser);
+    }
+    case DocFormat::RTF: {
+        if (in.path) {
+            RtfParser parser(*in.path);
+            return fn(parser);
+        }
+        RtfParser parser(reinterpret_cast<const char*>(in.data), in.size);
+        return fn(parser);
+    }
+    case DocFormat::HTML: {
+        if (in.path) {
+            HtmlParser parser(*in.path);
+            return fn(parser);
+        }
+        HtmlParser parser(reinterpret_cast<const char*>(in.data), in.size);
+        return fn(parser);
+    }
+    default:
+        throw std::runtime_error("Unsupported document format: " + in.display());
+    }
+}
+
+static std::vector<PageChunk> to_chunks_impl(DocFormat format, const DocInput& in,
+                                             const ConvertOptions& opts) {
+    auto chunks = with_office_parser(format, in, [&](auto& parser) {
+        return parser.to_chunks(opts);
+    });
 
     if (opts.output_format == OutputFormat::PLAINTEXT) {
-        auto chunks = office_to_markdown_chunks(file_path, opts);
+        for (auto& chunk : chunks)
+            chunk.text = util::strip_markdown(chunk.text);
+    }
+    return chunks;
+}
+
+static std::string to_markdown_impl(DocFormat format, const DocInput& in,
+                                    const ConvertOptions& opts) {
+    if (opts.output_format == OutputFormat::PLAINTEXT) {
+        auto chunks = to_chunks_impl(format, in, opts);
         if (chunks.size() <= 1 && !chunks.empty())
             return chunks[0].text;
         bool has_heading = (format == DocFormat::XLSX || format == DocFormat::XLSB ||
@@ -181,147 +363,40 @@ std::string office_to_markdown(const std::string& file_path, ConvertOptions opts
         return result;
     }
 
-    std::string md;
-    switch (format) {
-    case DocFormat::DOCX: {
-        ZipReader zip(file_path);
-        if (!zip.is_open()) throw std::runtime_error("Cannot open DOCX file: " + file_path);
-        DocxParser parser(zip);
-        md = parser.to_markdown(opts);
-        break;
-    }
-    case DocFormat::PPTX: {
-        ZipReader zip(file_path);
-        if (!zip.is_open()) throw std::runtime_error("Cannot open PPTX file: " + file_path);
-        PptxParser parser(zip);
-        md = parser.to_markdown(opts);
-        break;
-    }
-    case DocFormat::XLSX: {
-        ZipReader zip(file_path);
-        if (!zip.is_open()) throw std::runtime_error("Cannot open XLSX file: " + file_path);
-        XlsxParser parser(zip);
-        md = parser.to_markdown(opts);
-        break;
-    }
-    case DocFormat::XLSB: {
-        ZipReader zip(file_path);
-        if (!zip.is_open()) throw std::runtime_error("Cannot open XLSB file: " + file_path);
-        XlsbParser parser(zip);
-        md = parser.to_markdown(opts);
-        break;
-    }
-    case DocFormat::DOC: {
-        OleReader ole(file_path);
-        if (!ole.is_open()) throw std::runtime_error("Cannot open DOC file: " + file_path);
-        DocParser parser(ole);
-        md = parser.to_markdown(opts);
-        break;
-    }
-    case DocFormat::XLS: {
-        OleReader ole(file_path);
-        if (!ole.is_open()) throw std::runtime_error("Cannot open XLS file: " + file_path);
-        XlsParser parser(ole);
-        md = parser.to_markdown(opts);
-        break;
-    }
-    case DocFormat::PPT: {
-        OleReader ole(file_path);
-        if (!ole.is_open()) throw std::runtime_error("Cannot open PPT file: " + file_path);
-        PptParser parser(ole);
-        md = parser.to_markdown(opts);
-        break;
-    }
-    case DocFormat::RTF: {
-        RtfParser parser(file_path);
-        md = parser.to_markdown(opts);
-        break;
-    }
-    case DocFormat::HTML: {
-        HtmlParser parser(file_path);
-        md = parser.to_markdown(opts);
-        break;
-    }
-    default:
-        throw std::runtime_error("Unsupported document format: " + file_path);
-    }
-    return md;
+    return with_office_parser(format, in, [&](auto& parser) {
+        return parser.to_markdown(opts);
+    });
+}
+
+std::string office_to_markdown(const std::string& file_path, ConvertOptions opts) {
+    DocInput in;
+    in.path = &file_path;
+    return to_markdown_impl(detect_office_format(file_path), in, opts);
 }
 
 std::vector<PageChunk> office_to_markdown_chunks(const std::string& file_path,
                                                     ConvertOptions opts) {
-    auto format = detect_office_format(file_path);
-    std::vector<PageChunk> chunks;
+    DocInput in;
+    in.path = &file_path;
+    return to_chunks_impl(detect_office_format(file_path), in, opts);
+}
 
-    switch (format) {
-    case DocFormat::DOCX: {
-        ZipReader zip(file_path);
-        if (!zip.is_open()) throw std::runtime_error("Cannot open DOCX file: " + file_path);
-        DocxParser parser(zip);
-        chunks = parser.to_chunks(opts);
-        break;
-    }
-    case DocFormat::PPTX: {
-        ZipReader zip(file_path);
-        if (!zip.is_open()) throw std::runtime_error("Cannot open PPTX file: " + file_path);
-        PptxParser parser(zip);
-        chunks = parser.to_chunks(opts);
-        break;
-    }
-    case DocFormat::XLSX: {
-        ZipReader zip(file_path);
-        if (!zip.is_open()) throw std::runtime_error("Cannot open XLSX file: " + file_path);
-        XlsxParser parser(zip);
-        chunks = parser.to_chunks(opts);
-        break;
-    }
-    case DocFormat::XLSB: {
-        ZipReader zip(file_path);
-        if (!zip.is_open()) throw std::runtime_error("Cannot open XLSB file: " + file_path);
-        XlsbParser parser(zip);
-        chunks = parser.to_chunks(opts);
-        break;
-    }
-    case DocFormat::DOC: {
-        OleReader ole(file_path);
-        if (!ole.is_open()) throw std::runtime_error("Cannot open DOC file: " + file_path);
-        DocParser parser(ole);
-        chunks = parser.to_chunks(opts);
-        break;
-    }
-    case DocFormat::XLS: {
-        OleReader ole(file_path);
-        if (!ole.is_open()) throw std::runtime_error("Cannot open XLS file: " + file_path);
-        XlsParser parser(ole);
-        chunks = parser.to_chunks(opts);
-        break;
-    }
-    case DocFormat::PPT: {
-        OleReader ole(file_path);
-        if (!ole.is_open()) throw std::runtime_error("Cannot open PPT file: " + file_path);
-        PptParser parser(ole);
-        chunks = parser.to_chunks(opts);
-        break;
-    }
-    case DocFormat::RTF: {
-        RtfParser parser(file_path);
-        chunks = parser.to_chunks(opts);
-        break;
-    }
-    case DocFormat::HTML: {
-        HtmlParser parser(file_path);
-        chunks = parser.to_chunks(opts);
-        break;
-    }
-    default:
-        throw std::runtime_error("Unsupported document format: " + file_path);
-    }
+std::string office_to_markdown_mem(const uint8_t* data, size_t size,
+                                   const std::string& name_hint,
+                                   ConvertOptions opts) {
+    DocInput in;
+    in.data = data;
+    in.size = size;
+    return to_markdown_impl(detect_office_format_mem(data, size, name_hint), in, opts);
+}
 
-    if (opts.output_format == OutputFormat::PLAINTEXT) {
-        for (auto& chunk : chunks)
-            chunk.text = util::strip_markdown(chunk.text);
-    }
-    return chunks;
+std::vector<PageChunk> office_to_markdown_chunks_mem(const uint8_t* data, size_t size,
+                                                     const std::string& name_hint,
+                                                     ConvertOptions opts) {
+    DocInput in;
+    in.data = data;
+    in.size = size;
+    return to_chunks_impl(detect_office_format_mem(data, size, name_hint), in, opts);
 }
 
 } // namespace jdoc
