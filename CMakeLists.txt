@@ -14,6 +14,27 @@ find_package(JPEG REQUIRED)
 add_library(pugixml STATIC vendor/pugixml/pugixml.cpp)
 target_include_directories(pugixml PUBLIC vendor/pugixml)
 
+# LZMA SDK (7z container + LZMA/LZMA2 decoders, public domain)
+# Decoder-only subset: encoders and all multithreading code (Threads.c,
+# MtCoder.c, MtDec.c) are excluded, so decoding is single-threaded.
+add_library(lzma_sdk STATIC
+    vendor/lzma/7zAlloc.c
+    vendor/lzma/7zArcIn.c
+    vendor/lzma/7zBuf.c
+    vendor/lzma/7zCrc.c
+    vendor/lzma/7zCrcOpt.c
+    vendor/lzma/7zDec.c
+    vendor/lzma/7zStream.c
+    vendor/lzma/LzmaDec.c
+    vendor/lzma/Lzma2Dec.c
+    vendor/lzma/Bcj2.c
+    vendor/lzma/Bra.c
+    vendor/lzma/Bra86.c
+    vendor/lzma/Delta.c
+    vendor/lzma/CpuArch.c
+)
+target_include_directories(lzma_sdk PUBLIC vendor/lzma)
+
 # ── Common utilities (compiled once) ──────────────────────────
 
 add_library(jdoc_common STATIC src/common/string_utils.cpp)
