@@ -236,6 +236,13 @@ std::string convert_from_memory(const uint8_t* data, size_t size,
                                 const std::string& name_hint,
                                 const ConvertOptions& opts) {
     auto fmt = detect_format_mem(data, size, name_hint);
+    return convert_from_memory_as(fmt, data, size, name_hint, opts);
+}
+
+std::string convert_from_memory_as(FileFormat fmt,
+                                   const uint8_t* data, size_t size,
+                                   const std::string& name_hint,
+                                   const ConvertOptions& opts) {
     switch (fmt) {
         case FileFormat::PDF:    return pdf_to_markdown_mem(data, size, opts);
         case FileFormat::OFFICE: return office_to_markdown_mem(data, size, name_hint, opts);

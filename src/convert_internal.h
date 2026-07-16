@@ -32,6 +32,10 @@ inline bool is_archive_format(FileFormat f) {
 std::string convert_from_memory(const uint8_t* data, size_t size,
                                 const std::string& name_hint,
                                 const ConvertOptions& opts);
+std::string convert_from_memory_as(FileFormat fmt,
+                                   const uint8_t* data, size_t size,
+                                   const std::string& name_hint,
+                                   const ConvertOptions& opts);
 
 // ── Archive walker (archive_walker.cpp) ─────────────────
 
