@@ -97,7 +97,15 @@
   실패·캡 초과 시에도 멤버의 압축 바이트를 정확히 소진해 프레이밍을 보존 →
   멤버 단위 오류 후 순회 계속.
 - ALZ/EGG 모두 헤더 CRC32를 스트리밍 중 검증(불일치 → "member crc mismatch").
-- EGG 멀티블록 멤버 지원(블록별 독립 디코딩·CRC). solid/split은 아카이브 단위 오류.
+- EGG 멀티블록 멤버 지원(블록별 독립 디코딩·CRC). split·전역 암호화는 아카이브 단위 오류.
+- **후속 개선(2026-07-16, reference 디컴파일 정본화 후 재검토)**: 공식 명세 PDF(EggDotNet 동봉)
+  기준으로 재정렬 — Extra Field 4바이트 size 플래그, 파일명 헤더 locale/parent-path-id
+  길이 산술 수정(기존 EggDotNet 준거 구현은 locale 존재 시 2바이트 과독), 암호화 파일명
+  멤버 격리, 전역 코멘트 허용, LZMA prop_size를 헤더 오프셋 2에서 파싱(reference 디코더 확인),
+  ALZ 크기 필드 게이트를 descriptor 상위 니블(w!=0)로 수정, **solid EGG 스트리밍 demux
+  지원**(멤버 1개 상주 유지). 실물 검증: EggDotNet 자산 34종 전수 — 의도된 오류(암호화
+  10종·AZO 3종·분할 2종·전역암호화 1종) 외 전부 정상, solid_defaults.egg 출력이 non-solid
+  변형과 69,990B 정확 일치, bzip2 ON 빌드에서 zeros.egg(197MB)·bz_optimized 8/8 통과.
 - 검증: 합성 alz 픽스처를 **The Unarchiver(unar)** 로 추출 교차검증 — 멤버 내용 일치.
   (unar 꼬리 파싱 에러는 실제 ALZip이 종료 레코드 뒤에 쓰는 추가 구조 차이로 멤버와 무관.)
   EGG는 unar 미지원 포맷이라 교차검증 불가 — **실물 egg 샘플 확보 후 검증 필요**(잔여 리스크).

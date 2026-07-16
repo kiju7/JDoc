@@ -173,28 +173,43 @@ bool bzip2_stream(InputStream& src, uint64_t comp_size,
 bool lzma_egg_stream(InputStream& src, uint64_t comp_size,
                      uint64_t uncomp_size, const CodecSink& sink,
                      std::string* err) {
+    // Block payload: 2 reserved bytes, u16 property size, the LZMA
+    // properties, then the raw stream (layout per ALZip's decoder).
     if (comp_size < 9) {
         discard_stream(src, comp_size);
         set_err(err, "corrupt lzma block (too short)");
         return false;
     }
-    // 4 reserved bytes + 5 LZMA property bytes precede the raw stream.
-    unsigned char head[9];
+    unsigned char head[4 + LZMA_PROPS_SIZE];
     size_t got = 0;
-    while (got < sizeof(head)) {
-        size_t n = src.read(head + got, sizeof(head) - got);
+    while (got < 4) {
+        size_t n = src.read(head + got, 4 - got);
         if (n == 0) {
             set_err(err, "truncated member data");
             return false;
         }
         got += n;
     }
-    uint64_t left = comp_size - 9;
+    uint16_t prop_size = static_cast<uint16_t>(head[2] | (head[3] << 8));
+    if (prop_size != LZMA_PROPS_SIZE || comp_size < 4u + prop_size) {
+        discard_stream(src, comp_size - 4);
+        set_err(err, "unsupported lzma properties");
+        return false;
+    }
+    while (got < 4u + prop_size) {
+        size_t n = src.read(head + got, 4u + prop_size - got);
+        if (n == 0) {
+            set_err(err, "truncated member data");
+            return false;
+        }
+        got += n;
+    }
+    uint64_t left = comp_size - 4 - prop_size;
 
     ISzAlloc alloc = {SzAlloc, SzFree};
     CLzmaDec dec;
     LzmaDec_Construct(&dec);
-    if (LzmaDec_Allocate(&dec, head + 4, 5, &alloc) != SZ_OK) {
+    if (LzmaDec_Allocate(&dec, head + 4, prop_size, &alloc) != SZ_OK) {
         discard_stream(src, left);
         set_err(err, "invalid lzma properties");
         return false;

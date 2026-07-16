@@ -418,6 +418,142 @@ bool walk_alz(InputStream& src, const std::string& name_hint,
 
 // ── egg ─────────────────────────────────────────────────
 
+// Solid egg: all file headers precede one shared block stream whose
+// decoded bytes cover the members in order. Members are demultiplexed
+// while the stream decodes, so only one member is resident at a time.
+bool walk_egg_solid(EggReader& egg, const std::string& prefix, int depth,
+                    WalkBudget& budget, const ConvertOptions& opts,
+                    const MemberCallback& cb) {
+    std::vector<EggReader::Member> members;
+    EggReader::Member m;
+    while (egg.next(m)) members.push_back(std::move(m));
+    if (!egg.at_solid_data()) {
+        // No data area (all members empty) — nothing to emit.
+        return true;
+    }
+
+    struct Demux {
+        std::vector<EggReader::Member>& members;
+        const std::string& prefix;
+        int depth;
+        WalkBudget& budget;
+        const ConvertOptions& opts;
+        const MemberCallback& cb;
+
+        size_t idx = 0;              // next member to start
+        uint64_t member_left = 0;    // undelivered bytes of current member
+        std::vector<char> data;
+        bool draining = false;       // consume current member without keeping
+        bool cap_hit = false;        // draining because the member cap tripped
+        bool stopped = false;        // walk aborted (budget/cb)
+
+        // Position on the next member that has stream bytes; decides
+        // whether it will be materialized or just drained.
+        bool next_member() {
+            while (idx < members.size()) {
+                auto& mem = members[idx++];
+                if (mem.uncompressed_size == 0) continue;  // no stream bytes
+                member_left = mem.uncompressed_size;
+                draining = true;
+                cap_hit = false;
+
+                if (mem.name.empty() || is_metadata_member(mem.name))
+                    return true;  // silent drain
+
+                std::string path = prefix + normalize_member_name(mem.name);
+                if (!count_entry(path, budget, opts, cb)) {
+                    stopped = true;
+                    return false;
+                }
+                if (has_skippable_ext(mem.name) || mem.encrypted) {
+                    if (mem.encrypted || opts.archive.include_unsupported) {
+                        MemberResult r;
+                        r.member_path = path;
+                        r.uncompressed_size = mem.uncompressed_size;
+                        r.error = mem.encrypted ? "encrypted member unsupported"
+                                                : "unsupported format";
+                        if (!cb(std::move(r))) { stopped = true; return false; }
+                    }
+                    return true;  // drain
+                }
+
+                draining = false;
+                data.clear();
+                data.reserve(std::min<uint64_t>(mem.uncompressed_size,
+                                                opts.archive.max_member_bytes));
+                return true;
+            }
+            return false;  // stream longer than declared members: corrupt
+        }
+
+        bool finish_member() {
+            auto& mem = members[idx - 1];
+            std::string path = prefix + normalize_member_name(mem.name);
+            if (draining) {
+                if (cap_hit) {
+                    MemberResult r;
+                    r.member_path = path;
+                    r.uncompressed_size = mem.uncompressed_size;
+                    r.error = "member exceeds size/ratio limit, skipped";
+                    if (!cb(std::move(r))) { stopped = true; return false; }
+                }
+                return true;
+            }
+            if (!handle_member(path, std::move(data), depth, budget, opts, cb)) {
+                stopped = true;
+                return false;
+            }
+            data = std::vector<char>();
+            return true;
+        }
+
+        bool operator()(const char* p, size_t n) {
+            while (n > 0) {
+                if (member_left == 0 && !next_member()) return false;
+                size_t take = static_cast<size_t>(
+                    std::min<uint64_t>(n, member_left));
+                if (!draining) {
+                    if (data.size() + take > opts.archive.max_member_bytes) {
+                        draining = true;  // cap hit: drain the rest
+                        cap_hit = true;
+                        data = std::vector<char>();
+                    } else {
+                        budget.total_out += take;
+                        if (budget.total_out > opts.archive.max_total_bytes) {
+                            MemberResult r;
+                            r.member_path = prefix + normalize_member_name(
+                                members[idx - 1].name);
+                            r.error =
+                                "total uncompressed size limit exceeded; walk stopped";
+                            cb(std::move(r));
+                            stopped = true;
+                            return false;
+                        }
+                        data.insert(data.end(), p, p + take);
+                    }
+                }
+                p += take;
+                n -= take;
+                member_left -= take;
+                if (member_left == 0 && !finish_member()) return false;
+            }
+            return true;
+        }
+    } demux{members, prefix, depth, budget, opts, cb};
+
+    std::string err;
+    if (!egg.read_solid_stream(std::ref(demux), &err)) {
+        if (demux.stopped) return false;  // budget/cb abort already reported
+        MemberResult r;
+        r.member_path = demux.idx > 0 && demux.idx <= members.size()
+            ? prefix + normalize_member_name(members[demux.idx - 1].name)
+            : prefix;
+        r.error = err.empty() ? "corrupt solid egg data" : err;
+        return cb(std::move(r));
+    }
+    return true;
+}
+
 bool walk_egg(InputStream& src, const std::string& name_hint,
               const std::string& prefix, int depth, WalkBudget& budget,
               const ConvertOptions& opts, const MemberCallback& cb) {
@@ -428,13 +564,15 @@ bool walk_egg(InputStream& src, const std::string& name_hint,
         r.error = "cannot open egg archive";
         return cb(std::move(r));
     }
-    if (egg.is_solid() || egg.is_split()) {
+    if (egg.is_split() || egg.is_global_encrypted()) {
         MemberResult r;
         r.member_path = prefix.empty() ? name_hint : prefix;
-        r.error = egg.is_solid() ? "solid egg archive unsupported"
-                                 : "split egg volume unsupported";
+        r.error = egg.is_split() ? "split egg volume unsupported"
+                                 : "encrypted egg archive unsupported";
         return cb(std::move(r));
     }
+    if (egg.is_solid())
+        return walk_egg_solid(egg, prefix, depth, budget, opts, cb);
 
     EggReader::Member m;
     while (egg.next(m)) {

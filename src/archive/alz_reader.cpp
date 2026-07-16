@@ -72,8 +72,11 @@ bool AlzReader::next(Member& out) {
     cur_ = Member{};
     cur_.encrypted = (flags & kFlagEncrypted) != 0;
 
-    if (flags != 0) {
-        int width = (flags & 0xF0) >> 4;
+    // The size/method fields exist only when the descriptor's high nibble
+    // (size-field width) is nonzero — flag-only descriptors (e.g. just the
+    // encrypted bit) carry no data fields.
+    int width = (flags & 0xF0) >> 4;
+    if (width != 0) {
         if (width != 1 && width != 2 && width != 4 && width != 8) return false;
         // method(2) crc(4) csize(width) usize(width)
         unsigned char info[6 + 16];

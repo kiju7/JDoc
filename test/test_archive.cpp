@@ -256,6 +256,41 @@ struct EggEntrySpec {
     }
 };
 
+static void put_egg_block(std::string& out, const EggBlockSpec& b) {
+    std::string payload = b.payload;
+    if (payload.empty())
+        payload = (b.method == 1) ? raw_deflate(b.content) : b.content;
+    put_u32(out, 0x02B50C13);  // block header
+    put_u16(out, static_cast<uint16_t>(b.method));
+    put_u32(out, static_cast<uint32_t>(b.content.size()));
+    put_u32(out, static_cast<uint32_t>(payload.size()));
+    put_u32(out, crc_of(b.content));
+    put_u32(out, 0x08E28222);  // end of block header
+    out += payload;
+}
+
+static void put_egg_file_header(std::string& out, const EggEntrySpec& e,
+                                uint32_t fid) {
+    const uint32_t kEofArc = 0x08E28222;
+    put_u32(out, 0x0A8590E3);  // file header
+    put_u32(out, fid);
+    put_u64(out, e.total_size());
+    put_u32(out, 0x0A8591AC);  // filename header
+    out.push_back(0);          // flags
+    put_u16(out, static_cast<uint16_t>(e.name.size()));
+    out += e.name;
+    if (e.encrypted) {
+        put_u32(out, 0x08D1470F);  // encrypt header
+        out.push_back(0);
+        put_u16(out, 4);
+        out.append(4, '\0');
+    }
+    put_u32(out, kEofArc);     // end of file header section
+}
+
+// Normal layout: each file's headers are followed by its blocks.
+// Solid layout: every file header first, then one shared block stream
+// covering the concatenated contents (spec section 3, "Solid Archive").
 static std::string make_egg(const std::vector<EggEntrySpec>& entries,
                             bool solid = false) {
     const uint32_t kEofArc = 0x08E28222;
@@ -272,33 +307,17 @@ static std::string make_egg(const std::vector<EggEntrySpec>& entries,
     put_u32(out, kEofArc);
 
     uint32_t fid = 1;
-    for (const auto& e : entries) {
-        put_u32(out, 0x0A8590E3);  // file header
-        put_u32(out, fid++);
-        put_u64(out, e.total_size());
-        put_u32(out, 0x0A8591AC);  // filename header
-        out.push_back(0);          // flags
-        put_u16(out, static_cast<uint16_t>(e.name.size()));
-        out += e.name;
-        if (e.encrypted) {
-            put_u32(out, 0x08D1470F);  // encrypt header
-            out.push_back(0);
-            put_u16(out, 4);
-            out.append(4, '\0');
+    if (solid) {
+        std::string all;
+        for (const auto& e : entries) {
+            put_egg_file_header(out, e, fid++);
+            for (const auto& b : e.blocks) all += b.content;
         }
-        put_u32(out, kEofArc);     // end of file header section
-
-        for (const auto& b : e.blocks) {
-            std::string payload = b.payload;
-            if (payload.empty())
-                payload = (b.method == 1) ? raw_deflate(b.content) : b.content;
-            put_u32(out, 0x02B50C13);  // block header
-            put_u16(out, static_cast<uint16_t>(b.method));
-            put_u32(out, static_cast<uint32_t>(b.content.size()));
-            put_u32(out, static_cast<uint32_t>(payload.size()));
-            put_u32(out, crc_of(b.content));
-            put_u32(out, kEofArc);
-            out += payload;
+        put_egg_block(out, EggBlockSpec{all, 1});
+    } else {
+        for (const auto& e : entries) {
+            put_egg_file_header(out, e, fid++);
+            for (const auto& b : e.blocks) put_egg_block(out, b);
         }
     }
     put_u32(out, kEofArc);  // end of archive
@@ -327,7 +346,8 @@ static const unsigned char kLzmaAlone[] = {
     0x4d, 0xa0, 0x00};
 
 static std::string egg_lzma_payload() {
-    std::string p(4, '\0');  // reserved
+    std::string p(4, '\0');  // reserved(2) + property size u16
+    p[2] = 5;                // LZMA props are 5 bytes
     p.append(reinterpret_cast<const char*>(kLzmaAlone), 5);        // props
     p.append(reinterpret_cast<const char*>(kLzmaAlone) + 13,
              sizeof(kLzmaAlone) - 13);                             // raw stream
@@ -869,12 +889,87 @@ static void test_egg() {
         ASSERT(rs[0].error.find("AZO") != std::string::npos);
     TEST_END
 
-    TEST(egg_solid_archive_error)
-        EggEntrySpec e{"x.txt", {{"solid content", 1}}};
-        auto path = write_tmp("solid.egg", make_egg({e}, /*solid=*/true));
+    TEST(egg_solid_extraction)
+        // Three members share one solid block stream; each is demuxed out.
+        EggEntrySpec a{"a.txt", {{"solid first member", 0}}};
+        EggEntrySpec b{"dir/b.md", {{"# solid second", 0}}};
+        EggEntrySpec c{"c.txt", {{"third one closes the stream", 0}}};
+        auto path = write_tmp("solid.egg", make_egg({a, b, c}, /*solid=*/true));
         auto rs = jdoc::convert_archive(path);
-        ASSERT(rs.size() == 1 && !rs[0].ok());
-        ASSERT(rs[0].error.find("solid") != std::string::npos);
+        ASSERT(rs.size() == 3);
+        ASSERT(find_member(rs, "a.txt")->markdown == "solid first member");
+        ASSERT(find_member(rs, "dir/b.md")->markdown == "# solid second");
+        ASSERT(find_member(rs, "c.txt")->markdown == "third one closes the stream");
+    TEST_END
+
+    TEST(egg_solid_member_cap)
+        // Middle member exceeds the cap: it is skipped with an error while
+        // its stream bytes are drained, and the following member survives.
+        std::string big(2 << 20, 'q');
+        EggEntrySpec a{"ok1.txt", {{"first ok", 0}}};
+        EggEntrySpec bomb{"big.txt", {{big, 0}}};
+        EggEntrySpec c{"ok2.txt", {{"second ok", 0}}};
+        auto path = write_tmp("solidcap.egg", make_egg({a, bomb, c}, true));
+        jdoc::ConvertOptions opts;
+        opts.archive.max_member_bytes = 1 << 20;
+        auto rs = jdoc::convert_archive(path, opts);
+        ASSERT(rs.size() == 3);
+        ASSERT(find_member(rs, "ok1.txt")->ok());
+        auto* bm = find_member(rs, "big.txt");
+        ASSERT(bm && !bm->ok() && bm->error.find("limit") != std::string::npos);
+        ASSERT(find_member(rs, "ok2.txt")->ok());
+    TEST_END
+
+    TEST(egg_areacode_cp949_filename)
+        // Filename header with the area-code flag: locale(2) precedes the
+        // name and the size field covers both (spec p13).
+        std::string content = "areacode member";
+        std::string payload = raw_deflate(content);
+        std::string name949 = std::string("\xC7\xD1\xB1\xDB") + ".txt";  // 한글.txt
+        std::string out;
+        put_u32(out, 0x41474745); put_u16(out, 0x0100);
+        put_u32(out, 1); put_u32(out, 0); put_u32(out, 0x08E28222);
+        put_u32(out, 0x0A8590E3); put_u32(out, 1);
+        put_u64(out, content.size());
+        put_u32(out, 0x0A8591AC);
+        out.push_back(0x08);  // area-code flag
+        put_u16(out, static_cast<uint16_t>(2 + name949.size()));
+        put_u16(out, 949);    // locale
+        out += name949;
+        put_u32(out, 0x08E28222);
+        put_u32(out, 0x02B50C13); put_u16(out, 1);
+        put_u32(out, static_cast<uint32_t>(content.size()));
+        put_u32(out, static_cast<uint32_t>(payload.size()));
+        put_u32(out, crc_of(content));
+        put_u32(out, 0x08E28222);
+        out += payload;
+        put_u32(out, 0x08E28222);
+
+        auto path = write_tmp("areacode.egg", out);
+        auto rs = jdoc::convert_archive(path);
+        ASSERT(rs.size() == 1 && rs[0].ok());
+        ASSERT(rs[0].member_path == "\xED\x95\x9C\xEA\xB8\x80.txt");
+        ASSERT(rs[0].markdown == content);
+    TEST_END
+
+    TEST(egg_global_comment_between_members)
+        // A comment record between members must be skipped, not end the walk.
+        EggEntrySpec a{"a.txt", {{"before comment", 1}}};
+        EggEntrySpec b{"b.txt", {{"after comment", 1}}};
+        auto part1 = make_egg({a});
+        part1.resize(part1.size() - 4);  // drop end marker
+        std::string comment;
+        put_u32(comment, 0x04C63672);    // comment header
+        comment.push_back(0);
+        put_u16(comment, 5);
+        comment += "hello";
+        auto part2 = make_egg({b});
+        part2.erase(0, 18);              // drop EGGA header + EOFARC
+        auto path = write_tmp("comment.egg", part1 + comment + part2);
+        auto rs = jdoc::convert_archive(path);
+        ASSERT(rs.size() == 2);
+        ASSERT(find_member(rs, "a.txt")->ok());
+        ASSERT(find_member(rs, "b.txt")->markdown == "after comment");
     TEST_END
 
     TEST(egg_in_zip)
