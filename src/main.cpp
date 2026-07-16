@@ -4,6 +4,7 @@
 
 #include "jdoc/jdoc.h"
 #include "jdoc/archive.h"
+#include <cstdint>
 #include <iostream>
 #include <fstream>
 #include <sstream>
@@ -23,8 +24,8 @@ void print_usage(const char* prog) {
               << "  --min-image-size N  Skip images smaller than NxN pixels (default: 50, 0=no filter)\n"
               << "  --plaintext     Output plain text instead of Markdown\n"
               << "\nArchive options:\n"
-              << "  --max-depth N        Max nested-archive depth (default: 3)\n"
-              << "  --max-member-mb N    Per-member uncompressed cap in MiB (default: 512)\n"
+              << "  --max-depth N        Max nested-archive depth (default: 3, -1 = unlimited)\n"
+              << "  --max-member-mb N    Per-member uncompressed cap in MiB (default: 512, -1 = unlimited)\n"
               << "  --include-unsupported  Report unsupported members as errors\n"
               << "  --help          Show this help\n";
 }
@@ -77,11 +78,12 @@ int main(int argc, char* argv[]) {
             opts.output_format = jdoc::OutputFormat::PLAINTEXT;
         }
         else if (arg == "--max-depth" && i + 1 < argc) {
-            opts.archive.max_depth = std::stoi(argv[++i]);
+            opts.archive.max_depth = std::stoi(argv[++i]);  // negative = unlimited
         }
         else if (arg == "--max-member-mb" && i + 1 < argc) {
+            long long mb = std::stoll(argv[++i]);
             opts.archive.max_member_bytes =
-                static_cast<uint64_t>(std::stoull(argv[++i])) << 20;
+                mb < 0 ? UINT64_MAX : static_cast<uint64_t>(mb) << 20;
         }
         else if (arg == "--include-unsupported") {
             opts.archive.include_unsupported = true;

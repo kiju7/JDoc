@@ -14,7 +14,9 @@ typedef struct {
     const int* pages;                /* page numbers to extract (NULL = all) */
     int page_count;                  /* length of pages array */
     int plaintext;                   /* 0 = markdown, 1 = plaintext */
-    /* Archive limits (jdoc_convert_archive). 0 = library default. */
+    /* Archive limits (jdoc_convert_archive).
+     * 0 = library default, -1 = unlimited (disables that guard —
+     * only for trusted inputs; archive-bomb protection goes with it). */
     int max_archive_depth;               /* default 3 */
     long long max_member_bytes;          /* per-member uncompressed cap; default 512 MiB */
     long long max_total_bytes;           /* cumulative cap per call; default 64 GiB */

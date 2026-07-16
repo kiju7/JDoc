@@ -5,6 +5,8 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
+#include <cstdint>
+
 #include "jdoc/jdoc.h"
 #include "jdoc/archive.h"
 #include "jdoc/pdf.h"
@@ -187,31 +189,38 @@ Returns:
     m.def("convert_archive", [](const std::string& file_path,
                                  const std::string& format,
                                  int max_depth,
-                                 uint64_t max_member_bytes,
-                                 uint64_t max_total_bytes,
-                                 unsigned max_entries,
+                                 long long max_member_bytes,
+                                 long long max_total_bytes,
+                                 long long max_entries,
                                  bool include_unsupported)
                                  -> std::vector<jdoc::MemberResult> {
         jdoc::ConvertOptions opts;
         if (format == "text" || format == "plaintext" || format == "plain")
             opts.output_format = jdoc::OutputFormat::PLAINTEXT;
+        // -1 (any negative) disables the corresponding guard.
         opts.archive.max_depth = max_depth;
-        opts.archive.max_member_bytes = max_member_bytes;
-        opts.archive.max_total_bytes = max_total_bytes;
-        opts.archive.max_entries = max_entries;
+        opts.archive.max_member_bytes =
+            max_member_bytes < 0 ? UINT64_MAX : (uint64_t)max_member_bytes;
+        opts.archive.max_total_bytes =
+            max_total_bytes < 0 ? UINT64_MAX : (uint64_t)max_total_bytes;
+        opts.archive.max_entries =
+            max_entries < 0 ? UINT32_MAX : (uint32_t)max_entries;
         opts.archive.include_unsupported = include_unsupported;
         return jdoc::convert_archive(file_path, opts);
     },
     py::arg("file_path"),
     py::arg("format") = "markdown",
     py::arg("max_depth") = 3,
-    py::arg("max_member_bytes") = uint64_t(512) << 20,
-    py::arg("max_total_bytes") = uint64_t(64) << 30,
+    py::arg("max_member_bytes") = (long long)(512) << 20,
+    py::arg("max_total_bytes") = (long long)(64) << 30,
     py::arg("max_entries") = 200000,
     py::arg("include_unsupported") = false,
-    R"doc(Convert every supported document inside an archive (zip/gz/tar/tar.gz)
-without extracting to disk. Members are decompressed into memory one at a
-time; nested archives are walked recursively up to max_depth.
+    R"doc(Convert every supported document inside an archive (zip/gz/tar/tar.gz/
+7z/alz/egg) without extracting to disk. Members are decompressed into memory
+one at a time; nested archives are walked recursively up to max_depth.
+
+Limits: pass -1 to disable a limit (unlimited). Only do this for trusted
+inputs — archive-bomb protection is disabled with it.
 
 Returns:
     List of MemberResult (member_path, format, markdown, error, ok)

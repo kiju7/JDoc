@@ -124,7 +124,8 @@ bool handle_member(const std::string& member_path, std::vector<char>&& data,
     r.uncompressed_size = data.size();
 
     if (is_archive_format(fmt)) {
-        if (depth + 1 > opts.archive.max_depth) {
+        // Negative max_depth means unlimited nesting (caller's explicit choice).
+        if (opts.archive.max_depth >= 0 && depth + 1 > opts.archive.max_depth) {
             r.error = "max archive depth exceeded";
             return cb(std::move(r));
         }
@@ -139,7 +140,7 @@ bool handle_member(const std::string& member_path, std::vector<char>&& data,
     }
 
     try {
-        r.markdown = convert_from_memory(bytes, data.size(), member_path, opts);
+        r.markdown = convert_from_memory_as(fmt, bytes, data.size(), member_path, opts);
     } catch (const std::exception& e) {
         r.error = e.what();
     }
@@ -228,7 +229,9 @@ bool walk_zip(const ZipReader& zip, const std::string& prefix, int depth,
 bool walk_7z(const SevenZipReader& sz, const std::string& prefix, int depth,
              WalkBudget& budget, const ConvertOptions& opts,
              const MemberCallback& cb) {
-    for (const auto& e : sz.entries()) {
+    const auto& entries = sz.entries();
+    for (size_t i = 0; i < entries.size(); ++i) {
+        const auto& e = entries[i];
         if (e.name.empty() || is_metadata_member(e.name)) continue;
         std::string member_path = prefix + normalize_member_name(e.name);
 
@@ -266,11 +269,26 @@ bool walk_7z(const SevenZipReader& sz, const std::string& prefix, int depth,
                      opts.archive.max_total_bytes, budget};
         std::string err;
         if (!sz.read_entry_streamed(e, std::ref(sink), &err)) {
+            sz.release_cache();
             if (!emit_stream_failure(member_path, sink, err, "UNKNOWN",
                                      data.size(), cb))
                 return false;
             continue;
         }
+
+        bool keep_cache = false;
+        if (e.folder_index != SevenZipReader::kNoFolder) {
+            for (size_t j = i + 1; j < entries.size(); ++j) {
+                const auto& next = entries[j];
+                if (next.folder_index != e.folder_index) break;
+                if (!next.name.empty() && !is_metadata_member(next.name) &&
+                    !has_skippable_ext(next.name)) {
+                    keep_cache = true;
+                    break;
+                }
+            }
+        }
+        if (!keep_cache) sz.release_cache();
 
         if (!handle_member(member_path, std::move(data), depth, budget, opts, cb))
             return false;

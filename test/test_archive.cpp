@@ -474,6 +474,39 @@ static void test_nested() {
         ASSERT(leaf && leaf->ok() && leaf->markdown == "leaf");
     TEST_END
 
+    TEST(unlimited_depth_with_minus_one)
+        // 5 levels deep — beyond the default cap of 3; max_depth = -1 lifts it.
+        auto a = make_zip({{"leaf.txt", "deep leaf"}});
+        for (int i = 4; i >= 1; i--)
+            a = make_zip({{"l" + std::to_string(i) + ".zip", a}});
+        auto path = write_tmp("verydeep.zip", a);
+
+        auto rs = jdoc::convert_archive(path);  // default depth 3: blocked
+        ASSERT(!rs.empty() && !rs[0].ok());
+        ASSERT(rs[0].error.find("depth") != std::string::npos);
+
+        jdoc::ConvertOptions opts;
+        opts.archive.max_depth = -1;
+        rs = jdoc::convert_archive(path, opts);
+        auto* leaf = find_member(rs, "l1.zip/l2.zip/l3.zip/l4.zip/leaf.txt");
+        ASSERT(leaf && leaf->ok() && leaf->markdown == "deep leaf");
+    TEST_END
+
+    TEST(unlimited_member_cap_with_minus_one)
+        std::string big(2 << 20, 'x');  // 2 MiB member
+        auto path = write_tmp("bigmember.zip", make_zip({{"big.txt", big}}));
+
+        jdoc::ConvertOptions opts;
+        opts.archive.max_member_bytes = 1 << 20;  // capped: skipped
+        auto rs = jdoc::convert_archive(path, opts);
+        ASSERT(rs.size() == 1 && !rs[0].ok());
+
+        opts.archive.max_member_bytes = static_cast<uint64_t>(-1);  // unlimited
+        rs = jdoc::convert_archive(path, opts);
+        ASSERT(rs.size() == 1 && rs[0].ok());
+        ASSERT(rs[0].markdown.size() == big.size());
+    TEST_END
+
     TEST(gz_in_zip)
         auto gz = make_gz("gzipped text");
         ZipEntrySpec e{"note.txt.gz", gz};

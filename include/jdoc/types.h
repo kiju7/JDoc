@@ -38,6 +38,12 @@ struct PageChunk {
 // Limits for archive conversion (convert_archive). Sizes are enforced while
 // streaming decompression runs — header size fields are never trusted, so a
 // crafted archive (zip bomb) cannot cause unbounded allocation.
+//
+// Disabling a limit: max_depth < 0 means unlimited nesting; assigning -1 to
+// the unsigned fields yields their max value, which is effectively unlimited
+// (the C API and CLI accept -1 directly). max_ratio 0 disables the ratio
+// check. Only disable these for trusted inputs — every guard against
+// archive bombs goes with them.
 struct ArchiveLimits {
     int      max_depth = 3;                     // nesting: top-level archive = depth 1
     uint64_t max_member_bytes = 512ull << 20;   // per-member uncompressed cap (512 MiB);

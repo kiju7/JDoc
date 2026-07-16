@@ -2,6 +2,7 @@
 #include "jdoc/jdoc.h"
 #include "jdoc/archive.h"
 
+#include <cstdint>
 #include <cstring>
 #include <cstdlib>
 #include <string>
@@ -32,14 +33,23 @@ static jdoc::ConvertOptions to_cpp_opts(const JDocOptions* opts) {
         o.pages.assign(opts->pages, opts->pages + opts->page_count);
     if (opts->plaintext)
         o.output_format = jdoc::OutputFormat::PLAINTEXT;
+    // 0 keeps the library default; negative disables the guard entirely.
     if (opts->max_archive_depth > 0)
         o.archive.max_depth = opts->max_archive_depth;
+    else if (opts->max_archive_depth < 0)
+        o.archive.max_depth = -1;  // unlimited nesting
     if (opts->max_member_bytes > 0)
         o.archive.max_member_bytes = (uint64_t)opts->max_member_bytes;
+    else if (opts->max_member_bytes < 0)
+        o.archive.max_member_bytes = UINT64_MAX;
     if (opts->max_total_bytes > 0)
         o.archive.max_total_bytes = (uint64_t)opts->max_total_bytes;
+    else if (opts->max_total_bytes < 0)
+        o.archive.max_total_bytes = UINT64_MAX;
     if (opts->max_archive_entries > 0)
         o.archive.max_entries = (uint32_t)opts->max_archive_entries;
+    else if (opts->max_archive_entries < 0)
+        o.archive.max_entries = UINT32_MAX;
     o.archive.include_unsupported = (opts->include_unsupported != 0);
     return o;
 }
