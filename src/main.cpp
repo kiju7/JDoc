@@ -130,12 +130,12 @@ int main(int argc, char* argv[]) {
             int failed = 0;
             jdoc::convert_archive(input_path, [&](jdoc::MemberResult&& r) {
                 if (r.ok()) {
-                    *out << "=== " << r.member_path << " (" << r.format << ") ===\n"
+                    *out << "=== " << r.member_path << " ===\n"
                          << r.markdown << "\n\n";
                 } else {
                     failed++;
-                    *out << "=== " << r.member_path << " (" << r.format
-                         << ") — ERROR: " << r.error << " ===\n\n";
+                    *out << "=== " << r.member_path << " — ERROR: "
+                         << r.error << " ===\n\n";
                 }
                 return true;
             }, opts);
