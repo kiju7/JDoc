@@ -214,6 +214,7 @@ jdoc_free_pages(pages, page_count);
 | `include_unsupported` | `false` | 미지원 멤버도 결과에 오류로 포함 | `--include-unsupported` |
 
 - 멤버당·압축비·깊이 초과는 **해당 멤버만 스킵**하고 순회를 계속하며, 누적·멤버 수 초과만 순회를 중단
+- 아카이브 멤버의 이미지는 멤버 간 파일명 충돌을 막기 위해 `image_output_dir/<멤버 경로>/` 하위에 저장되며(중첩 구조 보존), 마크다운 참조 경로도 함께 조정됨
 - C API는 각 필드에 `0` = 라이브러리 기본값, `-1` = 무제한, 양수 = 지정 값
 - bzip2 멤버(ALZ/EGG 일부)는 `-DJDOC_WITH_BZIP2=ON` 빌드에서 지원. 기본 OFF 시 해당 멤버만 오류로 보고
 

@@ -441,9 +441,9 @@ private:
                             auto slash = saved.saved_path.find_last_of('/');
                             std::string ref = (slash != std::string::npos)
                                 ? saved.saved_path.substr(slash + 1) : saved.saved_path;
-                            para_text += "![" + saved.name + "](" + ref + ")";
+                            para_text += "![" + saved.name + "](" + opts_.image_ref_prefix + ref + ")";
                         } else {
-                            para_text += "![" + saved.name + "](" + saved.name + "." + saved.format + ")";
+                            para_text += "![" + saved.name + "](" + opts_.image_ref_prefix + saved.name + "." + saved.format + ")";
                         }
                     }
                 }
@@ -646,7 +646,7 @@ private:
                 ImageData idata = process_picture(pic, page_number, *p_image_idx);
                 if (!idata.name.empty()) {
                     std::string ref = idata.name + "." + idata.format;
-                    md += "\n![" + idata.name + "](" + ref + ")\n";
+                    md += "\n![" + idata.name + "](" + opts_.image_ref_prefix + ref + ")\n";
                     (*p_image_idx)++;
                 }
             }

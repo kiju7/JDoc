@@ -1183,7 +1183,7 @@ private:
         // When images not requested, emit embedded reference without loading data
         if (!opts_.extract_images) {
             image_idx++;
-            return "![" + unified + "](" + filename + ")\n\n";
+            return "![" + unified + "](" + opts_.image_ref_prefix + filename + ")\n\n";
         }
 
         // Detect format from file extension in OLE name
@@ -1250,7 +1250,7 @@ private:
 
         image_idx++;
 
-        return "![" + unified + "](" + filename + ")\n\n";
+        return "![" + unified + "](" + opts_.image_ref_prefix + filename + ")\n\n";
     }
 
     // ── Paragraph to Markdown ───────────────────────────────

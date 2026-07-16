@@ -6614,7 +6614,8 @@ std::string page_to_markdown(const std::vector<TextLine>& raw_lines,
                               const std::vector<double>& image_x_pos,
                               const std::vector<TableData>& tables,
                               const std::vector<AnnotEntry>& annots = {},
-                              double col_boundary = 0) {
+                              double col_boundary = 0,
+                              const std::string& img_ref_prefix = "") {
     auto lines = merge_colinear_lines(raw_lines);
 
     // Detect if page has column-split lines (for image placement)
@@ -6665,7 +6666,7 @@ std::string page_to_markdown(const std::vector<TextLine>& raw_lines,
                     ? img.saved_path.substr(slash + 1)
                     : img.saved_path;
             }
-            md += "\n![" + img.name + "](" + ref + ")\n";
+            md += "\n![" + img.name + "](" + img_ref_prefix + ref + ")\n";
         } else {
             auto& tbl = tables[ins.idx];
             if (!tbl.title.empty())
@@ -7140,7 +7141,8 @@ static std::string result_to_markdown(ExtractResult& r, const ConvertOptions& op
                                                 r.all_images[p], r.all_image_y[p], r.all_image_x[p],
                                                 r.all_tables[p],
                                                 p < (int)r.all_annots.size() ? r.all_annots[p] : std::vector<AnnotEntry>{},
-                                                r.col_boundaries[p]);
+                                                r.col_boundaries[p],
+                                                opts.image_ref_prefix);
         if (plaintext)
             full_md += util::strip_markdown(page_md);
         else
@@ -7172,7 +7174,8 @@ static std::vector<PageChunk> result_to_chunks(ExtractResult& r,
                                                 r.all_images[p], r.all_image_y[p], r.all_image_x[p],
                                                 r.all_tables[p],
                                                 p < (int)r.all_annots.size() ? r.all_annots[p] : std::vector<AnnotEntry>{},
-                                                r.col_boundaries[p]);
+                                                r.col_boundaries[p],
+                                                opts.image_ref_prefix);
         chunk.text = plaintext ? util::strip_markdown(page_md) : page_md;
 
         for (auto& td : r.all_tables[p])

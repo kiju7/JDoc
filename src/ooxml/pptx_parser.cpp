@@ -661,7 +661,7 @@ std::string PptxParser::to_markdown(const ConvertOptions& opts) {
                             ref_name = (sl != std::string::npos)
                                 ? img.saved_path.substr(sl + 1) : img.saved_path;
                         }
-                        out << "![" << img.name << "](" << ref_name << ")\n\n";
+                        out << "![" << img.name << "](" << opts.image_ref_prefix << ref_name << ")\n\n";
                     }
                     break;
                 }
@@ -732,7 +732,7 @@ std::vector<PageChunk> PptxParser::to_chunks(
                         ref_name = (slash != std::string::npos)
                             ? img.saved_path.substr(slash + 1) : img.saved_path;
                     }
-                    text << "![" << img.name << "](" << ref_name << ")\n\n";
+                    text << "![" << img.name << "](" << opts.image_ref_prefix << ref_name << ")\n\n";
 
                     if (first_ref)
                         chunk.images.push_back(std::move(img));

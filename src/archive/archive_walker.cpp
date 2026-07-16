@@ -9,6 +9,7 @@
 
 #include "convert_internal.h"
 #include "zip_reader.h"
+#include "common/file_utils.h"
 #include "archive/alz_reader.h"
 #include "archive/egg_reader.h"
 #include "archive/input_stream.h"
@@ -140,7 +141,22 @@ bool handle_member(const std::string& member_path, std::vector<char>&& data,
     }
 
     try {
-        r.markdown = convert_from_memory_as(fmt, bytes, data.size(), member_path, opts);
+        if (opts.extract_images && !opts.image_output_dir.empty()) {
+            // Members reuse document-relative image names (page1_img0), so
+            // each member gets its own subdirectory to prevent collisions;
+            // markdown refs follow via the ref prefix.
+            ConvertOptions member_opts = opts;
+            member_opts.image_output_dir =
+                opts.image_output_dir + "/" + member_path;
+            member_opts.image_ref_prefix =
+                opts.image_ref_prefix + member_path + "/";
+            util::ensure_dirs(member_opts.image_output_dir);
+            r.markdown = convert_from_memory_as(fmt, bytes, data.size(),
+                                                member_path, member_opts);
+        } else {
+            r.markdown = convert_from_memory_as(fmt, bytes, data.size(),
+                                                member_path, opts);
+        }
     } catch (const std::exception& e) {
         r.error = e.what();
     }

@@ -76,6 +76,15 @@ inline void ensure_dir(const std::string& dir) {
     if (!dir.empty()) jdoc_mkdir(dir.c_str());
 }
 
+// Create a directory and any missing parents (mkdir -p).
+inline void ensure_dirs(const std::string& dir) {
+    for (size_t pos = 0; pos != std::string::npos; ) {
+        pos = dir.find('/', pos + 1);
+        std::string parent = dir.substr(0, pos);
+        if (!parent.empty()) jdoc_mkdir(parent.c_str());
+    }
+}
+
 // Strip markdown formatting from text, returning plain text.
 // Removes: # headings, **bold**, *italic*, ![img](ref), table pipes, --- separators
 inline std::string strip_markdown(const std::string& md) {

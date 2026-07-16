@@ -723,7 +723,7 @@ std::string DocxParser::to_markdown(const ConvertOptions& opts) {
                     std::string ref = (nm != image_name_map_.end()) ? nm->second : orig;
                     auto dot = ref.rfind('.');
                     std::string alt = (dot != std::string::npos) ? ref.substr(0, dot) : ref;
-                    out << "![" << alt << "](" << ref << ")\n\n";
+                    out << "![" << alt << "](" << opts.image_ref_prefix << ref << ")\n\n";
                 }
             }
             continue;
@@ -743,7 +743,7 @@ std::string DocxParser::to_markdown(const ConvertOptions& opts) {
                 std::string ref = (nm != image_name_map_.end()) ? nm->second : orig;
                 auto dot = ref.rfind('.');
                 std::string alt = (dot != std::string::npos) ? ref.substr(0, dot) : ref;
-                out << "![" << alt << "](" << ref << ")\n\n";
+                out << "![" << alt << "](" << opts.image_ref_prefix << ref << ")\n\n";
             }
         }
 
@@ -868,7 +868,7 @@ std::vector<PageChunk> DocxParser::to_chunks(
                     std::string ref = (nm != image_name_map_.end()) ? nm->second : orig;
                     auto dot = ref.rfind('.');
                     std::string alt = (dot != std::string::npos) ? ref.substr(0, dot) : ref;
-                    text << "![" << alt << "](" << ref << ")\n\n";
+                    text << "![" << alt << "](" << opts.image_ref_prefix << ref << ")\n\n";
                 }
             }
             continue;
@@ -884,7 +884,7 @@ std::vector<PageChunk> DocxParser::to_chunks(
                 std::string ref = (nm != image_name_map_.end()) ? nm->second : orig;
                 auto dot = ref.rfind('.');
                 std::string alt = (dot != std::string::npos) ? ref.substr(0, dot) : ref;
-                text << "![" << alt << "](" << ref << ")\n\n";
+                text << "![" << alt << "](" << opts.image_ref_prefix << ref << ")\n\n";
             }
         }
 
