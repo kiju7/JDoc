@@ -255,4 +255,34 @@ std::string sanitize_utf8(const char* data, size_t len) {
     return out;
 }
 
+bool is_valid_utf8(const std::string& s) {
+    size_t pos = 0;
+    while (pos < s.size()) {
+        if (static_cast<unsigned char>(s[pos]) < 0x80) { pos++; continue; }
+        size_t before = pos;
+        if (decode_utf8(s.data(), s.size(), pos) == 0xFFFD) return false;
+        if (pos == before) return false;
+    }
+    return true;
+}
+
+std::string cp949_string_to_utf8(const std::string& s) {
+    std::string out;
+    out.reserve(s.size() * 2);
+    for (size_t i = 0; i < s.size(); ) {
+        uint8_t c = static_cast<uint8_t>(s[i]);
+        if (c < 0x80) {
+            out.push_back(static_cast<char>(c));
+            i++;
+        } else if (is_cp949_lead(c) && i + 1 < s.size()) {
+            out += cp949_to_utf8(c, static_cast<uint8_t>(s[i + 1]));
+            i += 2;
+        } else {
+            append_utf8(out, 0xFFFD);
+            i++;
+        }
+    }
+    return out;
+}
+
 }} // namespace jdoc::util

@@ -65,6 +65,13 @@ inline bool is_cp932_lead(uint8_t ch) {
 // pos past the sequence. Returns 0xFFFD on invalid/overlong sequences.
 uint32_t decode_utf8(const char* data, size_t len, size_t& pos);
 
+// True if the whole string is well-formed UTF-8.
+bool is_valid_utf8(const std::string& s);
+
+// Convert a CP949 byte string to UTF-8 (legacy Korean archive member names).
+// Invalid sequences become U+FFFD.
+std::string cp949_string_to_utf8(const std::string& s);
+
 // Sanitize a UTF-8 string: replace invalid sequences with U+FFFD.
 std::string sanitize_utf8(const char* data, size_t len);
 
