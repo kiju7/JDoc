@@ -14,6 +14,12 @@ typedef struct {
     const int* pages;                /* page numbers to extract (NULL = all) */
     int page_count;                  /* length of pages array */
     int plaintext;                   /* 0 = markdown, 1 = plaintext */
+    /* Archive limits (jdoc_convert_archive). 0 = library default. */
+    int max_archive_depth;               /* default 3 */
+    long long max_member_bytes;          /* per-member uncompressed cap; default 512 MiB */
+    long long max_total_bytes;           /* cumulative cap per call; default 64 GiB */
+    int max_archive_entries;             /* default 200000 */
+    int include_unsupported;             /* 1 = report unsupported members */
 } JDocOptions;
 
 /* Returns default options: no images, markdown, all pages, min_size=50. */
@@ -57,10 +63,35 @@ JDocPage* jdoc_convert_pages(const char* file_path, const JDocOptions* opts,
                               int* out_count,
                               char* err_buf, int err_buf_size);
 
+/* ── Archive ──────────────────────────────────────────────── */
+
+typedef struct {
+    char* member_path;               /* "outer.zip/dir/report.hwp" (UTF-8) */
+    char* format;                    /* "PDF", "HWP", "ZIP", ... */
+    char* markdown;                  /* NULL on error */
+    char* error;                     /* NULL on success */
+    long long uncompressed_size;
+} JDocMember;
+
+/* Convert every supported document inside an archive without extracting
+ * to disk. Per-member failures are recorded in that member's `error`.
+ * Returns malloc'd array of JDocMember; count written to *out_count.
+ * Returns NULL when the file cannot be opened (message in err_buf). */
+JDocMember* jdoc_convert_archive(const char* file_path, const JDocOptions* opts,
+                                 int* out_count,
+                                 char* err_buf, int err_buf_size);
+
+/* Convert a document held in memory. name_hint (e.g. original filename)
+ * resolves extension-based format ambiguity; may be NULL. */
+char* jdoc_convert_mem(const void* data, int size, const char* name_hint,
+                       const JDocOptions* opts,
+                       char* err_buf, int err_buf_size);
+
 /* ── Free ─────────────────────────────────────────────────── */
 
 void jdoc_free_string(char* str);
 void jdoc_free_pages(JDocPage* pages, int count);
+void jdoc_free_members(JDocMember* members, int count);
 
 #ifdef __cplusplus
 }

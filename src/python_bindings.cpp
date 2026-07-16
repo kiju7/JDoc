@@ -6,6 +6,7 @@
 #include <pybind11/stl.h>
 
 #include "jdoc/jdoc.h"
+#include "jdoc/archive.h"
 #include "jdoc/pdf.h"
 #include "jdoc/office.h"
 #include "jdoc/hwp.h"
@@ -167,6 +168,68 @@ Args:
 Returns:
     List of PageChunk objects, one per page/slide/sheet
 )doc");
+
+    // ── Archive conversion ────────────────────────────────
+
+    py::class_<jdoc::MemberResult>(m, "MemberResult")
+        .def(py::init<>())
+        .def_readwrite("member_path", &jdoc::MemberResult::member_path)
+        .def_readwrite("format", &jdoc::MemberResult::format)
+        .def_readwrite("markdown", &jdoc::MemberResult::markdown)
+        .def_readwrite("error", &jdoc::MemberResult::error)
+        .def_readwrite("uncompressed_size", &jdoc::MemberResult::uncompressed_size)
+        .def_property_readonly("ok", &jdoc::MemberResult::ok)
+        .def("__repr__", [](const jdoc::MemberResult& r) {
+            return "<MemberResult '" + r.member_path + "' (" + r.format + ") " +
+                   (r.ok() ? "ok" : "error: " + r.error) + ">";
+        });
+
+    m.def("convert_archive", [](const std::string& file_path,
+                                 const std::string& format,
+                                 int max_depth,
+                                 uint64_t max_member_bytes,
+                                 uint64_t max_total_bytes,
+                                 unsigned max_entries,
+                                 bool include_unsupported)
+                                 -> std::vector<jdoc::MemberResult> {
+        jdoc::ConvertOptions opts;
+        if (format == "text" || format == "plaintext" || format == "plain")
+            opts.output_format = jdoc::OutputFormat::PLAINTEXT;
+        opts.archive.max_depth = max_depth;
+        opts.archive.max_member_bytes = max_member_bytes;
+        opts.archive.max_total_bytes = max_total_bytes;
+        opts.archive.max_entries = max_entries;
+        opts.archive.include_unsupported = include_unsupported;
+        return jdoc::convert_archive(file_path, opts);
+    },
+    py::arg("file_path"),
+    py::arg("format") = "markdown",
+    py::arg("max_depth") = 3,
+    py::arg("max_member_bytes") = uint64_t(512) << 20,
+    py::arg("max_total_bytes") = uint64_t(64) << 30,
+    py::arg("max_entries") = 200000,
+    py::arg("include_unsupported") = false,
+    R"doc(Convert every supported document inside an archive (zip/gz/tar/tar.gz)
+without extracting to disk. Members are decompressed into memory one at a
+time; nested archives are walked recursively up to max_depth.
+
+Returns:
+    List of MemberResult (member_path, format, markdown, error, ok)
+)doc");
+
+    m.def("is_archive", &jdoc::is_archive_file, py::arg("file_path"),
+          "True if the file is an archive container rather than a document.");
+
+    m.def("convert_bytes", [](py::bytes data, const std::string& name_hint,
+                               const std::string& format) -> std::string {
+        jdoc::ConvertOptions opts;
+        if (format == "text" || format == "plaintext" || format == "plain")
+            opts.output_format = jdoc::OutputFormat::PLAINTEXT;
+        std::string buf = data;  // copy out of the Python object
+        return jdoc::convert(buf.data(), buf.size(), name_hint, opts);
+    },
+    py::arg("data"), py::arg("name_hint") = "", py::arg("format") = "markdown",
+    "Convert a document held in bytes (no file I/O).");
 
     // ── Per-format functions (for advanced usage) ────────
 

@@ -3,6 +3,7 @@
 // Supports: PDF, DOCX, XLSX, PPTX, DOC, XLS, PPT, RTF, HWP, HWPX
 
 #include "jdoc/jdoc.h"
+#include "jdoc/archive.h"
 #include <iostream>
 #include <fstream>
 #include <sstream>
@@ -13,6 +14,7 @@ void print_usage(const char* prog) {
     std::cerr << "Usage: " << prog << " <input_file> [output.md] [options]\n"
               << "\nSupported formats:\n"
               << "  PDF, DOCX, XLSX, PPTX, DOC, XLS, PPT, RTF, HTML, HWP, HWPX\n"
+              << "  Archives (parsed in memory, no extraction): ZIP, GZ, TAR, TAR.GZ\n"
               << "\nOptions:\n"
               << "  --pages N,N,N   Page numbers (0-based, comma-separated)\n"
               << "  --no-tables     Disable table detection\n"
@@ -20,6 +22,10 @@ void print_usage(const char* prog) {
               << "  --images DIR    Extract images to directory\n"
               << "  --min-image-size N  Skip images smaller than NxN pixels (default: 50, 0=no filter)\n"
               << "  --plaintext     Output plain text instead of Markdown\n"
+              << "\nArchive options:\n"
+              << "  --max-depth N        Max nested-archive depth (default: 3)\n"
+              << "  --max-member-mb N    Per-member uncompressed cap in MiB (default: 512)\n"
+              << "  --include-unsupported  Report unsupported members as errors\n"
               << "  --help          Show this help\n";
 }
 
@@ -70,6 +76,16 @@ int main(int argc, char* argv[]) {
         else if (arg == "--plaintext" || arg == "--text") {
             opts.output_format = jdoc::OutputFormat::PLAINTEXT;
         }
+        else if (arg == "--max-depth" && i + 1 < argc) {
+            opts.archive.max_depth = std::stoi(argv[++i]);
+        }
+        else if (arg == "--max-member-mb" && i + 1 < argc) {
+            opts.archive.max_member_bytes =
+                static_cast<uint64_t>(std::stoull(argv[++i])) << 20;
+        }
+        else if (arg == "--include-unsupported") {
+            opts.archive.include_unsupported = true;
+        }
         else if (input_path.empty()) {
             input_path = arg;
         }
@@ -97,6 +113,33 @@ int main(int argc, char* argv[]) {
     }
 
     try {
+        if (jdoc::is_archive_file(input_path)) {
+            std::ofstream ofs;
+            std::ostream* out = &std::cout;
+            if (!output_path.empty()) {
+                ofs.open(output_path);
+                if (!ofs) {
+                    std::cerr << "Error: Cannot write to " << output_path << "\n";
+                    return 1;
+                }
+                out = &ofs;
+            }
+
+            int failed = 0;
+            jdoc::convert_archive(input_path, [&](jdoc::MemberResult&& r) {
+                if (r.ok()) {
+                    *out << "=== " << r.member_path << " (" << r.format << ") ===\n"
+                         << r.markdown << "\n\n";
+                } else {
+                    failed++;
+                    *out << "=== " << r.member_path << " (" << r.format
+                         << ") — ERROR: " << r.error << " ===\n\n";
+                }
+                return true;
+            }, opts);
+            return failed > 0 ? 2 : 0;
+        }
+
         if (chunk_mode) {
             auto chunks = jdoc::convert_chunks(input_path, opts);
 

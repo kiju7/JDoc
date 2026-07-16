@@ -33,6 +33,10 @@ from _jdoc import (
     # High-level API
     convert,
     convert_pages,
+    convert_archive,
+    convert_bytes,
+    is_archive,
+    MemberResult,
     # Per-format functions
     pdf_to_markdown,
     pdf_to_markdown_chunks,
@@ -55,6 +59,10 @@ __all__ = [
     "ConvertOptions",
     "convert",
     "convert_pages",
+    "convert_archive",
+    "convert_bytes",
+    "is_archive",
+    "MemberResult",
     "pdf_to_markdown",
     "pdf_to_markdown_chunks",
     "office_to_markdown",

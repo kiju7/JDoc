@@ -1,5 +1,6 @@
 #include "jdoc/jdoc_c_api.h"
 #include "jdoc/jdoc.h"
+#include "jdoc/archive.h"
 
 #include <cstring>
 #include <cstdlib>
@@ -31,6 +32,15 @@ static jdoc::ConvertOptions to_cpp_opts(const JDocOptions* opts) {
         o.pages.assign(opts->pages, opts->pages + opts->page_count);
     if (opts->plaintext)
         o.output_format = jdoc::OutputFormat::PLAINTEXT;
+    if (opts->max_archive_depth > 0)
+        o.archive.max_depth = opts->max_archive_depth;
+    if (opts->max_member_bytes > 0)
+        o.archive.max_member_bytes = (uint64_t)opts->max_member_bytes;
+    if (opts->max_total_bytes > 0)
+        o.archive.max_total_bytes = (uint64_t)opts->max_total_bytes;
+    if (opts->max_archive_entries > 0)
+        o.archive.max_entries = (uint32_t)opts->max_archive_entries;
+    o.archive.include_unsupported = (opts->include_unsupported != 0);
     return o;
 }
 
@@ -124,7 +134,76 @@ JDocPage* jdoc_convert_pages(const char* file_path, const JDocOptions* opts,
     }
 }
 
+JDocMember* jdoc_convert_archive(const char* file_path, const JDocOptions* opts,
+                                 int* out_count,
+                                 char* err_buf, int err_buf_size) {
+    if (!file_path || !out_count) {
+        set_error(err_buf, err_buf_size, "file_path or out_count is NULL");
+        return nullptr;
+    }
+    *out_count = 0;
+    try {
+        auto results = jdoc::convert_archive(file_path, to_cpp_opts(opts));
+        if (results.empty()) return nullptr;
+
+        JDocMember* members = (JDocMember*)calloc(results.size(), sizeof(JDocMember));
+        if (!members) {
+            set_error(err_buf, err_buf_size, "memory allocation failed");
+            return nullptr;
+        }
+        for (size_t i = 0; i < results.size(); i++) {
+            auto& src = results[i];
+            members[i].member_path = strdup_c(src.member_path);
+            members[i].format = strdup_c(src.format);
+            members[i].uncompressed_size = (long long)src.uncompressed_size;
+            if (src.ok())
+                members[i].markdown = strdup_c(src.markdown);
+            else
+                members[i].error = strdup_c(src.error);
+        }
+        *out_count = (int)results.size();
+        return members;
+    } catch (const std::exception& e) {
+        set_error(err_buf, err_buf_size, e.what());
+        return nullptr;
+    } catch (...) {
+        set_error(err_buf, err_buf_size, "unknown error");
+        return nullptr;
+    }
+}
+
+char* jdoc_convert_mem(const void* data, int size, const char* name_hint,
+                       const JDocOptions* opts,
+                       char* err_buf, int err_buf_size) {
+    if (!data || size <= 0) {
+        set_error(err_buf, err_buf_size, "data is NULL or empty");
+        return nullptr;
+    }
+    try {
+        auto cpp_opts = to_cpp_opts(opts);
+        return strdup_c(jdoc::convert(data, (size_t)size,
+                                      name_hint ? name_hint : "", cpp_opts));
+    } catch (const std::exception& e) {
+        set_error(err_buf, err_buf_size, e.what());
+        return nullptr;
+    } catch (...) {
+        set_error(err_buf, err_buf_size, "unknown error");
+        return nullptr;
+    }
+}
+
 void jdoc_free_string(char* str) { free(str); }
+
+void jdoc_free_members(JDocMember* members, int count) {
+    if (!members) return;
+    for (int i = 0; i < count; i++) {
+        free(members[i].member_path);
+        free(members[i].format);
+        free(members[i].markdown);
+        free(members[i].error);
+    }
+    free(members);
+}
 
 void jdoc_free_pages(JDocPage* pages, int count) {
     if (!pages) return;
