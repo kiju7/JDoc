@@ -46,6 +46,28 @@ add_library(jdoc_zip STATIC src/zip_reader.cpp)
 target_include_directories(jdoc_zip PUBLIC include PRIVATE src)
 target_link_libraries(jdoc_zip PUBLIC ZLIB::ZLIB jdoc_common)
 
+# ── Archive streams (gz/tar; container readers for convert_archive) ──
+
+# bzip2 members (alz/egg) are a minority method: optional system libbz2
+# instead of vendoring. OFF by default; members then fail with a clear error.
+option(JDOC_WITH_BZIP2 "Decode bzip2 members in alz/egg via system libbz2" OFF)
+
+add_library(jdoc_archive STATIC
+    src/archive/input_stream.cpp
+    src/archive/tar_reader.cpp
+    src/archive/seven_zip_reader.cpp
+    src/archive/codec_streams.cpp
+    src/archive/alz_reader.cpp
+    src/archive/egg_reader.cpp
+)
+target_include_directories(jdoc_archive PUBLIC include PRIVATE src)
+target_link_libraries(jdoc_archive PUBLIC ZLIB::ZLIB jdoc_common lzma_sdk)
+if(JDOC_WITH_BZIP2)
+    find_package(BZip2 REQUIRED)
+    target_compile_definitions(jdoc_archive PRIVATE JDOC_WITH_BZIP2)
+    target_link_libraries(jdoc_archive PUBLIC BZip2::BZip2)
+endif()
+
 # ── PDF ───────────────────────────────────────────────────────
 
 add_library(jdoc_pdf STATIC src/pdf.cpp)
