@@ -106,9 +106,10 @@ target_link_libraries(jdoc_office PUBLIC pugixml jdoc_zip jdoc_common)
 
 # ── Unified API (auto-detect format) ─────────────────────────
 
-add_library(jdoc_all STATIC src/jdoc.cpp)
+add_library(jdoc_all STATIC src/jdoc.cpp src/archive/archive_walker.cpp)
 target_include_directories(jdoc_all PUBLIC include PRIVATE src)
-target_link_libraries(jdoc_all PUBLIC jdoc_pdf jdoc_office jdoc_hwpx jdoc_hwp)
+target_link_libraries(jdoc_all PUBLIC jdoc_pdf jdoc_office jdoc_hwpx jdoc_hwp
+                                      jdoc_zip jdoc_archive)
 
 # ── Shared library with C API ─────────────────────────────────
 

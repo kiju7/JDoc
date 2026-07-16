@@ -35,6 +35,22 @@ struct PageChunk {
     std::vector<ImageData> images;
 };
 
+// Limits for archive conversion (convert_archive). Sizes are enforced while
+// streaming decompression runs — header size fields are never trusted, so a
+// crafted archive (zip bomb) cannot cause unbounded allocation.
+struct ArchiveLimits {
+    int      max_depth = 3;                     // nesting: top-level archive = depth 1
+    uint64_t max_member_bytes = 512ull << 20;   // per-member uncompressed cap (512 MiB);
+                                                // this is the actual memory ceiling —
+                                                // one member is resident at a time
+    uint64_t max_total_bytes  = 64ull << 30;    // cumulative uncompressed per call (64 GiB);
+                                                // CPU-time guard, not memory — bounds the
+                                                // damage of ratio-limit-evading bombs
+    uint32_t max_entries = 200000;              // members visited incl. nested archives
+    uint32_t max_ratio = 1000;                  // suspected-bomb compression ratio
+    bool     include_unsupported = false;       // emit results for unsupported members
+};
+
 struct ConvertOptions {
     std::vector<int> pages;
     bool extract_tables = true;
@@ -44,6 +60,7 @@ struct ConvertOptions {
     std::string image_ref_prefix;   // prepended to image filenames in markdown refs
     unsigned min_image_size = 50;   // skip images smaller than NxN pixels (0 = no filter)
     OutputFormat output_format = OutputFormat::MARKDOWN;
+    ArchiveLimits archive;
 };
 
 } // namespace jdoc
