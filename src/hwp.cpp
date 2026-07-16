@@ -1005,8 +1005,6 @@ private:
             case hwp::HWPCharType::ControlChar:
                 if (code == 13 || code == 10) {
                     para.text.push_back(u'\n');
-                } else if (code == 9) {
-                    para.text.push_back(u'\t');
                 } else {
                     para.text.push_back(0);  // placeholder
                 }
@@ -1029,7 +1027,10 @@ private:
                 if (off + 14 <= size) {
                     off += 14;
                 }
-                for (int k = 0; k < 8; k++) para.text.push_back(0);
+                // Tab is an inline control; keep its visible character and
+                // pad the rest so char positions stay in sync.
+                para.text.push_back(code == 9 ? u'\t' : char16_t(0));
+                for (int k = 0; k < 7; k++) para.text.push_back(0);
                 char_pos += 8;
                 break;
             }

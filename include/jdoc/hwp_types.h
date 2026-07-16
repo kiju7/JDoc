@@ -108,15 +108,21 @@ inline RecordHeader parse_record_header(const uint8_t* data, size_t& offset) {
 // ── HWP Character Type Classification ──────────────────────
 enum class HWPCharType { Normal, ControlChar, ControlExtend, ControlInline };
 
+// HWP 5.0 spec: codes 1-3/11-12/14-18/21-23 are extended controls and
+// 4-9/19-20 are inline controls, both 8 WCHARs long (code + 12-byte
+// payload + trailing code). Everything else below 32 (0, 10, 13, 24-31)
+// is a single-WCHAR char control. Tab (9) is inline — treating it as a
+// 1-WCHAR control leaks its payload (e.g. TOC leader config) into text.
 inline HWPCharType classify_hwp_char(uint16_t code) {
     if (code > 31) return HWPCharType::Normal;
     switch (code) {
-        case 0: case 1: case 2: case 3:
+        case 1: case 2: case 3:
         case 11: case 12:
         case 14: case 15: case 16: case 17: case 18:
         case 21: case 22: case 23:
             return HWPCharType::ControlExtend;
         case 4: case 5: case 6: case 7: case 8:
+        case 9: case 19: case 20:
             return HWPCharType::ControlInline;
         default:
             return HWPCharType::ControlChar;
