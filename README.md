@@ -17,7 +17,10 @@ C++17 기반 문서 → 마크다운 변환기. 무거운 의존성 없이 zlib,
 - **손상 PDF 복구** — xref 재구축, 스트림 길이 복구
 - **CJK 인코딩** — CP949, CP932, CMap 기반 유니코드 매핑
 - **페이지 청킹** — RAG 파이프라인용 페이지별 출력(메타데이터 포함)
-- **아카이브 직접 파싱** — ZIP/GZ/TAR/TAR.GZ/7Z/ALZ/EGG 내부 문서를 디스크에 풀지 않고 메모리에서 스트리밍 변환. 멤버는 한 번에 하나만 메모리에 상주하며, 중첩 아카이브 재귀(깊이 제한)·압축폭탄 방어(해제 중 크기·비율 강제)·CP949 파일명 변환 지원. 단일 스레드로 동작하며 호출자가 문서 단위로 병렬화 가능
+- **아카이브 직접 파싱** — ZIP/GZ/TAR/TAR.GZ/7Z/ALZ/EGG 내부 문서를 디스크에 풀지 않고 메모리에서 스트리밍 변환. 멤버는 한 번에 하나만 상주하고, 중첩 아카이브는 재귀 처리하며, 손상·미지원 멤버는 해당 멤버만 오류로 기록하고 순회 지속
+- **아카이브 코덱** — 7Z: LZMA/LZMA2·branch 필터(디코더 전용 LZMA SDK 벤더링, solid block 사전 크기 검사). ALZ/EGG: store/deflate/bzip2/LZMA, CRC 검증, CP949 파일명 변환. 암호화·독점 코덱(AZO) 멤버는 명확한 오류로 보고
+- **압축폭탄 방어** — 헤더 크기 필드를 신뢰하지 않고 해제 도중 출력 바이트를 계수해 강제. 멤버당·누적·멤버 수·압축비·재귀 깊이 한도 (기본값과 해제 방법은 [옵션](#옵션) 참조)
+- **단일 스레드** — 변환 호출당 스레드 1개, 전역 상태 없음. 호출자가 문서/아카이브 단위로 자유롭게 병렬화 가능
 - **다양한 API** — CLI, Python (pybind11), C, C++
 
 ## 설치
@@ -180,6 +183,40 @@ for (int i = 0; i < page_count; i++) {
 jdoc_free_pages(pages, page_count);
 ```
 
+## 옵션
+
+모든 API가 같은 옵션을 공유한다 (C++ `ConvertOptions`, C `JDocOptions`, Python 키워드 인자, CLI 플래그).
+
+### 변환 옵션
+
+| 옵션 | 기본값 | 설명 | CLI |
+|---|---|---|---|
+| `pages` | 전체 | 추출할 페이지 번호 목록 (0부터 시작) | `--pages 0,1,2` |
+| `extract_tables` | `true` | 표를 마크다운 표로 추출 | `--no-tables` (비활성화) |
+| `page_chunks` | `false` | 페이지/슬라이드/시트별 청크로 출력 | `--chunks` |
+| `extract_images` | `false` | 이미지 추출 | `--images DIR` |
+| `image_output_dir` | `""` (메모리 유지) | 이미지 저장 디렉토리. 빈 값이면 바이트로만 반환 | `--images DIR` |
+| `image_ref_prefix` | `""` | 마크다운 이미지 참조 경로 앞에 붙일 접두사 | — |
+| `min_image_size` | `50` | N×N px 미만 이미지 제외 (`0` = 필터 없음) | `--min-image-size N` |
+| `output_format` | `markdown` | `markdown` 또는 `plaintext` | `--plaintext` |
+
+### 아카이브 한도 (`ConvertOptions::archive`)
+
+해제 도중 실시간으로 강제되며, 헤더의 크기 필드는 신뢰하지 않는다. **-1 = 무제한**(음수 전반) — 해당 폭탄 방어가 함께 꺼지므로 신뢰할 수 있는 입력에만 사용.
+
+| 옵션 | 기본값 | 설명 | CLI |
+|---|---|---|---|
+| `max_depth` | `3` | 중첩 아카이브 재귀 깊이 (최상위 = 1) | `--max-depth N` |
+| `max_member_bytes` | `512MiB` | 멤버당 해제 후 크기 상한. 멤버가 하나씩만 상주하므로 **실질 메모리 상한** | `--max-member-mb N` |
+| `max_total_bytes` | `64GiB` | 호출당 누적 해제 크기 (CPU 시간 가드) | — |
+| `max_entries` | `200000` | 방문 멤버 수 상한 (중첩 포함) | — |
+| `max_ratio` | `1000` | 압축비 폭탄 의심 한도 (`0` = 검사 안 함, C++ 전용) | — |
+| `include_unsupported` | `false` | 미지원 멤버도 결과에 오류로 포함 | `--include-unsupported` |
+
+- 멤버당·압축비·깊이 초과는 **해당 멤버만 스킵**하고 순회를 계속하며, 누적·멤버 수 초과만 순회를 중단
+- C API는 각 필드에 `0` = 라이브러리 기본값, `-1` = 무제한, 양수 = 지정 값
+- bzip2 멤버(ALZ/EGG 일부)는 `-DJDOC_WITH_BZIP2=ON` 빌드에서 지원. 기본 OFF 시 해당 멤버만 오류로 보고
+
 ## 포맷별 지원 범위
 
 | 기능 | PDF | DOCX | DOC | XLSX/XLSB | XLS | PPTX | PPT | HWP/HWPX | RTF | HTML | TXT |
@@ -195,38 +232,15 @@ jdoc_free_pages(pages, page_count);
 | 차트/SmartArt | | | | | | ✓ | | | | | |
 | 발표자 노트 | | | | | | ✓ | ✓ | | | | |
 
-## 아카이브 처리
-
-ZIP/GZ/TAR/TAR.GZ/7Z/ALZ/EGG 아카이브를 디스크에 풀지 않고 내부 문서를 변환한다.
-
-- **메모리 상주 최소화** — 멤버를 한 번에 하나만 스트리밍 해제(64KB 청크)해 메모리 버퍼에서 파싱하고, 다음 멤버 전에 해제. tar.gz는 컨테이너 자체도 스트리밍 순회(gzip inflate → tar 헤더 파싱)라 전체가 메모리에 올라가지 않음. 7z는 solid block 단위로 디코딩하므로 피크 메모리가 solid block 크기와 같고, 디코딩 전에 block 크기를 멤버 상한과 비교해 초과분은 할당 없이 스킵
-- **7z 코덱** — LZMA/LZMA2/store 및 branch 필터(BCJ/BCJ2/delta 등) 지원, 디코더 전용 LZMA SDK 벤더링(`vendor/lzma/`). 암호화 멤버·PPMd는 멤버별 오류로 보고
-- **국산 포맷(ALZ/EGG)** — ALZ: store/deflate/bzip2, CP949 파일명 변환, 멤버 CRC 검증. EGG: store/deflate/bzip2/LZMA(벤더링 LzmaDec 재사용), 멀티블록 멤버, 블록별 CRC 검증. 암호화 멤버·AZO(독점 코덱)·solid/분할 egg는 명확한 오류로 보고. bzip2 멤버는 `-DJDOC_WITH_BZIP2=ON`(시스템 libbz2) 빌드에서 지원, 기본 OFF 시 해당 멤버만 오류
-- **압축폭탄 방어** — 헤더의 크기 필드를 신뢰하지 않고 해제 도중 출력 바이트를 계수해 강제. 기본값: 멤버당 512MiB(실질 메모리 상한), 호출당 누적 64GiB·멤버 수 200,000(CPU 시간 가드 — 메모리와 무관), 압축비 1000:1, 재귀 깊이 3 (`ConvertOptions::archive`). 멤버당·압축비·깊이 초과는 해당 멤버만 스킵하고 순회를 계속하며, 누적·멤버 수 초과만 순회를 중단. 각 한도는 **-1로 무제한 해제 가능**(C API·CLI·Python 공통) — 신뢰할 수 있는 입력에만 사용 권장
-- **단일 스레드** — 변환 호출당 스레드 1개. 전역 상태가 없어 호출자가 문서/아카이브 단위로 자유롭게 병렬화 가능
-- **한글 파일명** — UTF-8 플래그가 없는 레거시 ZIP의 CP949 파일명을 UTF-8로 변환
-- **관대한 실패 처리** — 손상 멤버는 해당 멤버만 오류로 기록하고 순회 지속. macOS 메타데이터(`__MACOSX/`, `._*`, `.DS_Store`)는 자동 제외
-
-### 벤치마크 — 압축해제 후 파싱 대비
-
-Apple Silicon macOS, 실문서 코퍼스 기준. A = 압축 해제 후 파일별 변환(임시 디렉토리 왕복), B = `convert_archive()` 직접 파싱. 동일 픽스처에서 변환 결과(멤버 수·출력 바이트)는 두 방식이 일치.
-
-| 픽스처 | A: 해제 후 파싱 | B: 직접 파싱 | 속도 향상 | B 최대 메모리 |
-|---|---|---|---|---|
-| 문서 203개 zip (80MB) | 1.29s | 0.45s | **2.9×** | 68MB |
-| 문서 203개 tar.gz (81MB) | 1.12s | 0.47s | **2.4×** | 106MB |
-| 대용량 단일 zip (144MB) | 1.31s | 0.37s | **3.5×** | 144MB¹ |
-| 대용량 단일 tar.gz (145MB) | 0.57s | 0.18s | **3.1×** | 144MB¹ |
-
-¹ 멤버가 메모리에 실체화되므로 최대 메모리 ≈ 멤버 해제 크기(상한은 `max_member_bytes`로 제어). 방식 A는 같은 데이터를 디스크에 쓰고 다시 읽는 비용을 치른다.
-
 ## 의존성
 
 | 라이브러리 | 라이선스 | 역할 |
 |---|---|---|
-| zlib | zlib | 압축 (FlateDecode, PNG) |
+| zlib | zlib | 압축 (FlateDecode, PNG, deflate 아카이브 멤버) |
 | libjpeg-turbo | IJG/BSD | PDF 이미지 JPEG 디코딩 |
 | pugixml | MIT | XML 파싱 (번들 포함) |
+| LZMA SDK | public domain | 7z 컨테이너·LZMA 디코딩 (번들 포함, 디코더 전용) |
+| libbz2 | BSD | ALZ/EGG bzip2 멤버 (선택, `JDOC_WITH_BZIP2`) |
 | pybind11 | BSD-3 | Python 바인딩 (선택) |
 
 ## 지원 플랫폼
