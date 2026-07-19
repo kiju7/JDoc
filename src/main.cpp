@@ -15,7 +15,7 @@ void print_usage(const char* prog) {
     std::cerr << "Usage: " << prog << " <input_file> [output.md] [options]\n"
               << "\nSupported formats:\n"
               << "  PDF, DOCX, XLSX, PPTX, DOC, XLS, PPT, RTF, HTML, HWP, HWPX\n"
-              << "  Archives (parsed in memory, no extraction): ZIP, GZ, TAR, TAR.GZ, 7Z, ALZ, EGG\n"
+              << "  Archives (parsed in memory, no extraction): ZIP, GZ, BZ2, TAR, TAR.GZ, TAR.BZ2, 7Z, ALZ, EGG\n"
               << "\nOptions:\n"
               << "  --pages N,N,N   Page numbers (0-based, comma-separated)\n"
               << "  --no-tables     Disable table detection\n"

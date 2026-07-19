@@ -4,7 +4,7 @@ C++17 기반 문서 → 마크다운 변환기. 무거운 의존성 없이 zlib,
 
 **지원 포맷:** PDF, DOCX, XLSX, XLSB, PPTX, DOC, XLS, PPT, RTF, HTML, HWP, HWPX, TXT
 
-**아카이브 (압축 해제 없이 직접 파싱):** ZIP, GZ, TAR, TAR.GZ, 7Z, ALZ, EGG
+**아카이브 (압축 해제 없이 직접 파싱):** ZIP, GZ, BZ2, TAR, TAR.GZ, TAR.BZ2, 7Z, ALZ, EGG
 
 ## 주요 특징
 
@@ -17,7 +17,7 @@ C++17 기반 문서 → 마크다운 변환기. 무거운 의존성 없이 zlib,
 - **손상 PDF 복구** — xref 재구축, 스트림 길이 복구
 - **CJK 인코딩** — CP949, CP932, CMap 기반 유니코드 매핑
 - **페이지 청킹** — RAG 파이프라인용 페이지별 출력(메타데이터 포함)
-- **아카이브 직접 파싱** — ZIP/GZ/TAR/TAR.GZ/7Z/ALZ/EGG 내부 문서를 디스크에 풀지 않고 메모리에서 스트리밍 변환. 멤버는 한 번에 하나만 상주하고, 중첩 아카이브는 재귀 처리하며, 손상·미지원 멤버는 해당 멤버만 오류로 기록하고 순회 지속
+- **아카이브 직접 파싱** — ZIP/GZ/BZ2/TAR/TAR.GZ/TAR.BZ2/7Z/ALZ/EGG 내부 문서를 디스크에 풀지 않고 메모리에서 스트리밍 변환. 멤버는 한 번에 하나만 상주하고, 중첩 아카이브는 재귀 처리하며, 손상·미지원 멤버는 해당 멤버만 오류로 기록하고 순회 지속
 - **아카이브 코덱** — 7Z: LZMA/LZMA2·branch 필터(디코더 전용 LZMA SDK 벤더링, solid block 사전 크기 검사). ALZ/EGG: store/deflate/bzip2/LZMA, solid EGG 스트리밍 분배 지원, CRC 검증, CP949 파일명 변환. 암호화·독점 코덱(AZO) 멤버는 명확한 오류로 보고
 - **압축폭탄 방어** — 헤더 크기 필드를 신뢰하지 않고 해제 도중 출력 바이트를 계수해 강제. 멤버당·누적·멤버 수·압축비·재귀 깊이 한도 (기본값과 해제 방법은 [옵션](#옵션) 참조)
 - **단일 스레드** — 변환 호출당 스레드 1개, 전역 상태 없음. 호출자가 문서/아카이브 단위로 자유롭게 병렬화 가능
@@ -216,7 +216,7 @@ jdoc_free_pages(pages, page_count);
 - 멤버당·압축비·깊이 초과는 **해당 멤버만 스킵**하고 순회를 계속하며, 누적·멤버 수 초과만 순회를 중단
 - 아카이브 멤버의 이미지는 멤버 간 파일명 충돌을 막기 위해 `image_output_dir/<멤버 경로>/` 하위에 저장되며(중첩 구조 보존), 마크다운 참조 경로도 함께 조정됨
 - C API는 각 필드에 `0` = 라이브러리 기본값, `-1` = 무제한, 양수 = 지정 값
-- bzip2 멤버(ALZ/EGG 일부)는 `-DJDOC_WITH_BZIP2=ON` 빌드에서 지원. 기본 OFF 시 해당 멤버만 오류로 보고
+- bzip2(단독 BZ2/TAR.BZ2, ALZ/EGG 일부 멤버)는 `-DJDOC_WITH_BZIP2=ON` 빌드에서 지원. 기본 OFF 시 해당 멤버만 오류로 보고
 
 ## 포맷별 지원 범위
 
@@ -241,7 +241,7 @@ jdoc_free_pages(pages, page_count);
 | libjpeg-turbo | IJG/BSD | PDF 이미지 JPEG 디코딩 |
 | pugixml | MIT | XML 파싱 (번들 포함) |
 | LZMA SDK | public domain | 7z 컨테이너·LZMA 디코딩 (번들 포함, 디코더 전용) |
-| libbz2 | BSD | ALZ/EGG bzip2 멤버 (선택, `JDOC_WITH_BZIP2`) |
+| libbz2 | BSD | BZ2/TAR.BZ2, ALZ/EGG bzip2 멤버 (선택, `JDOC_WITH_BZIP2`) |
 | pybind11 | BSD-3 | Python 바인딩 (선택) |
 
 ## 지원 플랫폼

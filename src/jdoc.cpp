@@ -68,6 +68,7 @@ static FileFormat format_from_ext(const std::string& name) {
         return FileFormat::OFFICE;
     if (ext == ".zip") return FileFormat::ZIP;
     if (ext == ".gz" || ext == ".tgz") return FileFormat::GZIP;
+    if (ext == ".bz2" || ext == ".tbz2") return FileFormat::BZIP2;
     if (ext == ".tar") return FileFormat::TAR;
     if (ext == ".7z") return FileFormat::SEVENZIP;
     if (ext == ".alz") return FileFormat::ALZ;
@@ -93,6 +94,9 @@ static FileFormat format_from_magic(const unsigned char* magic, size_t n) {
         return FileFormat::PDF;
     if (n >= 2 && magic[0] == 0x1F && magic[1] == 0x8B)
         return FileFormat::GZIP;
+    if (n >= 4 && magic[0] == 'B' && magic[1] == 'Z' && magic[2] == 'h' &&
+        magic[3] >= '1' && magic[3] <= '9')
+        return FileFormat::BZIP2;
     if (n >= 6 && magic[0] == 0x37 && magic[1] == 0x7A && magic[2] == 0xBC &&
         magic[3] == 0xAF && magic[4] == 0x27 && magic[5] == 0x1C)
         return FileFormat::SEVENZIP;
@@ -224,6 +228,7 @@ const char* file_format_name(FileFormat fmt) {
         case FileFormat::TXT:      return "TXT";
         case FileFormat::ZIP:      return "ZIP";
         case FileFormat::GZIP:     return "GZIP";
+        case FileFormat::BZIP2:    return "BZIP2";
         case FileFormat::TAR:      return "TAR";
         case FileFormat::SEVENZIP: return "7Z";
         case FileFormat::ALZ:      return "ALZ";

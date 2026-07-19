@@ -12,7 +12,7 @@ namespace jdoc {
 
 enum class FileFormat {
     PDF, OFFICE, HWP, HWPX, TXT,
-    ZIP, GZIP, TAR, SEVENZIP, ALZ, EGG,
+    ZIP, GZIP, BZIP2, TAR, SEVENZIP, ALZ, EGG,
     UNKNOWN
 };
 
@@ -23,8 +23,9 @@ const char* file_format_name(FileFormat fmt);
 
 inline bool is_archive_format(FileFormat f) {
     return f == FileFormat::ZIP || f == FileFormat::GZIP ||
-           f == FileFormat::TAR || f == FileFormat::SEVENZIP ||
-           f == FileFormat::ALZ || f == FileFormat::EGG;
+           f == FileFormat::BZIP2 || f == FileFormat::TAR ||
+           f == FileFormat::SEVENZIP || f == FileFormat::ALZ ||
+           f == FileFormat::EGG;
 }
 
 // Convert a single non-archive document held in memory.
