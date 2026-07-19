@@ -92,8 +92,7 @@ bool AlzReader::next(Member& out) {
     if (!read_full(&name[0], name_len)) return false;
     // ALZip writes Windows separators; CP949 names predate the UTF-8 era.
     std::replace(name.begin(), name.end(), '\\', '/');
-    cur_.name = util::is_valid_utf8(name) ? name
-                                          : util::cp949_string_to_utf8(name);
+    cur_.name = util::legacy_name_to_utf8(name);
 
     data_pending_ = true;
     out = cur_;

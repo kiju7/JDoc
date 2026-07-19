@@ -72,6 +72,16 @@ bool is_valid_utf8(const std::string& s);
 // Invalid sequences become U+FFFD.
 std::string cp949_string_to_utf8(const std::string& s);
 
+bool is_valid_utf8(const std::string& s);  // defined below with decode_utf8
+
+// Normalize a legacy archive member name to UTF-8: already-valid UTF-8 is
+// kept as-is, anything else is decoded as CP949 (the encoding Korean
+// archivers used before UTF-8 flags/records existed). Every archive reader
+// shares this so all member paths leave the library as UTF-8.
+inline std::string legacy_name_to_utf8(const std::string& name) {
+    return is_valid_utf8(name) ? name : cp949_string_to_utf8(name);
+}
+
 // Sanitize a UTF-8 string: replace invalid sequences with U+FFFD.
 std::string sanitize_utf8(const char* data, size_t len);
 

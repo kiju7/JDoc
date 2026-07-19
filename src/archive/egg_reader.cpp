@@ -141,13 +141,10 @@ bool EggReader::parse_filename(Member& m) {
     if (flag & kNameFlagAreaCode) {
         // Area-code names are in a legacy codepage; 949 (Korean) is the
         // common case. Fall back to UTF-8 validation for other locales.
-        if (locale == 949 || !util::is_valid_utf8(name))
-            m.name = util::cp949_string_to_utf8(name);
-        else
-            m.name = name;
+        m.name = (locale == 949) ? util::cp949_string_to_utf8(name)
+                                 : util::legacy_name_to_utf8(name);
     } else {
-        m.name = util::is_valid_utf8(name) ? name
-                                           : util::cp949_string_to_utf8(name);
+        m.name = util::legacy_name_to_utf8(name);
     }
     return true;
 }

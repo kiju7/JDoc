@@ -102,8 +102,8 @@ bool ZipReader::parse_central_directory() {
         pos += name_len;
 
         // Legacy Korean zips (ALZip, Windows explorer) store names in CP949.
-        if (!(e.flags & FLAG_UTF8_NAME) && !util::is_valid_utf8(e.name))
-            e.name = util::cp949_string_to_utf8(e.name);
+        if (!(e.flags & FLAG_UTF8_NAME))
+            e.name = util::legacy_name_to_utf8(e.name);
 
         // Skip extra + comment
         pos += static_cast<uint64_t>(extra_len) + comment_len;
