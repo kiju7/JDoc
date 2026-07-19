@@ -48,9 +48,10 @@ target_link_libraries(jdoc_zip PUBLIC ZLIB::ZLIB jdoc_common)
 
 # ── Archive streams (gz/tar; container readers for convert_archive) ──
 
-# bzip2 members (alz/egg) are a minority method: optional system libbz2
-# instead of vendoring. OFF by default; members then fail with a clear error.
-option(JDOC_WITH_BZIP2 "Decode bzip2 members in alz/egg via system libbz2" OFF)
+# bzip2 (standalone .bz2/.tar.bz2 and alz/egg members) is a minority method:
+# optional system libbz2 instead of vendoring. OFF by default; those inputs
+# then fail with a clear error.
+option(JDOC_WITH_BZIP2 "Decode bzip2 (.bz2, alz/egg members) via system libbz2" OFF)
 
 add_library(jdoc_archive STATIC
     src/archive/input_stream.cpp

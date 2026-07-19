@@ -335,6 +335,22 @@ static const unsigned char kBzip2Blob[] = {
     0x86, 0x9a, 0x60, 0x01, 0x32, 0x00, 0x75, 0x10, 0xfb, 0xee, 0x22, 0x48,
     0x22, 0x89, 0x56, 0x96, 0x4e, 0x7c, 0x5d, 0xc9, 0x14, 0xe1, 0x42, 0x40,
     0x4c, 0xc0, 0x55, 0x4c};
+// bzip2 of a make_tar-style tar holding one file "t.txt" containing
+// "tar bz2 member payload" — a tar.bz2 fixture needs an encoder, so the
+// compressed bytes are checked in like the blobs above.
+static const char kTarBz2Content[] = "tar bz2 member payload";
+static const unsigned char kTarBz2Blob[] = {
+    0x42, 0x5a, 0x68, 0x39, 0x31, 0x41, 0x59, 0x26, 0x53, 0x59, 0x48, 0x9d,
+    0xe9, 0xa2, 0x00, 0x00, 0x36, 0x5b, 0x81, 0xca, 0x80, 0x40, 0x01, 0x55,
+    0x80, 0x00, 0x08, 0x76, 0x06, 0xde, 0x70, 0x00, 0x08, 0x04, 0x08, 0x20,
+    0x00, 0x54, 0x51, 0x34, 0xf5, 0x30, 0x99, 0x18, 0x09, 0xea, 0x61, 0xa0,
+    0x94, 0x50, 0x64, 0x33, 0x53, 0x40, 0x34, 0x1a, 0x13, 0x7f, 0xca, 0xa1,
+    0x9d, 0x82, 0x03, 0x45, 0xe3, 0x61, 0x73, 0x90, 0x14, 0x16, 0x78, 0xac,
+    0x1a, 0xd1, 0x2b, 0x51, 0x09, 0x39, 0x0a, 0xa9, 0x28, 0xc1, 0xfd, 0xa9,
+    0x40, 0x09, 0x37, 0xce, 0x30, 0x8f, 0x95, 0xe2, 0xd9, 0x10, 0xfd, 0x1d,
+    0x25, 0x18, 0xce, 0x88, 0xb4, 0x5e, 0xad, 0xf1, 0x39, 0xf6, 0x2e, 0xe4,
+    0x8a, 0x70, 0xa1, 0x20, 0x91, 0x3b, 0xd3, 0x44};
+
 static const char kLzmaContent[] = "lzma egg member payload text";
 // .lzma (LZMA-alone) output of xz: props(5) + size(8) + raw stream. The egg
 // block payload is 4 reserved bytes + props + raw stream.
@@ -565,6 +581,52 @@ static void test_tar_gz() {
         ASSERT(rs.size() == 1 && rs[0].ok());
         ASSERT(rs[0].member_path == "solo.txt");
         ASSERT(rs[0].markdown == "gz solo");
+    TEST_END
+}
+
+static void test_bz2() {
+    std::cerr << "bz2 containers:\n";
+    // With JDOC_WITH_BZIP2 these convert; without it, the file reports a
+    // single "not built" error result — both builds must pass.
+    std::string blob(reinterpret_cast<const char*>(kBzip2Blob),
+                     sizeof(kBzip2Blob));
+
+    TEST(single_bz2_member)
+        auto path = write_tmp("solo.txt.bz2", blob);
+        auto rs = jdoc::convert_archive(path);
+        ASSERT(rs.size() == 1);
+        if (rs[0].ok()) {
+            ASSERT(rs[0].member_path == "solo.txt");
+            ASSERT(rs[0].markdown == kBzip2Content);
+        } else {
+            ASSERT(rs[0].error.find("bzip2 support not built") != std::string::npos);
+        }
+    TEST_END
+
+    TEST(tar_bz2_streaming)
+        auto path = write_tmp("arch.tar.bz2",
+                              std::string(reinterpret_cast<const char*>(kTarBz2Blob),
+                                          sizeof(kTarBz2Blob)));
+        auto rs = jdoc::convert_archive(path);
+        ASSERT(rs.size() == 1);
+        if (rs[0].ok()) {
+            ASSERT(rs[0].member_path == "t.txt");
+            ASSERT(rs[0].markdown == kTarBz2Content);
+        } else {
+            ASSERT(rs[0].error.find("bzip2 support not built") != std::string::npos);
+        }
+    TEST_END
+
+    TEST(bz2_in_zip)
+        auto path = write_tmp("bzinzip.zip", make_zip({{"note.txt.bz2", blob}}));
+        auto rs = jdoc::convert_archive(path);
+        ASSERT(rs.size() == 1);
+        if (rs[0].ok()) {
+            ASSERT(rs[0].member_path == "note.txt.bz2/note.txt");
+            ASSERT(rs[0].markdown == kBzip2Content);
+        } else {
+            ASSERT(rs[0].error.find("bzip2 support not built") != std::string::npos);
+        }
     TEST_END
 }
 
@@ -1031,6 +1093,7 @@ int main(int argc, char* argv[]) {
     test_basic_zip();
     test_nested();
     test_tar_gz();
+    test_bz2();
     test_seven_zip();
     test_alz();
     test_egg();

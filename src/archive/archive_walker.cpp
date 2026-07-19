@@ -78,6 +78,15 @@ std::string strip_gz_ext(const std::string& name) {
     return name;
 }
 
+std::string strip_bz2_ext(const std::string& name) {
+    if (name.size() > 4) {
+        std::string tail = name.substr(name.size() - 4);
+        for (auto& c : tail) c = std::tolower(static_cast<unsigned char>(c));
+        if (tail == ".bz2") return name.substr(0, name.size() - 4);
+    }
+    return name;
+}
+
 // Sink that appends to a buffer while enforcing the per-member cap and the
 // cumulative budget during streaming decompression.
 struct CapSink {
@@ -706,6 +715,73 @@ bool walk_gz(InputStream& raw, const std::string& name_hint,
     return handle_member(member_path, std::move(data), depth, budget, opts, cb);
 }
 
+// ── bzip2 (single member or tar.bz2) ────────────────────
+
+bool walk_bz2(InputStream& raw, const std::string& name_hint,
+              const std::string& prefix, int depth, WalkBudget& budget,
+              const ConvertOptions& opts, const MemberCallback& cb) {
+    BzInflateStream bz(raw);
+    if (!bz.is_open()) {
+        MemberResult r;
+        r.member_path = prefix + normalize_member_name(name_hint);
+        r.error = BzInflateStream::supported()
+            ? "cannot initialize bzip2 decompressor"
+            : "bzip2 support not built (JDOC_WITH_BZIP2)";
+        return cb(std::move(r));
+    }
+
+    // Peek the first 512 bytes: "ustar" at offset 257 means tar.bz2.
+    std::vector<char> head(512);
+    size_t got = 0;
+    while (got < head.size()) {
+        size_t n = bz.read(head.data() + got, head.size() - got);
+        if (n == 0) break;
+        got += n;
+    }
+    head.resize(got);
+
+    bool is_tar = got >= 262 && memcmp(head.data() + 257, "ustar", 5) == 0;
+    PrefixedStream stream(std::move(head), bz);
+
+    if (is_tar)
+        return walk_tar(stream, prefix, depth, budget, opts, cb);
+
+    // Single bzipped member (e.g. report.pdf.bz2) — inner name is the
+    // basename with .bz2 stripped
+    std::string base = name_hint;
+    auto slash = base.rfind('/');
+    if (slash != std::string::npos) base = base.substr(slash + 1);
+    std::string inner_name = strip_bz2_ext(base);
+    std::string member_path = prefix + normalize_member_name(inner_name);
+    if (!count_entry(member_path, budget, opts, cb)) return false;
+
+    std::vector<char> data;
+    CapSink sink{data, opts.archive.max_member_bytes,
+                 opts.archive.max_total_bytes, budget};
+    char buf[65536];
+    bool aborted = false;
+    for (;;) {
+        size_t n = stream.read(buf, sizeof(buf));
+        if (n == 0) break;
+        if (!sink(buf, n)) { aborted = true; break; }
+        // Ratio check with exact stream counters
+        if (data.size() > (16ull << 20) && opts.archive.max_ratio > 0 &&
+            bz.compressed_in() > 0 &&
+            data.size() / bz.compressed_in() > opts.archive.max_ratio) {
+            sink.member_exceeded = true;
+            aborted = true;
+            break;
+        }
+    }
+    if (aborted || bz.error()) {
+        return emit_stream_failure(member_path, sink,
+                                   bz.error() ? "corrupt bzip2 stream" : "",
+                                   "UNKNOWN", data.size(), cb);
+    }
+
+    return handle_member(member_path, std::move(data), depth, budget, opts, cb);
+}
+
 } // anonymous namespace
 
 // ── Entry points ────────────────────────────────────────
@@ -725,6 +801,8 @@ static bool walk_dispatch(FileFormat fmt,
             return walk_7z(*sevenzip, prefix, depth, budget, opts, cb);
         case FileFormat::GZIP:
             return walk_gz(*stream, name_hint, prefix, depth, budget, opts, cb);
+        case FileFormat::BZIP2:
+            return walk_bz2(*stream, name_hint, prefix, depth, budget, opts, cb);
         case FileFormat::TAR:
             return walk_tar(*stream, prefix, depth, budget, opts, cb);
         case FileFormat::ALZ:

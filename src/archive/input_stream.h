@@ -1,7 +1,7 @@
 #pragma once
 // input_stream.h - Sequential (pull-based) byte streams
-// Used for formats that are consumed front-to-back: gzip members and
-// tar containers. Composing TarReader(GzInflateStream(FileStream))
+// Used for formats that are consumed front-to-back: gzip/bzip2 members
+// and tar containers. Composing TarReader(GzInflateStream(FileStream))
 // walks a .tar.gz without ever holding the container in memory.
 // License: MIT
 
@@ -74,6 +74,40 @@ private:
     InputStream& src_;
     z_stream* zs_ = nullptr;
     std::vector<unsigned char> in_buf_;
+    bool src_eof_ = false;
+    bool finished_ = false;
+    bool error_ = false;
+    uint64_t compressed_in_ = 0;
+    uint64_t uncompressed_out_ = 0;
+};
+
+// Streaming bzip2 decompressor over another stream (src must outlive this).
+// Same contract as GzInflateStream. Always compiles; without JDOC_WITH_BZIP2
+// is_open() stays false (bzlib.h never leaks into this header — bz_stream is
+// an anonymous typedef, hence the void* handle).
+class BzInflateStream final : public InputStream {
+public:
+    explicit BzInflateStream(InputStream& src);
+    ~BzInflateStream() override;
+
+    BzInflateStream(const BzInflateStream&) = delete;
+    BzInflateStream& operator=(const BzInflateStream&) = delete;
+
+    // True when the build includes libbz2 (JDOC_WITH_BZIP2).
+    static bool supported();
+
+    bool is_open() const { return bs_ != nullptr; }
+    size_t read(void* buf, size_t len) override;
+
+    bool error() const { return error_; }
+    bool finished() const { return finished_; }
+    uint64_t compressed_in() const { return compressed_in_; }
+    uint64_t uncompressed_out() const { return uncompressed_out_; }
+
+private:
+    InputStream& src_;
+    void* bs_ = nullptr;  // bz_stream*
+    std::vector<char> in_buf_;
     bool src_eof_ = false;
     bool finished_ = false;
     bool error_ = false;
