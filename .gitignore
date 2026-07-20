@@ -11,3 +11,6 @@ __pycache__/
 dist/
 .eggs/
 test_archive_tmp/
+.claude/
+.DS_Store
+build-release/
