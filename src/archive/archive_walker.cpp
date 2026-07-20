@@ -13,6 +13,7 @@
 #include "archive/alz_reader.h"
 #include "archive/egg_reader.h"
 #include "archive/input_stream.h"
+#include "archive/member_pipeline.h"
 #include "archive/rar_reader.h"
 #include "archive/seven_zip_reader.h"
 #include "archive/tar_reader.h"
@@ -160,18 +161,34 @@ std::string total_limit_msg(const ArchiveLimits& lim) {
            "); walk stopped — raise max_total_bytes";
 }
 
-// Process one fully materialized member: detect, recurse or convert, emit.
+// Per-member ConvertOptions: members reuse document-relative image names
+// (page1_img0), so each member gets its own subdirectory to prevent
+// collisions; markdown refs follow via the ref prefix.
+ConvertOptions member_convert_opts(const ConvertOptions& opts,
+                                   const std::string& member_path) {
+    ConvertOptions member_opts = opts;
+    member_opts.image_output_dir = opts.image_output_dir + "/" + member_path;
+    member_opts.image_ref_prefix = opts.image_ref_prefix + member_path + "/";
+    util::ensure_dirs(member_opts.image_output_dir);
+    return member_opts;
+}
+
+// Process one materialized member: detect, recurse or convert, emit.
+// `bytes` need only stay valid for the duration of the call (zero-copy
+// views into a parent buffer or the 7z solid-block cache are fine);
+// `owned` is non-null when the caller can hand over ownership of the same
+// bytes, sparing the parallel pipeline a copy.
 // Returns false to stop the whole walk (budget exhausted or cb abort).
-bool handle_member(const std::string& member_path, std::vector<char>&& data,
-                   int depth, WalkBudget& budget, const ConvertOptions& opts,
-                   const MemberCallback& cb) {
-    const auto* bytes = reinterpret_cast<const uint8_t*>(data.data());
-    FileFormat fmt = detect_format_mem(bytes, data.size(), member_path);
+bool handle_member_bytes(const std::string& member_path, const uint8_t* bytes,
+                         size_t size, std::vector<char>* owned, int depth,
+                         WalkBudget& budget, const ConvertOptions& opts,
+                         const MemberCallback& cb) {
+    FileFormat fmt = detect_format_mem(bytes, size, member_path);
 
     MemberResult r;
     r.member_path = member_path;
     r.format = file_format_name(fmt);
-    r.uncompressed_size = data.size();
+    r.uncompressed_size = size;
 
     if (is_archive_format(fmt)) {
         // Negative max_depth means unlimited nesting (caller's explicit choice).
@@ -182,7 +199,7 @@ bool handle_member(const std::string& member_path, std::vector<char>&& data,
                       "); raise max_depth (--max-depth) to descend";
             return cb(std::move(r));
         }
-        return walk_archive_mem(bytes, data.size(), fmt, member_path + "/",
+        return walk_archive_mem(bytes, size, fmt, member_path + "/",
                                 depth + 1, budget, opts, cb);
     }
 
@@ -193,21 +210,27 @@ bool handle_member(const std::string& member_path, std::vector<char>&& data,
         return cb(std::move(r));
     }
 
+    bool wants_images = opts.extract_images && !opts.image_output_dir.empty();
+
+    if (budget.pipeline) {
+        // Leaf documents convert on the pipeline workers while this thread
+        // keeps decoding. Zero-copy views must be copied here — the buffer
+        // they point into may be released before a worker runs.
+        std::vector<char> data = owned
+            ? std::move(*owned)
+            : std::vector<char>(bytes, bytes + size);
+        return budget.pipeline->submit(
+            std::move(r), fmt, std::move(data),
+            wants_images ? member_convert_opts(opts, member_path) : opts);
+    }
+
     try {
-        if (opts.extract_images && !opts.image_output_dir.empty()) {
-            // Members reuse document-relative image names (page1_img0), so
-            // each member gets its own subdirectory to prevent collisions;
-            // markdown refs follow via the ref prefix.
-            ConvertOptions member_opts = opts;
-            member_opts.image_output_dir =
-                opts.image_output_dir + "/" + member_path;
-            member_opts.image_ref_prefix =
-                opts.image_ref_prefix + member_path + "/";
-            util::ensure_dirs(member_opts.image_output_dir);
-            r.markdown = convert_from_memory_as(fmt, bytes, data.size(),
-                                                member_path, member_opts);
+        if (wants_images) {
+            r.markdown = convert_from_memory_as(
+                fmt, bytes, size, member_path,
+                member_convert_opts(opts, member_path));
         } else {
-            r.markdown = convert_from_memory_as(fmt, bytes, data.size(),
+            r.markdown = convert_from_memory_as(fmt, bytes, size,
                                                 member_path, opts);
         }
     } catch (const std::exception& e) {
@@ -215,6 +238,14 @@ bool handle_member(const std::string& member_path, std::vector<char>&& data,
         r.error = e.what();
     }
     return cb(std::move(r));
+}
+
+bool handle_member(const std::string& member_path, std::vector<char>&& data,
+                   int depth, WalkBudget& budget, const ConvertOptions& opts,
+                   const MemberCallback& cb) {
+    return handle_member_bytes(member_path,
+                               reinterpret_cast<const uint8_t*>(data.data()),
+                               data.size(), &data, depth, budget, opts, cb);
 }
 
 // Count a member against the entry budget; emits a final error result and
@@ -232,6 +263,36 @@ bool count_entry(const std::string& member_path, WalkBudget& budget,
         return false;
     }
     return true;
+}
+
+// Result of pre-checking a zero-copy view member against the caps.
+enum class ViewCheck { PROCEED, SKIP, STOP };
+
+// A member whose bytes are already resident (zero-copy view) skips CapSink;
+// this applies the same member/total caps up front. Emits the limit result
+// itself on SKIP/STOP.
+ViewCheck precheck_view_member(const std::string& member_path, uint64_t size,
+                               WalkBudget& budget, const ConvertOptions& opts,
+                               const MemberCallback& cb) {
+    if (size > opts.archive.max_member_bytes) {
+        MemberResult r;
+        r.member_path = member_path;
+        r.uncompressed_size = size;
+        r.error_code = MemberErrorCode::MEMBER_LIMIT;
+        r.error = member_limit_msg(opts.archive, size);
+        return cb(std::move(r)) ? ViewCheck::SKIP : ViewCheck::STOP;
+    }
+    budget.total_out += size;
+    if (budget.total_out > opts.archive.max_total_bytes) {
+        MemberResult r;
+        r.member_path = member_path;
+        r.uncompressed_size = size;
+        r.error_code = MemberErrorCode::TOTAL_LIMIT;
+        r.error = total_limit_msg(opts.archive);
+        cb(std::move(r));
+        return ViewCheck::STOP;  // cumulative budget gone — stop everything
+    }
+    return ViewCheck::PROCEED;
 }
 
 // Emit the appropriate error result after a failed materialization.
@@ -295,6 +356,22 @@ bool walk_zip(const ZipReader& zip, const std::string& prefix, int depth,
                 r.uncompressed_size = e.uncompressed_size;
                 if (!cb(std::move(r))) return false;
             }
+            continue;
+        }
+
+        // Zero-copy: a STORE entry of a memory-backed zip (nested archive)
+        // is already resident in the parent buffer — hand it to the parser
+        // without materializing a copy.
+        if (const uint8_t* view = zip.stored_view(e)) {
+            switch (precheck_view_member(member_path, e.uncompressed_size,
+                                         budget, opts, cb)) {
+                case ViewCheck::SKIP: continue;
+                case ViewCheck::STOP: return false;
+                case ViewCheck::PROCEED: break;
+            }
+            if (!handle_member_bytes(member_path, view, e.uncompressed_size,
+                                     nullptr, depth, budget, opts, cb))
+                return false;
             continue;
         }
 
@@ -362,21 +439,36 @@ bool walk_7z(const SevenZipReader& sz, const std::string& prefix, int depth,
             continue;
         }
 
-        std::vector<char> data;
-        data.reserve(std::min<uint64_t>(e.uncompressed_size,
-                                        opts.archive.max_member_bytes));
-        CapSink sink{data, opts.archive.max_member_bytes, 0,
-                     opts.archive.max_total_bytes, budget};
+        // Zero-copy: the SDK decodes the whole solid block into the cache
+        // buffer and the member is a slice of it — hand the slice to the
+        // parser directly. Peak memory drops from (block + member copy)
+        // to the block alone.
+        const uint8_t* view = nullptr;
+        size_t view_size = 0;
         std::string err;
-        if (!sz.read_entry_streamed(e, std::ref(sink), &err)) {
+        if (!sz.read_entry_view(e, &view, &view_size, &err)) {
             sz.release_cache();
-            if (!emit_stream_failure(member_path, sink, err, "UNKNOWN",
-                                     data.size(), e.uncompressed_size,
+            std::vector<char> none;
+            CapSink no_sink{none, 0, 0, 0, budget};  // flags stay false:
+            if (!emit_stream_failure(member_path, no_sink, err, "UNKNOWN",
+                                     0, e.uncompressed_size,
                                      opts.archive, cb))
                 return false;
             continue;
         }
 
+        ViewCheck vc = precheck_view_member(member_path, view_size, budget,
+                                            opts, cb);
+        if (vc == ViewCheck::STOP) return false;
+
+        bool ok = true;
+        if (vc == ViewCheck::PROCEED)
+            ok = handle_member_bytes(member_path, view, view_size, nullptr,
+                                     depth, budget, opts, cb);
+
+        // The view points into the block cache, so release only after the
+        // member is fully processed; keep the cache when upcoming members
+        // share the folder.
         bool keep_cache = false;
         if (e.folder_index != SevenZipReader::kNoFolder) {
             for (size_t j = i + 1; j < entries.size(); ++j) {
@@ -391,8 +483,7 @@ bool walk_7z(const SevenZipReader& sz, const std::string& prefix, int depth,
         }
         if (!keep_cache) sz.release_cache();
 
-        if (!handle_member(member_path, std::move(data), depth, budget, opts, cb))
-            return false;
+        if (!ok) return false;
     }
     return true;
 }
@@ -423,6 +514,21 @@ bool walk_tar(InputStream& src, const std::string& prefix, int depth,
                 if (!cb(std::move(r))) return false;
             }
             if (!tar.skip_data()) break;
+            continue;
+        }
+
+        // Zero-copy: a memory-backed tar (nested archive) exposes the
+        // member's bytes in place — no materialization needed.
+        if (const uint8_t* view = tar.view_data()) {
+            switch (precheck_view_member(member_path, m.size, budget, opts,
+                                         cb)) {
+                case ViewCheck::SKIP: continue;
+                case ViewCheck::STOP: return false;
+                case ViewCheck::PROCEED: break;
+            }
+            if (!handle_member_bytes(member_path, view, m.size, nullptr,
+                                     depth, budget, opts, cb))
+                return false;
             continue;
         }
 

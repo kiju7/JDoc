@@ -125,6 +125,15 @@ bool ZipReader::find_data_offset(const Entry& entry, uint64_t& data_offset) cons
     return true;
 }
 
+const uint8_t* ZipReader::stored_view(const Entry& entry) const {
+    if (!open_ || entry.method != 0 ||
+        entry.compressed_size != entry.uncompressed_size)
+        return nullptr;
+    uint64_t pos = 0;
+    if (!find_data_offset(entry, pos)) return nullptr;
+    return src_->view_at(pos, entry.uncompressed_size);
+}
+
 bool ZipReader::read_entry_streamed(const Entry& entry, const WriteFn& sink,
                                     std::string* err) const {
     auto fail = [&](const char* reason) {

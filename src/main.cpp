@@ -27,6 +27,7 @@ void print_usage(const char* prog) {
               << "  --max-depth N        Max nested-archive depth (default: 3, -1 = unlimited)\n"
               << "  --max-member-mb N    Per-member uncompressed cap in MiB (default: 512, -1 = unlimited)\n"
               << "  --include-unsupported  Report unsupported members as errors\n"
+              << "  --threads N          Conversion worker threads (default: 1, 0 = all cores)\n"
               << "  --help          Show this help\n";
 }
 
@@ -87,6 +88,10 @@ int main(int argc, char* argv[]) {
         }
         else if (arg == "--include-unsupported") {
             opts.archive.include_unsupported = true;
+        }
+        else if (arg == "--threads" && i + 1 < argc) {
+            opts.archive.threads = static_cast<uint32_t>(
+                std::max(0, std::stoi(argv[++i])));
         }
         else if (input_path.empty()) {
             input_path = arg;

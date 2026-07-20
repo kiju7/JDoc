@@ -40,11 +40,16 @@ std::string convert_from_memory_as(FileFormat fmt,
 
 // ── Archive walker (archive_walker.cpp) ─────────────────
 
+class MemberPipeline;
+
 // Cumulative accounting shared across the whole convert_archive call,
 // including nested archives.
 struct WalkBudget {
     uint64_t total_out = 0;   // uncompressed bytes materialized so far
     uint32_t entries = 0;     // members visited so far
+    // Non-null when ArchiveLimits::threads > 1: leaf-document conversion is
+    // handed to this pipeline instead of running inline (archive.h docs).
+    MemberPipeline* pipeline = nullptr;
 };
 
 // Walk an archive and emit one MemberResult per member via cb.

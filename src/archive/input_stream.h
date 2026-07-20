@@ -21,6 +21,15 @@ public:
 
     // Read up to len bytes. Returns bytes read; 0 means EOF or error.
     virtual size_t read(void* buf, size_t len) = 0;
+
+    // Zero-copy view of the next len bytes when the stream is memory-backed
+    // and that many bytes remain. On success the stream advances past them;
+    // nullptr means the caller must fall back to read(). The pointer is
+    // valid for the lifetime of the stream's backing buffer.
+    virtual const uint8_t* view(size_t len) {
+        (void)len;
+        return nullptr;
+    }
 };
 
 class FileStream final : public InputStream {
@@ -44,6 +53,13 @@ public:
     MemoryStream(const uint8_t* data, size_t size) : data_(data), size_(size) {}
 
     size_t read(void* buf, size_t len) override;
+
+    const uint8_t* view(size_t len) override {
+        if (len > size_ - pos_) return nullptr;
+        const uint8_t* p = data_ + pos_;
+        pos_ += len;
+        return p;
+    }
 
 private:
     const uint8_t* data_ = nullptr;

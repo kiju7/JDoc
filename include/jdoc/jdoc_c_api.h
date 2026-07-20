@@ -22,6 +22,10 @@ typedef struct {
     long long max_total_bytes;           /* cumulative cap per call; default 64 GiB */
     int max_archive_entries;             /* default 200000 */
     int include_unsupported;             /* 1 = report unsupported members */
+    int archive_threads;                 /* conversion worker threads:
+                                          * 0 = library default (single-threaded),
+                                          * -1 = all cores, N > 1 = N workers.
+                                          * Results keep walk order. */
 } JDocOptions;
 
 /* Returns default options: no images, markdown, all pages, min_size=50. */

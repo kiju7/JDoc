@@ -1302,6 +1302,127 @@ static void test_consistency() {
     TEST_END
 }
 
+// Zero-copy view paths (nested store zip / nested tar) and the opt-in
+// conversion pipeline (ArchiveLimits::threads).
+static void test_views_and_threads() {
+    std::cerr << "Zero-copy views and conversion threads:\n";
+
+    TEST(nested_store_zip_zero_copy)
+        // Store members of a memory-backed (nested) zip take the view path.
+        ZipEntrySpec doc{"doc.rtf", "{\\rtf1\\ansi View Path}", /*deflate=*/false};
+        ZipEntrySpec txt{"note.txt", "plain note", /*deflate=*/false};
+        auto inner = make_zip({doc, txt});
+        ZipEntrySpec wrap{"inner.zip", inner, /*deflate=*/false};
+        auto path = write_tmp("storeview.zip", make_zip({wrap}));
+        auto rs = jdoc::convert_archive(path);
+        auto* d = find_member(rs, "inner.zip/doc.rtf");
+        auto* t = find_member(rs, "inner.zip/note.txt");
+        ASSERT(d && d->ok() && d->markdown.find("View Path") != std::string::npos);
+        ASSERT(t && t->ok() && t->markdown == "plain note");
+    TEST_END
+
+    TEST(nested_tar_zero_copy)
+        // A tar inside a zip is walked from memory — members take the
+        // stream-view path.
+        auto tar = make_tar({{"a.txt", "tar view A"}, {"b.txt", "tar view B"}});
+        auto path = write_tmp("tarview.zip",
+                              make_zip({{"inner.tar", tar, /*deflate=*/false}}));
+        auto rs = jdoc::convert_archive(path);
+        auto* a = find_member(rs, "inner.tar/a.txt");
+        auto* b = find_member(rs, "inner.tar/b.txt");
+        ASSERT(a && a->ok() && a->markdown == "tar view A");
+        ASSERT(b && b->ok() && b->markdown == "tar view B");
+    TEST_END
+
+    // Note: a view member can never trip max_member_bytes on its own — its
+    // parent container materializes under the same cap first and a leaf is
+    // always smaller than its container (the precheck's member branch is
+    // defense in depth). The cumulative budget, however, can trip mid-walk.
+    TEST(view_total_budget_stops_walk)
+        std::string chunk(1 << 20, 'a');
+        ZipEntrySpec m1{"m1.txt", chunk, /*deflate=*/false};
+        ZipEntrySpec m2{"m2.txt", chunk, /*deflate=*/false};
+        ZipEntrySpec m3{"m3.txt", chunk, /*deflate=*/false};
+        auto inner = make_zip({m1, m2, m3});
+        // Budget covers materializing inner.zip plus m1 and half of m2.
+        uint64_t budget = inner.size() + (1 << 20) + (1 << 19);
+        auto path = write_tmp("viewtotal.zip",
+                              make_zip({{"inner.zip", inner, /*deflate=*/false}}));
+        jdoc::ConvertOptions opts;
+        opts.archive.max_total_bytes = budget;
+        auto rs = jdoc::convert_archive(path, opts);
+        ASSERT(find_member(rs, "inner.zip/m1.txt") &&
+               find_member(rs, "inner.zip/m1.txt")->ok());
+        auto* second = find_member(rs, "inner.zip/m2.txt");
+        ASSERT(second && !second->ok() &&
+               second->error_code == jdoc::MemberErrorCode::TOTAL_LIMIT);
+        ASSERT(!find_member(rs, "inner.zip/m3.txt"));  // walk stopped
+    TEST_END
+
+    TEST(threads_match_single_thread_output)
+        // Mixed workload: documents, an unknown member, a nested archive,
+        // a corrupt member. Parallel conversion must produce the same
+        // results in the same order as the single-threaded walk.
+        std::string binary("\x00\x01\x02\x03genuinely-binary", 20);
+        ZipEntrySpec bad{"bad.txt", "truncated member, long enough to matter"};
+        bad.truncate_data = 8;
+        auto nested = make_zip({{"leaf.rtf", "{\\rtf1\\ansi Leaf}"}});
+        auto zip = make_zip({
+            {"d1.rtf", "{\\rtf1\\ansi Doc One}"},
+            {"d2.rtf", "{\\rtf1\\ansi Doc Two}"},
+            {"blob.bin", binary},
+            bad,
+            {"nested.zip", nested},
+            {"d3.txt", "third document"},
+        });
+        auto path = write_tmp("mt.zip", zip);
+
+        jdoc::ConvertOptions seq;
+        seq.archive.include_unsupported = true;
+        jdoc::ConvertOptions par = seq;
+        par.archive.threads = 4;
+
+        auto rs1 = jdoc::convert_archive(path, seq);
+        auto rs4 = jdoc::convert_archive(path, par);
+        ASSERT(rs1.size() == rs4.size());
+        for (size_t i = 0; i < rs1.size(); i++) {
+            ASSERT(rs1[i].member_path == rs4[i].member_path);  // order kept
+            ASSERT(rs1[i].markdown == rs4[i].markdown);
+            ASSERT(rs1[i].error_code == rs4[i].error_code);
+        }
+    TEST_END
+
+    TEST(threads_callback_early_stop)
+        auto zip = make_zip({{"1.txt", "one"}, {"2.txt", "two"},
+                             {"3.txt", "three"}, {"4.txt", "four"}});
+        auto path = write_tmp("mtstop.zip", zip);
+        jdoc::ConvertOptions opts;
+        opts.archive.threads = 4;
+        int seen = 0;
+        jdoc::convert_archive(path, [&](jdoc::MemberResult&&) {
+            return ++seen < 2;
+        }, opts);
+        ASSERT(seen == 2);  // no results delivered after the stop
+    TEST_END
+
+    TEST(threads_limits_still_enforced)
+        std::string big(8 << 20, '\0');
+        big.insert(0, "text ");
+        ZipEntrySpec e{"bomb.txt", big};
+        e.lie_uncompressed_size = 10;
+        auto zip = make_zip({e, {"after.txt", "still here"}});
+        auto path = write_tmp("mtbomb.zip", zip);
+        jdoc::ConvertOptions opts;
+        opts.archive.threads = 4;
+        opts.archive.max_member_bytes = 1 << 20;
+        auto rs = jdoc::convert_archive(path, opts);
+        auto* bomb = find_member(rs, "bomb.txt");
+        auto* after = find_member(rs, "after.txt");
+        ASSERT(bomb && bomb->error_code == jdoc::MemberErrorCode::MEMBER_LIMIT);
+        ASSERT(after && after->ok());
+    TEST_END
+}
+
 int main(int argc, char* argv[]) {
     g_tmpdir = (argc > 1) ? argv[1] : "test_archive_tmp";
     g_fixdir = (argc > 2) ? argv[2] : "test/fixtures/7z";
@@ -1323,6 +1444,7 @@ int main(int argc, char* argv[]) {
     test_rar();
     test_limits();
     test_consistency();
+    test_views_and_threads();
 
     std::cerr << "\n=== Results: " << tests_passed << " passed, "
               << tests_failed << " failed ===\n";

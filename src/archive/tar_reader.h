@@ -33,6 +33,12 @@ public:
     using WriteFn = std::function<bool(const char* data, size_t len)>;
     bool read_data(const WriteFn& sink);
 
+    // Zero-copy view of the current member's data when the underlying
+    // stream is memory-backed and the member (with padding) is fully
+    // available. On success the member is consumed; nullptr means fall
+    // back to read_data. Valid for the stream's backing buffer lifetime.
+    const uint8_t* view_data();
+
     // Skip the current member's data without buffering it.
     bool skip_data();
 

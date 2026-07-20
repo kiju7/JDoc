@@ -18,6 +18,16 @@ public:
     // Read up to len bytes at absolute offset. Returns bytes read (0 on EOF/error).
     virtual size_t read_at(uint64_t offset, void* buf, size_t len) const = 0;
 
+    // Zero-copy view of [offset, offset+len) when the bytes are already
+    // resident in memory. Returns nullptr when unavailable (file-backed
+    // source or out of bounds); callers must fall back to read_at. The
+    // pointer is valid for the lifetime of the source's backing buffer.
+    virtual const uint8_t* view_at(uint64_t offset, size_t len) const {
+        (void)offset;
+        (void)len;
+        return nullptr;
+    }
+
     virtual uint64_t size() const = 0;
 };
 
@@ -70,6 +80,11 @@ public:
         size_t n = len < avail ? len : avail;
         memcpy(buf, data_ + offset, n);
         return n;
+    }
+
+    const uint8_t* view_at(uint64_t offset, size_t len) const override {
+        if (!data_ || offset > size_ || len > size_ - offset) return nullptr;
+        return data_ + offset;
     }
 
     uint64_t size() const override { return size_; }

@@ -51,6 +51,10 @@ static jdoc::ConvertOptions to_cpp_opts(const JDocOptions* opts) {
     else if (opts->max_archive_entries < 0)
         o.archive.max_entries = UINT32_MAX;
     o.archive.include_unsupported = (opts->include_unsupported != 0);
+    if (opts->archive_threads > 0)
+        o.archive.threads = (uint32_t)opts->archive_threads;
+    else if (opts->archive_threads < 0)
+        o.archive.threads = 0;  // 0 = hardware concurrency
     return o;
 }
 

@@ -7,6 +7,9 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 find_package(ZLIB REQUIRED)
 find_package(JPEG REQUIRED)
+find_package(Threads REQUIRED)  # opt-in archive conversion pipeline only
+                                # (ArchiveLimits::threads; default stays
+                                # fully single-threaded)
 
 # ── Vendor libraries ────────────────────────────────────────
 
@@ -28,18 +31,18 @@ add_library(lzma_sdk STATIC
     vendor/lzma/LzmaDec.c
     vendor/lzma/Lzma2Dec.c
     vendor/lzma/Bcj2.c
+    vendor/lzma/Ppmd7.c
+    vendor/lzma/Ppmd7Dec.c
     vendor/lzma/Bra.c
     vendor/lzma/Bra86.c
     vendor/lzma/Delta.c
-    vendor/lzma/Ppmd7.c
-    vendor/lzma/Ppmd7Dec.c
     vendor/lzma/CpuArch.c
 )
 target_include_directories(lzma_sdk PUBLIC vendor/lzma)
+target_compile_definitions(lzma_sdk PRIVATE Z7_PPMD_SUPPORT)
 
 # ── Common utilities (compiled once) ──────────────────────────
 
-target_compile_definitions(lzma_sdk PRIVATE Z7_PPMD_SUPPORT)
 add_library(jdoc_common STATIC src/common/string_utils.cpp)
 target_include_directories(jdoc_common PUBLIC include PRIVATE src)
 
@@ -112,10 +115,11 @@ target_link_libraries(jdoc_office PUBLIC pugixml jdoc_zip jdoc_common)
 
 # ── Unified API (auto-detect format) ─────────────────────────
 
-add_library(jdoc_all STATIC src/jdoc.cpp src/archive/archive_walker.cpp)
+add_library(jdoc_all STATIC src/jdoc.cpp src/archive/archive_walker.cpp
+                            src/archive/member_pipeline.cpp)
 target_include_directories(jdoc_all PUBLIC include PRIVATE src)
 target_link_libraries(jdoc_all PUBLIC jdoc_pdf jdoc_office jdoc_hwpx jdoc_hwp
-                                      jdoc_zip jdoc_archive)
+                                      jdoc_zip jdoc_archive Threads::Threads)
 
 # ── Shared library with C API ─────────────────────────────────
 
@@ -167,6 +171,10 @@ target_include_directories(test_hwp3 PRIVATE include src)
 add_executable(bench_convert test/bench_convert.cpp)
 target_link_libraries(bench_convert PRIVATE jdoc_all)
 target_include_directories(bench_convert PRIVATE include)
+
+add_executable(pii_bench test/bench/pii/pii_bench.cpp)
+target_link_libraries(pii_bench PRIVATE jdoc_all)
+target_include_directories(pii_bench PRIVATE include)
 
 # ── Python bindings (pybind11) ────────────────────────────────
 

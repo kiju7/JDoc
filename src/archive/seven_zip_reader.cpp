@@ -145,8 +145,8 @@ void SevenZipReader::open_archive() {
     open_ = true;
 }
 
-bool SevenZipReader::read_entry_streamed(const Entry& entry, const WriteFn& sink,
-                                         std::string* err) const {
+bool SevenZipReader::read_entry_view(const Entry& entry, const uint8_t** data,
+                                     size_t* size, std::string* err) const {
     if (!open_) {
         if (err) *err = "archive not open";
         return false;
@@ -160,9 +160,18 @@ bool SevenZipReader::read_entry_streamed(const Entry& entry, const WriteFn& sink
         if (err) *err = decode_error_message(res);
         return false;
     }
+    *data = im.block_buf + offset;
+    *size = out_size;
+    return true;
+}
 
-    const char* data = reinterpret_cast<const char*>(im.block_buf) + offset;
-    size_t remaining = out_size;
+bool SevenZipReader::read_entry_streamed(const Entry& entry, const WriteFn& sink,
+                                         std::string* err) const {
+    const uint8_t* p = nullptr;
+    size_t remaining = 0;
+    if (!read_entry_view(entry, &p, &remaining, err)) return false;
+
+    const char* data = reinterpret_cast<const char*>(p);
     while (remaining > 0) {
         size_t n = std::min<size_t>(remaining, 64 * 1024);
         if (!sink(data, n)) return false;  // sink abort: err stays empty

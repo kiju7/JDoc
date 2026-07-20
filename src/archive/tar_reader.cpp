@@ -148,6 +148,16 @@ bool TarReader::read_data(const WriteFn& sink) {
     return true;
 }
 
+const uint8_t* TarReader::view_data() {
+    uint64_t total = data_remaining_ + pad_remaining_;
+    if (data_remaining_ == 0 || total > SIZE_MAX) return nullptr;
+    // Padding is viewed together with the data so a truncated final block
+    // falls back to read_data and fails the same way it does today.
+    const uint8_t* p = src_.view(static_cast<size_t>(total));
+    if (p) data_remaining_ = pad_remaining_ = 0;
+    return p;
+}
+
 bool TarReader::skip_data() {
     if (!discard(data_remaining_ + pad_remaining_)) return false;
     data_remaining_ = pad_remaining_ = 0;

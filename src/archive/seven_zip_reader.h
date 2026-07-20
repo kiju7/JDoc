@@ -50,6 +50,13 @@ public:
     bool read_entry_streamed(const Entry& entry, const WriteFn& sink,
                              std::string* err = nullptr) const;
 
+    // Zero-copy read: decode (or reuse) the member's solid block and return
+    // a view of the member's bytes inside the cached block buffer — the
+    // member is never copied out. The view stays valid until release_cache()
+    // or the next read of a different folder.
+    bool read_entry_view(const Entry& entry, const uint8_t** data,
+                         size_t* size, std::string* err = nullptr) const;
+
     // Drop the cached solid-block buffer (frees peak memory early).
     void release_cache() const;
 

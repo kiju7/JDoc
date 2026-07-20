@@ -9,26 +9,68 @@
 > 교차검증). reference 대비 신규 우위: RAR5 store(reference 전체 거부), HWP3 표 셀(reference 파싱 중단).
 > 잔여: RAR 압축 코덱(libarchive 기반 후속 플랜), 실물 hwp3 표 문서 검증.
 
-## P5 플랜 — RAR 전체 디코딩 + 디코더 성능 (미착수)
+## P5 플랜 — RAR 전체 디코딩 + 디코더 성능 (2·3번 구현 완료: 제로카피·멤버 병렬화)
 
 1. **RAR 압축 코덱 (클린룸 MIT)** — libarchive(BSD-2) 리더 기반, 상세와 공수
    추정(RAR4 1–2주, RAR5 +1–2주)은 `docs/rar-feasibility.md` 후속 플랜 절 참조.
-2. **디코더 핫루프 최적화** (신규 RAR 엔진이 주 대상):
+2. **제로카피 멤버 전달 (✅ 구현 완료, 2026-07-20)** — memcpy 벌크 복사(5번)와
+   구분되는 별개 최적화: memcpy화는 "복사를 크게 묶어" 바이트 단위 루프 오버헤드를
+   줄이는 것이고, 제로카피는 이미 메모리에 상주한 멤버 바이트를 **복사 없이
+   포인터(뷰)로 파서에 전달**하는 것. 적용 지점:
+   - 중첩 아카이브의 zip **store 멤버**: 부모 버퍼 안의 데이터 구간을 뷰로 직결
+     (`DataSource::view_at`).
+   - `MemoryStream` 기반 tar 멤버(중첩 tar): 스트림 뷰 직결(`InputStream::view`).
+   - **7z solid 캐시 슬라이스(전 멤버, 압축 여부 무관)**: folder 디코드 버퍼의
+     멤버 구간을 뷰로 직결 — 기존에는 folder 캐시 + 멤버 사본이 동시 상주(2×),
+     제로카피로 1×. 피크 메모리·시간 모두 이득, 효과가 가장 큰 지점.
+   - 캡 회계는 동일 유지(멤버·누적 캡을 뷰 크기로 선검사). deflate/bzip2/lzma
+     압축 멤버는 디코딩 산출물이라 제로카피 대상이 아님.
+   - 뷰의 수명 문제로 **단일 스레드(기본) 경로에서만 무복사**; 병렬 모드(3번)에서는
+     워커에 넘길 때 사본 생성(병렬은 처리량 최적화, 제로카피는 기본 경로 최적화).
+   - 후속 여지: alz/egg/rar store 멤버 뷰, 최상위 파일 mmap(파일 기반 store/tar도
+     무복사 가능하나 maxRSS에 매핑 페이지가 잡혀 벤치 지표가 왜곡될 수 있어 보류).
+   - **구현**: `DataSource::view_at`/`InputStream::view`/`ZipReader::stored_view`/
+     `TarReader::view_data`/`SevenZipReader::read_entry_view` + walker 뷰 경로
+     (`precheck_view_member`로 캡 회계 동일 유지). 7z는 캐시 해제를 멤버 처리
+     후로 이동(뷰 수명 보장).
+   - **실측(2026-07-20, Apple Silicon 네이티브, Release)**: solid 7z(49MB 텍스트
+     ×2, 1 folder)에서 피크 RSS **194.0MB → 144.9MB**(멤버 사본 49MB 제거 확증).
+     시간은 동률(디코드 지배 워크로드라 기대대로). 단일 멤버 folder는 기존에도
+     캐시 선해제라 피크 동일 — 이득은 멀티 멤버 folder에서 발생. 중첩 store
+     멤버가 멤버 캡을 단독 초과하는 경우는 구조상 불가(부모가 같은 캡으로 먼저
+     실체화)라 뷰 캡 검사는 심층 방어로만 동작.
+3. **멤버 병렬화 (옵트인, ✅ 구현 완료, 2026-07-20)** — RAR 전용이 아니라
+   zip/7z/alz/egg 전 포맷 공통 효과. 단일 스레드 원칙은 기본값으로 유지하고
+   `ConvertOptions::archive`에 스레드 수 옵션(기본 1) 추가:
+   - 전 포맷 공통 파이프라인: 디코드·순회는 호출 스레드 1개 유지 + **문서 변환만
+     워커 N**에 위임(변환이 지배 비용). 결과 콜백은 호출 스레드에서 **순회 순서
+     보존** 전달(순서 슬롯 큐).
+   - 이 설계로 `WalkBudget`/`CapSink` 원자화가 불필요해짐 — 디코드·캡 회계가
+     호출 스레드에 남으므로 스레드 안전 재설계 없이 성립(플랜 수정).
+   - zip/7z 멤버 파티션 병렬(디코드 자체 병렬)은 디코드가 전체의 10–20%라
+     이득이 작아 후순위. unrar식 코덱 내부 멀티스레드(rar5 디코드 분할)도 동일.
+   - 인플라이트 멤버 수는 워커 수 기준으로 상한(메모리 = 상한 × 멤버 크기).
+   - **구현**: `ArchiveLimits::threads`(1=단일 스레드 기본, 0=코어 수, N=워커 N),
+     `src/archive/member_pipeline.{h,cpp}`(순서 슬롯 큐 + 백프레셔 2×워커,
+     조기 중단 시 잔여 결과 폐기), CLI `--threads`, C API `archive_threads`,
+     Python `threads` kwarg. 병렬 모드에서 뷰 멤버는 제출 시 사본 생성(수명).
+   - **실측(2026-07-20, Apple Silicon 네이티브, M-코어 로컬)**:
+     | 워크로드 | t=1 | t=4 | t=8 | 비고 |
+     |---|---|---|---|---|
+     | hwp 코퍼스 zip(store, 177문서 641MB) | 0.29s | **0.14s (2.1×)** | 0.15s | t≥4는 디코드 직렬 플로어 |
+     | pdf+hwp zip(185문서 713MB) | 6.6s | **5.1s (1.3×)** | 5.2s | big.pdf 단독 4.9s가 Amdahl 하한(74%) — 하한 근접 |
+     | reference 벤치 zip(40문서 27MB) | 0.096s | 0.080s | 0.078s | 소형이라 워크·디코드 오버헤드 지배 |
+     스레드 1 vs 8 출력 완전 일치(zip/7z/alz/egg, out_bytes·순서·에러코드),
+     테스트 76/76 그린(순서 보존·조기 중단·캡 강제 포함).
+4. 검증: reference 대비 Docker 재측정 + 아래 대비표 갱신(잔여 — 위 수치는 네이티브
+   로컬이라 표의 에뮬레이션 수치와 직접 비교 불가).
+5. **디코더 핫루프 최적화** (신규 RAR 엔진이 주 대상):
    - 64비트 프리페치 비트리더 리필(바이트 단위 리필 대체) — Huffman 디코드 1.5–2배.
-   - LZ 매치 구간의 겹침 없는 범위를 memcpy 벌크 복사로 처리.
+   - LZ 매치 구간의 겹침 없는 범위를 memcpy 벌크 복사로 처리(복사 횟수·분기 감소;
+     복사 자체를 없애는 2번 제로카피와는 별개).
    - 목표: 참조 구현(libarchive ~110MB/s, `-mt1` unrar ~410MB/s) 대비 200MB/s+.
    - 기존 코덱(deflate/bzip2/LZMA)은 라이브러리 디코더라 핫루프가 외부에 있음 —
      대신 `InputStream` 버퍼·`CodecSink` 호출 단위(64KB 배치)만 점검.
-3. **멤버 병렬화 (옵트인)** — RAR 전용이 아니라 zip/7z/alz/egg 전 포맷 공통 효과.
-   단일 스레드 원칙은 기본값으로 유지하고 `ConvertOptions::archive`에 스레드 수
-   옵션(기본 1) 추가:
-   - 순차 컨테이너(tar/alz/egg/rar): 디코드 1 스레드 + 문서 변환 워커 N 파이프라인
-     (변환이 지배 비용이므로 여기서 이득).
-   - 랜덤액세스 컨테이너(zip/7z 비솔리드): 멤버 파티션 병렬.
-   - `WalkBudget`/entry 계수 원자화, `CapSink` 누적 캡의 스레드 안전 설계 필요.
-   - 기대: 변환 지배 워크로드(zip 40문서 0.60s)에서 코어 수 배 근접. unrar식 코덱
-     내부 멀티스레드(rar5 디코드 분할)는 공수 대비 이득이 작아 후순위.
-4. 검증: `bench_convert` 재측정 + 아래 reference 대비표 갱신.
 
 ## reference 대비 벤치 결과 (2026-07-16)
 
@@ -182,7 +224,9 @@
 
 ## 검증 (공통)
 - `test_office`/`test_pdf`/`test_archive` 그린.
-- 단일 스레드: `src/archive/`·`vendor/lzma/`에 `std::thread`/`pthread_create` 부재 grep, `Threads.c` 미포함.
+- 단일 스레드(기본 경로): `vendor/lzma/`에 `Threads.c` 미포함, `src/archive/`의
+  스레드 사용은 옵트인 파이프라인(`member_pipeline.{h,cpp}`)에 한정 —
+  `ArchiveLimits::threads` 기본값 1이면 스레드 생성 자체가 없음.
 - 메모리: `/usr/bin/time -l`로 solid 7z·대형 alz 멤버가 캡 내 유지 확인.
 - reference 대비: 동일 Docker(linux/amd64)에서 동일 픽스처로 시간·maxRSS 비교. 목표: **reference보다 빠르고 메모리 적게**.
 

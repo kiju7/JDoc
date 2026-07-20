@@ -47,6 +47,12 @@ public:
     bool read_entry_streamed(const Entry& entry, const WriteFn& sink,
                              std::string* err = nullptr) const;
 
+    // Zero-copy view of a STORE entry's bytes when the archive is
+    // memory-backed. Returns nullptr otherwise (compressed entry,
+    // file-backed source, or corrupt header) — fall back to
+    // read_entry_streamed. Valid for the source buffer's lifetime.
+    const uint8_t* stored_view(const Entry& entry) const;
+
     // Read entire entry into memory (built on read_entry_streamed; output is
     // capped so a lying central directory cannot trigger unbounded allocation)
     std::vector<char> read_entry(const std::string& name) const;

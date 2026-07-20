@@ -44,7 +44,7 @@ static bool has_skippable_ext(const fs::path& p) {
 
 int main(int argc, char* argv[]) {
     if (argc < 3) {
-        fprintf(stderr, "Usage: %s <archive|dir> <path>\n", argv[0]);
+        fprintf(stderr, "Usage: %s <archive|dir> <path> [threads]\n", argv[0]);
         return 1;
     }
     std::string mode = argv[1];
@@ -54,6 +54,7 @@ int main(int argc, char* argv[]) {
     uint64_t out_bytes = 0;
     jdoc::ConvertOptions opts;
     opts.archive.max_total_bytes = 16ull << 30;  // benchmark corpus can exceed the library default.
+    if (argc > 3) opts.archive.threads = static_cast<uint32_t>(atoi(argv[3]));
 
     auto t0 = std::chrono::steady_clock::now();
 
