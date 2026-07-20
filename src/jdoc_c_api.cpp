@@ -68,6 +68,7 @@ JDocOptions jdoc_default_options(void) {
 
 char* jdoc_convert(const char* file_path, const JDocOptions* opts,
                    char* err_buf, int err_buf_size) {
+    set_error(err_buf, err_buf_size, "");
     if (!file_path) {
         set_error(err_buf, err_buf_size, "file_path is NULL");
         return nullptr;
@@ -87,6 +88,7 @@ char* jdoc_convert(const char* file_path, const JDocOptions* opts,
 JDocPage* jdoc_convert_pages(const char* file_path, const JDocOptions* opts,
                               int* out_count,
                               char* err_buf, int err_buf_size) {
+    set_error(err_buf, err_buf_size, "");
     if (!file_path || !out_count) {
         set_error(err_buf, err_buf_size, "file_path or out_count is NULL");
         return nullptr;
@@ -147,6 +149,7 @@ JDocPage* jdoc_convert_pages(const char* file_path, const JDocOptions* opts,
 JDocMember* jdoc_convert_archive(const char* file_path, const JDocOptions* opts,
                                  int* out_count,
                                  char* err_buf, int err_buf_size) {
+    set_error(err_buf, err_buf_size, "");
     if (!file_path || !out_count) {
         set_error(err_buf, err_buf_size, "file_path or out_count is NULL");
         return nullptr;
@@ -186,6 +189,7 @@ JDocMember* jdoc_convert_archive(const char* file_path, const JDocOptions* opts,
 char* jdoc_convert_mem(const void* data, int size, const char* name_hint,
                        const JDocOptions* opts,
                        char* err_buf, int err_buf_size) {
+    set_error(err_buf, err_buf_size, "");
     if (!data || size <= 0) {
         set_error(err_buf, err_buf_size, "data is NULL or empty");
         return nullptr;

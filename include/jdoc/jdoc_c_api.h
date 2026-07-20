@@ -96,7 +96,9 @@ typedef struct {
 /* Convert every supported document inside an archive without extracting
  * to disk. Per-member failures are recorded in that member's `error`.
  * Returns malloc'd array of JDocMember; count written to *out_count.
- * Returns NULL when the file cannot be opened (message in err_buf). */
+ * Returns NULL when the file cannot be opened (message in err_buf).
+ * err_buf is cleared on entry: a NULL return with an EMPTY err_buf means
+ * the archive simply had no reportable members, not an error. */
 JDocMember* jdoc_convert_archive(const char* file_path, const JDocOptions* opts,
                                  int* out_count,
                                  char* err_buf, int err_buf_size);
