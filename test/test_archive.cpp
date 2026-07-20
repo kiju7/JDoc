@@ -839,6 +839,12 @@ static void test_seven_zip() {
         }
     TEST_END
 
+    TEST(ppmd_7z)
+        auto rs = jdoc::convert_archive(fixture("ppmd.7z"));
+        ASSERT(rs.size() == 1 && rs[0].ok());
+        ASSERT(rs[0].markdown == "ppmd compressed text member");
+    TEST_END
+
     TEST(encrypted_member_reports_error)
         auto rs = jdoc::convert_archive(fixture("encrypted.7z"));
         ASSERT(rs.size() == 1 && !rs[0].ok());

@@ -31,12 +31,15 @@ add_library(lzma_sdk STATIC
     vendor/lzma/Bra.c
     vendor/lzma/Bra86.c
     vendor/lzma/Delta.c
+    vendor/lzma/Ppmd7.c
+    vendor/lzma/Ppmd7Dec.c
     vendor/lzma/CpuArch.c
 )
 target_include_directories(lzma_sdk PUBLIC vendor/lzma)
 
 # ── Common utilities (compiled once) ──────────────────────────
 
+target_compile_definitions(lzma_sdk PRIVATE Z7_PPMD_SUPPORT)
 add_library(jdoc_common STATIC src/common/string_utils.cpp)
 target_include_directories(jdoc_common PUBLIC include PRIVATE src)
 
