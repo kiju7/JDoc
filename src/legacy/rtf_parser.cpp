@@ -510,7 +510,7 @@ std::string RtfParser::to_markdown(const ConvertOptions& opts) {
             std::string name = "rtf_image_" + std::to_string(i + 1);
             std::string ext = pi.format.empty() ? "bin" : pi.format;
             std::string filename = name + "." + ext;
-            if (opts.extract_images)
+            if (opts.images)
                 text += "![" + filename + "](" + opts.image_ref_prefix + filename + ")\n\n";
             else
                 text += "![" + filename + "](" + filename + ")\n\n";
@@ -532,7 +532,7 @@ std::vector<PageChunk> RtfParser::to_chunks(const ConvertOptions& opts) {
     chunk.page_height = 792.0;
     chunk.body_font_size = 12.0;
 
-    if (opts.extract_images) {
+    if (opts.images) {
         for (size_t i = 0; i < pict_images.size(); ++i) {
             const auto& pi = pict_images[i];
             ImageData img;

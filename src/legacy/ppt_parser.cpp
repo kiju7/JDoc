@@ -665,7 +665,7 @@ std::string PptParser::to_markdown(const ConvertOptions& opts) {
     auto all_images = extract_images(opts.min_image_size);
 
     // Save images to disk if requested
-    if (opts.extract_images) {
+    if (opts.images) {
         for (auto& img : all_images) {
             img.saved_path = util::save_image_to_file(
                 opts.image_dir, img.name, img.format,
@@ -692,7 +692,7 @@ std::string PptParser::to_markdown(const ConvertOptions& opts) {
             if (blip_idx >= 1 && blip_idx <= static_cast<int>(all_images.size())) {
                 auto& img = all_images[blip_idx - 1];
                 std::string filename = img.name + "." + img.format;
-                if (opts.extract_images)
+                if (opts.images)
                     md += "![" + filename + "](" + opts.image_ref_prefix + filename + ")\n\n";
                 else
                     md += "![" + filename + "](" + filename + ")\n\n";
@@ -707,7 +707,7 @@ std::vector<PageChunk> PptParser::to_chunks(const ConvertOptions& opts) {
     std::vector<PageChunk> chunks;
     auto all_images = extract_images(opts.min_image_size);
 
-    if (opts.extract_images) {
+    if (opts.images) {
         for (auto& img : all_images) {
             img.saved_path = util::save_image_to_file(
                 opts.image_dir, img.name, img.format,
@@ -737,7 +737,7 @@ std::vector<PageChunk> PptParser::to_chunks(const ConvertOptions& opts) {
             if (blip_idx >= 1 && blip_idx <= static_cast<int>(all_images.size())) {
                 auto& img = all_images[blip_idx - 1];
                 std::string filename = img.name + "." + img.format;
-                if (opts.extract_images)
+                if (opts.images)
                     slide_md += "![" + filename + "](" + opts.image_ref_prefix + filename + ")\n\n";
                 else
                     slide_md += "![" + filename + "](" + filename + ")\n\n";

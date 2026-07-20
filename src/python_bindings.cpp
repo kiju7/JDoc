@@ -74,8 +74,8 @@ PYBIND11_MODULE(_jdoc, m) {
     py::class_<jdoc::ConvertOptions>(m, "ConvertOptions")
         .def(py::init<>())
         .def_readwrite("pages", &jdoc::ConvertOptions::pages)
-        .def_readwrite("extract_tables", &jdoc::ConvertOptions::extract_tables)
-        .def_readwrite("extract_images", &jdoc::ConvertOptions::extract_images)
+        .def_readwrite("tables", &jdoc::ConvertOptions::tables)
+        .def_readwrite("images", &jdoc::ConvertOptions::images)
         .def_readwrite("image_dir", &jdoc::ConvertOptions::image_dir)
         .def_readwrite("min_image_size", &jdoc::ConvertOptions::min_image_size)
         .def_readwrite("format", &jdoc::ConvertOptions::format);
@@ -99,15 +99,15 @@ PYBIND11_MODULE(_jdoc, m) {
     m.def("convert", [](const std::string& file_path,
                          const std::string& format,
                          const std::vector<int>& pages,
-                         bool extract_tables,
-                         bool extract_images,
+                         bool tables,
+                         bool images,
                          const std::string& image_dir,
                          const std::string& image_ref_prefix,
                          unsigned min_image_size) -> std::string {
         jdoc::ConvertOptions opts;
         opts.pages = pages;
-        opts.extract_tables = extract_tables;
-        opts.extract_images = extract_images;
+        opts.tables = tables;
+        opts.images = images;
         opts.image_dir = image_dir;
         opts.image_ref_prefix = image_ref_prefix;
         opts.min_image_size = min_image_size;
@@ -120,8 +120,8 @@ PYBIND11_MODULE(_jdoc, m) {
     py::arg("file_path"),
     py::arg("format") = "markdown",
     py::arg("pages") = std::vector<int>{},
-    py::arg("extract_tables") = true,
-    py::arg("extract_images") = false,
+    py::arg("tables") = true,
+    py::arg("images") = false,
     py::arg("image_dir") = "",
     py::arg("image_ref_prefix") = "",
     py::arg("min_image_size") = 50,
@@ -131,7 +131,7 @@ Args:
     file_path: Path to the document file (PDF, DOCX, XLSX, PPTX, DOC, XLS, PPT, RTF, HWP, HWPX)
     format: Output format - "markdown" (default) or "text"/"plaintext"
     pages: List of page numbers (0-based). Empty = all pages.
-    extract_images: Whether to extract images
+    images: Whether to extract images
     image_dir: Directory to save extracted images (if empty, images kept in memory only)
     min_image_size: Skip images smaller than NxN pixels (default: 50, 0=no filter)
 
@@ -142,16 +142,16 @@ Returns:
     m.def("convert_pages", [](const std::string& file_path,
                                const std::string& format,
                                const std::vector<int>& pages,
-                               bool extract_tables,
-                               bool extract_images,
+                               bool tables,
+                               bool images,
                                const std::string& image_dir,
                                const std::string& image_ref_prefix,
                                unsigned min_image_size)
                                -> std::vector<jdoc::PageChunk> {
         jdoc::ConvertOptions opts;
         opts.pages = pages;
-        opts.extract_tables = extract_tables;
-        opts.extract_images = extract_images;
+        opts.tables = tables;
+        opts.images = images;
         opts.image_dir = image_dir;
         opts.image_ref_prefix = image_ref_prefix;
         opts.min_image_size = min_image_size;
@@ -164,8 +164,8 @@ Returns:
     py::arg("file_path"),
     py::arg("format") = "markdown",
     py::arg("pages") = std::vector<int>{},
-    py::arg("extract_tables") = true,
-    py::arg("extract_images") = false,
+    py::arg("tables") = true,
+    py::arg("images") = false,
     py::arg("image_dir") = "",
     py::arg("image_ref_prefix") = "",
     py::arg("min_image_size") = 50,
@@ -175,7 +175,7 @@ Args:
     file_path: Path to the document file
     format: Output format - "markdown" (default) or "text"/"plaintext"
     pages: List of page numbers (0-based). Empty = all pages.
-    extract_images: Whether to extract images (accessible via chunk.images)
+    images: Whether to extract images (accessible via chunk.images)
     image_dir: Directory to save images (if empty, images available via ImageData.data bytes)
     min_image_size: Skip images smaller than NxN pixels (default: 50, 0=no filter)
 

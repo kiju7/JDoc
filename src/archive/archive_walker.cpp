@@ -210,7 +210,7 @@ bool handle_member_bytes(const std::string& member_path, const uint8_t* bytes,
         return cb(std::move(r));
     }
 
-    bool wants_images = opts.extract_images && !opts.image_dir.empty();
+    bool wants_images = opts.images && !opts.image_dir.empty();
 
     if (budget.pipeline) {
         // Leaf documents convert on the pipeline workers while this thread

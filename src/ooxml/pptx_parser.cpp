@@ -600,7 +600,7 @@ ImageData PptxParser::extract_image_data(const std::string& media_path,
     std::string filename = img.name + (ext.empty() ? ".png" : ext);
     idx++;
 
-    if (opts.extract_images) {
+    if (opts.images) {
         img.data = zip_.read_entry(media_path);
         util::populate_image_dimensions(img);
 
@@ -666,7 +666,7 @@ std::string PptxParser::to_markdown(const ConvertOptions& opts) {
                     break;
                 }
                 case SlideElement::TABLE:
-                    if (opts.extract_tables)
+                    if (opts.tables)
                         out << "\n" << format_table(elem.rows) << "\n";
                     break;
             }
@@ -688,7 +688,7 @@ std::vector<PageChunk> PptxParser::to_chunks(
     std::vector<PageChunk> chunks;
     std::set<std::string> extracted;
     ConvertOptions img_opts = opts;
-    img_opts.extract_images = true;
+    img_opts.images = true;
 
     for (size_t i = 0; i < slide_paths_.size(); ++i) {
         int slide_num = static_cast<int>(i) + 1;
@@ -739,7 +739,7 @@ std::vector<PageChunk> PptxParser::to_chunks(
                     break;
                 }
                 case SlideElement::TABLE:
-                    if (opts.extract_tables) {
+                    if (opts.tables) {
                         chunk.tables.push_back(elem.rows);
                         text << "\n" << format_table(elem.rows) << "\n";
                     }

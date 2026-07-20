@@ -415,7 +415,7 @@ private:
                 }
                 else if (in == "hp:tbl") {
                     // Table
-                    if (opts_.extract_tables) {
+                    if (opts_.tables) {
                         std::string table_md = process_table(item, chunk.page_number, &image_idx);
                         if (!table_md.empty()) {
                             // Flush preceding text
@@ -772,7 +772,7 @@ private:
             return {};
 
         // Save to disk if requested (BMP -> PNG for compression)
-        if (opts_.extract_images) {
+        if (opts_.images) {
             std::string save_name = "page" + std::to_string(page_number) +
                                     "_img" + std::to_string(image_idx);
             img.saved_path = util::save_image_to_file(

@@ -1430,7 +1430,7 @@ std::string DocParser::to_markdown(const ConvertOptions& opts) {
 
     auto images = extract_images(opts.min_image_size);
 
-    if (opts.extract_images) {
+    if (opts.images) {
         for (auto& img : images) {
             img.saved_path = util::save_image_to_file(
                 opts.image_dir, img.name, img.format,
@@ -1454,7 +1454,7 @@ std::vector<PageChunk> DocParser::to_chunks(const ConvertOptions& opts) {
     std::string raw = extract_text();
     chunk.text = strip_image_markers(text_to_markdown(raw));
 
-    if (opts.extract_images) {
+    if (opts.images) {
         chunk.images = extract_images(opts.min_image_size);
     }
 

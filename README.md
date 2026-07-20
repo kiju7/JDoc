@@ -77,7 +77,7 @@ text = jdoc.convert("document.pdf")
 text = jdoc.convert("report.docx", format="text", pages=[0, 1])
 
 # 이미지 포함 페이지별 청크
-pages = jdoc.convert_pages("document.pdf", extract_images=True)
+pages = jdoc.convert_pages("document.pdf", images=True)
 for page in pages:
     print(page.text)
     for img in page.images:
@@ -86,12 +86,12 @@ for page in pages:
         # img.pixels — 원시 RGB 버퍼 (width * height * components)
 
 # 이미지 크기 필터
-text = jdoc.convert("doc.pdf", extract_images=True, min_image_size=100)  # 100px 미만 제외
-text = jdoc.convert("doc.pdf", extract_images=True, min_image_size=0)    # 필터 없음
+text = jdoc.convert("doc.pdf", images=True, min_image_size=100)  # 100px 미만 제외
+text = jdoc.convert("doc.pdf", images=True, min_image_size=0)    # 필터 없음
 
 # ConvertOptions로 세부 제어
 opts = jdoc.ConvertOptions()
-opts.extract_images = True
+opts.images = True
 opts.image_dir = "./images"
 opts.min_image_size = 50
 opts.pages = [0, 1, 2]
@@ -119,7 +119,7 @@ std::string md = jdoc::convert("report.docx");
 // 이미지를 디렉터리로 추출
 jdoc::ConvertOptions opts;
 opts.pages = {0, 1, 2};
-opts.extract_images = true;
+opts.images = true;
 opts.image_dir = "./images";  // 파일로 저장
 opts.min_image_size = 50;
 std::string md = jdoc::convert("input.pdf", opts);
@@ -166,7 +166,7 @@ jdoc_free_string(text);
 
 // 이미지 포함 페이지별 청크
 JDocOptions opts = jdoc_default_options();
-opts.extract_images = 1;
+opts.images = 1;
 opts.image_dir = "./images";  // NULL = 메모리에만 유지
 
 int page_count;
@@ -192,9 +192,9 @@ jdoc_free_pages(pages, page_count);
 | 옵션 | 기본값 | 설명 | CLI |
 |---|---|---|---|
 | `pages` | 전체 | 추출할 페이지 번호 목록 (0부터 시작) | `--pages 0,1,2` |
-| `extract_tables` | `true` | 표를 마크다운 표로 추출 | `--no-tables` (비활성화) |
+| `tables` | `true` | 표를 마크다운 표로 추출 | `--no-tables` (비활성화) |
 | `page_chunks` | `false` | 페이지/슬라이드/시트별 청크로 출력 | `--chunks` |
-| `extract_images` | `false` | 이미지 추출 | `--images DIR` |
+| `images` | `false` | 이미지 추출 | `--images DIR` |
 | `image_dir` | `""` (메모리 유지) | 이미지 저장 디렉토리. 빈 값이면 바이트로만 반환 | `--images DIR` |
 | `image_ref_prefix` | `""` | 마크다운 이미지 참조 경로 앞에 붙일 접두사 | — |
 | `min_image_size` | `50` | N×N px 미만 이미지 제외 (`0` = 필터 없음) | `--min-image-size N` |

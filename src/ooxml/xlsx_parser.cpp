@@ -740,7 +740,7 @@ std::vector<ImageData> XlsxParser::extract_images(
     const ConvertOptions& opts) {
 
     std::vector<ImageData> images;
-    if (!opts.extract_images) return images;
+    if (!opts.images) return images;
 
     std::set<std::string> extracted;
 
@@ -920,7 +920,7 @@ std::string XlsxParser::to_markdown(const ConvertOptions& opts) {
     auto images = extract_images(opts);
     if (!images.empty()) {
         for (auto& img : images) {
-            if (opts.extract_images)
+            if (opts.images)
                 out << "![" << img.name << "](" << opts.image_ref_prefix << img.name << ")\n\n";
             else
                 out << "![" << img.name << "](" << img.name << "." << img.format << ")\n\n";
@@ -938,7 +938,7 @@ std::vector<PageChunk> XlsxParser::to_chunks(
     std::vector<PageChunk> chunks;
     // Always enumerate images so we can reference them in text
     ConvertOptions img_opts = opts;
-    img_opts.extract_images = true;
+    img_opts.images = true;
     auto all_images = extract_images(img_opts);
 
     for (size_t i = 0; i < sheets_.size(); ++i) {
@@ -969,7 +969,7 @@ std::vector<PageChunk> XlsxParser::to_chunks(
 
             // Build structured table data for the chunk
             // Convert sparse grid to dense 2D vector
-            if (opts.extract_tables) {
+            if (opts.tables) {
                 int total_rows = sheet.max_row + 1;
                 int total_cols = sheet.max_col + 1;
                 int display_rows = std::min(total_rows, 10000);

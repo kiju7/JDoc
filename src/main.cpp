@@ -66,13 +66,13 @@ int main(int argc, char* argv[]) {
             opts.pages = parse_pages(argv[++i]);
         }
         else if (arg == "--no-tables") {
-            opts.extract_tables = false;
+            opts.tables = false;
         }
         else if (arg == "--chunks") {
             chunk_mode = true;
         }
         else if (arg == "--images" && i + 1 < argc) {
-            opts.extract_images = true;
+            opts.images = true;
             opts.image_dir = argv[++i];
         }
         else if (arg == "--min-image-size" && i + 1 < argc) {
@@ -129,7 +129,7 @@ int main(int argc, char* argv[]) {
     }
 
     // Compute image reference prefix: relative path from md file dir to image dir
-    if (opts.extract_images && !opts.image_dir.empty()) {
+    if (opts.images && !opts.image_dir.empty()) {
         namespace fs = std::filesystem;
         fs::path img_dir = fs::weakly_canonical(fs::absolute(opts.image_dir));
         fs::path md_dir = output_path.empty()

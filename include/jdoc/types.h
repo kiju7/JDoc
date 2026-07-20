@@ -67,9 +67,9 @@ struct ArchiveLimits {
 
 struct ConvertOptions {
     std::vector<int> pages;
-    bool extract_tables = true;
+    bool tables = true;
     bool page_chunks = false;
-    bool extract_images = false;
+    bool images = false;
     std::string image_dir;
     std::string image_ref_prefix;   // prepended to image filenames in markdown refs
     unsigned min_image_size = 50;   // skip images smaller than NxN pixels (0 = no filter)

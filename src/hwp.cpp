@@ -1183,7 +1183,7 @@ private:
         std::string filename = unified + "." + ext;
 
         // When images not requested, emit embedded reference without loading data
-        if (!opts_.extract_images) {
+        if (!opts_.images) {
             image_idx++;
             return "![" + unified + "](" + opts_.image_ref_prefix + filename + ")\n\n";
         }
@@ -1261,7 +1261,7 @@ private:
         std::string result;
 
         // First, handle any tables attached to this paragraph
-        if (opts_.extract_tables) {
+        if (opts_.tables) {
             for (auto& tbl : para.tables) {
                 result += format_table(tbl, chunk, image_idx);
             }

@@ -25,8 +25,8 @@ static char* strdup_c(const std::string& s) {
 static jdoc::ConvertOptions to_cpp_opts(const JDocOptions* opts) {
     jdoc::ConvertOptions o;
     if (!opts) return o;
-    o.extract_tables = (opts->extract_tables != 0);
-    o.extract_images = (opts->extract_images != 0);
+    o.tables = (opts->tables != 0);
+    o.images = (opts->images != 0);
     if (opts->image_dir)
         o.image_dir = opts->image_dir;
     if (opts->image_ref_prefix)
@@ -75,7 +75,7 @@ extern "C" {
 
 JDocOptions jdoc_default_options(void) {
     JDocOptions o = {};
-    o.extract_tables = 1;
+    o.tables = 1;
     o.min_image_size = 50;
     o.threads = 1;
     return o;

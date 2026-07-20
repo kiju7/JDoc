@@ -764,7 +764,7 @@ std::string HtmlParser::to_markdown(const ConvertOptions& opts) {
     if (!images.empty()) {
         md += "\n";
         for (auto& img : images) {
-            if (opts.extract_images)
+            if (opts.images)
                 md += "![" + img.name + "](" + opts.image_ref_prefix + img.name + ")\n";
             else
                 md += "![" + img.name + "](" + img.name + "." + img.format + ")\n";

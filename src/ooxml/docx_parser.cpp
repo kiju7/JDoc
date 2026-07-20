@@ -236,7 +236,7 @@ std::vector<ImageData> DocxParser::extract_images(
     const ConvertOptions& opts) {
 
     std::vector<ImageData> images;
-    if (!opts.extract_images) return images;
+    if (!opts.images) return images;
 
     auto entries = zip_.entries_with_prefix("word/media/");
     int img_idx = 0;
@@ -711,7 +711,7 @@ std::string DocxParser::to_markdown(const ConvertOptions& opts) {
         }
 
         if (elem.type == DocxElement::TABLE) {
-            if (opts.extract_tables) {
+            if (opts.tables) {
                 out << "\n" << format_table(elem.table_rows) << "\n";
             }
             // Emit images from table cells after the table
@@ -854,7 +854,7 @@ std::vector<PageChunk> DocxParser::to_chunks(
         }
 
         if (elem.type == DocxElement::TABLE) {
-            if (opts.extract_tables) {
+            if (opts.tables) {
                 // Add table as structured data
                 current.tables.push_back(elem.table_rows);
                 // Also add to text as markdown table

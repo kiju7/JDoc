@@ -9,11 +9,11 @@ extern "C" {
 
 /* Field names match the C++ ConvertOptions / Python keywords one-to-one.
  * Initialize with jdoc_default_options(); a zero-filled struct is NOT a
- * valid default (extract_tables would be off). */
+ * valid default (tables would be off). */
 typedef struct {
     /* conversion */
-    int extract_tables;              /* 1 = tables as markdown tables (default 1) */
-    int extract_images;              /* 0 = skip images, 1 = extract */
+    int tables;              /* 1 = tables as markdown tables (default 1) */
+    int images;              /* 0 = skip images, 1 = extract */
     const char* image_dir;           /* image output directory; NULL = keep in memory */
     const char* image_ref_prefix;    /* prepended to image refs in markdown; NULL = none */
     unsigned int min_image_size;     /* skip images smaller than NxN (0 = no filter) */

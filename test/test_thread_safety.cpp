@@ -144,7 +144,7 @@ static bool extract_text(const std::string& path) {
 static bool extract_all_paged(const std::string& path) {
     char err[256] = {};
     JDocOptions opts = jdoc_default_options();
-    opts.extract_images = 1;
+    opts.images = 1;
     int count = 0;
     JDocPage* pages = jdoc_convert_pages(path.c_str(), &opts, &count, err, sizeof(err));
     if (pages || count == 0) {

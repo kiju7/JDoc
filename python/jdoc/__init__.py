@@ -15,7 +15,7 @@ Usage:
         print(f"Page {page.page_number}: {page.text[:100]}")
 
     # With images
-    pages = jdoc.convert_pages("document.pdf", extract_images=True)
+    pages = jdoc.convert_pages("document.pdf", images=True)
     for page in pages:
         for img in page.images:
             print(f"  Image: {img.name} ({img.width}x{img.height})")

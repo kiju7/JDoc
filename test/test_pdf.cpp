@@ -69,7 +69,7 @@ int main(int argc, char* argv[]) {
     std::cout << "[4] Testing no-tables mode...\n";
     try {
         jdoc::ConvertOptions opts;
-        opts.extract_tables = false;
+        opts.tables = false;
         std::string md = jdoc::pdf_to_markdown(test_pdf, opts);
         std::cout << "    No tables: " << md.size() << " bytes\n";
         assert(!md.empty());

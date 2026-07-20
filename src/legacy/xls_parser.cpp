@@ -863,7 +863,7 @@ std::string XlsParser::to_markdown(const ConvertOptions& opts) {
         auto images = extract_images(opts.min_image_size);
         for (const auto& img : images) {
             std::string filename = img.name + "." + img.format;
-            if (opts.extract_images)
+            if (opts.images)
                 md += "![" + filename + "](" + opts.image_ref_prefix + filename + ")\n\n";
             else
                 md += "![" + filename + "](" + filename + ")\n\n";
@@ -876,7 +876,7 @@ std::string XlsParser::to_markdown(const ConvertOptions& opts) {
 std::vector<PageChunk> XlsParser::to_chunks(const ConvertOptions& opts) {
     std::vector<PageChunk> chunks;
 
-    auto images = opts.extract_images ? extract_images(opts.min_image_size) : std::vector<ImageData>{};
+    auto images = opts.images ? extract_images(opts.min_image_size) : std::vector<ImageData>{};
     int img_per_sheet = images.empty() ? 0 : static_cast<int>((images.size() + sheets_.size() - 1) / sheets_.size());
 
     for (size_t i = 0; i < sheets_.size(); ++i) {
@@ -887,7 +887,7 @@ std::vector<PageChunk> XlsParser::to_chunks(const ConvertOptions& opts) {
         chunk.page_height = 792.0;
         chunk.body_font_size = 10.0;
 
-        if (opts.extract_tables && !sheets_[i].cells.empty()) {
+        if (opts.tables && !sheets_[i].cells.empty()) {
             uint16_t max_row = 0, max_col = 0;
             for (const auto& c : sheets_[i].cells) {
                 max_row = std::max(max_row, c.row);
@@ -920,7 +920,7 @@ std::vector<PageChunk> XlsParser::to_chunks(const ConvertOptions& opts) {
             }
         }
 
-        if (opts.extract_images && img_per_sheet > 0) {
+        if (opts.images && img_per_sheet > 0) {
             int start = static_cast<int>(i) * img_per_sheet;
             int end = std::min(start + img_per_sheet, static_cast<int>(images.size()));
             for (int j = start; j < end; ++j) {
