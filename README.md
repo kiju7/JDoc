@@ -53,7 +53,7 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j
 ```bash
 jdoc input.pdf                              # 마크다운을 stdout으로 출력
 jdoc input.pdf output.md                    # 파일로 저장
-jdoc input.docx --plaintext                 # 일반 텍스트 출력
+jdoc input.docx --format text               # 일반 텍스트 출력
 jdoc input.pdf --pages 0,1,2                # 페이지 선택 (0부터 시작)
 jdoc input.pdf --chunks                     # 페이지별 출력
 jdoc input.pdf --images ./imgs              # 이미지 추출
