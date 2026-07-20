@@ -19,11 +19,13 @@ class ZipReader {
 public:
     struct Entry {
         std::string name;               // UTF-8 (CP949 legacy names converted)
-        uint32_t compressed_size = 0;
-        uint32_t uncompressed_size = 0;
+        // 64-bit: zip64 archives (>4GiB, or offsets past 2GiB from writers
+        // like Python's zipfile) store these in the zip64 extra field.
+        uint64_t compressed_size = 0;
+        uint64_t uncompressed_size = 0;
         uint16_t method = 0;            // 0=STORE, 8=DEFLATE
         uint16_t flags = 0;             // general purpose bit flags
-        uint32_t local_header_offset = 0;
+        uint64_t local_header_offset = 0;
     };
 
     explicit ZipReader(const std::string& path);

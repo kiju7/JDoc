@@ -1405,6 +1405,20 @@ static void test_views_and_threads() {
         ASSERT(seen == 2);  // no results delivered after the stop
     TEST_END
 
+    TEST(zip64_extra_fields_and_eocd64)
+        // Python zipfile writes zip64 records for offsets past 2 GiB; this
+        // checked-in fixture forces the same structure at small size
+        // (0xFFFFFFFF sentinels + 0x0001 extra + EOCD64). Regression for the
+        // 3.36GB benchmark archive whose members past 2 GiB failed to open.
+        auto rs = jdoc::convert_archive("test/fixtures/zip64/small_zip64.zip");
+        ASSERT(rs.size() == 2);
+        auto* doc = find_member(rs, "doc.rtf");
+        auto* note = find_member(rs, "note.txt");
+        ASSERT(doc && doc->ok() &&
+               doc->markdown.find("123456-1234567") != std::string::npos);
+        ASSERT(note && note->ok() && note->markdown == "zip64 second member");
+    TEST_END
+
     TEST(threads_limits_still_enforced)
         std::string big(8 << 20, '\0');
         big.insert(0, "text ");

@@ -17,6 +17,12 @@ namespace jdoc {
 static constexpr uint32_t EOCD_SIGNATURE = 0x06054b50;
 static constexpr uint32_t CD_SIGNATURE   = 0x02014b50;
 static constexpr uint32_t LFH_SIGNATURE  = 0x04034b50;
+static constexpr uint32_t EOCD64_LOCATOR_SIGNATURE = 0x07064b50;
+static constexpr uint32_t EOCD64_SIGNATURE = 0x06064b50;
+// zip64 sentinels: the 32/16-bit field holds this, the real value lives in
+// the 0x0001 extra field (or the zip64 EOCD for directory-level fields).
+static constexpr uint32_t ZIP64_U32 = 0xFFFFFFFFu;
+static constexpr uint16_t ZIP64_U16 = 0xFFFFu;
 
 // General purpose flag bit 11: filename is UTF-8
 static constexpr uint16_t FLAG_UTF8_NAME = 0x0800;
@@ -70,14 +76,31 @@ bool ZipReader::parse_central_directory() {
     unsigned char eocd[22];
     if (src_->read_at(static_cast<uint64_t>(eocd_offset), eocd, 22) != 22) return false;
 
-    uint16_t num_entries = util::read_u16_le(&eocd[10]);
-    uint32_t cd_offset   = util::read_u32_le(&eocd[16]);
+    uint64_t num_entries = util::read_u16_le(&eocd[10]);
+    uint64_t cd_offset   = util::read_u32_le(&eocd[16]);
+
+    // zip64: when a directory-level field is saturated, the real values are
+    // in the zip64 EOCD, located via the 20-byte locator just before EOCD.
+    if ((num_entries == ZIP64_U16 || cd_offset == ZIP64_U32) &&
+        eocd_offset >= 20) {
+        unsigned char loc[20];
+        if (src_->read_at(static_cast<uint64_t>(eocd_offset) - 20, loc, 20) == 20 &&
+            util::read_u32_le(loc) == EOCD64_LOCATOR_SIGNATURE) {
+            uint64_t eocd64_off = util::read_u64_le(&loc[8]);
+            unsigned char eocd64[56];
+            if (src_->read_at(eocd64_off, eocd64, 56) != 56) return false;
+            if (util::read_u32_le(eocd64) != EOCD64_SIGNATURE) return false;
+            num_entries = util::read_u64_le(&eocd64[32]);
+            cd_offset   = util::read_u64_le(&eocd64[48]);
+        }
+    }
 
     // Parse Central Directory
     uint64_t pos = cd_offset;
-    entries_.reserve(num_entries);
+    if (num_entries > 10'000'000) return false;  // sanity bound
+    entries_.reserve(static_cast<size_t>(num_entries));
 
-    for (int i = 0; i < num_entries; ++i) {
+    for (uint64_t i = 0; i < num_entries; ++i) {
         unsigned char hdr[46];
         if (src_->read_at(pos, hdr, 46) != 46) return false;
         if (util::read_u32_le(hdr) != CD_SIGNATURE) return false;
@@ -104,6 +127,41 @@ bool ZipReader::parse_central_directory() {
         // Legacy Korean zips (ALZip, Windows explorer) store names in CP949.
         if (!(e.flags & FLAG_UTF8_NAME))
             e.name = util::legacy_name_to_utf8(e.name);
+
+        // zip64 extra field (0x0001): any saturated 32-bit field above has
+        // its 64-bit value here, in fixed order for the fields present.
+        if (extra_len > 0 &&
+            (e.uncompressed_size == ZIP64_U32 ||
+             e.compressed_size == ZIP64_U32 ||
+             e.local_header_offset == ZIP64_U32)) {
+            std::vector<unsigned char> extra(extra_len);
+            if (src_->read_at(pos, extra.data(), extra_len) != extra_len)
+                return false;
+            size_t ep = 0;
+            while (ep + 4 <= extra.size()) {
+                uint16_t id = util::read_u16_le(&extra[ep]);
+                uint16_t sz = util::read_u16_le(&extra[ep + 2]);
+                ep += 4;
+                if (ep + sz > extra.size()) break;
+                if (id == 0x0001) {
+                    size_t fp = ep;
+                    if (e.uncompressed_size == ZIP64_U32 && fp + 8 <= ep + sz) {
+                        e.uncompressed_size = util::read_u64_le(&extra[fp]);
+                        fp += 8;
+                    }
+                    if (e.compressed_size == ZIP64_U32 && fp + 8 <= ep + sz) {
+                        e.compressed_size = util::read_u64_le(&extra[fp]);
+                        fp += 8;
+                    }
+                    if (e.local_header_offset == ZIP64_U32 &&
+                        fp + 8 <= ep + sz) {
+                        e.local_header_offset = util::read_u64_le(&extra[fp]);
+                    }
+                    break;
+                }
+                ep += sz;
+            }
+        }
 
         // Skip extra + comment
         pos += static_cast<uint64_t>(extra_len) + comment_len;
