@@ -1230,9 +1230,9 @@ private:
 
         filename = unified + "." + (ext == "jpeg" ? "jpg" : ext);
         std::string saved_path;
-        if (!opts_.image_output_dir.empty()) {
-            util::ensure_dir(opts_.image_output_dir);
-            saved_path = opts_.image_output_dir + "/" + filename;
+        if (!opts_.image_dir.empty()) {
+            util::ensure_dir(opts_.image_dir);
+            saved_path = opts_.image_dir + "/" + filename;
             std::ofstream ofs(saved_path, std::ios::binary);
             if (!ofs) return "";
             ofs.write(reinterpret_cast<const char*>(image_data.data()),
@@ -1244,7 +1244,7 @@ private:
         idata.name = unified;
         idata.format = ext;
         idata.saved_path = saved_path;
-        if (opts_.image_output_dir.empty()) {
+        if (opts_.image_dir.empty()) {
             idata.data.assign(reinterpret_cast<const char*>(image_data.data()),
                               reinterpret_cast<const char*>(image_data.data()) + image_data.size());
         }
@@ -1389,7 +1389,7 @@ static std::string hwp_chunks_to_markdown(HWPParser& parser,
     parser.parse();
     auto chunks = parser.convert_chunks();
 
-    bool plaintext = (opts.output_format == OutputFormat::PLAINTEXT);
+    bool plaintext = (opts.format == OutputFormat::PLAINTEXT);
 
     std::string result;
     for (size_t i = 0; i < chunks.size(); i++) {
@@ -1442,7 +1442,7 @@ std::vector<PageChunk> hwp_to_markdown_chunks(const std::string& hwp_path,
     parser.parse();
     auto chunks = parser.convert_chunks();
 
-    if (opts.output_format == OutputFormat::PLAINTEXT) {
+    if (opts.format == OutputFormat::PLAINTEXT) {
         for (auto& chunk : chunks)
             chunk.text = util::strip_markdown(chunk.text);
     }

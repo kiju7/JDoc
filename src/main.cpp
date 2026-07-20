@@ -22,10 +22,13 @@ void print_usage(const char* prog) {
               << "  --chunks        Output per-page/slide/sheet chunks\n"
               << "  --images DIR    Extract images to directory\n"
               << "  --min-image-size N  Skip images smaller than NxN pixels (default: 50, 0=no filter)\n"
-              << "  --plaintext     Output plain text instead of Markdown\n"
+              << "  --format F      Output format: markdown (default) or text\n"
               << "\nArchive options:\n"
               << "  --max-depth N        Max nested-archive depth (default: 3, -1 = unlimited)\n"
               << "  --max-member-mb N    Per-member uncompressed cap in MiB (default: 512, -1 = unlimited)\n"
+              << "  --max-total-mb N     Cumulative uncompressed cap in MiB (default: 65536, -1 = unlimited)\n"
+              << "  --max-entries N      Max members visited (default: 200000, -1 = unlimited)\n"
+              << "  --max-ratio N        Bomb-suspect compression ratio (default: 1000, 0 = off)\n"
               << "  --include-unsupported  Report unsupported members as errors\n"
               << "  --threads N          Conversion worker threads (default: 1, 0 = all cores)\n"
               << "  --help          Show this help\n";
@@ -70,13 +73,18 @@ int main(int argc, char* argv[]) {
         }
         else if (arg == "--images" && i + 1 < argc) {
             opts.extract_images = true;
-            opts.image_output_dir = argv[++i];
+            opts.image_dir = argv[++i];
         }
         else if (arg == "--min-image-size" && i + 1 < argc) {
             opts.min_image_size = static_cast<unsigned>(std::stoi(argv[++i]));
         }
-        else if (arg == "--plaintext" || arg == "--text") {
-            opts.output_format = jdoc::OutputFormat::PLAINTEXT;
+        else if (arg == "--format" && i + 1 < argc) {
+            std::string f = argv[++i];
+            if (f == "text" || f == "plaintext")
+                opts.format = jdoc::OutputFormat::PLAINTEXT;
+        }
+        else if (arg == "--plaintext" || arg == "--text") {  // alias of --format text
+            opts.format = jdoc::OutputFormat::PLAINTEXT;
         }
         else if (arg == "--max-depth" && i + 1 < argc) {
             opts.archive.max_depth = std::stoi(argv[++i]);  // negative = unlimited
@@ -85,6 +93,20 @@ int main(int argc, char* argv[]) {
             long long mb = std::stoll(argv[++i]);
             opts.archive.max_member_bytes =
                 mb < 0 ? UINT64_MAX : static_cast<uint64_t>(mb) << 20;
+        }
+        else if (arg == "--max-total-mb" && i + 1 < argc) {
+            long long mb = std::stoll(argv[++i]);
+            opts.archive.max_total_bytes =
+                mb < 0 ? UINT64_MAX : static_cast<uint64_t>(mb) << 20;
+        }
+        else if (arg == "--max-entries" && i + 1 < argc) {
+            long long n = std::stoll(argv[++i]);
+            opts.archive.max_entries =
+                n < 0 ? UINT32_MAX : static_cast<uint32_t>(n);
+        }
+        else if (arg == "--max-ratio" && i + 1 < argc) {
+            long long n = std::stoll(argv[++i]);
+            opts.archive.max_ratio = n <= 0 ? 0 : static_cast<uint32_t>(n);
         }
         else if (arg == "--include-unsupported") {
             opts.archive.include_unsupported = true;
@@ -107,9 +129,9 @@ int main(int argc, char* argv[]) {
     }
 
     // Compute image reference prefix: relative path from md file dir to image dir
-    if (opts.extract_images && !opts.image_output_dir.empty()) {
+    if (opts.extract_images && !opts.image_dir.empty()) {
         namespace fs = std::filesystem;
-        fs::path img_dir = fs::weakly_canonical(fs::absolute(opts.image_output_dir));
+        fs::path img_dir = fs::weakly_canonical(fs::absolute(opts.image_dir));
         fs::path md_dir = output_path.empty()
             ? fs::current_path()
             : fs::weakly_canonical(fs::absolute(output_path)).parent_path();

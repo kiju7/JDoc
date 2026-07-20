@@ -129,7 +129,7 @@ target_include_directories(jdoc_shared PUBLIC include PRIVATE src)
 set_target_properties(jdoc_shared PROPERTIES
     OUTPUT_NAME "jdoc"
     VERSION ${PROJECT_VERSION}
-    SOVERSION 3
+    SOVERSION 4
 )
 
 

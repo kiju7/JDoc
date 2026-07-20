@@ -6918,8 +6918,8 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
     std::string image_dir;
     ConvertOptions img_opts = opts;
     img_opts.extract_images = true;
-    if (!opts.image_output_dir.empty()) {
-        image_dir = opts.image_output_dir;
+    if (!opts.image_dir.empty()) {
+        image_dir = opts.image_dir;
         util::ensure_dir(image_dir);
     }
 
@@ -6962,7 +6962,7 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
         if (content_data.empty()) continue;
 
         // Extract text lines
-        bool plaintext = (opts.output_format == OutputFormat::PLAINTEXT);
+        bool plaintext = (opts.format == OutputFormat::PLAINTEXT);
         bool need_tables = opts.extract_tables && !plaintext;
         bool need_graphics = need_tables || img_opts.extract_images;
 
@@ -7122,7 +7122,7 @@ static std::string result_to_markdown(ExtractResult& r, const ConvertOptions& op
         page_indices = opts.pages;
     }
 
-    bool plaintext = (opts.output_format == OutputFormat::PLAINTEXT);
+    bool plaintext = (opts.format == OutputFormat::PLAINTEXT);
 
     std::string full_md;
     full_md.reserve(64 * 1024);
@@ -7160,7 +7160,7 @@ static std::vector<PageChunk> result_to_chunks(ExtractResult& r,
         page_indices = opts.pages;
     }
 
-    bool plaintext = (opts.output_format == OutputFormat::PLAINTEXT);
+    bool plaintext = (opts.format == OutputFormat::PLAINTEXT);
 
     std::vector<PageChunk> chunks;
     for (int p : page_indices) {

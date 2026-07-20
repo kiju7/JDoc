@@ -7,25 +7,29 @@ extern "C" {
 
 /* ── Options ──────────────────────────────────────────────── */
 
+/* Field names match the C++ ConvertOptions / Python keywords one-to-one.
+ * Initialize with jdoc_default_options(); a zero-filled struct is NOT a
+ * valid default (extract_tables would be off). */
 typedef struct {
+    /* conversion */
+    int extract_tables;              /* 1 = tables as markdown tables (default 1) */
     int extract_images;              /* 0 = skip images, 1 = extract */
-    const char* image_output_dir;    /* NULL = keep in memory only */
+    const char* image_dir;           /* image output directory; NULL = keep in memory */
+    const char* image_ref_prefix;    /* prepended to image refs in markdown; NULL = none */
     unsigned int min_image_size;     /* skip images smaller than NxN (0 = no filter) */
     const int* pages;                /* page numbers to extract (NULL = all) */
     int page_count;                  /* length of pages array */
-    int plaintext;                   /* 0 = markdown, 1 = plaintext */
+    const char* format;              /* NULL or "markdown" (default), "text" */
     /* Archive limits (jdoc_convert_archive).
      * 0 = library default, -1 = unlimited (disables that guard —
      * only for trusted inputs; archive-bomb protection goes with it). */
-    int max_archive_depth;               /* default 3 */
-    long long max_member_bytes;          /* per-member uncompressed cap; default 512 MiB */
-    long long max_total_bytes;           /* cumulative cap per call; default 64 GiB */
-    int max_archive_entries;             /* default 200000 */
-    int include_unsupported;             /* 1 = report unsupported members */
-    int archive_threads;                 /* conversion worker threads:
-                                          * 0 = library default (single-threaded),
-                                          * -1 = all cores, N > 1 = N workers.
-                                          * Results keep walk order. */
+    int max_depth;                   /* nesting depth; default 3 */
+    long long max_member_bytes;      /* per-member uncompressed cap; default 512 MiB */
+    long long max_total_bytes;       /* cumulative cap per call; default 64 GiB */
+    int max_entries;                 /* members visited; default 200000 */
+    int max_ratio;                   /* bomb-suspect compression ratio; default 1000 */
+    int include_unsupported;         /* 1 = report unsupported members */
+    int threads;                     /* conversion workers; default 1, -1 = all cores */
 } JDocOptions;
 
 /* Returns default options: no images, markdown, all pages, min_size=50. */
@@ -41,7 +45,7 @@ typedef struct {
     char* data;                      /* raw image bytes (jpeg/png/bmp) */
     int data_size;
     char* format;                    /* "jpeg", "png", "bmp", ... */
-    char* saved_path;                /* disk path if image_output_dir was set */
+    char* saved_path;                /* disk path if image_dir was set */
 } JDocImage;
 
 /* ── Page ─────────────────────────────────────────────────── */
@@ -80,8 +84,8 @@ typedef enum {
     JDOC_MEMBER_ERR_MEMBER_LIMIT = 1,   /* raise max_member_bytes */
     JDOC_MEMBER_ERR_RATIO_LIMIT = 2,    /* suspected archive bomb (max_ratio) */
     JDOC_MEMBER_ERR_TOTAL_LIMIT = 3,    /* raise max_total_bytes; walk stopped */
-    JDOC_MEMBER_ERR_ENTRY_LIMIT = 4,    /* raise max_archive_entries; walk stopped */
-    JDOC_MEMBER_ERR_DEPTH_LIMIT = 5,    /* raise max_archive_depth */
+    JDOC_MEMBER_ERR_ENTRY_LIMIT = 4,    /* raise max_entries; walk stopped */
+    JDOC_MEMBER_ERR_DEPTH_LIMIT = 5,    /* raise max_depth */
     JDOC_MEMBER_ERR_ENCRYPTED = 6,      /* encrypted member or archive */
     JDOC_MEMBER_ERR_UNSUPPORTED = 7,    /* format jdoc cannot convert */
     JDOC_MEMBER_ERR_CORRUPT = 8,        /* container/member data unreadable */

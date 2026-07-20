@@ -776,7 +776,7 @@ private:
             std::string save_name = "page" + std::to_string(page_number) +
                                     "_img" + std::to_string(image_idx);
             img.saved_path = util::save_image_to_file(
-                opts_.image_output_dir, save_name, img.format,
+                opts_.image_dir, save_name, img.format,
                 img.data.data(), img.data.size());
             if (!img.saved_path.empty()) {
                 img.data.clear();
@@ -795,7 +795,7 @@ static std::string hwpx_chunks_to_markdown(HWPXParser& parser,
     parser.parse();
     auto chunks = parser.convert_chunks();
 
-    bool plaintext = (opts.output_format == OutputFormat::PLAINTEXT);
+    bool plaintext = (opts.format == OutputFormat::PLAINTEXT);
 
     std::string result;
     for (size_t i = 0; i < chunks.size(); i++) {
@@ -826,7 +826,7 @@ std::vector<PageChunk> hwpx_to_markdown_chunks(const std::string& hwpx_path,
     parser.parse();
     auto chunks = parser.convert_chunks();
 
-    if (opts.output_format == OutputFormat::PLAINTEXT) {
+    if (opts.format == OutputFormat::PLAINTEXT) {
         for (auto& chunk : chunks)
             chunk.text = util::strip_markdown(chunk.text);
     }

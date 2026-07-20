@@ -76,9 +76,9 @@ PYBIND11_MODULE(_jdoc, m) {
         .def_readwrite("pages", &jdoc::ConvertOptions::pages)
         .def_readwrite("extract_tables", &jdoc::ConvertOptions::extract_tables)
         .def_readwrite("extract_images", &jdoc::ConvertOptions::extract_images)
-        .def_readwrite("image_output_dir", &jdoc::ConvertOptions::image_output_dir)
+        .def_readwrite("image_dir", &jdoc::ConvertOptions::image_dir)
         .def_readwrite("min_image_size", &jdoc::ConvertOptions::min_image_size)
-        .def_readwrite("output_format", &jdoc::ConvertOptions::output_format);
+        .def_readwrite("format", &jdoc::ConvertOptions::format);
 
     // DocFormat enum
     py::enum_<jdoc::DocFormat>(m, "DocFormat")
@@ -99,25 +99,31 @@ PYBIND11_MODULE(_jdoc, m) {
     m.def("convert", [](const std::string& file_path,
                          const std::string& format,
                          const std::vector<int>& pages,
+                         bool extract_tables,
                          bool extract_images,
-                         const std::string& image_output_dir,
+                         const std::string& image_dir,
+                         const std::string& image_ref_prefix,
                          unsigned min_image_size) -> std::string {
         jdoc::ConvertOptions opts;
         opts.pages = pages;
+        opts.extract_tables = extract_tables;
         opts.extract_images = extract_images;
-        opts.image_output_dir = image_output_dir;
+        opts.image_dir = image_dir;
+        opts.image_ref_prefix = image_ref_prefix;
         opts.min_image_size = min_image_size;
         if (format == "text" || format == "plaintext" || format == "plain")
-            opts.output_format = jdoc::OutputFormat::PLAINTEXT;
+            opts.format = jdoc::OutputFormat::PLAINTEXT;
         else
-            opts.output_format = jdoc::OutputFormat::MARKDOWN;
+            opts.format = jdoc::OutputFormat::MARKDOWN;
         return jdoc::convert(file_path, opts);
     },
     py::arg("file_path"),
     py::arg("format") = "markdown",
     py::arg("pages") = std::vector<int>{},
+    py::arg("extract_tables") = true,
     py::arg("extract_images") = false,
-    py::arg("image_output_dir") = "",
+    py::arg("image_dir") = "",
+    py::arg("image_ref_prefix") = "",
     py::arg("min_image_size") = 50,
     R"doc(Convert a document file to text.
 
@@ -126,7 +132,7 @@ Args:
     format: Output format - "markdown" (default) or "text"/"plaintext"
     pages: List of page numbers (0-based). Empty = all pages.
     extract_images: Whether to extract images
-    image_output_dir: Directory to save extracted images (if empty, images kept in memory only)
+    image_dir: Directory to save extracted images (if empty, images kept in memory only)
     min_image_size: Skip images smaller than NxN pixels (default: 50, 0=no filter)
 
 Returns:
@@ -136,26 +142,32 @@ Returns:
     m.def("convert_pages", [](const std::string& file_path,
                                const std::string& format,
                                const std::vector<int>& pages,
+                               bool extract_tables,
                                bool extract_images,
-                               const std::string& image_output_dir,
+                               const std::string& image_dir,
+                               const std::string& image_ref_prefix,
                                unsigned min_image_size)
                                -> std::vector<jdoc::PageChunk> {
         jdoc::ConvertOptions opts;
         opts.pages = pages;
+        opts.extract_tables = extract_tables;
         opts.extract_images = extract_images;
-        opts.image_output_dir = image_output_dir;
+        opts.image_dir = image_dir;
+        opts.image_ref_prefix = image_ref_prefix;
         opts.min_image_size = min_image_size;
         if (format == "text" || format == "plaintext" || format == "plain")
-            opts.output_format = jdoc::OutputFormat::PLAINTEXT;
+            opts.format = jdoc::OutputFormat::PLAINTEXT;
         else
-            opts.output_format = jdoc::OutputFormat::MARKDOWN;
+            opts.format = jdoc::OutputFormat::MARKDOWN;
         return jdoc::convert_chunks(file_path, opts);
     },
     py::arg("file_path"),
     py::arg("format") = "markdown",
     py::arg("pages") = std::vector<int>{},
+    py::arg("extract_tables") = true,
     py::arg("extract_images") = false,
-    py::arg("image_output_dir") = "",
+    py::arg("image_dir") = "",
+    py::arg("image_ref_prefix") = "",
     py::arg("min_image_size") = 50,
     R"doc(Convert a document file to per-page chunks.
 
@@ -164,7 +176,7 @@ Args:
     format: Output format - "markdown" (default) or "text"/"plaintext"
     pages: List of page numbers (0-based). Empty = all pages.
     extract_images: Whether to extract images (accessible via chunk.images)
-    image_output_dir: Directory to save images (if empty, images available via ImageData.data bytes)
+    image_dir: Directory to save images (if empty, images available via ImageData.data bytes)
     min_image_size: Skip images smaller than NxN pixels (default: 50, 0=no filter)
 
 Returns:
@@ -208,12 +220,13 @@ Returns:
                                  long long max_member_bytes,
                                  long long max_total_bytes,
                                  long long max_entries,
+                                 long long max_ratio,
                                  bool include_unsupported,
                                  int threads)
                                  -> std::vector<jdoc::MemberResult> {
         jdoc::ConvertOptions opts;
         if (format == "text" || format == "plaintext" || format == "plain")
-            opts.output_format = jdoc::OutputFormat::PLAINTEXT;
+            opts.format = jdoc::OutputFormat::PLAINTEXT;
         // -1 (any negative) disables the corresponding guard.
         opts.archive.max_depth = max_depth;
         opts.archive.max_member_bytes =
@@ -222,6 +235,8 @@ Returns:
             max_total_bytes < 0 ? UINT64_MAX : (uint64_t)max_total_bytes;
         opts.archive.max_entries =
             max_entries < 0 ? UINT32_MAX : (uint32_t)max_entries;
+        opts.archive.max_ratio =
+            max_ratio < 0 ? 0 : (uint32_t)max_ratio;
         opts.archive.include_unsupported = include_unsupported;
         // 1 = single-threaded (default), 0 = all cores, N = N workers.
         opts.archive.threads = threads < 0 ? 0 : (uint32_t)threads;
@@ -233,6 +248,7 @@ Returns:
     py::arg("max_member_bytes") = (long long)(512) << 20,
     py::arg("max_total_bytes") = (long long)(64) << 30,
     py::arg("max_entries") = 200000,
+    py::arg("max_ratio") = 1000,
     py::arg("include_unsupported") = false,
     py::arg("threads") = 1,
     R"doc(Convert every supported document inside an archive (zip/gz/tar/tar.gz/
@@ -257,7 +273,7 @@ Returns:
                                const std::string& format) -> std::string {
         jdoc::ConvertOptions opts;
         if (format == "text" || format == "plaintext" || format == "plain")
-            opts.output_format = jdoc::OutputFormat::PLAINTEXT;
+            opts.format = jdoc::OutputFormat::PLAINTEXT;
         std::string buf = data;  // copy out of the Python object
         return jdoc::convert(buf.data(), buf.size(), name_hint, opts);
     },

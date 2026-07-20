@@ -167,9 +167,9 @@ std::string total_limit_msg(const ArchiveLimits& lim) {
 ConvertOptions member_convert_opts(const ConvertOptions& opts,
                                    const std::string& member_path) {
     ConvertOptions member_opts = opts;
-    member_opts.image_output_dir = opts.image_output_dir + "/" + member_path;
+    member_opts.image_dir = opts.image_dir + "/" + member_path;
     member_opts.image_ref_prefix = opts.image_ref_prefix + member_path + "/";
-    util::ensure_dirs(member_opts.image_output_dir);
+    util::ensure_dirs(member_opts.image_dir);
     return member_opts;
 }
 
@@ -210,7 +210,7 @@ bool handle_member_bytes(const std::string& member_path, const uint8_t* bytes,
         return cb(std::move(r));
     }
 
-    bool wants_images = opts.extract_images && !opts.image_output_dir.empty();
+    bool wants_images = opts.extract_images && !opts.image_dir.empty();
 
     if (budget.pipeline) {
         // Leaf documents convert on the pipeline workers while this thread

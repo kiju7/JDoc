@@ -25,18 +25,23 @@ static char* strdup_c(const std::string& s) {
 static jdoc::ConvertOptions to_cpp_opts(const JDocOptions* opts) {
     jdoc::ConvertOptions o;
     if (!opts) return o;
+    o.extract_tables = (opts->extract_tables != 0);
     o.extract_images = (opts->extract_images != 0);
-    if (opts->image_output_dir)
-        o.image_output_dir = opts->image_output_dir;
+    if (opts->image_dir)
+        o.image_dir = opts->image_dir;
+    if (opts->image_ref_prefix)
+        o.image_ref_prefix = opts->image_ref_prefix;
     o.min_image_size = opts->min_image_size;
     if (opts->pages && opts->page_count > 0)
         o.pages.assign(opts->pages, opts->pages + opts->page_count);
-    if (opts->plaintext)
-        o.output_format = jdoc::OutputFormat::PLAINTEXT;
-    // 0 keeps the library default; negative disables the guard entirely.
-    if (opts->max_archive_depth > 0)
-        o.archive.max_depth = opts->max_archive_depth;
-    else if (opts->max_archive_depth < 0)
+    if (opts->format && (strcmp(opts->format, "text") == 0 ||
+                         strcmp(opts->format, "plaintext") == 0))
+        o.format = jdoc::OutputFormat::PLAINTEXT;
+    // Archive limits: 0 keeps the library default; negative disables the
+    // guard (threads: negative = all cores).
+    if (opts->max_depth > 0)
+        o.archive.max_depth = opts->max_depth;
+    else if (opts->max_depth < 0)
         o.archive.max_depth = -1;  // unlimited nesting
     if (opts->max_member_bytes > 0)
         o.archive.max_member_bytes = (uint64_t)opts->max_member_bytes;
@@ -46,14 +51,18 @@ static jdoc::ConvertOptions to_cpp_opts(const JDocOptions* opts) {
         o.archive.max_total_bytes = (uint64_t)opts->max_total_bytes;
     else if (opts->max_total_bytes < 0)
         o.archive.max_total_bytes = UINT64_MAX;
-    if (opts->max_archive_entries > 0)
-        o.archive.max_entries = (uint32_t)opts->max_archive_entries;
-    else if (opts->max_archive_entries < 0)
+    if (opts->max_entries > 0)
+        o.archive.max_entries = (uint32_t)opts->max_entries;
+    else if (opts->max_entries < 0)
         o.archive.max_entries = UINT32_MAX;
+    if (opts->max_ratio > 0)
+        o.archive.max_ratio = (uint32_t)opts->max_ratio;
+    else if (opts->max_ratio < 0)
+        o.archive.max_ratio = 0;  // ratio check off
     o.archive.include_unsupported = (opts->include_unsupported != 0);
-    if (opts->archive_threads > 0)
-        o.archive.threads = (uint32_t)opts->archive_threads;
-    else if (opts->archive_threads < 0)
+    if (opts->threads > 0)
+        o.archive.threads = (uint32_t)opts->threads;
+    else if (opts->threads < 0)
         o.archive.threads = 0;  // 0 = hardware concurrency
     return o;
 }
@@ -66,7 +75,9 @@ extern "C" {
 
 JDocOptions jdoc_default_options(void) {
     JDocOptions o = {};
+    o.extract_tables = 1;
     o.min_image_size = 50;
+    o.threads = 1;
     return o;
 }
 

@@ -334,7 +334,7 @@ static std::vector<PageChunk> to_chunks_impl(DocFormat format, const DocInput& i
         return parser.to_chunks(opts);
     });
 
-    if (opts.output_format == OutputFormat::PLAINTEXT) {
+    if (opts.format == OutputFormat::PLAINTEXT) {
         for (auto& chunk : chunks)
             chunk.text = util::strip_markdown(chunk.text);
     }
@@ -343,7 +343,7 @@ static std::vector<PageChunk> to_chunks_impl(DocFormat format, const DocInput& i
 
 static std::string to_markdown_impl(DocFormat format, const DocInput& in,
                                     const ConvertOptions& opts) {
-    if (opts.output_format == OutputFormat::PLAINTEXT) {
+    if (opts.format == OutputFormat::PLAINTEXT) {
         auto chunks = to_chunks_impl(format, in, opts);
         if (chunks.size() <= 1 && !chunks.empty())
             return chunks[0].text;

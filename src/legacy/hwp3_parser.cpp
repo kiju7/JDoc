@@ -740,7 +740,7 @@ std::string Hwp3Parser::to_markdown(const ConvertOptions& opts) {
     std::string md = std::move(doc.text());
     while (!md.empty() && md.back() == '\n') md.pop_back();
     if (!md.empty()) md += "\n";
-    if (opts.output_format == OutputFormat::PLAINTEXT)
+    if (opts.format == OutputFormat::PLAINTEXT)
         md = util::strip_markdown(md);
     return md;
 }

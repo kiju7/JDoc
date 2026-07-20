@@ -1433,7 +1433,7 @@ std::string DocParser::to_markdown(const ConvertOptions& opts) {
     if (opts.extract_images) {
         for (auto& img : images) {
             img.saved_path = util::save_image_to_file(
-                opts.image_output_dir, img.name, img.format,
+                opts.image_dir, img.name, img.format,
                 img.data.data(), img.data.size());
             if (!img.saved_path.empty()) {
                 img.data.clear();

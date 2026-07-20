@@ -257,7 +257,7 @@ std::vector<ImageData> DocxParser::extract_images(
 
         std::string filename = img.name + (ext.empty() ? ".png" : ext);
         img.saved_path = util::save_image_to_file(
-            opts.image_output_dir, img.name, fmt,
+            opts.image_dir, img.name, fmt,
             img.data.data(), img.data.size());
         if (!img.saved_path.empty()) {
             filename = util::get_filename(img.saved_path);
