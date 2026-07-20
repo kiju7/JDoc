@@ -36,7 +36,7 @@ using MemberCallback = std::function<bool(MemberResult&&)>;
 void convert_archive(const std::string& file_path, const MemberCallback& cb,
                      ConvertOptions opts = {});
 
-// True if the file is an archive container (zip/gz/tar/7z/alz/egg) rather
+// True if the file is an archive container (zip/gz/tar/7z/alz/egg/rar) rather
 // than a single document. OOXML/HWPX packages are documents, not archives.
 bool is_archive_file(const std::string& file_path);
 

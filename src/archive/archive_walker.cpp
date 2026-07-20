@@ -13,6 +13,7 @@
 #include "archive/alz_reader.h"
 #include "archive/egg_reader.h"
 #include "archive/input_stream.h"
+#include "archive/rar_reader.h"
 #include "archive/seven_zip_reader.h"
 #include "archive/tar_reader.h"
 
@@ -416,6 +417,67 @@ bool walk_alz(InputStream& src, const std::string& name_hint,
     return true;
 }
 
+// ── rar ─────────────────────────────────────────────────
+
+bool walk_rar(InputStream& src, const std::string& name_hint,
+              const std::string& prefix, int depth, WalkBudget& budget,
+              const ConvertOptions& opts, const MemberCallback& cb) {
+    RarReader rar(src);
+    if (!rar.is_open()) {
+        MemberResult r;
+        r.member_path = prefix.empty() ? name_hint : prefix;
+        r.error = "cannot open rar archive";
+        return cb(std::move(r));
+    }
+    RarReader::Member m;
+    while (rar.next(m)) {
+        if (m.directory || m.uncompressed_size == 0 ||
+            is_metadata_member(m.name)) {
+            if (!rar.skip_data()) break;
+            continue;
+        }
+        std::string member_path = prefix + normalize_member_name(m.name);
+
+        if (!count_entry(member_path, budget, opts, cb)) return false;
+
+        if (has_skippable_ext(m.name)) {
+            if (opts.archive.include_unsupported) {
+                MemberResult r;
+                r.member_path = member_path;
+                r.error = "unsupported format";
+                r.uncompressed_size = m.uncompressed_size;
+                if (!cb(std::move(r))) return false;
+            }
+            if (!rar.skip_data()) break;
+            continue;
+        }
+
+        std::vector<char> data;
+        data.reserve(std::min<uint64_t>(m.uncompressed_size,
+                                        opts.archive.max_member_bytes));
+        CapSink sink{data, effective_member_cap(opts.archive, m.compressed_size),
+                     opts.archive.max_total_bytes, budget};
+        std::string err;
+        if (!rar.read_data(std::ref(sink), &err)) {
+            if (!emit_stream_failure(member_path, sink, err, "UNKNOWN",
+                                     data.size(), cb))
+                return false;
+            continue;  // failed reads still consume the member: framing holds
+        }
+
+        if (!handle_member(member_path, std::move(data), depth, budget, opts, cb))
+            return false;
+    }
+    // rar4 flags this in the constructor, rar5 on the first header block.
+    if (rar.headers_encrypted()) {
+        MemberResult r;
+        r.member_path = prefix.empty() ? name_hint : prefix;
+        r.error = "encrypted rar archive unsupported";
+        return cb(std::move(r));
+    }
+    return true;
+}
+
 // ── egg ─────────────────────────────────────────────────
 
 // Solid egg: all file headers precede one shared block stream whose
@@ -731,6 +793,8 @@ static bool walk_dispatch(FileFormat fmt,
             return walk_alz(*stream, name_hint, prefix, depth, budget, opts, cb);
         case FileFormat::EGG:
             return walk_egg(*stream, name_hint, prefix, depth, budget, opts, cb);
+        case FileFormat::RAR:
+            return walk_rar(*stream, name_hint, prefix, depth, budget, opts, cb);
         default: {
             MemberResult r;
             r.member_path = prefix.empty() ? name_hint : prefix;

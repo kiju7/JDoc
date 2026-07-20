@@ -72,6 +72,7 @@ static FileFormat format_from_ext(const std::string& name) {
     if (ext == ".7z") return FileFormat::SEVENZIP;
     if (ext == ".alz") return FileFormat::ALZ;
     if (ext == ".egg") return FileFormat::EGG;
+    if (ext == ".rar") return FileFormat::RAR;
     if (ext == ".txt" || ext == ".text" || ext == ".log" || ext == ".csv" ||
         ext == ".tsv" || ext == ".md" || ext == ".json" || ext == ".xml" ||
         ext == ".yml" || ext == ".yaml" || ext == ".ini" || ext == ".cfg" ||
@@ -102,6 +103,9 @@ static FileFormat format_from_magic(const unsigned char* magic, size_t n) {
     if (n >= 4 && magic[0] == 'E' && magic[1] == 'G' && magic[2] == 'G' &&
         magic[3] == 'A')
         return FileFormat::EGG;
+    if (n >= 7 && memcmp(magic, "Rar!\x1A\x07", 6) == 0 &&
+        (magic[6] == 0x00 || magic[6] == 0x01))
+        return FileFormat::RAR;
     if (n >= 262 && memcmp(magic + 257, "ustar", 5) == 0)
         return FileFormat::TAR;
     if (n >= 5 && magic[0] == '{' && magic[1] == '\\' && magic[2] == 'r' &&
@@ -228,6 +232,7 @@ const char* file_format_name(FileFormat fmt) {
         case FileFormat::SEVENZIP: return "7Z";
         case FileFormat::ALZ:      return "ALZ";
         case FileFormat::EGG:      return "EGG";
+        case FileFormat::RAR:      return "RAR";
         default:                   return "UNKNOWN";
     }
 }

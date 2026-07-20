@@ -58,6 +58,7 @@ add_library(jdoc_archive STATIC
     src/archive/seven_zip_reader.cpp
     src/archive/codec_streams.cpp
     src/archive/alz_reader.cpp
+    src/archive/rar_reader.cpp
     src/archive/egg_reader.cpp
 )
 target_include_directories(jdoc_archive PUBLIC include PRIVATE src)

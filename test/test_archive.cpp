@@ -354,6 +354,59 @@ static std::string egg_lzma_payload() {
     return p;
 }
 
+// ── rar fixture synthesis (4.x, store only) ─────────────────
+// rar 7.x can no longer create the 4.x format, so RAR4 fixtures are
+// synthesized. Layout follows the public RARLAB technote; the synthesized
+// output was cross-validated against unrar/lsar/unar once at development
+// time to confirm real-world tools accept it.
+
+struct RarEntrySpec {
+    std::string name;       // raw name bytes as stored (CP949/encoded ok)
+    std::string content;    // member data (store: pack == unp == size)
+    uint8_t method = 0x30;  // 0x30 = store
+    uint16_t flags_extra = 0;    // ORed into HEAD_FLAGS (0x04 enc, 0x200 uni)
+    uint32_t crc_override = 0;   // nonzero: write a lying CRC
+};
+
+static void put_rar4_block(std::string& out, uint8_t type, uint16_t flags,
+                           const std::string& body) {
+    std::string hdr;
+    hdr.push_back(static_cast<char>(type));
+    put_u16(hdr, flags);
+    put_u16(hdr, static_cast<uint16_t>(7 + body.size()));
+    hdr += body;
+    put_u16(out, static_cast<uint16_t>(crc_of(hdr) & 0xFFFF));  // HEAD_CRC
+    out += hdr;
+}
+
+static std::string make_rar4(const std::vector<RarEntrySpec>& entries) {
+    std::string out("Rar!\x1A\x07\x00", 7);
+    {
+        std::string body;                       // main header
+        put_u16(body, 0);                       // HighPosAV
+        put_u32(body, 0);                       // PosAV
+        put_rar4_block(out, 0x73, 0x0000, body);
+    }
+    for (const auto& e : entries) {
+        std::string body;
+        put_u32(body, static_cast<uint32_t>(e.content.size()));  // PACK_SIZE
+        put_u32(body, static_cast<uint32_t>(e.content.size()));  // UNP_SIZE
+        body.push_back(2);                                       // HOST_OS
+        put_u32(body, e.crc_override ? e.crc_override : crc_of(e.content));
+        put_u32(body, 0);                                        // FTIME
+        body.push_back(20);                                      // UNP_VER
+        body.push_back(static_cast<char>(e.method));
+        put_u16(body, static_cast<uint16_t>(e.name.size()));
+        put_u32(body, 0x20);                                     // ATTR
+        body += e.name;
+        put_rar4_block(out, 0x74,
+                       static_cast<uint16_t>(0x8000 | e.flags_extra), body);
+        out += e.content;
+    }
+    put_rar4_block(out, 0x7B, 0x4000, "");      // end of archive
+    return out;
+}
+
 // Checked-in 7z fixtures (test/fixtures/7z). 7z containers cannot be
 // synthesized with a few lines of code the way zip/tar/gz are, so small
 // p7zip-generated binaries are used instead.
@@ -361,6 +414,14 @@ static std::string g_fixdir;
 
 static std::string fixture(const std::string& name) {
     return g_fixdir + "/" + name;
+}
+
+// Checked-in rar 5.x fixtures (test/fixtures/rar), written by the real
+// rar CLI (7.23).
+static std::string g_rar_fixdir;
+
+static std::string rar_fixture(const std::string& name) {
+    return g_rar_fixdir + "/" + name;
 }
 
 static std::string read_file(const std::string& path) {
@@ -997,6 +1058,128 @@ static void test_egg() {
     TEST_END
 }
 
+static void test_rar() {
+    std::cerr << "rar (4.x synthesized, 5.x fixtures):\n";
+
+    TEST(rar4_store_members)
+        auto path = write_tmp("s.rar", make_rar4({
+            {"a.txt", "hello rar stored"},
+            {"dir\\b.md", "# rar heading"}}));
+        auto rs = jdoc::convert_archive(path);
+        ASSERT(rs.size() == 2);
+        auto* a = find_member(rs, "a.txt");
+        auto* b = find_member(rs, "dir/b.md");
+        ASSERT(a && a->ok() && a->markdown == "hello rar stored");
+        ASSERT(b && b->ok() && b->markdown == "# rar heading");
+        ASSERT(a->format == "TXT");
+    TEST_END
+
+    TEST(rar4_cp949_filename)
+        std::string name = "\xC7\xD1\xB1\xDB.txt";  // "한글.txt" in CP949
+        auto path = write_tmp("cp.rar", make_rar4({{name, "cp949 name"}}));
+        auto rs = jdoc::convert_archive(path);
+        ASSERT(rs.size() == 1 && rs[0].ok());
+        ASSERT(rs[0].member_path == "\xED\x95\x9C\xEA\xB8\x80.txt");
+    TEST_END
+
+    TEST(rar4_unicode_filename)
+        // ANSI fallback "?.txt", NUL, then the RAR4 compact UTF-16
+        // encoding of "가.txt" (high byte 0x00; opcode 2 = full 16-bit,
+        // opcode 0 = literal low byte).
+        std::string raw = std::string("?.txt") + '\0';
+        const unsigned char enc[] = {0x00, 0x80, 0x00, 0xAC,
+                                     '.', 't', 'x', 0x00, 't'};
+        raw.append(reinterpret_cast<const char*>(enc), sizeof(enc));
+        RarEntrySpec e{raw, "unicode name"};
+        e.flags_extra = 0x0200;  // LHD_UNICODE
+        auto path = write_tmp("uni.rar", make_rar4({e}));
+        auto rs = jdoc::convert_archive(path);
+        ASSERT(rs.size() == 1 && rs[0].ok());
+        ASSERT(rs[0].member_path == "\xEA\xB0\x80.txt");  // "가.txt"
+    TEST_END
+
+    TEST(rar4_compressed_member_error)
+        RarEntrySpec e{"c.txt", "not really lzss data"};
+        e.method = 0x33;  // normal compression
+        auto path = write_tmp("comp4.rar", make_rar4({e, {"ok.txt", "still walked"}}));
+        auto rs = jdoc::convert_archive(path);
+        ASSERT(rs.size() == 2);
+        ASSERT(!rs[0].ok() && rs[0].error == "rar compressed member unsupported");
+        auto* ok = find_member(rs, "ok.txt");
+        ASSERT(ok && ok->ok());  // framing survives the failed member
+    TEST_END
+
+    TEST(rar4_encrypted_member_error)
+        RarEntrySpec e{"e.txt", "ciphertextpayload"};
+        e.flags_extra = 0x0004;  // LHD_PASSWORD
+        auto path = write_tmp("enc4.rar", make_rar4({e}));
+        auto rs = jdoc::convert_archive(path);
+        ASSERT(rs.size() == 1 && !rs[0].ok());
+        ASSERT(rs[0].error == "encrypted member unsupported");
+    TEST_END
+
+    TEST(rar4_crc_mismatch)
+        RarEntrySpec e{"bad.txt", "content"};
+        e.crc_override = 0xDEADBEEF;
+        auto path = write_tmp("crc4.rar", make_rar4({e}));
+        auto rs = jdoc::convert_archive(path);
+        ASSERT(rs.size() == 1 && !rs[0].ok());
+        ASSERT(rs[0].error == "member crc mismatch");
+    TEST_END
+
+    TEST(rar4_truncated_member)
+        auto data = make_rar4({{"t.txt", "0123456789"}});
+        data.resize(data.size() - 15);  // cut end block + part of the data
+        auto path = write_tmp("trunc.rar", data);
+        auto rs = jdoc::convert_archive(path);
+        ASSERT(rs.size() == 1 && !rs[0].ok());
+    TEST_END
+
+    TEST(zip_nested_in_rar4)
+        auto inner = make_zip({{"in.txt", "nested in rar"}});
+        auto path = write_tmp("nest.rar", make_rar4({{"inner.zip", inner}}));
+        auto rs = jdoc::convert_archive(path);
+        auto* n = find_member(rs, "inner.zip/in.txt");
+        ASSERT(n && n->ok() && n->markdown == "nested in rar");
+    TEST_END
+
+    TEST(rar5_store_fixture)
+        auto rs = jdoc::convert_archive(rar_fixture("rar5_store.rar"));
+        ASSERT(rs.size() == 3);
+        auto* a = find_member(rs, "a.txt");
+        ASSERT(a && a->ok() && a->markdown == "hello rar stored");
+        // "한글이름.txt" — rar5 stores names as UTF-8 directly
+        auto* k = find_member(rs,
+            "\xED\x95\x9C\xEA\xB8\x80\xEC\x9D\xB4\xEB\xA6\x84.txt");
+        ASSERT(k && k->ok());
+    TEST_END
+
+    TEST(rar5_compressed_member_error)
+        auto rs = jdoc::convert_archive(rar_fixture("rar5_comp.rar"));
+        ASSERT(rs.size() == 1 && !rs[0].ok());
+        ASSERT(rs[0].error == "rar compressed member unsupported");
+    TEST_END
+
+    TEST(rar5_encrypted_member_error)
+        auto rs = jdoc::convert_archive(rar_fixture("rar5_enc.rar"));
+        ASSERT(rs.size() == 1 && !rs[0].ok());
+        ASSERT(rs[0].error == "encrypted member unsupported");
+    TEST_END
+
+    TEST(rar5_encrypted_headers_error)
+        auto rs = jdoc::convert_archive(rar_fixture("rar5_hdrenc.rar"));
+        ASSERT(rs.size() == 1 && !rs[0].ok());
+        ASSERT(rs[0].error == "encrypted rar archive unsupported");
+    TEST_END
+
+    TEST(rar_magic_detection_without_ext)
+        auto path = write_tmp("noext_rar",
+                              read_file(rar_fixture("rar5_store.rar")));
+        auto rs = jdoc::convert_archive(path);
+        ASSERT(rs.size() == 3);
+    TEST_END
+}
+
 static void test_consistency() {
     std::cerr << "Path/memory conversion consistency:\n";
 
@@ -1021,6 +1204,7 @@ static void test_consistency() {
 int main(int argc, char* argv[]) {
     g_tmpdir = (argc > 1) ? argv[1] : "test_archive_tmp";
     g_fixdir = (argc > 2) ? argv[2] : "test/fixtures/7z";
+    g_rar_fixdir = (argc > 3) ? argv[3] : "test/fixtures/rar";
     std::string mkdir_cmd = "mkdir -p '" + g_tmpdir + "'";
     if (system(mkdir_cmd.c_str()) != 0) {
         std::cerr << "cannot create tmp dir\n";
@@ -1034,6 +1218,7 @@ int main(int argc, char* argv[]) {
     test_seven_zip();
     test_alz();
     test_egg();
+    test_rar();
     test_limits();
     test_consistency();
 
