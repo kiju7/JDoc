@@ -5,6 +5,51 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
+# A bare `cmake -S . -B build` leaves CMAKE_BUILD_TYPE empty on single-config
+# generators, which means no optimization flags at all — a -O0 build that looks
+# normal. Release is the only sensible default for a conversion library.
+# (Release already implies -O3 -DNDEBUG on GCC/Clang; spelling -O3 out again
+# would be a no-op.)
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+    set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS
+                 Debug Release RelWithDebInfo MinSizeRel)
+endif()
+
+# LTO. Off by default because it measured slower, not faster: on the canon
+# bench machine (Rocky 8.10 x86_64, 5 runs, median) it cost 4.6% on a store zip
+# and 5.6% on a document directory, and only broke even on a deflate zip.
+# The option stays so the trade-off can be rechecked on another toolchain.
+# Applied to the C++ targets only — mixing LTO objects with the C lzma_sdk and
+# pugixml is where toolchain trouble usually starts.
+option(JDOC_LTO "Enable link-time optimization in optimized builds" OFF)
+include(CheckIPOSupported)
+check_ipo_supported(RESULT JDOC_IPO_SUPPORTED OUTPUT JDOC_IPO_ERROR)
+if(JDOC_LTO AND NOT JDOC_IPO_SUPPORTED)
+    message(STATUS "jdoc: LTO requested but unsupported, continuing without it "
+                   "(${JDOC_IPO_ERROR})")
+endif()
+
+# Host-specific codegen. Off by default: jdoc_shared is a distributable
+# artifact and -march=native builds SIGILL on any older CPU. The measured win
+# is small anyway (arm64 baseline already has NEON, and zlib dispatches at
+# runtime on x86-64), so benchmark headline numbers should not use it.
+option(JDOC_NATIVE_ARCH "Build for the host CPU only (not portable)" OFF)
+
+# Marks a target as hot C++ code: LTO where available, native arch on request.
+function(jdoc_optimize target)
+    if(JDOC_LTO AND JDOC_IPO_SUPPORTED)
+        set_property(TARGET ${target} PROPERTY
+                     INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)
+        set_property(TARGET ${target} PROPERTY
+                     INTERPROCEDURAL_OPTIMIZATION_RELWITHDEBINFO TRUE)
+    endif()
+    if(JDOC_NATIVE_ARCH)
+        target_compile_options(${target} PRIVATE
+            $<$<COMPILE_LANGUAGE:CXX>:-march=native>)
+    endif()
+endfunction()
+
 find_package(ZLIB REQUIRED)
 find_package(JPEG REQUIRED)
 find_package(Threads REQUIRED)  # opt-in archive conversion pipeline only
@@ -58,6 +103,7 @@ target_link_libraries(jdoc_zip PUBLIC ZLIB::ZLIB jdoc_common)
 # optional system libbz2 instead of vendoring. OFF by default; those inputs
 # then fail with a clear error.
 option(JDOC_WITH_BZIP2 "Decode bzip2 (.bz2, alz/egg members) via system libbz2" OFF)
+
 
 add_library(jdoc_archive STATIC
     src/archive/input_stream.cpp
@@ -121,10 +167,16 @@ target_include_directories(jdoc_all PUBLIC include PRIVATE src)
 target_link_libraries(jdoc_all PUBLIC jdoc_pdf jdoc_office jdoc_hwpx jdoc_hwp
                                       jdoc_zip jdoc_archive Threads::Threads)
 
+foreach(_t jdoc_common jdoc_zip jdoc_archive jdoc_pdf jdoc_hwpx jdoc_hwp
+            jdoc_office jdoc_all)
+    jdoc_optimize(${_t})
+endforeach()
+
 # ── Shared library with C API ─────────────────────────────────
 
 add_library(jdoc_shared SHARED src/jdoc_c_api.cpp)
 target_link_libraries(jdoc_shared PRIVATE jdoc_all)
+jdoc_optimize(jdoc_shared)
 target_include_directories(jdoc_shared PUBLIC include PRIVATE src)
 set_target_properties(jdoc_shared PROPERTIES
     OUTPUT_NAME "jdoc"
@@ -142,6 +194,7 @@ endif()
 
 add_executable(jdoc src/main.cpp)
 target_link_libraries(jdoc PRIVATE jdoc_all)
+jdoc_optimize(jdoc)
 target_include_directories(jdoc PRIVATE include src)
 
 # GCC 8 requires explicit linking for std::filesystem
@@ -175,6 +228,10 @@ target_include_directories(test_hwp3 PRIVATE include src)
 add_executable(test_hwp5 test/test_hwp5.cpp)
 target_link_libraries(test_hwp5 PRIVATE jdoc_all ZLIB::ZLIB)
 target_include_directories(test_hwp5 PRIVATE include src)
+
+add_executable(test_hwpx test/test_hwpx.cpp)
+target_link_libraries(test_hwpx PRIVATE jdoc_all ZLIB::ZLIB)
+target_include_directories(test_hwpx PRIVATE include src)
 
 add_executable(bench_convert test/bench_convert.cpp)
 target_link_libraries(bench_convert PRIVATE jdoc_all)
