@@ -101,6 +101,7 @@ struct HWPTable {
     int row_count = 0;
     int col_count = 0;
     std::vector<HWPTableCell> cells;  // flat list, placed by col_addr/row_addr
+    std::string caption;              // caption list preceding the TABLE record
 };
 
 struct HWPParagraph {
@@ -115,6 +116,11 @@ struct HWPParagraph {
     // Inline controls (tables, images) attached to this paragraph
     std::vector<HWPTable> tables;
     std::vector<int> image_bin_ids;  // binDataId references for images
+    // Text held inside drawing objects (text boxes, captions) anchored here.
+    // Flattened like cell text: \x01{bid}\x01 image markers, \x02 line breaks.
+    std::vector<std::string> shape_texts;
+    // Footnote/endnote bodies referenced from this paragraph, same encoding.
+    std::vector<std::string> note_texts;
 };
 
 struct HWPEmbeddedImage {
@@ -213,6 +219,9 @@ private:
     int sequential_bin_id_ = 0;  // sequential image counter for fallback bin_id
 
     HWPDocInfo doc_info_;
+    // Header/footer text collected while parsing the current section, emitted
+    // once at the top of that section rather than at each anchor paragraph.
+    std::vector<std::string> section_header_texts_;
     std::vector<std::vector<uint8_t>> section_data_;
     // Keyed by lowercase name for O(1) case-insensitive lookup
     std::map<std::string, HWPEmbeddedImage> embedded_images_;
@@ -474,6 +483,7 @@ private:
     // ── Section parsing ─────────────────────────────────────
     void parse_section(int section_idx, PageChunk& chunk) {
         sequential_bin_id_ = 0;
+        section_header_texts_.clear();
         auto& raw = section_data_[section_idx];
 
         std::vector<uint8_t> data;
@@ -501,6 +511,12 @@ private:
 
         std::map<int, int> size_counts;
         int image_idx = 0;
+
+        // Header/footer text applies to the whole section, so emit it once up
+        // front instead of repeating it at whichever paragraph anchors it
+        for (auto& header_text : section_header_texts_) {
+            md += render_flat_text(header_text, chunk, image_idx);
+        }
 
         for (auto& para : paragraphs) {
             std::string para_md = format_paragraph(para, chunk, size_counts, image_idx);
@@ -647,6 +663,13 @@ private:
         } else if (ctrl_str == "gso ") {
             std::string dummy;
             read_gso(cur, ctrl_level, para, false, dummy);
+        } else if (ctrl_str == "head" || ctrl_str == "foot") {
+            // Page furniture: hoisted to the top of the section rather than
+            // emitted at the anchor paragraph, which sits mid-prose.
+            read_list_control_text(cur, ctrl_level, section_header_texts_);
+        } else if (ctrl_str == "fn  " || ctrl_str == "en  ") {
+            // Notes stay with the paragraph that references them
+            read_list_control_text(cur, ctrl_level, para.note_texts);
         } else {
             // Skip all records belonging to this control
             skip_control(cur, ctrl_level);
@@ -664,15 +687,30 @@ private:
 
     // Read a table: TABLE record + N cells via LIST_HEADER
     void read_table(RecordCursor& cur, uint16_t ctrl_level, HWPParagraph& para) {
-        // Expect TABLE record next
         if (!cur.has_next()) return;
+        HWPTable table;
+
+        // A captioned table stores its caption as a LIST_HEADER subtree ahead
+        // of the TABLE record. Consume it first, otherwise the TABLE record is
+        // never reached and the whole table is discarded as an unknown control.
         auto r = cur.peek();
+        if (r.tag == hwp::LIST_HEADER) {
+            auto lh = cur.next();
+            read_shape_text(cur, lh.level, table.caption);
+            if (!cur.has_next()) {
+                if (!table.caption.empty()) para.tables.push_back(std::move(table));
+                return;
+            }
+            r = cur.peek();
+        }
+
+        // Expect TABLE record next
         if (r.tag != hwp::TABLE) {
             skip_control(cur, ctrl_level);
+            if (!table.caption.empty()) para.tables.push_back(std::move(table));
             return;
         }
 
-        HWPTable table;
         auto tbl_rec = cur.next();
         if (tbl_rec.data && tbl_rec.size >= 8) {
             table.row_count = util::read_u16_le(tbl_rec.data + 4);
@@ -758,14 +796,21 @@ private:
         return cell;
     }
 
-    // Flatten paragraphs into a cell text string with inline markers
-    void flatten_cell_paragraphs(std::vector<HWPParagraph>& paras, std::string& out) {
+    // Flatten paragraphs into a cell text string with inline markers.
+    // para_sep joins consecutive paragraphs: ' ' for table cells (which are
+    // rendered on one line), '\x02' for drawing object text (kept as breaks).
+    void flatten_cell_paragraphs(std::vector<HWPParagraph>& paras, std::string& out,
+                                 char para_sep = ' ') {
         for (size_t pi = 0; pi < paras.size(); pi++) {
             auto& cpara = paras[pi];
 
             // Flatten nested tables recursively, then clear to prevent
             // format_paragraph from re-rendering them
             for (auto& tbl : cpara.tables) {
+                if (!tbl.caption.empty()) {
+                    if (!out.empty()) out += '\x02';
+                    out += tbl.caption;
+                }
                 for (auto& tcell : tbl.cells) {
                     if (!tcell.text.empty()) {
                         if (!out.empty()) out += '\x02';
@@ -774,6 +819,22 @@ private:
                 }
             }
             cpara.tables.clear();
+
+            // Append drawing object and note text (already flattened), then
+            // clear so format_paragraph does not render them a second time
+            for (auto& shape_text : cpara.shape_texts) {
+                if (shape_text.empty()) continue;
+                if (!out.empty()) out += '\x02';
+                out += shape_text;
+            }
+            cpara.shape_texts.clear();
+
+            for (auto& note_text : cpara.note_texts) {
+                if (note_text.empty()) continue;
+                if (!out.empty()) out += '\x02';
+                out += note_text;
+            }
+            cpara.note_texts.clear();
 
             // Append images as \x01{bid}\x01 markers, then clear
             for (int bid : cpara.image_bin_ids) {
@@ -792,8 +853,53 @@ private:
             txt = util::trim(txt);
             if (!txt.empty()) {
                 if (!out.empty() && out.back() != '\x02')
-                    out += ' ';
+                    out += para_sep;
                 out += txt;
+            }
+        }
+    }
+
+    // Read the paragraph list held by a drawing object's LIST_HEADER
+    // (text box body, figure caption) and flatten it like cell text.
+    // The LIST_HEADER must already be consumed; lh_level is its record level.
+    // Paragraphs are siblings of the LIST_HEADER, so records at lh_level are
+    // accepted — but any non-paragraph record at that level (SHAPE_COMPONENT,
+    // the next LIST_HEADER) ends the list and is left for read_gso to handle.
+    void read_shape_text(RecordCursor& cur, uint16_t lh_level, std::string& out) {
+        std::vector<HWPParagraph> shape_paras;
+        while (cur.has_next()) {
+            auto pk = cur.peek();
+            if (pk.level < lh_level) break;
+            if (pk.tag == hwp::PARA_HEADER) {
+                HWPParagraph spara;
+                read_paragraph(cur, pk.level, spara);
+                shape_paras.push_back(std::move(spara));
+            } else if (pk.level == lh_level) {
+                break;  // sibling shape record — not part of this text list
+            } else {
+                cur.skip();
+            }
+        }
+
+        flatten_cell_paragraphs(shape_paras, out, '\x02');
+        out = util::trim(out);
+    }
+
+    // Read a control whose body is one or more LIST_HEADER paragraph subtrees
+    // (header, footer, footnote, endnote). Each list is flattened and appended
+    // to out; every other record belonging to the control is skipped.
+    void read_list_control_text(RecordCursor& cur, uint16_t ctrl_level,
+                                std::vector<std::string>& out) {
+        while (cur.has_next()) {
+            auto r = cur.peek();
+            if (r.level <= ctrl_level) break;
+            if (r.tag == hwp::LIST_HEADER) {
+                auto lh = cur.next();
+                std::string text;
+                read_shape_text(cur, lh.level, text);
+                if (!text.empty()) out.push_back(std::move(text));
+            } else {
+                cur.skip();
             }
         }
     }
@@ -929,12 +1035,18 @@ private:
             } else if (r.tag == hwp::CTRL_DATA) {
                 cur.skip();
             } else if (r.tag == hwp::LIST_HEADER) {
+                // Text box / caption body: LIST_HEADER followed by sibling
+                // paragraphs at the same record level (same layout as table cells).
                 auto lh = cur.next();
-                uint16_t lh_level = lh.level;
-                while (cur.has_next()) {
-                    auto pk = cur.peek();
-                    if (pk.level <= lh_level) break;
-                    cur.skip();
+                std::string shape_text;
+                read_shape_text(cur, lh.level, shape_text);
+                if (!shape_text.empty()) {
+                    if (in_cell) {
+                        if (!cell_text.empty()) cell_text += '\x02';
+                        cell_text += shape_text;
+                    } else {
+                        para.shape_texts.push_back(std::move(shape_text));
+                    }
                 }
             } else if (r.tag == hwp::CTRL_HEADER) {
                 // Flush pending image before nested control
@@ -1051,8 +1163,55 @@ private:
         }
     }
 
+    // Replace inline \x01{bid}\x01 image markers with rendered markdown.
+    // Used for both table cell text and drawing object text.
+    std::string resolve_image_markers(const std::string& text, PageChunk& chunk,
+                                      int& image_idx) {
+        std::string resolved;
+        resolved.reserve(text.size());
+        for (size_t i = 0; i < text.size(); i++) {
+            if (text[i] == '\x01') {
+                size_t end = text.find('\x01', i + 1);
+                if (end != std::string::npos) {
+                    int bid = std::atoi(text.substr(i + 1, end - i - 1).c_str());
+                    i = end;
+                    if (bid > 0) {
+                        std::string img_md = format_image(bid, chunk, image_idx);
+                        while (!img_md.empty() && img_md.back() == '\n')
+                            img_md.pop_back();
+                        if (!resolved.empty() && resolved.back() != ' ')
+                            resolved += ' ';
+                        resolved += img_md;
+                    }
+                }
+            } else {
+                resolved += text[i];
+            }
+        }
+        return resolved;
+    }
+
+    // Render flattened control text (drawing object, note, header/footer) as a
+    // standalone markdown block: image markers resolved, \x02 breaks to newlines.
+    std::string render_flat_text(const std::string& flat, PageChunk& chunk,
+                                 int& image_idx) {
+        std::string resolved = resolve_image_markers(flat, chunk, image_idx);
+        std::string out;
+        out.reserve(resolved.size());
+        for (char c : resolved)
+            out += (c == '\x02') ? '\n' : c;
+        out = util::trim(out);
+        if (out.empty()) return "";
+        return out + "\n\n";
+    }
+
     // ── Table formatting ─────────────────────────────────────
     std::string format_table(const HWPTable& table, PageChunk& chunk, int& image_idx) {
+        // Caption precedes the table it labels
+        std::string caption;
+        if (!table.caption.empty())
+            caption = render_flat_text(table.caption, chunk, image_idx);
+
         if (table.cells.empty() || table.col_count == 0 || table.row_count == 0) {
             // If there are cells but row/col is 0, emit cell text as body text
             if (!table.cells.empty()) {
@@ -1063,9 +1222,9 @@ private:
                         fallback += cell.text;
                     }
                 }
-                return fallback.empty() ? "" : fallback + "\n\n";
+                return fallback.empty() ? caption : caption + fallback + "\n\n";
             }
-            return "";
+            return caption;
         }
 
         // Build a 2D grid using cell addresses and spans
@@ -1075,27 +1234,7 @@ private:
         for (auto& cell : table.cells) {
             if (cell.row_addr < table.row_count && cell.col_addr < table.col_count) {
                 // Resolve inline image markers (\x01{bid}\x01) before escaping
-                std::string resolved;
-                resolved.reserve(cell.text.size());
-                for (size_t i = 0; i < cell.text.size(); i++) {
-                    if (cell.text[i] == '\x01') {
-                        size_t end = cell.text.find('\x01', i + 1);
-                        if (end != std::string::npos) {
-                            int bid = std::atoi(cell.text.substr(i + 1, end - i - 1).c_str());
-                            i = end;
-                            if (bid > 0) {
-                                std::string img_md = format_image(bid, chunk, image_idx);
-                                while (!img_md.empty() && img_md.back() == '\n')
-                                    img_md.pop_back();
-                                if (!resolved.empty() && resolved.back() != ' ')
-                                    resolved += ' ';
-                                resolved += img_md;
-                            }
-                        }
-                    } else {
-                        resolved += cell.text[i];
-                    }
-                }
+                std::string resolved = resolve_image_markers(cell.text, chunk, image_idx);
                 std::string content = util::escape_cell(resolved);
                 // Replace \x02 line break markers with <br>
                 for (size_t p = 0; p < content.size(); p++) {
@@ -1120,7 +1259,7 @@ private:
             used_cols--;
         }
 
-        std::string md;
+        std::string md = caption;
         for (int r = 0; r < table.row_count; r++) {
             md += "|";
             for (int c = 0; c < used_cols; c++) {
@@ -1272,7 +1411,19 @@ private:
             result += format_image(bin_id, chunk, image_idx);
         }
 
-        if (para.text.empty()) return result;
+        // Emit drawing object text (text boxes, figure captions) as body text,
+        // after the images so a caption follows the figure it describes.
+        for (auto& shape_text : para.shape_texts) {
+            result += render_flat_text(shape_text, chunk, image_idx);
+        }
+
+        // Footnote/endnote bodies trail the paragraph that references them
+        std::string notes;
+        for (auto& note_text : para.note_texts) {
+            notes += render_flat_text(note_text, chunk, image_idx);
+        }
+
+        if (para.text.empty()) return result + notes;
 
         // Convert UTF-16 text to UTF-8, applying formatting
         std::string text;
@@ -1349,7 +1500,7 @@ private:
         }
 
         text = util::trim(text);
-        if (text.empty()) return result;
+        if (text.empty()) return result + notes;
 
         // Format as heading or body
         if (outline_level > 0 && outline_level <= 6) {
@@ -1359,7 +1510,7 @@ private:
                    clean.substr(clean.size() - 2) == "**") {
                 clean = clean.substr(2, clean.size() - 4);
             }
-            return result + hashes + " " + clean + "\n\n";
+            return result + hashes + " " + clean + "\n\n" + notes;
         }
 
         // Font-size based heading fallback
@@ -1371,14 +1522,14 @@ private:
 
         double ratio = dominant_height / 1000.0;
         if (ratio >= 2.0) {
-            return result + "# " + text + "\n\n";
+            return result + "# " + text + "\n\n" + notes;
         } else if (ratio >= 1.6) {
-            return result + "## " + text + "\n\n";
+            return result + "## " + text + "\n\n" + notes;
         } else if (ratio >= 1.3) {
-            return result + "### " + text + "\n\n";
+            return result + "### " + text + "\n\n" + notes;
         }
 
-        return result + text + "\n\n";
+        return result + text + "\n\n" + notes;
     }
 };
 
