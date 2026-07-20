@@ -1,7 +1,13 @@
 # JDoc 아카이브 확장 로드맵 (P2: 7z, P3: alz/egg) — reference 커버리지 추월
 
 > 상태: **P2(7z)·P3(alz/egg) 구현 완료, reference 대비 벤치·실물 검증 완료.**
-> P1(zip/gz/tar/tar.gz)은 JDLAB-1510 참조. 남은 작업: Jira 결과 이슈 생성.
+> P1(zip/gz/tar/tar.gz)은 JDLAB-1510 참조.
+>
+> **P4 (2026-07-20, 병렬 에이전트)**: 단독 BZ2/TAR.BZ2(`BzInflateStream`), RAR 4.x/5.x
+> 헤더 워크+store 멤버(클린룸 MIT — unrar 배제 근거는 `docs/rar-feasibility.md`),
+> HWP 3.x 텍스트 추출(`src/legacy/hwp3_parser`, 조합형 한글·표 셀 포함, reference·LibreOffice
+> 교차검증). reference 대비 신규 우위: RAR5 store(reference 전체 거부), HWP3 표 셀(reference 파싱 중단).
+> 잔여: RAR 압축 코덱(libarchive 기반 후속 플랜), 실물 hwp3 표 문서 검증.
 
 ## reference 대비 벤치 결과 (2026-07-16)
 
