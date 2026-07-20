@@ -17,6 +17,7 @@
 #include "archive/tar_reader.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 #include <vector>
 
@@ -87,18 +88,27 @@ std::string strip_bz2_ext(const std::string& name) {
     return name;
 }
 
-// Sink that appends to a buffer while enforcing the per-member cap and the
-// cumulative budget during streaming decompression.
+// Sink that appends to a buffer while enforcing the per-member cap, the
+// compression-ratio bound, and the cumulative budget during streaming
+// decompression. The two per-member checks are separate flags so the
+// error can name the option that actually tripped.
 struct CapSink {
     std::vector<char>& out;
-    uint64_t member_cap;
+    uint64_t member_cap;   // from max_member_bytes
+    uint64_t ratio_cap;    // compression-ratio bound; 0 = not applicable
     uint64_t total_cap;
     WalkBudget& budget;
     bool member_exceeded = false;
+    bool ratio_exceeded = false;
     bool total_exceeded = false;
 
     bool operator()(const char* p, size_t n) {
-        if (out.size() + n > member_cap) { member_exceeded = true; return false; }
+        uint64_t grown = out.size() + n;
+        if (grown > member_cap) { member_exceeded = true; return false; }
+        if (ratio_cap != 0 && grown > ratio_cap) {
+            ratio_exceeded = true;
+            return false;
+        }
         budget.total_out += n;
         if (budget.total_out > total_cap) { total_exceeded = true; return false; }
         out.insert(out.end(), p, p + n);
@@ -106,18 +116,47 @@ struct CapSink {
     }
 };
 
-// Per-member cap: the smaller of max_member_bytes and the compression-ratio
-// bound (when the compressed size is known). Small members are allowed to
-// expand freely up to 16 MiB so tiny highly-compressible files don't trip
-// the ratio check.
-uint64_t effective_member_cap(const ArchiveLimits& lim, uint64_t compressed_size) {
-    uint64_t cap = lim.max_member_bytes;
-    if (compressed_size > 0 && lim.max_ratio > 0) {
-        uint64_t ratio_cap = std::max<uint64_t>(16ull << 20,
-                                                compressed_size * lim.max_ratio);
-        cap = std::min(cap, ratio_cap);
-    }
-    return cap;
+// Compression-ratio bound for a member whose compressed size is known
+// (0 = not applicable). Small members are allowed to expand freely up to
+// 16 MiB so tiny highly-compressible files don't trip the ratio check.
+uint64_t ratio_cap_for(const ArchiveLimits& lim, uint64_t compressed_size) {
+    if (compressed_size == 0 || lim.max_ratio == 0) return 0;
+    return std::max<uint64_t>(16ull << 20, compressed_size * lim.max_ratio);
+}
+
+std::string human_size(uint64_t bytes) {
+    char buf[32];
+    if (bytes >= (1ull << 30))
+        snprintf(buf, sizeof buf, "%.4g GiB", bytes / double(1ull << 30));
+    else if (bytes >= (1ull << 20))
+        snprintf(buf, sizeof buf, "%.4g MiB", bytes / double(1ull << 20));
+    else
+        snprintf(buf, sizeof buf, "%llu bytes", (unsigned long long)bytes);
+    return buf;
+}
+
+// Limit-failure messages name the ArchiveLimits option to raise, its
+// current value, and (when known) the size the member actually needs.
+std::string member_limit_msg(const ArchiveLimits& lim, uint64_t needed) {
+    std::string s = "member exceeds max_member_bytes limit (" +
+                    human_size(lim.max_member_bytes);
+    if (needed > lim.max_member_bytes)
+        s += ", member is at least " + human_size(needed);
+    s += "); skipped — raise max_member_bytes (--max-member-mb)";
+    return s;
+}
+
+std::string ratio_limit_msg(const ArchiveLimits& lim) {
+    return "member expansion exceeds max_ratio limit (" +
+           std::to_string(lim.max_ratio) +
+           "x compression ratio, suspected archive bomb); skipped — raise "
+           "max_ratio only for trusted input";
+}
+
+std::string total_limit_msg(const ArchiveLimits& lim) {
+    return "total uncompressed output exceeds max_total_bytes limit (" +
+           human_size(lim.max_total_bytes) +
+           "); walk stopped — raise max_total_bytes";
 }
 
 // Process one fully materialized member: detect, recurse or convert, emit.
@@ -136,7 +175,10 @@ bool handle_member(const std::string& member_path, std::vector<char>&& data,
     if (is_archive_format(fmt)) {
         // Negative max_depth means unlimited nesting (caller's explicit choice).
         if (opts.archive.max_depth >= 0 && depth + 1 > opts.archive.max_depth) {
-            r.error = "max archive depth exceeded";
+            r.error_code = MemberErrorCode::DEPTH_LIMIT;
+            r.error = "nested archive exceeds max_depth limit (" +
+                      std::to_string(opts.archive.max_depth) +
+                      "); raise max_depth (--max-depth) to descend";
             return cb(std::move(r));
         }
         return walk_archive_mem(bytes, data.size(), fmt, member_path + "/",
@@ -145,6 +187,7 @@ bool handle_member(const std::string& member_path, std::vector<char>&& data,
 
     if (fmt == FileFormat::UNKNOWN) {
         if (!opts.archive.include_unsupported) return true;
+        r.error_code = MemberErrorCode::UNSUPPORTED;
         r.error = "unsupported format";
         return cb(std::move(r));
     }
@@ -167,6 +210,7 @@ bool handle_member(const std::string& member_path, std::vector<char>&& data,
                                                 member_path, opts);
         }
     } catch (const std::exception& e) {
+        r.error_code = MemberErrorCode::CONVERT_FAILED;
         r.error = e.what();
     }
     return cb(std::move(r));
@@ -179,7 +223,10 @@ bool count_entry(const std::string& member_path, WalkBudget& budget,
     if (++budget.entries > opts.archive.max_entries) {
         MemberResult r;
         r.member_path = member_path;
-        r.error = "max archive entry count exceeded; walk stopped";
+        r.error_code = MemberErrorCode::ENTRY_LIMIT;
+        r.error = "archive entry count exceeds max_entries limit (" +
+                  std::to_string(opts.archive.max_entries) +
+                  "); walk stopped — raise max_entries";
         cb(std::move(r));
         return false;
     }
@@ -187,23 +234,34 @@ bool count_entry(const std::string& member_path, WalkBudget& budget,
 }
 
 // Emit the appropriate error result after a failed materialization.
+// declared_size is the header's uncompressed-size claim (0 = unknown);
+// combined with the bytes actually produced it gives the caller a lower
+// bound on how far max_member_bytes must be raised.
 // Returns false if the whole walk must stop.
 bool emit_stream_failure(const std::string& member_path, const CapSink& sink,
                          const std::string& stream_err, const char* fmt_name,
-                         uint64_t got, const MemberCallback& cb) {
+                         uint64_t got, uint64_t declared_size,
+                         const ArchiveLimits& lim, const MemberCallback& cb) {
     MemberResult r;
     r.member_path = member_path;
     r.format = fmt_name;
     r.uncompressed_size = got;
     if (sink.total_exceeded) {
-        r.error = "total uncompressed size limit exceeded; walk stopped";
+        r.error_code = MemberErrorCode::TOTAL_LIMIT;
+        r.error = total_limit_msg(lim);
         cb(std::move(r));
         return false;  // cumulative budget gone — stop everything
     }
-    if (sink.member_exceeded)
-        r.error = "member exceeds size/ratio limit, skipped";
-    else
+    if (sink.member_exceeded) {
+        r.error_code = MemberErrorCode::MEMBER_LIMIT;
+        r.error = member_limit_msg(lim, std::max(declared_size, got));
+    } else if (sink.ratio_exceeded) {
+        r.error_code = MemberErrorCode::RATIO_LIMIT;
+        r.error = ratio_limit_msg(lim);
+    } else {
+        r.error_code = MemberErrorCode::CORRUPT;
         r.error = stream_err.empty() ? "corrupt member data" : stream_err;
+    }
     return cb(std::move(r));
 }
 
@@ -223,6 +281,7 @@ bool walk_zip(const ZipReader& zip, const std::string& prefix, int depth,
             if (opts.archive.include_unsupported) {
                 MemberResult r;
                 r.member_path = member_path;
+                r.error_code = MemberErrorCode::UNSUPPORTED;
                 r.error = "unsupported format";
                 r.uncompressed_size = e.uncompressed_size;
                 if (!cb(std::move(r))) return false;
@@ -233,12 +292,14 @@ bool walk_zip(const ZipReader& zip, const std::string& prefix, int depth,
         std::vector<char> data;
         data.reserve(std::min<uint64_t>(e.uncompressed_size,
                                         opts.archive.max_member_bytes));
-        CapSink sink{data, effective_member_cap(opts.archive, e.compressed_size),
+        CapSink sink{data, opts.archive.max_member_bytes,
+                     ratio_cap_for(opts.archive, e.compressed_size),
                      opts.archive.max_total_bytes, budget};
         std::string err;
         if (!zip.read_entry_streamed(e, std::ref(sink), &err)) {
             if (!emit_stream_failure(member_path, sink, err, "UNKNOWN",
-                                     data.size(), cb))
+                                     data.size(), e.uncompressed_size,
+                                     opts.archive, cb))
                 return false;
             continue;
         }
@@ -266,6 +327,7 @@ bool walk_7z(const SevenZipReader& sz, const std::string& prefix, int depth,
             if (opts.archive.include_unsupported) {
                 MemberResult r;
                 r.member_path = member_path;
+                r.error_code = MemberErrorCode::UNSUPPORTED;
                 r.error = "unsupported format";
                 r.uncompressed_size = e.uncompressed_size;
                 if (!cb(std::move(r))) return false;
@@ -282,7 +344,11 @@ bool walk_7z(const SevenZipReader& sz, const std::string& prefix, int depth,
             MemberResult r;
             r.member_path = member_path;
             r.uncompressed_size = e.uncompressed_size;
-            r.error = "solid block exceeds size limit, skipped";
+            r.error_code = MemberErrorCode::MEMBER_LIMIT;
+            r.error = "solid block exceeds max_member_bytes limit (" +
+                      human_size(opts.archive.max_member_bytes) +
+                      ", block is " + human_size(e.folder_unpack_size) +
+                      "); skipped — raise max_member_bytes (--max-member-mb)";
             if (!cb(std::move(r))) return false;
             continue;
         }
@@ -290,13 +356,14 @@ bool walk_7z(const SevenZipReader& sz, const std::string& prefix, int depth,
         std::vector<char> data;
         data.reserve(std::min<uint64_t>(e.uncompressed_size,
                                         opts.archive.max_member_bytes));
-        CapSink sink{data, opts.archive.max_member_bytes,
+        CapSink sink{data, opts.archive.max_member_bytes, 0,
                      opts.archive.max_total_bytes, budget};
         std::string err;
         if (!sz.read_entry_streamed(e, std::ref(sink), &err)) {
             sz.release_cache();
             if (!emit_stream_failure(member_path, sink, err, "UNKNOWN",
-                                     data.size(), cb))
+                                     data.size(), e.uncompressed_size,
+                                     opts.archive, cb))
                 return false;
             continue;
         }
@@ -341,6 +408,7 @@ bool walk_tar(InputStream& src, const std::string& prefix, int depth,
             if (opts.archive.include_unsupported) {
                 MemberResult r;
                 r.member_path = member_path;
+                r.error_code = MemberErrorCode::UNSUPPORTED;
                 r.error = "unsupported format";
                 r.uncompressed_size = m.size;
                 if (!cb(std::move(r))) return false;
@@ -353,11 +421,12 @@ bool walk_tar(InputStream& src, const std::string& prefix, int depth,
         // container itself, but caps still apply (and guard the total budget).
         std::vector<char> data;
         data.reserve(std::min<uint64_t>(m.size, opts.archive.max_member_bytes));
-        CapSink sink{data, opts.archive.max_member_bytes,
+        CapSink sink{data, opts.archive.max_member_bytes, 0,
                      opts.archive.max_total_bytes, budget};
         if (!tar.read_data(std::ref(sink))) {
             if (!emit_stream_failure(member_path, sink, "truncated tar member",
-                                     "UNKNOWN", data.size(), cb))
+                                     "UNKNOWN", data.size(), m.size,
+                                     opts.archive, cb))
                 return false;
             // A partially consumed member breaks tar framing — stop this tar.
             break;
@@ -378,6 +447,7 @@ bool walk_alz(InputStream& src, const std::string& name_hint,
     if (!alz.is_open()) {
         MemberResult r;
         r.member_path = prefix.empty() ? name_hint : prefix;
+        r.error_code = MemberErrorCode::CORRUPT;
         r.error = "cannot open alz archive";
         return cb(std::move(r));
     }
@@ -398,6 +468,7 @@ bool walk_alz(InputStream& src, const std::string& name_hint,
             if (opts.archive.include_unsupported) {
                 MemberResult r;
                 r.member_path = member_path;
+                r.error_code = MemberErrorCode::UNSUPPORTED;
                 r.error = "unsupported format";
                 r.uncompressed_size = m.uncompressed_size;
                 if (!cb(std::move(r))) return false;
@@ -409,12 +480,14 @@ bool walk_alz(InputStream& src, const std::string& name_hint,
         std::vector<char> data;
         data.reserve(std::min<uint64_t>(m.uncompressed_size,
                                         opts.archive.max_member_bytes));
-        CapSink sink{data, effective_member_cap(opts.archive, m.compressed_size),
+        CapSink sink{data, opts.archive.max_member_bytes,
+                     ratio_cap_for(opts.archive, m.compressed_size),
                      opts.archive.max_total_bytes, budget};
         std::string err;
         if (!alz.read_data(std::ref(sink), &err)) {
             if (!emit_stream_failure(member_path, sink, err, "UNKNOWN",
-                                     data.size(), cb))
+                                     data.size(), m.uncompressed_size,
+                                     opts.archive, cb))
                 return false;
             continue;  // failed reads still consume the member: framing holds
         }
@@ -479,6 +552,9 @@ bool walk_egg_solid(EggReader& egg, const std::string& prefix, int depth,
                         MemberResult r;
                         r.member_path = path;
                         r.uncompressed_size = mem.uncompressed_size;
+                        r.error_code = mem.encrypted
+                            ? MemberErrorCode::ENCRYPTED
+                            : MemberErrorCode::UNSUPPORTED;
                         r.error = mem.encrypted ? "encrypted member unsupported"
                                                 : "unsupported format";
                         if (!cb(std::move(r))) { stopped = true; return false; }
@@ -503,7 +579,9 @@ bool walk_egg_solid(EggReader& egg, const std::string& prefix, int depth,
                     MemberResult r;
                     r.member_path = path;
                     r.uncompressed_size = mem.uncompressed_size;
-                    r.error = "member exceeds size/ratio limit, skipped";
+                    r.error_code = MemberErrorCode::MEMBER_LIMIT;
+                    r.error = member_limit_msg(opts.archive,
+                                               mem.uncompressed_size);
                     if (!cb(std::move(r))) { stopped = true; return false; }
                 }
                 return true;
@@ -532,8 +610,8 @@ bool walk_egg_solid(EggReader& egg, const std::string& prefix, int depth,
                             MemberResult r;
                             r.member_path = prefix + normalize_member_name(
                                 members[idx - 1].name);
-                            r.error =
-                                "total uncompressed size limit exceeded; walk stopped";
+                            r.error_code = MemberErrorCode::TOTAL_LIMIT;
+                            r.error = total_limit_msg(opts.archive);
                             cb(std::move(r));
                             stopped = true;
                             return false;
@@ -557,6 +635,7 @@ bool walk_egg_solid(EggReader& egg, const std::string& prefix, int depth,
         r.member_path = demux.idx > 0 && demux.idx <= members.size()
             ? prefix + normalize_member_name(members[demux.idx - 1].name)
             : prefix;
+        r.error_code = MemberErrorCode::CORRUPT;
         r.error = err.empty() ? "corrupt solid egg data" : err;
         return cb(std::move(r));
     }
@@ -570,12 +649,15 @@ bool walk_egg(InputStream& src, const std::string& name_hint,
     if (!egg.is_open()) {
         MemberResult r;
         r.member_path = prefix.empty() ? name_hint : prefix;
+        r.error_code = MemberErrorCode::CORRUPT;
         r.error = "cannot open egg archive";
         return cb(std::move(r));
     }
     if (egg.is_split() || egg.is_global_encrypted()) {
         MemberResult r;
         r.member_path = prefix.empty() ? name_hint : prefix;
+        r.error_code = egg.is_split() ? MemberErrorCode::UNSUPPORTED
+                                      : MemberErrorCode::ENCRYPTED;
         r.error = egg.is_split() ? "split egg volume unsupported"
                                  : "encrypted egg archive unsupported";
         return cb(std::move(r));
@@ -598,6 +680,7 @@ bool walk_egg(InputStream& src, const std::string& name_hint,
             if (opts.archive.include_unsupported) {
                 MemberResult r;
                 r.member_path = member_path;
+                r.error_code = MemberErrorCode::UNSUPPORTED;
                 r.error = "unsupported format";
                 r.uncompressed_size = m.uncompressed_size;
                 if (!cb(std::move(r))) return false;
@@ -612,12 +695,13 @@ bool walk_egg(InputStream& src, const std::string& name_hint,
         std::vector<char> data;
         data.reserve(std::min<uint64_t>(m.uncompressed_size,
                                         opts.archive.max_member_bytes));
-        CapSink sink{data, opts.archive.max_member_bytes,
+        CapSink sink{data, opts.archive.max_member_bytes, 0,
                      opts.archive.max_total_bytes, budget};
         std::string err;
         if (!egg.read_data(std::ref(sink), &err)) {
             if (!emit_stream_failure(member_path, sink, err, "UNKNOWN",
-                                     data.size(), cb))
+                                     data.size(), m.uncompressed_size,
+                                     opts.archive, cb))
                 return false;
             continue;
         }
@@ -659,6 +743,7 @@ bool walk_gz(InputStream& raw, const std::string& name_hint,
     if (!gz.is_open()) {
         MemberResult r;
         r.member_path = prefix + normalize_member_name(name_hint);
+        r.error_code = MemberErrorCode::CORRUPT;
         r.error = "cannot initialize gzip decompressor";
         return cb(std::move(r));
     }
@@ -689,7 +774,7 @@ bool walk_gz(InputStream& raw, const std::string& name_hint,
     if (!count_entry(member_path, budget, opts, cb)) return false;
 
     std::vector<char> data;
-    CapSink sink{data, opts.archive.max_member_bytes,
+    CapSink sink{data, opts.archive.max_member_bytes, 0,
                  opts.archive.max_total_bytes, budget};
     char buf[65536];
     bool aborted = false;
@@ -701,7 +786,7 @@ bool walk_gz(InputStream& raw, const std::string& name_hint,
         if (data.size() > (16ull << 20) && opts.archive.max_ratio > 0 &&
             gz.compressed_in() > 0 &&
             data.size() / gz.compressed_in() > opts.archive.max_ratio) {
-            sink.member_exceeded = true;
+            sink.ratio_exceeded = true;
             aborted = true;
             break;
         }
@@ -709,7 +794,8 @@ bool walk_gz(InputStream& raw, const std::string& name_hint,
     if (aborted || gz.error()) {
         return emit_stream_failure(member_path, sink,
                                    gz.error() ? "corrupt gzip stream" : "",
-                                   "UNKNOWN", data.size(), cb);
+                                   "UNKNOWN", data.size(), 0,
+                                   opts.archive, cb);
     }
 
     return handle_member(member_path, std::move(data), depth, budget, opts, cb);
@@ -724,6 +810,9 @@ bool walk_bz2(InputStream& raw, const std::string& name_hint,
     if (!bz.is_open()) {
         MemberResult r;
         r.member_path = prefix + normalize_member_name(name_hint);
+        r.error_code = BzInflateStream::supported()
+            ? MemberErrorCode::CORRUPT
+            : MemberErrorCode::UNSUPPORTED;
         r.error = BzInflateStream::supported()
             ? "cannot initialize bzip2 decompressor"
             : "bzip2 support not built (JDOC_WITH_BZIP2)";
@@ -756,7 +845,7 @@ bool walk_bz2(InputStream& raw, const std::string& name_hint,
     if (!count_entry(member_path, budget, opts, cb)) return false;
 
     std::vector<char> data;
-    CapSink sink{data, opts.archive.max_member_bytes,
+    CapSink sink{data, opts.archive.max_member_bytes, 0,
                  opts.archive.max_total_bytes, budget};
     char buf[65536];
     bool aborted = false;
@@ -768,7 +857,7 @@ bool walk_bz2(InputStream& raw, const std::string& name_hint,
         if (data.size() > (16ull << 20) && opts.archive.max_ratio > 0 &&
             bz.compressed_in() > 0 &&
             data.size() / bz.compressed_in() > opts.archive.max_ratio) {
-            sink.member_exceeded = true;
+            sink.ratio_exceeded = true;
             aborted = true;
             break;
         }
@@ -776,7 +865,8 @@ bool walk_bz2(InputStream& raw, const std::string& name_hint,
     if (aborted || bz.error()) {
         return emit_stream_failure(member_path, sink,
                                    bz.error() ? "corrupt bzip2 stream" : "",
-                                   "UNKNOWN", data.size(), cb);
+                                   "UNKNOWN", data.size(), 0,
+                                   opts.archive, cb);
     }
 
     return handle_member(member_path, std::move(data), depth, budget, opts, cb);
@@ -813,6 +903,7 @@ static bool walk_dispatch(FileFormat fmt,
             MemberResult r;
             r.member_path = prefix.empty() ? name_hint : prefix;
             r.format = file_format_name(fmt);
+            r.error_code = MemberErrorCode::UNSUPPORTED;
             r.error = "archive format not yet supported";
             cb(std::move(r));
             return true;
@@ -828,6 +919,7 @@ bool walk_archive_path(const std::string& file_path, FileFormat fmt,
         if (!zip.is_open()) {
             MemberResult r;
             r.member_path = prefix.empty() ? file_path : prefix;
+            r.error_code = MemberErrorCode::CORRUPT;
             r.error = "cannot open zip archive";
             return cb(std::move(r));
         }
@@ -839,6 +931,7 @@ bool walk_archive_path(const std::string& file_path, FileFormat fmt,
         if (!sz.is_open()) {
             MemberResult r;
             r.member_path = prefix.empty() ? file_path : prefix;
+            r.error_code = MemberErrorCode::CORRUPT;
             r.error = "cannot open 7z archive";
             return cb(std::move(r));
         }
@@ -849,6 +942,7 @@ bool walk_archive_path(const std::string& file_path, FileFormat fmt,
     if (!stream->is_open()) {
         MemberResult r;
         r.member_path = prefix.empty() ? file_path : prefix;
+        r.error_code = MemberErrorCode::CORRUPT;
         r.error = "cannot open archive file";
         return cb(std::move(r));
     }
@@ -864,6 +958,7 @@ bool walk_archive_mem(const uint8_t* data, size_t size, FileFormat fmt,
         if (!zip.is_open()) {
             MemberResult r;
             r.member_path = prefix;
+            r.error_code = MemberErrorCode::CORRUPT;
             r.error = "cannot open nested zip archive";
             return cb(std::move(r));
         }
@@ -875,6 +970,7 @@ bool walk_archive_mem(const uint8_t* data, size_t size, FileFormat fmt,
         if (!sz.is_open()) {
             MemberResult r;
             r.member_path = prefix;
+            r.error_code = MemberErrorCode::CORRUPT;
             r.error = "cannot open nested 7z archive";
             return cb(std::move(r));
         }

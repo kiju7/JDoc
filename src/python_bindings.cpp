@@ -173,12 +173,28 @@ Returns:
 
     // ── Archive conversion ────────────────────────────────
 
+    py::enum_<jdoc::MemberErrorCode>(m, "MemberErrorCode",
+        "Machine-readable member failure classification. The *_LIMIT values "
+        "name the convert_archive() limit argument to raise; the remaining "
+        "values are input problems no limit change can fix.")
+        .value("OK", jdoc::MemberErrorCode::OK)
+        .value("MEMBER_LIMIT", jdoc::MemberErrorCode::MEMBER_LIMIT)
+        .value("RATIO_LIMIT", jdoc::MemberErrorCode::RATIO_LIMIT)
+        .value("TOTAL_LIMIT", jdoc::MemberErrorCode::TOTAL_LIMIT)
+        .value("ENTRY_LIMIT", jdoc::MemberErrorCode::ENTRY_LIMIT)
+        .value("DEPTH_LIMIT", jdoc::MemberErrorCode::DEPTH_LIMIT)
+        .value("ENCRYPTED", jdoc::MemberErrorCode::ENCRYPTED)
+        .value("UNSUPPORTED", jdoc::MemberErrorCode::UNSUPPORTED)
+        .value("CORRUPT", jdoc::MemberErrorCode::CORRUPT)
+        .value("CONVERT_FAILED", jdoc::MemberErrorCode::CONVERT_FAILED);
+
     py::class_<jdoc::MemberResult>(m, "MemberResult")
         .def(py::init<>())
         .def_readwrite("member_path", &jdoc::MemberResult::member_path)
         .def_readwrite("format", &jdoc::MemberResult::format)
         .def_readwrite("markdown", &jdoc::MemberResult::markdown)
         .def_readwrite("error", &jdoc::MemberResult::error)
+        .def_readwrite("error_code", &jdoc::MemberResult::error_code)
         .def_readwrite("uncompressed_size", &jdoc::MemberResult::uncompressed_size)
         .def_property_readonly("ok", &jdoc::MemberResult::ok)
         .def("__repr__", [](const jdoc::MemberResult& r) {

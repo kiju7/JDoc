@@ -503,6 +503,7 @@ static void test_nested() {
         auto* blocked = find_member(rs, "l2.zip/l3.zip");
         ASSERT(blocked && !blocked->ok());
         ASSERT(blocked->error.find("depth") != std::string::npos);
+        ASSERT(blocked->error_code == jdoc::MemberErrorCode::DEPTH_LIMIT);
 
         opts.archive.max_depth = 3;
         rs = jdoc::convert_archive(path, opts);
@@ -650,6 +651,7 @@ static void test_limits() {
         auto* after = find_member(rs, "after.txt");
         ASSERT(bomb && !bomb->ok());
         ASSERT(bomb->error.find("limit") != std::string::npos);
+        ASSERT(bomb->error_code == jdoc::MemberErrorCode::MEMBER_LIMIT);
         ASSERT(after && after->ok());  // walk continued
     TEST_END
 
@@ -665,6 +667,7 @@ static void test_limits() {
         ASSERT(find_member(rs, "m1.txt") && find_member(rs, "m1.txt")->ok());
         auto* m2 = find_member(rs, "m2.txt");
         ASSERT(m2 && !m2->ok() && m2->error.find("total") != std::string::npos);
+        ASSERT(m2->error_code == jdoc::MemberErrorCode::TOTAL_LIMIT);
         ASSERT(!find_member(rs, "m3.txt"));
     TEST_END
 
@@ -680,6 +683,7 @@ static void test_limits() {
         ASSERT(rs.size() == 6);  // 5 converted + 1 "walk stopped" error
         ASSERT(!rs.back().ok());
         ASSERT(rs.back().error.find("entry count") != std::string::npos);
+        ASSERT(rs.back().error_code == jdoc::MemberErrorCode::ENTRY_LIMIT);
     TEST_END
 
     TEST(corrupt_member_walk_continues)

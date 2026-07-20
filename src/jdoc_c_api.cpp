@@ -165,6 +165,7 @@ JDocMember* jdoc_convert_archive(const char* file_path, const JDocOptions* opts,
             auto& src = results[i];
             members[i].member_path = strdup_c(src.member_path);
             members[i].format = strdup_c(src.format);
+            members[i].error_code = (int)src.error_code;
             members[i].uncompressed_size = (long long)src.uncompressed_size;
             if (src.ok())
                 members[i].markdown = strdup_c(src.markdown);

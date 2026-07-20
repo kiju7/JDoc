@@ -67,11 +67,29 @@ JDocPage* jdoc_convert_pages(const char* file_path, const JDocOptions* opts,
 
 /* ── Archive ──────────────────────────────────────────────── */
 
+/* Machine-readable member failure classification (JDocMember.error_code).
+ * The *_LIMIT codes name the JDocOptions field to raise; the remaining
+ * codes are input problems no limit change can fix. Values mirror the
+ * C++ jdoc::MemberErrorCode enum. */
+typedef enum {
+    JDOC_MEMBER_OK = 0,
+    JDOC_MEMBER_ERR_MEMBER_LIMIT = 1,   /* raise max_member_bytes */
+    JDOC_MEMBER_ERR_RATIO_LIMIT = 2,    /* suspected archive bomb (max_ratio) */
+    JDOC_MEMBER_ERR_TOTAL_LIMIT = 3,    /* raise max_total_bytes; walk stopped */
+    JDOC_MEMBER_ERR_ENTRY_LIMIT = 4,    /* raise max_archive_entries; walk stopped */
+    JDOC_MEMBER_ERR_DEPTH_LIMIT = 5,    /* raise max_archive_depth */
+    JDOC_MEMBER_ERR_ENCRYPTED = 6,      /* encrypted member or archive */
+    JDOC_MEMBER_ERR_UNSUPPORTED = 7,    /* format jdoc cannot convert */
+    JDOC_MEMBER_ERR_CORRUPT = 8,        /* container/member data unreadable */
+    JDOC_MEMBER_ERR_CONVERT_FAILED = 9, /* parser rejected the document */
+} JDocMemberErrorCode;
+
 typedef struct {
     char* member_path;               /* "outer.zip/dir/report.hwp" (UTF-8) */
     char* format;                    /* "PDF", "HWP", "ZIP", ... */
     char* markdown;                  /* NULL on error */
     char* error;                     /* NULL on success */
+    int error_code;                  /* JDocMemberErrorCode */
     long long uncompressed_size;
 } JDocMember;
 

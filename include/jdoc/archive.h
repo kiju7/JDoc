@@ -12,11 +12,28 @@
 
 namespace jdoc {
 
+// Machine-readable classification of a member failure. The *_LIMIT codes
+// name the ArchiveLimits field to raise; the remaining codes are input
+// problems no limit change can fix.
+enum class MemberErrorCode {
+    OK = 0,
+    MEMBER_LIMIT,    // member larger than max_member_bytes
+    RATIO_LIMIT,     // expansion above max_ratio (suspected archive bomb)
+    TOTAL_LIMIT,     // cumulative output hit max_total_bytes; walk stopped
+    ENTRY_LIMIT,     // member count hit max_entries; walk stopped
+    DEPTH_LIMIT,     // nested archive deeper than max_depth
+    ENCRYPTED,       // encrypted member or archive
+    UNSUPPORTED,     // format jdoc cannot convert
+    CORRUPT,         // container or member data unreadable
+    CONVERT_FAILED,  // recognized document, but the parser rejected it
+};
+
 struct MemberResult {
     std::string member_path;   // nested path, '/'-joined: "outer.zip/dir/report.hwp"
     std::string format;        // detected format: "PDF", "HWP", "ZIP", "UNKNOWN", ...
     std::string markdown;      // conversion output; empty on error
     std::string error;         // empty on success
+    MemberErrorCode error_code = MemberErrorCode::OK;
     uint64_t uncompressed_size = 0;
 
     bool ok() const { return error.empty(); }

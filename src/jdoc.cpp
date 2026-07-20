@@ -326,6 +326,9 @@ void convert_archive(const std::string& file_path, const MemberCallback& cb,
         try {
             r.markdown = convert(file_path, opts);
         } catch (const std::exception& e) {
+            r.error_code = fmt == FileFormat::UNKNOWN
+                ? MemberErrorCode::UNSUPPORTED
+                : MemberErrorCode::CONVERT_FAILED;
             r.error = e.what();
         }
         cb(std::move(r));
