@@ -9,6 +9,14 @@
 #include <cstring>
 #include <string>
 
+#if defined(__unix__) || defined(__APPLE__)
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#define JDOC_HAVE_POSIX_IO 1
+#endif
+
 namespace jdoc {
 
 class DataSource {
@@ -31,40 +39,146 @@ public:
     virtual uint64_t size() const = 0;
 };
 
+// Reads an archive off disk, optionally through a mapping.
+//
+// Mapping the file lets stored members be handed to a parser without copying
+// them (view_at), which is a large win on Linux and a large loss on macOS —
+// see docs/decode-profile.md section 3, where a mapped read measured 3x faster
+// than fread on Linux and 8x slower on macOS. JDOC_USE_MMAP therefore defaults
+// on only where it was measured to help; every build keeps the read path and
+// falls back to it whenever mapping is unavailable.
+//
+// Caveat: if the file is truncated while mapped, touching the lost pages
+// raises SIGBUS. Callers that hand untrusted, concurrently-written files to
+// jdoc should build with -DJDOC_USE_MMAP=OFF.
 class FileSource final : public DataSource {
 public:
     explicit FileSource(const std::string& path) {
-        fp_ = fopen(path.c_str(), "rb");
-        if (!fp_) return;
-        fseek(fp_, 0, SEEK_END);
-        long sz = ftell(fp_);
-        if (sz < 0) {
-            fclose(fp_);
-            fp_ = nullptr;
+#ifdef JDOC_HAVE_POSIX_IO
+        fd_ = ::open(path.c_str(), O_RDONLY);
+        if (fd_ < 0) return;
+        struct stat st;
+        if (::fstat(fd_, &st) != 0 || !S_ISREG(st.st_mode)) {
+            ::close(fd_);
+            fd_ = -1;
             return;
         }
+        size_ = static_cast<uint64_t>(st.st_size);
+        map_file();
+#else
+        fp_ = fopen(path.c_str(), "rb");
+        if (!fp_) return;
+        if (_fseeki64(fp_, 0, SEEK_END) != 0) { close_fp(); return; }
+        long long sz = _ftelli64(fp_);
+        if (sz < 0) { close_fp(); return; }
         size_ = static_cast<uint64_t>(sz);
+#endif
     }
 
     ~FileSource() override {
-        if (fp_) fclose(fp_);
+#ifdef JDOC_HAVE_POSIX_IO
+        if (map_) ::munmap(map_, static_cast<size_t>(size_));
+        if (fd_ >= 0) ::close(fd_);
+#else
+        close_fp();
+#endif
     }
 
     FileSource(const FileSource&) = delete;
     FileSource& operator=(const FileSource&) = delete;
 
+#ifdef JDOC_HAVE_POSIX_IO
+    bool is_open() const { return fd_ >= 0; }
+
+    // pread, not fseek+fread: it takes a 64-bit offset (the old fseek(long)
+    // truncated past 2 GiB on 32-bit platforms, which zip64 members reach) and
+    // leaves no file position behind, so this stays const and thread-safe.
+    // Deliberately reads even when the file is mapped. Copying out of the
+    // mapping is marginally faster, but every byte read that way stays
+    // resident, and a compressed archive reads its whole content this way for
+    // no benefit — the decompressor needs a copy regardless. Keeping the
+    // mapping exclusively for view_at means pages accumulate only where they
+    // actually save a copy.
+    size_t read_at(uint64_t offset, void* buf, size_t len) const override {
+        if (fd_ < 0 || offset >= size_) return 0;
+        size_t avail = static_cast<size_t>(size_ - offset);
+        if (len > avail) len = avail;
+        size_t got = 0;
+        while (got < len) {
+            ssize_t n = ::pread(fd_, static_cast<char*>(buf) + got, len - got,
+                                static_cast<off_t>(offset + got));
+            if (n <= 0) break;  // EOF or error; report the short read
+            got += static_cast<size_t>(n);
+        }
+        return got;
+    }
+
+    const uint8_t* view_at(uint64_t offset, size_t len) const override {
+        if (!map_ || offset > size_ || len > size_ - offset) return nullptr;
+        served_ += len;
+        trim_resident();
+        return map_ + offset;
+    }
+#else
     bool is_open() const { return fp_ != nullptr; }
 
     size_t read_at(uint64_t offset, void* buf, size_t len) const override {
         if (!fp_ || offset >= size_) return 0;
-        if (fseek(fp_, static_cast<long>(offset), SEEK_SET) != 0) return 0;
+        if (_fseeki64(fp_, static_cast<long long>(offset), SEEK_SET) != 0) return 0;
         return fread(buf, 1, len, fp_);
     }
+#endif
 
     uint64_t size() const override { return size_; }
 
 private:
+#ifdef JDOC_HAVE_POSIX_IO
+    void map_file() {
+#ifdef JDOC_USE_MMAP
+        // An empty file has nothing to map, and a file larger than the address
+        // space cannot be mapped whole on 32-bit builds.
+        if (size_ == 0 || size_ > static_cast<uint64_t>(SIZE_MAX)) return;
+        void* p = ::mmap(nullptr, static_cast<size_t>(size_), PROT_READ,
+                         MAP_PRIVATE, fd_, 0);
+        if (p == MAP_FAILED) return;  // read_at falls back to pread
+        map_ = static_cast<uint8_t*>(p);
+#ifdef MADV_RANDOM
+        // Container readers seek around the central directory before touching
+        // member data, so this is not a sequential scan.
+        ::madvise(map_, static_cast<size_t>(size_), MADV_RANDOM);
+#endif
+#endif
+    }
+
+    // Every page the walk touches stays resident for the life of the mapping,
+    // so a multi-gigabyte archive would report a multi-gigabyte RSS. The pages
+    // are clean and file-backed — not a leak — but a container memory limit
+    // counts them, so drop them once enough has been served. Anything still in
+    // use is simply re-read from the file on next touch; MADV_DONTNEED on a
+    // read-only MAP_PRIVATE mapping does not lose data.
+    void trim_resident() const {
+#if defined(JDOC_USE_MMAP) && defined(MADV_DONTNEED)
+        if (served_ < kTrimAfterBytes) return;
+        served_ = 0;
+        ::madvise(map_, static_cast<size_t>(size_), MADV_DONTNEED);
+#endif
+    }
+
+    // Large enough that ordinary archives never trim, small enough to bound
+    // residency well under the size of the archives that do.
+    static constexpr uint64_t kTrimAfterBytes = 256ull << 20;
+
+    int fd_ = -1;
+    uint8_t* map_ = nullptr;
+    mutable uint64_t served_ = 0;  // walker decodes single-threaded
+#else
+    void close_fp() {
+        if (fp_) fclose(fp_);
+        fp_ = nullptr;
+    }
+
     FILE* fp_ = nullptr;
+#endif
     uint64_t size_ = 0;
 };
 

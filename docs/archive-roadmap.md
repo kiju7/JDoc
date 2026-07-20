@@ -27,8 +27,12 @@
      압축 멤버는 디코딩 산출물이라 제로카피 대상이 아님.
    - 뷰의 수명 문제로 **단일 스레드(기본) 경로에서만 무복사**; 병렬 모드(3번)에서는
      워커에 넘길 때 사본 생성(병렬은 처리량 최적화, 제로카피는 기본 경로 최적화).
-   - 후속 여지: alz/egg/rar store 멤버 뷰, 최상위 파일 mmap(파일 기반 store/tar도
-     무복사 가능하나 maxRSS에 매핑 페이지가 잡혀 벤치 지표가 왜곡될 수 있어 보류).
+   - 후속 여지: alz/egg/rar store 멤버 뷰.
+   - ✅ **최상위 파일 mmap 완료(2026-07-21)**: 보류 사유였던 maxRSS 왜곡은 매핑을
+     `view_at` 전용으로 한정해 해소했다(`read_at`은 항상 pread). 압축 아카이브는
+     시간·RSS 모두 불변, store 아카이브는 **−82% / 피크 RSS −82%**.
+     `JDOC_USE_MMAP`은 Linux만 기본 ON — macOS는 매핑 읽기가 fread보다 8배 느리다
+     (`docs/decode-profile.md` 3번·부록 E).
    - **구현**: `DataSource::view_at`/`InputStream::view`/`ZipReader::stored_view`/
      `TarReader::view_data`/`SevenZipReader::read_entry_view` + walker 뷰 경로
      (`precheck_view_member`로 캡 회계 동일 유지). 7z는 캐시 해제를 멤버 처리

@@ -1307,6 +1307,43 @@ static void test_consistency() {
 static void test_views_and_threads() {
     std::cerr << "Zero-copy views and conversion threads:\n";
 
+    // With JDOC_USE_MMAP, a stored member of a file-backed archive is handed to
+    // the parser as a view instead of being copied through CapSink. These pin
+    // the limit behaviour to that path: the caps have to trip in the same place
+    // and stop the walk the same way whether or not the archive is mapped.
+    TEST(file_backed_store_member_cap)
+        std::string big(2 << 20, 'x');  // 2 MiB, stored
+        ZipEntrySpec e{"big.txt", big};
+        e.deflate = false;
+        auto path = write_tmp("storecap.zip", make_zip({e, {"after.txt", "tail"}}));
+
+        jdoc::ConvertOptions opts;
+        opts.archive.max_member_bytes = 1 << 20;
+        auto rs = jdoc::convert_archive(path, opts);
+        // Over-cap member is skipped and named; the walk continues past it.
+        ASSERT(rs.size() == 2);
+        ASSERT(!rs[0].ok() && rs[0].error_code == jdoc::MemberErrorCode::MEMBER_LIMIT);
+        ASSERT(rs[1].ok() && rs[1].markdown == "tail");
+
+        opts.archive.max_member_bytes = static_cast<uint64_t>(-1);
+        rs = jdoc::convert_archive(path, opts);
+        ASSERT(rs.size() == 2 && rs[0].ok() && rs[0].markdown.size() == big.size());
+    TEST_END
+
+    TEST(file_backed_store_member_total_cap)
+        std::string a(512 << 10, 'a'), b(512 << 10, 'b');
+        ZipEntrySpec ea{"a.txt", a}, eb{"b.txt", b};
+        ea.deflate = eb.deflate = false;
+        auto path = write_tmp("storetotal.zip", make_zip({ea, eb}));
+
+        jdoc::ConvertOptions opts;
+        opts.archive.max_total_bytes = 768 << 10;  // fits a.txt, not both
+        auto rs = jdoc::convert_archive(path, opts);
+        ASSERT(rs.size() == 2);
+        ASSERT(rs[0].ok() && rs[0].markdown.size() == a.size());
+        ASSERT(!rs[1].ok() && rs[1].error_code == jdoc::MemberErrorCode::TOTAL_LIMIT);
+    TEST_END
+
     TEST(nested_store_zip_zero_copy)
         // Store members of a memory-backed (nested) zip take the view path.
         ZipEntrySpec doc{"doc.rtf", "{\\rtf1\\ansi View Path}", /*deflate=*/false};

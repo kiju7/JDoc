@@ -36,6 +36,17 @@ endif()
 # runtime on x86-64), so benchmark headline numbers should not use it.
 option(JDOC_NATIVE_ARCH "Build for the host CPU only (not portable)" OFF)
 
+# Map archives instead of read()ing them, so stored members reach the parser
+# without a copy. Measured 3x faster than fread on Linux and 8x slower on
+# macOS (docs/decode-profile.md section 3), so the default follows the
+# platform. Turn it off to avoid SIGBUS on files that may be truncated while
+# jdoc has them open.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    option(JDOC_USE_MMAP "Read archives through a memory mapping" ON)
+else()
+    option(JDOC_USE_MMAP "Read archives through a memory mapping" OFF)
+endif()
+
 # Marks a target as hot C++ code: LTO where available, native arch on request.
 function(jdoc_optimize target)
     if(JDOC_LTO AND JDOC_IPO_SUPPORTED)
@@ -170,6 +181,9 @@ target_link_libraries(jdoc_all PUBLIC jdoc_pdf jdoc_office jdoc_hwpx jdoc_hwp
 foreach(_t jdoc_common jdoc_zip jdoc_archive jdoc_pdf jdoc_hwpx jdoc_hwp
             jdoc_office jdoc_all)
     jdoc_optimize(${_t})
+    if(JDOC_USE_MMAP)
+        target_compile_definitions(${_t} PUBLIC JDOC_USE_MMAP)
+    endif()
 endforeach()
 
 # ── Shared library with C API ─────────────────────────────────
