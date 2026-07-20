@@ -5,6 +5,7 @@
 
 #include "jdoc/hwp.h"
 #include "jdoc/hwp_types.h"
+#include "legacy/hwp3_parser.h"
 #include "legacy/ole_reader.h"
 #include "common/file_utils.h"
 #include "common/image_utils.h"
@@ -1401,13 +1402,31 @@ static std::string hwp_chunks_to_markdown(HWPParser& parser,
     return result;
 }
 
+// Peek at the file head to route HWP 3.x legacy binaries (flat stream,
+// not OLE) to the dedicated parser.
+static bool file_is_hwp3(const std::string& path) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) return false;
+    uint8_t head[32] = {};
+    f.read(reinterpret_cast<char*>(head), sizeof(head));
+    return is_hwp3_signature(head, static_cast<size_t>(f.gcount()));
+}
+
 std::string hwp_to_markdown(const std::string& hwp_path, ConvertOptions opts) {
+    if (file_is_hwp3(hwp_path)) {
+        Hwp3Parser parser(hwp_path);
+        return parser.to_markdown(opts);
+    }
     HWPParser parser(hwp_path, opts);
     return hwp_chunks_to_markdown(parser, opts);
 }
 
 std::string hwp_to_markdown_mem(const uint8_t* data, size_t size,
                                 ConvertOptions opts) {
+    if (is_hwp3_signature(data, size)) {
+        Hwp3Parser parser(data, size);
+        return parser.to_markdown(opts);
+    }
     HWPParser parser(data, size, opts);
     return hwp_chunks_to_markdown(parser, opts);
 }
@@ -1415,6 +1434,10 @@ std::string hwp_to_markdown_mem(const uint8_t* data, size_t size,
 std::vector<PageChunk> hwp_to_markdown_chunks(const std::string& hwp_path,
                                                ConvertOptions opts) {
     opts.page_chunks = true;
+    if (file_is_hwp3(hwp_path)) {
+        Hwp3Parser parser(hwp_path);
+        return parser.to_chunks(opts);
+    }
     HWPParser parser(hwp_path, opts);
     parser.parse();
     auto chunks = parser.convert_chunks();
