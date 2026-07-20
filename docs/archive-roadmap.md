@@ -9,6 +9,27 @@
 > 교차검증). reference 대비 신규 우위: RAR5 store(reference 전체 거부), HWP3 표 셀(reference 파싱 중단).
 > 잔여: RAR 압축 코덱(libarchive 기반 후속 플랜), 실물 hwp3 표 문서 검증.
 
+## P5 플랜 — RAR 전체 디코딩 + 디코더 성능 (미착수)
+
+1. **RAR 압축 코덱 (클린룸 MIT)** — libarchive(BSD-2) 리더 기반, 상세와 공수
+   추정(RAR4 1–2주, RAR5 +1–2주)은 `docs/rar-feasibility.md` 후속 플랜 절 참조.
+2. **디코더 핫루프 최적화** (신규 RAR 엔진이 주 대상):
+   - 64비트 프리페치 비트리더 리필(바이트 단위 리필 대체) — Huffman 디코드 1.5–2배.
+   - LZ 매치 구간의 겹침 없는 범위를 memcpy 벌크 복사로 처리.
+   - 목표: 참조 구현(libarchive ~110MB/s, `-mt1` unrar ~410MB/s) 대비 200MB/s+.
+   - 기존 코덱(deflate/bzip2/LZMA)은 라이브러리 디코더라 핫루프가 외부에 있음 —
+     대신 `InputStream` 버퍼·`CodecSink` 호출 단위(64KB 배치)만 점검.
+3. **멤버 병렬화 (옵트인)** — RAR 전용이 아니라 zip/7z/alz/egg 전 포맷 공통 효과.
+   단일 스레드 원칙은 기본값으로 유지하고 `ConvertOptions::archive`에 스레드 수
+   옵션(기본 1) 추가:
+   - 순차 컨테이너(tar/alz/egg/rar): 디코드 1 스레드 + 문서 변환 워커 N 파이프라인
+     (변환이 지배 비용이므로 여기서 이득).
+   - 랜덤액세스 컨테이너(zip/7z 비솔리드): 멤버 파티션 병렬.
+   - `WalkBudget`/entry 계수 원자화, `CapSink` 누적 캡의 스레드 안전 설계 필요.
+   - 기대: 변환 지배 워크로드(zip 40문서 0.60s)에서 코어 수 배 근접. unrar식 코덱
+     내부 멀티스레드(rar5 디코드 분할)는 공수 대비 이득이 작아 후순위.
+4. 검증: `bench_convert` 재측정 + 아래 reference 대비표 갱신.
+
 ## reference 대비 벤치 결과 (2026-07-16)
 
 환경: Docker Ubuntu 22.04 linux/amd64(Apple Silicon 에뮬레이션), 양쪽 동일 조건.

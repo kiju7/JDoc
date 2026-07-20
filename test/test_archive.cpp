@@ -1244,6 +1244,35 @@ static void test_rar() {
         auto rs = jdoc::convert_archive(path);
         ASSERT(rs.size() == 3);
     TEST_END
+
+    // Real WinRAR-written RAR4 archives from the libarchive test suite
+    // (BSD-2-Clause, github.com/libarchive/libarchive) — store members,
+    // directories, symlinks, unicode filenames.
+    TEST(rar4_real_winrar_store)
+        auto rs = jdoc::convert_archive(rar_fixture("rar4_libarchive.rar"));
+        auto* t = find_member(rs, "test.txt");
+        auto* d = find_member(rs, "testdir/test.txt");
+        ASSERT(t && t->ok() && t->markdown.find("test text document") == 0);
+        ASSERT(d && d->ok());
+    TEST_END
+
+    TEST(rar4_real_winrar_unicode_names)
+        auto rs = jdoc::convert_archive(
+            rar_fixture("rar4_libarchive_unicode.rar"));
+        // "表だよ/漢字長いファイル名long-filename-in-漢字.txt", store member
+        const jdoc::MemberResult* k = nullptr;
+        for (const auto& r : rs)
+            if (r.member_path.find("long-filename-in-") != std::string::npos)
+                k = &r;
+        ASSERT(k && k->ok() && k->markdown.find("kanji") == 0);
+        ASSERT(k->member_path.compare(0, 10,
+                                      "\xE8\xA1\xA8\xE3\x81\xA0\xE3\x82\x88/") == 0);
+        // the archive's one compressed member fails member-locally
+        bool comp_err = false;
+        for (const auto& r : rs)
+            if (r.error == "rar compressed member unsupported") comp_err = true;
+        ASSERT(comp_err);
+    TEST_END
 }
 
 static void test_consistency() {
