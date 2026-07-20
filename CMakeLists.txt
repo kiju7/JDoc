@@ -82,7 +82,8 @@ target_link_libraries(jdoc_hwpx PUBLIC pugixml jdoc_zip jdoc_common)
 
 # ── HWP (binary format) ──────────────────────────────────────
 
-add_library(jdoc_hwp STATIC src/hwp.cpp src/legacy/ole_reader.cpp)
+add_library(jdoc_hwp STATIC src/hwp.cpp src/legacy/hwp3_parser.cpp
+                            src/legacy/ole_reader.cpp)
 target_include_directories(jdoc_hwp PUBLIC include PRIVATE src)
 target_link_libraries(jdoc_hwp PUBLIC ZLIB::ZLIB jdoc_common)
 
@@ -153,6 +154,10 @@ target_include_directories(test_office PRIVATE include src)
 add_executable(test_archive test/test_archive.cpp)
 target_link_libraries(test_archive PRIVATE jdoc_all ZLIB::ZLIB)
 target_include_directories(test_archive PRIVATE include src)
+
+add_executable(test_hwp3 test/test_hwp3.cpp)
+target_link_libraries(test_hwp3 PRIVATE jdoc_all ZLIB::ZLIB)
+target_include_directories(test_hwp3 PRIVATE include src)
 
 add_executable(bench_convert test/bench_convert.cpp)
 target_link_libraries(bench_convert PRIVATE jdoc_all)

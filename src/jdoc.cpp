@@ -107,6 +107,9 @@ static FileFormat format_from_magic(const unsigned char* magic, size_t n) {
     if (n >= 5 && magic[0] == '{' && magic[1] == '\\' && magic[2] == 'r' &&
         magic[3] == 't' && magic[4] == 'f')
         return FileFormat::OFFICE;
+    // HWP 2.x/3.x legacy binary ("HWP Document File V3.00 \x1A\x01\x02\x03\x04\x05")
+    if (n >= 19 && memcmp(magic, "HWP Document File V", 19) == 0)
+        return FileFormat::HWP;
     return FileFormat::UNKNOWN;
 }
 
