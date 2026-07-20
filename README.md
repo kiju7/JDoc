@@ -4,7 +4,7 @@ C++17 기반 문서 → 마크다운 변환기. 무거운 의존성 없이 zlib,
 
 **지원 포맷:** PDF, DOCX, XLSX, XLSB, PPTX, DOC, XLS, PPT, RTF, HTML, HWP, HWPX, TXT
 
-**아카이브 (압축 해제 없이 직접 파싱):** ZIP, GZ, BZ2, TAR, TAR.GZ, TAR.BZ2, 7Z, ALZ, EGG
+**아카이브 (압축 해제 없이 직접 파싱):** ZIP, GZ, BZ2, TAR, TAR.GZ, TAR.BZ2, 7Z, ALZ, EGG, RAR(store 멤버)
 
 ## 주요 특징
 
@@ -17,8 +17,8 @@ C++17 기반 문서 → 마크다운 변환기. 무거운 의존성 없이 zlib,
 - **손상 PDF 복구** — xref 재구축, 스트림 길이 복구
 - **CJK 인코딩** — CP949, CP932, CMap 기반 유니코드 매핑
 - **페이지 청킹** — RAG 파이프라인용 페이지별 출력(메타데이터 포함)
-- **아카이브 직접 파싱** — ZIP/GZ/BZ2/TAR/TAR.GZ/TAR.BZ2/7Z/ALZ/EGG 내부 문서를 디스크에 풀지 않고 메모리에서 스트리밍 변환. 멤버는 한 번에 하나만 상주하고, 중첩 아카이브는 재귀 처리하며, 손상·미지원 멤버는 해당 멤버만 오류로 기록하고 순회 지속
-- **아카이브 코덱** — 7Z: LZMA/LZMA2·branch 필터(디코더 전용 LZMA SDK 벤더링, solid block 사전 크기 검사). ALZ/EGG: store/deflate/bzip2/LZMA, solid EGG 스트리밍 분배 지원, CRC 검증, CP949 파일명 변환. 암호화·독점 코덱(AZO) 멤버는 명확한 오류로 보고
+- **아카이브 직접 파싱** — ZIP/GZ/BZ2/TAR/TAR.GZ/TAR.BZ2/7Z/ALZ/EGG/RAR 내부 문서를 디스크에 풀지 않고 메모리에서 스트리밍 변환. 멤버는 한 번에 하나만 상주하고, 중첩 아카이브는 재귀 처리하며, 손상·미지원 멤버는 해당 멤버만 오류로 기록하고 순회 지속
+- **아카이브 코덱** — 7Z: LZMA/LZMA2·branch 필터(디코더 전용 LZMA SDK 벤더링, solid block 사전 크기 검사). ALZ/EGG: store/deflate/bzip2/LZMA, solid EGG 스트리밍 분배 지원, CRC 검증, CP949 파일명 변환. RAR: 4.x/5.x 헤더 워크·store 멤버(독점 압축 코덱 멤버는 멤버별 오류, [근거](docs/rar-feasibility.md)). 암호화·독점 코덱(AZO) 멤버는 명확한 오류로 보고
 - **압축폭탄 방어** — 헤더 크기 필드를 신뢰하지 않고 해제 도중 출력 바이트를 계수해 강제. 멤버당·누적·멤버 수·압축비·재귀 깊이 한도 (기본값과 해제 방법은 [옵션](#옵션) 참조)
 - **단일 스레드** — 변환 호출당 스레드 1개, 전역 상태 없음. 호출자가 문서/아카이브 단위로 자유롭게 병렬화 가능
 - **다양한 API** — CLI, Python (pybind11), C, C++
