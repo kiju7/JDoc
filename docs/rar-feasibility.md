@@ -19,7 +19,9 @@ JDoc은 순수 MIT를 유지하므로 다음을 배제했다.
    unrar 라이선스(비-OSI, 사용 제한)로 남아 MIT 트리에 제한 조항이 유입된다.
    기존 벤더링 선례(public domain LZMA SDK, MIT pugixml)와 달리 permissive가 아니다.
 2. **(a) reference 디컴파일 소스 참고 배제** — `sn3rar_unpack.cpp`는 스스로
-   "adapted unrar"라 명시한 unrar 행동 재구성물이다. 이를 참고해 디코더를 쓰면
+   "adapted unrar"라 명시한 unrar 행동 재구성물이다. 맹글링된 심볼에 unrar
+   원본 클래스명(`CItemEx`, `CRarTime`, `CInArchive`, `NArchive` 네임스페이스)이
+   그대로 남아 있어 파생 관계가 심볼 수준에서 확인된다. 이를 참고해 디코더를 쓰면
    라이선스 표기 없는 unrar 파생물이 되어 (b)보다 나쁘다. 헤더 레이아웃 같은
    순수 포맷 사실 확인만 허용했다.
 3. **완전 클린룸 전체 디코더 보류** — RAR 2.9 해제는 LZSS+Huffman에 PPMd var.H
