@@ -78,7 +78,7 @@ endif()
 
 # ── PDF ───────────────────────────────────────────────────────
 
-add_library(jdoc_pdf STATIC src/pdf.cpp)
+add_library(jdoc_pdf STATIC src/pdf.cpp src/pdf_crypt.cpp)
 target_include_directories(jdoc_pdf PUBLIC include PRIVATE src)
 target_link_libraries(jdoc_pdf PUBLIC jdoc_common ZLIB::ZLIB JPEG::JPEG)
 
@@ -154,6 +154,10 @@ endif()
 
 add_executable(test_pdf test/test_pdf.cpp)
 target_link_libraries(test_pdf PRIVATE jdoc_pdf)
+
+add_executable(test_pdf_crypt test/test_pdf_crypt.cpp)
+target_link_libraries(test_pdf_crypt PRIVATE jdoc_pdf)
+target_include_directories(test_pdf_crypt PRIVATE src)
 target_include_directories(test_pdf PRIVATE include)
 
 add_executable(test_office test/test_office.cpp)
