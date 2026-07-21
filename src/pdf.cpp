@@ -6563,10 +6563,59 @@ std::string page_to_markdown(const std::vector<TextLine>& raw_lines,
         }
 
         if (hlevel > 0) {
+            // A heading that wraps onto several visual lines is one heading.
+            // Fold in immediately following heading lines in the same column
+            // whose vertical gap is a single line height — a wrapped
+            // continuation, never a separate heading (those have body text, and
+            // thus a larger gap, between them). Font size need only be close,
+            // not identical, so a small-caps title (whose lines measure at two
+            // sizes) still merges; the merged heading takes the strongest level.
+            // Whether a line is written mostly in CJK script. Two heading lines
+            // in different scripts (a Korean title stacked above its English
+            // translation) are separate headings, not a wrapped one.
+            auto is_cjk_line = [](const std::string& s) {
+                size_t cjk = 0, letters = 0;
+                for (size_t k = 0; k < s.size();) {
+                    unsigned char c = s[k];
+                    uint32_t cp;
+                    int n;
+                    if (c < 0x80)      { cp = c; n = 1; }
+                    else if (c < 0xE0) { cp = c & 0x1F; n = 2; }
+                    else if (c < 0xF0) { cp = c & 0x0F; n = 3; }
+                    else               { cp = c & 0x07; n = 4; }
+                    for (int b = 1; b < n && k + b < s.size(); b++)
+                        cp = (cp << 6) | (s[k + b] & 0x3F);
+                    k += n;
+                    if (cp > 0x3040) { letters++; if (cp >= 0xAC00 && cp <= 0xD7A3) cjk++; }
+                    else if ((cp | 0x20) - 'a' < 26u) letters++;
+                }
+                return letters > 0 && cjk * 2 >= letters;
+            };
+            std::string heading = l.text;
+            bool head_cjk = is_cjk_line(l.text);
+            while (i + 1 < lines.size()) {
+                const auto& nx = lines[i + 1];
+                int nx_level = stats.heading_level(nx.font_size, nx.is_bold);
+                bool same_col = nx.is_column_split == l.is_column_split &&
+                    ((nx.x_left + nx.x_right) / 2.0 < col_boundary) ==
+                    ((l.x_left + l.x_right) / 2.0 < col_boundary);
+                double gap = std::fabs(nx.y_center - lines[i].y_center);
+                double ratio = std::min(nx.font_size, l.font_size) /
+                               std::max(nx.font_size, l.font_size);
+                if (nx_level == 0 || line_in_table(nx, tables) || !same_col ||
+                    nx.is_bold != l.is_bold || ratio < 0.75 ||
+                    is_cjk_line(nx.text) != head_cjk ||
+                    gap > l.font_size * 1.5)
+                    break;
+                heading += ' ';
+                heading += nx.text;
+                hlevel = std::min(hlevel, nx_level);
+                i++;
+            }
             if (i > 0) md += '\n';
             for (int h = 0; h < hlevel; h++) md += '#';
             md += ' ';
-            md += l.text;
+            md += heading;
             md += '\n';
         } else if (l.is_bold && l.is_italic) {
             md += "***" + l.text + "***\n";
