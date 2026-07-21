@@ -101,9 +101,8 @@ CharsetDecision decide_charset(const char* d, size_t n, const std::string& hint)
     }
 
     // 4) heuristic: valid UTF-8 stays UTF-8, otherwise assume EUC-KR (CP949).
-    return {util::is_valid_utf8(std::string(d, n)) ? Charset::UTF8
-                                                   : Charset::EUCKR,
-            0};
+    // Validate over the raw buffer — no full-document copy on the common path.
+    return {util::is_valid_utf8(d, n) ? Charset::UTF8 : Charset::EUCKR, 0};
 }
 
 std::string to_utf8(const char* data, size_t size, Charset cs) {

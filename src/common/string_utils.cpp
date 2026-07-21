@@ -257,15 +257,19 @@ std::string sanitize_utf8(const char* data, size_t len) {
     return out;
 }
 
-bool is_valid_utf8(const std::string& s) {
+bool is_valid_utf8(const char* data, size_t len) {
     size_t pos = 0;
-    while (pos < s.size()) {
-        if (static_cast<unsigned char>(s[pos]) < 0x80) { pos++; continue; }
+    while (pos < len) {
+        if (static_cast<unsigned char>(data[pos]) < 0x80) { pos++; continue; }
         size_t before = pos;
-        if (decode_utf8(s.data(), s.size(), pos) == 0xFFFD) return false;
+        if (decode_utf8(data, len, pos) == 0xFFFD) return false;
         if (pos == before) return false;
     }
     return true;
+}
+
+bool is_valid_utf8(const std::string& s) {
+    return is_valid_utf8(s.data(), s.size());
 }
 
 std::string cp949_string_to_utf8(const std::string& s) {
