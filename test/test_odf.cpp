@@ -188,6 +188,25 @@ void test_odf() {
         ASSERT(chunks.size() == 2);
     TEST_END
 
+    TEST(odp_speaker_notes_extracted_not_leaked)
+        std::string body =
+            "<office:presentation><draw:page draw:name=\"p1\">"
+            "<draw:frame presentation:class=\"subtitle\"><draw:text-box>"
+            "<text:p>visible body</text:p></draw:text-box></draw:frame>"
+            "<presentation:notes><draw:frame><draw:text-box>"
+            "<text:p>hidden speaker note</text:p></draw:text-box></draw:frame>"
+            "</presentation:notes>"
+            "</draw:page></office:presentation>";
+        auto md = conv(make_odf("application/vnd.oasis.opendocument.presentation", body),
+                       "d.odp");
+        ASSERT(md.find("visible body") != std::string::npos);
+        ASSERT(md.find("> **Notes:** hidden speaker note") != std::string::npos);
+        // The note text must appear once (in the Notes block), not leaked twice.
+        size_t first = md.find("hidden speaker note");
+        ASSERT(first != std::string::npos);
+        ASSERT(md.find("hidden speaker note", first + 1) == std::string::npos);
+    TEST_END
+
     TEST(detected_via_mimetype_without_extension)
         // No .od? extension — detection must fall back to the mimetype member.
         std::string body = "<office:text><text:p>from mimetype</text:p></office:text>";

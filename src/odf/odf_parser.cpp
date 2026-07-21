@@ -28,6 +28,19 @@ std::string rstrip(std::string s) {
     return s;
 }
 
+// Collect slide-content frames from a draw:page in document order, descending
+// into group shapes but never into <presentation:notes> (handled separately).
+void collect_slide_frames(const pugi::xml_node& n,
+                          std::vector<pugi::xml_node>& out, int depth = 0) {
+    if (depth > 32) return;
+    for (auto c = n.first_child(); c; c = c.next_sibling()) {
+        const char* l = loc(c);
+        if (strcmp(l, "notes") == 0) continue;   // speaker notes: separate path
+        if (strcmp(l, "frame") == 0) { out.push_back(c); continue; }
+        collect_slide_frames(c, out, depth + 1);
+    }
+}
+
 // Collect a paragraph's text in document order, honoring soft breaks, tabs and
 // the <text:s> repeated-space element.
 void collect_para(const pugi::xml_node& node, std::string& out, int depth = 0) {
@@ -280,10 +293,11 @@ std::vector<PageChunk> OdfParser::parse_presentation(const pugi::xml_node& body,
 
         std::string title;
         std::string md;
-        // Frames in document order; the title frame (presentation:class="title")
-        // becomes a heading, the rest contribute body paragraphs.
+        // Frames in document order (excluding the notes subtree); the title
+        // frame (presentation:class="title") becomes a heading, the rest
+        // contribute body paragraphs.
         std::vector<pugi::xml_node> frames;
-        xml_find_all(page, "frame", frames);
+        collect_slide_frames(page, frames);
         for (auto& fr : frames) {
             const char* cls = xml_attr(fr, "class");  // presentation:class
             std::vector<pugi::xml_node> ps;
@@ -311,9 +325,25 @@ std::vector<PageChunk> OdfParser::parse_presentation(const pugi::xml_node& body,
             }
         }
 
+        // Speaker notes (presentation:notes) — visible only in the notes view.
+        std::string notes;
+        auto notes_node = xml_child(page, "notes");
+        if (notes_node) {
+            std::vector<pugi::xml_node> nps;
+            xml_find_all(notes_node, "p", nps);
+            for (auto& p : nps) {
+                std::string t = rstrip(paragraph_text(p));
+                if (!t.empty()) {
+                    if (!notes.empty()) notes += "\n";
+                    notes += t;
+                }
+            }
+        }
+
         std::string body_md;
         if (!title.empty()) body_md += "# " + title + "\n\n";
         body_md += md;
+        if (!notes.empty()) body_md += "\n> **Notes:** " + notes + "\n";
 
         PageChunk chunk;
         chunk.page_number = page_num;
