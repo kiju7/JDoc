@@ -44,6 +44,49 @@ static const void* pdf_memmem(const void* hay, size_t hay_len,
     return nullptr;
 }
 
+// Parse a PDF real number from s[0..n) — the PDF grammar is just
+// [+-]? digit* ('.' digit*)?  (no exponent, no locale, no inf/nan), so we skip
+// std::strtod entirely. strtod is locale-aware (a localeconv lookup per call on
+// both glibc and macOS) and handles forms PDF never uses; avoiding it removes a
+// hot cost in content-stream parsing. Digits are accumulated into an integer
+// mantissa (capped at 15 significant digits, which stays exact in a double) and
+// scaled by a single power of ten, so the result is correctly rounded — and
+// thus byte-identical to strtod — for the value ranges PDFs actually contain.
+static inline double parse_pdf_real(const char* s, size_t n) {
+    static const double kPow10[] = {
+        1e0,  1e1,  1e2,  1e3,  1e4,  1e5,  1e6,  1e7,  1e8,  1e9,  1e10, 1e11,
+        1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 1e18, 1e19, 1e20, 1e21, 1e22};
+    size_t i = 0;
+    bool neg = false;
+    if (i < n && (s[i] == '+' || s[i] == '-')) { neg = (s[i] == '-'); ++i; }
+    uint64_t mant = 0;
+    int exp10 = 0;   // power-of-ten to apply to mant
+    int sig = 0;     // significant digits accumulated (kept exact in double)
+    bool dot = false;
+    for (; i < n; ++i) {
+        char c = s[i];
+        if (c >= '0' && c <= '9') {
+            if (sig < 15) {
+                mant = mant * 10 + static_cast<uint64_t>(c - '0');
+                ++sig;
+                if (dot) --exp10;      // this digit is fractional
+            } else if (!dot) {
+                ++exp10;               // extra integer digit: scale up instead
+            }                          // extra fractional digits: negligible
+        } else if (c == '.' && !dot) {
+            dot = true;
+        } else {
+            break;                     // stop at first non-number byte
+        }
+    }
+    double val = static_cast<double>(mant);
+    if (exp10 > 0)
+        val *= (exp10 <= 22) ? kPow10[exp10] : std::pow(10.0, exp10);
+    else if (exp10 < 0)
+        val /= (-exp10 <= 22) ? kPow10[-exp10] : std::pow(10.0, -exp10);
+    return neg ? -val : val;
+}
+
 // ── PDF Object Model ─────────────────────────────────────
 
 enum class ObjType { NONE, BOOL, INT, REAL, STRING, NAME, ARRAY, DICT, STREAM, REF };
@@ -304,7 +347,7 @@ PdfObj PdfLexer::parse_object(int depth) {
 
     if (all_digit || has_sign) {
         if (has_dot) {
-            return PdfObj::make_real(std::strtod(tok.c_str(), nullptr));
+            return PdfObj::make_real(parse_pdf_real(tok.data(), tok.size()));
         }
         int64_t num = std::strtoll(tok.c_str(), nullptr, 10);
         // Look ahead for "gen R"
@@ -1935,8 +1978,8 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
                 for (; i < nlen; i++) val = val * 10 + (ndata[i] - '0');
                 operands.push_back(PdfObj::make_int(neg ? -val : val));
             } else {
-                operands.push_back(PdfObj::make_real(
-                    std::strtod(reinterpret_cast<const char*>(ndata), nullptr)));
+                operands.push_back(PdfObj::make_real(parse_pdf_real(
+                    reinterpret_cast<const char*>(ndata), nlen)));
             }
             continue;
         }
