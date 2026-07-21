@@ -676,6 +676,104 @@ void test_docx_header_footer() {
     TEST_END
 }
 
+// ── XLSX rels/comment fixes ──────────────────────────────────
+
+static std::string convert_xlsx(const std::string& xlsx) {
+    return jdoc::office_to_markdown_mem(
+        reinterpret_cast<const uint8_t*>(xlsx.data()), xlsx.size(), "book.xlsx");
+}
+
+// Minimal one-sheet workbook. rel_target is the workbook->sheet relationship
+// Target (varied to exercise absolute vs relative paths). sheet_body is the
+// <sheetData> content; extra adds further parts (comments, persons, sheet rels).
+static std::string make_xlsx(
+    const std::string& rel_target, const std::string& sheet_body,
+    const std::vector<std::pair<std::string, std::string>>& extra = {}) {
+    std::vector<std::pair<std::string, std::string>> entries = {
+        {"[Content_Types].xml",
+         "<?xml version=\"1.0\"?><Types xmlns=\"http://schemas.openxmlformats.org/"
+         "package/2006/content-types\"><Default Extension=\"xml\" "
+         "ContentType=\"application/xml\"/></Types>"},
+        {"xl/workbook.xml",
+         "<?xml version=\"1.0\"?><workbook xmlns=\"http://schemas.openxmlformats.org/"
+         "spreadsheetml/2006/main\" xmlns:r=\"http://schemas.openxmlformats.org/"
+         "officeDocument/2006/relationships\"><sheets>"
+         "<sheet name=\"Sheet1\" sheetId=\"1\" r:id=\"rId1\"/></sheets></workbook>"},
+        {"xl/_rels/workbook.xml.rels",
+         "<?xml version=\"1.0\"?><Relationships xmlns=\"http://schemas.openxmlformats.org/"
+         "package/2006/relationships\"><Relationship Id=\"rId1\" Type=\""
+         "http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\""
+         " Target=\"" + rel_target + "\"/></Relationships>"},
+        {"xl/worksheets/sheet1.xml",
+         "<?xml version=\"1.0\"?><worksheet xmlns=\"http://schemas.openxmlformats.org/"
+         "spreadsheetml/2006/main\"><sheetData>" + sheet_body +
+         "</sheetData></worksheet>"},
+    };
+    for (const auto& e : extra) entries.push_back(e);
+    return make_zip(entries);
+}
+
+void test_xlsx_fixes() {
+    std::cerr << "\nXLSX rels/comments:\n";
+
+    TEST(absolute_rels_target_inlinestr)
+        // openpyxl-style absolute Target ("/xl/...") + inlineStr cells used to
+        // yield an empty sheet; the path must normalize and the value appear.
+        auto md = convert_xlsx(make_xlsx(
+            "/xl/worksheets/sheet1.xml",
+            "<row r=\"1\"><c r=\"A1\" t=\"inlineStr\"><is><t>InlineHello</t></is></c></row>"));
+        ASSERT(md.find("InlineHello") != std::string::npos);
+        ASSERT(md.find("Empty sheet") == std::string::npos);
+    TEST_END
+
+    TEST(comment_on_empty_cell)
+        // A comment anchored to a cell with no <c> element must still be emitted.
+        std::string sheet =
+            "<row r=\"1\"><c r=\"A1\" t=\"inlineStr\"><is><t>Val</t></is></c></row>";
+        std::string sheet_rels =
+            "<?xml version=\"1.0\"?><Relationships xmlns=\"http://schemas.openxmlformats.org/"
+            "package/2006/relationships\"><Relationship Id=\"rIdC\" Type=\""
+            "http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments\""
+            " Target=\"../comments1.xml\"/></Relationships>";
+        std::string comments =
+            "<?xml version=\"1.0\"?><comments xmlns=\"http://schemas.openxmlformats.org/"
+            "spreadsheetml/2006/main\"><authors><author>Rev</author></authors>"
+            "<commentList><comment ref=\"E1\" authorId=\"0\"><text><t>EmptyCellMemo"
+            "</t></text></comment></commentList></comments>";
+        auto md = convert_xlsx(make_xlsx(
+            "worksheets/sheet1.xml", sheet,
+            {{"xl/worksheets/_rels/sheet1.xml.rels", sheet_rels},
+             {"xl/comments1.xml", comments}}));
+        ASSERT(md.find("EmptyCellMemo") != std::string::npos);
+    TEST_END
+
+    TEST(threaded_comment_with_author)
+        // Threaded comments resolve personId -> displayName and join a thread.
+        std::string sheet =
+            "<row r=\"1\"><c r=\"A1\" t=\"inlineStr\"><is><t>Val</t></is></c></row>";
+        std::string sheet_rels =
+            "<?xml version=\"1.0\"?><Relationships xmlns=\"http://schemas.openxmlformats.org/"
+            "package/2006/relationships\"><Relationship Id=\"rIdT\" Type=\""
+            "http://schemas.microsoft.com/office/2017/10/relationships/threadedComment\""
+            " Target=\"../threadedComments/threadedComment1.xml\"/></Relationships>";
+        std::string persons =
+            "<?xml version=\"1.0\"?><personList xmlns=\"http://schemas.microsoft.com/"
+            "office/spreadsheetml/2018/threadedcomments\">"
+            "<person displayName=\"Kim\" id=\"{P1}\"/></personList>";
+        std::string tc =
+            "<?xml version=\"1.0\"?><ThreadedComments xmlns=\"http://schemas.microsoft.com/"
+            "office/spreadsheetml/2018/threadedcomments\">"
+            "<threadedComment ref=\"B2\" personId=\"{P1}\" id=\"{T1}\"><text>needs review"
+            "</text></threadedComment></ThreadedComments>";
+        auto md = convert_xlsx(make_xlsx(
+            "worksheets/sheet1.xml", sheet,
+            {{"xl/worksheets/_rels/sheet1.xml.rels", sheet_rels},
+             {"xl/persons/person1.xml", persons},
+             {"xl/threadedComments/threadedComment1.xml", tc}}));
+        ASSERT(md.find("Kim: needs review") != std::string::npos);
+    TEST_END
+}
+
 // ── Main ────────────────────────────────────────────────────
 
 int main() {
@@ -689,6 +787,7 @@ int main() {
     test_pptx_master_layout();
     test_pptx_shared_media();
     test_docx_header_footer();
+    test_xlsx_fixes();
 
     std::cerr << "\n=== Results: " << tests_passed << " passed, "
               << tests_failed << " failed ===\n";

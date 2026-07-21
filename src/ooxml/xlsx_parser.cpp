@@ -19,12 +19,37 @@
 
 namespace jdoc {
 
+namespace {
+
+// Normalize a package relationship Target into a zip member path.
+//  - strips a leading '/' (absolute package path, e.g. openpyxl's "/xl/...")
+//  - folds "../" segments against base_dir
+//  - otherwise treats the target as relative to base_dir
+// base_dir examples: "xl" (workbook.xml), "xl/worksheets" (a sheet part).
+static std::string resolve_package_path(std::string target,
+                                        const std::string& base_dir) {
+    if (target.empty()) return target;
+    if (target[0] == '/') return target.substr(1);   // "/xl/foo" -> "xl/foo"
+
+    std::string base = base_dir;
+    while (target.rfind("../", 0) == 0) {
+        target.erase(0, 3);
+        auto slash = base.rfind('/');
+        base = (slash == std::string::npos) ? "" : base.substr(0, slash);
+    }
+    if (target.rfind("xl/", 0) == 0) return target;  // already package-root relative
+    return base.empty() ? target : base + "/" + target;
+}
+
+} // namespace
+
 // ── Constructor ─────────────────────────────────────────
 
 XlsxParser::XlsxParser(ZipReader& zip) : zip_(zip) {
     parse_shared_strings();
     parse_workbook();
     parse_workbook_rels();
+    parse_persons();
     parse_styles();
 }
 
@@ -127,15 +152,9 @@ void XlsxParser::parse_workbook_rels() {
     for (auto& sheet : sheets_) {
         auto it = id_to_target.find(sheet.r_id);
         if (it != id_to_target.end()) {
-            std::string target = it->second;
-            // Targets are relative to xl/ directory
-            if (target.find("xl/") != 0 && target.find('/') == std::string::npos) {
-                target = "xl/" + target;
-            } else if (target.find("xl/") != 0 &&
-                       target.find("worksheets/") == 0) {
-                target = "xl/" + target;
-            }
-            sheet.file_path = target;
+            // Targets are relative to the xl/ directory; also handles absolute
+            // package paths ("/xl/...") emitted by some writers (e.g. openpyxl).
+            sheet.file_path = resolve_package_path(it->second, "xl");
         }
     }
 }
@@ -496,8 +515,9 @@ std::map<std::string, std::string> XlsxParser::parse_comments(
     pugi::xml_document rels_doc;
     if (!rels_doc.load_buffer(rels_data.data(), rels_data.size())) return comments;
 
-    // Find comments target
-    std::string comments_path;
+    // Locate the legacy (xl/comments*.xml) and modern threaded-comment parts.
+    // Both Target forms — relative and absolute ("/xl/...") — are normalized.
+    std::string legacy_path, threaded_path;
     std::vector<pugi::xml_node> rel_nodes;
     xml_find_all(rels_doc, "Relationship", rel_nodes);
     for (auto& rel : rel_nodes) {
@@ -505,22 +525,29 @@ std::map<std::string, std::string> XlsxParser::parse_comments(
         const char* target = xml_attr(rel, "Target");
         if (!target[0]) continue;
         std::string type_str = type;
-        if (type_str.find("/comments") != std::string::npos) {
-            comments_path = target;
-            if (comments_path.find("../") == 0)
-                comments_path = "xl/" + comments_path.substr(3);
-            else if (comments_path.find("xl/") != 0)
-                comments_path = dir + "/" + comments_path;
-            break;
+        if (type_str.find("threadedComment") != std::string::npos) {
+            threaded_path = resolve_package_path(target, dir);
+        } else if (type_str.find("/comments") != std::string::npos) {
+            legacy_path = resolve_package_path(target, dir);
         }
     }
 
-    if (comments_path.empty() || !zip_.has_entry(comments_path))
-        return comments;
+    // Legacy comments first; threaded comments (author + reply chain) override
+    // the same cell when both are present (legacy is kept only for compat).
+    if (!legacy_path.empty() && zip_.has_entry(legacy_path))
+        parse_legacy_comments(legacy_path, comments);
+    if (!threaded_path.empty() && zip_.has_entry(threaded_path))
+        parse_threaded_comments(threaded_path, comments);
 
-    auto data = zip_.read_entry(comments_path);
+    return comments;
+}
+
+void XlsxParser::parse_legacy_comments(
+    const std::string& path, std::map<std::string, std::string>& out) {
+
+    auto data = zip_.read_entry(path);
     pugi::xml_document doc;
-    if (!doc.load_buffer(data.data(), data.size(), pugi::parse_default | pugi::parse_ws_pcdata)) return comments;
+    if (!doc.load_buffer(data.data(), data.size(), pugi::parse_default | pugi::parse_ws_pcdata)) return;
 
     // Parse <commentList><comment ref="A1"><text><t>...</t></text></comment>
     std::vector<pugi::xml_node> comment_nodes;
@@ -542,11 +569,62 @@ std::map<std::string, std::string> XlsxParser::parse_comments(
         }
 
         if (!text.empty()) {
-            comments[ref] = text;
+            out[ref] = text;
         }
     }
+}
 
-    return comments;
+void XlsxParser::parse_threaded_comments(
+    const std::string& path, std::map<std::string, std::string>& out) {
+
+    auto data = zip_.read_entry(path);
+    pugi::xml_document doc;
+    if (!doc.load_buffer(data.data(), data.size(), pugi::parse_default | pugi::parse_ws_pcdata)) return;
+
+    // <threadedComment ref="A1" personId="{..}"><text>..</text></threadedComment>
+    // Replies to a cell share its ref; join them in document order.
+    std::map<std::string, std::string> threads;  // ref -> joined thread
+    std::vector<pugi::xml_node> tc_nodes;
+    xml_find_all(doc, "threadedComment", tc_nodes);
+    for (auto& node : tc_nodes) {
+        const char* ref = xml_attr(node, "ref");
+        if (!ref[0]) continue;
+
+        std::string text;
+        auto text_node = xml_child(node, "text");
+        if (text_node) text = xml_text_content(text_node);
+        if (text.empty()) continue;
+
+        const char* pid = xml_attr(node, "personId");
+        std::string author;
+        if (pid[0]) {
+            auto it = persons_.find(pid);
+            if (it != persons_.end()) author = it->second;
+        }
+        std::string entry = author.empty() ? text : author + ": " + text;
+
+        auto it = threads.find(ref);
+        if (it == threads.end()) threads[ref] = entry;
+        else it->second += " / " + entry;
+    }
+
+    for (auto& [ref, txt] : threads) out[ref] = txt;
+}
+
+// Threaded-comment authors live in xl/persons/person*.xml, referenced by GUID.
+void XlsxParser::parse_persons() {
+    for (const auto* e : zip_.entries_with_prefix("xl/persons/")) {
+        auto data = zip_.read_entry(e->name);
+        pugi::xml_document doc;
+        if (!doc.load_buffer(data.data(), data.size())) continue;
+        std::vector<pugi::xml_node> person_nodes;
+        xml_find_all(doc, "person", person_nodes);
+        for (auto& p : person_nodes) {
+            const char* id = xml_attr(p, "id");
+            const char* name = xml_attr(p, "displayName");
+            if (id[0] && name[0]) persons_[id] = name;
+        }
+    }
 }
 
 // ── Sheet parsing ───────────────────────────────────────
@@ -675,6 +753,23 @@ XlsxParser::SheetData XlsxParser::parse_sheet(const SheetInfo& info) {
         }
     }
 
+    // A comment can be anchored to an empty cell, which has no <c> element and
+    // is therefore never visited by the loop above. Inject any such unconsumed
+    // comment at its own coordinate so the memo is not silently dropped.
+    for (const auto& [ref, text] : comments) {
+        auto [c, r] = parse_cell_ref(ref);
+        auto& row_map = sheet.cells[r];
+        if (row_map.count(c)) continue;  // populated cell already merged its comment
+        std::string v = "[" + text + "]";
+        for (auto& ch : v) {
+            if (ch == '|') ch = '/';
+            if (ch == '\n') ch = ' ';
+        }
+        row_map[c] = {v, false};
+        sheet.max_row = std::max(sheet.max_row, r);
+        sheet.max_col = std::max(sheet.max_col, c);
+    }
+
     return sheet;
 }
 
@@ -775,13 +870,8 @@ std::vector<ImageData> XlsxParser::extract_images(
             std::string type_str = type;
             if (type_str.find("/drawing") == std::string::npos) continue;
 
-            // Resolve drawing path
-            std::string drawing_path = target;
-            if (drawing_path.find("../") == 0) {
-                drawing_path = "xl/" + drawing_path.substr(3);
-            } else if (drawing_path.find("xl/") != 0) {
-                drawing_path = dir + "/" + drawing_path;
-            }
+            // Resolve drawing path (relative, "../", or absolute "/xl/...").
+            std::string drawing_path = resolve_package_path(target, dir);
 
             if (!zip_.has_entry(drawing_path)) continue;
 
@@ -804,10 +894,7 @@ std::vector<ImageData> XlsxParser::extract_images(
                 const char* id = xml_attr(dr, "Id");
                 const char* tgt = xml_attr(dr, "Target");
                 if (id[0] && tgt[0]) {
-                    std::string full = tgt;
-                    if (full.find("../") == 0) full = "xl/" + full.substr(3);
-                    else if (full.find("xl/") != 0) full = draw_dir + "/" + full;
-                    draw_rel_map[id] = full;
+                    draw_rel_map[id] = resolve_package_path(tgt, draw_dir);
                 }
             }
 
