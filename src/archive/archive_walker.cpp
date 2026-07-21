@@ -118,29 +118,6 @@ struct CapSink {
     }
 };
 
-// Borrows a member buffer from the walk's pool for one member and hands it
-// back on scope exit. Declaring one per member is the point: the buffer
-// returns to the pool with its capacity intact, so the next member writes into
-// pages that are already faulted in.
-//
-// On the parallel path handle_member moves the buffer out to a worker, which
-// leaves an empty one here; BufferPool::release drops those, so that path
-// keeps allocating per member exactly as before.
-class PooledBuffer {
-public:
-    explicit PooledBuffer(BufferPool& pool) : pool_(pool), buf_(pool.acquire()) {}
-    ~PooledBuffer() { pool_.release(std::move(buf_)); }
-
-    PooledBuffer(const PooledBuffer&) = delete;
-    PooledBuffer& operator=(const PooledBuffer&) = delete;
-
-    std::vector<char>& get() { return buf_; }
-
-private:
-    BufferPool& pool_;
-    std::vector<char> buf_;
-};
-
 // Compression-ratio bound for a member whose compressed size is known
 // (0 = not applicable). Small members are allowed to expand freely up to
 // 16 MiB so tiny highly-compressible files don't trip the ratio check.
@@ -398,8 +375,7 @@ bool walk_zip(const ZipReader& zip, const std::string& prefix, int depth,
             continue;
         }
 
-        PooledBuffer pooled(budget.buffers);
-        std::vector<char>& data = pooled.get();
+        std::vector<char> data;
         data.reserve(std::min<uint64_t>(e.uncompressed_size,
                                         opts.archive.max_member_bytes));
         CapSink sink{data, opts.archive.max_member_bytes,
@@ -558,8 +534,7 @@ bool walk_tar(InputStream& src, const std::string& prefix, int depth,
 
         // tar stores members uncompressed; the size field is bounded by the
         // container itself, but caps still apply (and guard the total budget).
-        PooledBuffer pooled(budget.buffers);
-        std::vector<char>& data = pooled.get();
+        std::vector<char> data;
         data.reserve(std::min<uint64_t>(m.size, opts.archive.max_member_bytes));
         CapSink sink{data, opts.archive.max_member_bytes, 0,
                      opts.archive.max_total_bytes, budget};
@@ -617,8 +592,7 @@ bool walk_alz(InputStream& src, const std::string& name_hint,
             continue;
         }
 
-        PooledBuffer pooled(budget.buffers);
-        std::vector<char>& data = pooled.get();
+        std::vector<char> data;
         data.reserve(std::min<uint64_t>(m.uncompressed_size,
                                         opts.archive.max_member_bytes));
         CapSink sink{data, opts.archive.max_member_bytes,
@@ -676,8 +650,7 @@ bool walk_rar(InputStream& src, const std::string& name_hint,
             continue;
         }
 
-        PooledBuffer pooled(budget.buffers);
-        std::vector<char>& data = pooled.get();
+        std::vector<char> data;
         data.reserve(std::min<uint64_t>(m.uncompressed_size,
                                         opts.archive.max_member_bytes));
         CapSink sink{data, opts.archive.max_member_bytes,
@@ -900,8 +873,7 @@ bool walk_egg(InputStream& src, const std::string& name_hint,
         // No per-member compressed size up front (data is block-framed), so
         // the ratio cap is skipped; the member and total caps still bound
         // memory and cumulative output.
-        PooledBuffer pooled(budget.buffers);
-        std::vector<char>& data = pooled.get();
+        std::vector<char> data;
         data.reserve(std::min<uint64_t>(m.uncompressed_size,
                                         opts.archive.max_member_bytes));
         CapSink sink{data, opts.archive.max_member_bytes, 0,
@@ -982,8 +954,7 @@ bool walk_gz(InputStream& raw, const std::string& name_hint,
     std::string member_path = prefix + normalize_member_name(inner_name);
     if (!count_entry(member_path, budget, opts, cb)) return false;
 
-    PooledBuffer pooled(budget.buffers);
-    std::vector<char>& data = pooled.get();
+    std::vector<char> data;
     CapSink sink{data, opts.archive.max_member_bytes, 0,
                  opts.archive.max_total_bytes, budget};
     char buf[65536];
@@ -1054,8 +1025,7 @@ bool walk_bz2(InputStream& raw, const std::string& name_hint,
     std::string member_path = prefix + normalize_member_name(inner_name);
     if (!count_entry(member_path, budget, opts, cb)) return false;
 
-    PooledBuffer pooled(budget.buffers);
-    std::vector<char>& data = pooled.get();
+    std::vector<char> data;
     CapSink sink{data, opts.archive.max_member_bytes, 0,
                  opts.archive.max_total_bytes, budget};
     char buf[65536];

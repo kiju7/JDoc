@@ -7,7 +7,6 @@
 #include "jdoc/archive.h"
 #include <cstdint>
 #include <string>
-#include <vector>
 
 namespace jdoc {
 
@@ -43,43 +42,6 @@ std::string convert_from_memory_as(FileFormat fmt,
 
 class MemberPipeline;
 
-// Recycles member buffers across a walk.
-//
-// Materializing each member into a fresh vector means faulting in its pages
-// every time, and that — not the file read — is what bounds a walk over stored
-// members (docs/decode-profile.md section 4). Handing buffers back here keeps
-// the pages resident for the next member.
-//
-// Buffers are borrowed rather than kept in a free list keyed by size: a nested
-// archive borrows its own while the outer walk still holds one, so the pool
-// naturally grows to the recursion depth and no deeper.
-class BufferPool {
-public:
-    std::vector<char> acquire() {
-        if (free_.empty()) return {};
-        std::vector<char> buf = std::move(free_.back());
-        free_.pop_back();
-        buf.clear();  // keeps capacity
-        return buf;
-    }
-
-    void release(std::vector<char>&& buf) {
-        // Nothing to recycle: the parallel pipeline moves the buffer out to a
-        // worker, which leaves this one empty.
-        if (buf.capacity() == 0) return;
-        // Don't let one outsized member pin its capacity for the rest of the
-        // walk, and don't hoard buffers past what the recursion needs.
-        if (buf.capacity() > kMaxRetainedBytes || free_.size() >= kMaxBuffers)
-            return;
-        free_.push_back(std::move(buf));
-    }
-
-private:
-    static constexpr size_t kMaxRetainedBytes = 64u << 20;  // 64 MiB
-    static constexpr size_t kMaxBuffers = 8;
-    std::vector<std::vector<char>> free_;
-};
-
 // Cumulative accounting shared across the whole convert_archive call,
 // including nested archives.
 struct WalkBudget {
@@ -88,7 +50,6 @@ struct WalkBudget {
     // Non-null when ArchiveLimits::threads > 1: leaf-document conversion is
     // handed to this pipeline instead of running inline (archive.h docs).
     MemberPipeline* pipeline = nullptr;
-    BufferPool buffers;
 };
 
 // Walk an archive and emit one MemberResult per member via cb.
