@@ -138,8 +138,13 @@ add_library(jdoc_lib STATIC
     src/archive/egg_reader.cpp
     src/archive/archive_walker.cpp
     # pdf
-    src/pdf.cpp
-    src/pdf_crypt.cpp
+    src/pdf/pdf_core.cpp
+    src/pdf/pdf_content.cpp
+    src/pdf/pdf_tables.cpp
+    src/pdf/pdf_visual.cpp
+    src/pdf/pdf_markdown.cpp
+    src/pdf/pdf.cpp
+    src/pdf/pdf_crypt.cpp
     # hwpx
     src/hwpx.cpp
     # hwp

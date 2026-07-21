@@ -1,6 +1,6 @@
 // test_pdf_crypt.cpp — Standard test vectors for the PDF crypto primitives
 // MD5 (RFC 1321), SHA-2 (FIPS 180-4), AES (FIPS 197), RC4.
-#include "pdf_crypt.h"
+#include "pdf/pdf_crypt.h"
 
 #include <cstdio>
 #include <cstring>
