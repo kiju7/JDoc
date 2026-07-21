@@ -1,0 +1,39 @@
+name: build
+
+# Verifies the project configures, builds and passes tests on Linux, macOS and
+# Windows. On the Windows runner there is no system zlib/libjpeg, so this also
+# exercises the FetchContent (zlib) + ExternalProject (libjpeg-turbo) fallback
+# and compiles the Windows-only I/O code paths under MSVC.
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --config Release -j 4 --target jdoc test_office test_pdf test_archive
+
+      - name: Run tests
+        shell: bash
+        run: |
+          for t in test_office test_pdf test_archive; do
+            if   [ -x "build/Release/$t.exe" ]; then "build/Release/$t.exe"
+            elif [ -x "build/$t" ];             then "build/$t"
+            else echo "::error::$t binary not found" && exit 1
+            fi
+          done

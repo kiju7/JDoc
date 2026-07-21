@@ -16,8 +16,69 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
                  Debug Release RelWithDebInfo MinSizeRel)
 endif()
 
-find_package(ZLIB REQUIRED)
-find_package(JPEG REQUIRED)
+# ── Dependencies (zlib, libjpeg) ────────────────────────────
+# Prefer a system copy; on machines without one (typically a clean Windows box)
+# fall back to fetching and building it, so `cmake -B build` works out of the
+# box on Linux, macOS and Windows without a package manager.
+include(FetchContent)
+
+find_package(ZLIB QUIET)
+if(NOT ZLIB_FOUND)
+    message(STATUS "System zlib not found — fetching and building it (FetchContent)")
+    FetchContent_Declare(zlib
+        GIT_REPOSITORY https://github.com/madler/zlib.git
+        GIT_TAG v1.3.1
+        GIT_SHALLOW TRUE)
+    set(ZLIB_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+    FetchContent_MakeAvailable(zlib)
+    # zlib's CMake builds `zlibstatic` but does not provide the imported target
+    # or export its (partly generated) headers; wire both up ourselves.
+    if(NOT TARGET ZLIB::ZLIB)
+        add_library(ZLIB::ZLIB ALIAS zlibstatic)
+    endif()
+    target_include_directories(zlibstatic INTERFACE
+        $<BUILD_INTERFACE:${zlib_SOURCE_DIR}>
+        $<BUILD_INTERFACE:${zlib_BINARY_DIR}>)
+endif()
+
+find_package(JPEG QUIET)
+if(NOT JPEG_FOUND)
+    message(STATUS "System libjpeg not found — building libjpeg-turbo (ExternalProject)")
+    # libjpeg-turbo refuses add_subdirectory()/FetchContent, so build+install it
+    # as a standalone project and consume the result as an imported static lib.
+    include(ExternalProject)
+    set(_jpeg_prefix ${CMAKE_BINARY_DIR}/_deps/libjpeg-turbo)
+    # libjpeg-turbo installs its static lib as "libjpeg.a" everywhere except
+    # MSVC, where it keeps the target name and installs "jpeg-static.lib".
+    if(MSVC)
+        set(_jpeg_libname jpeg-static)
+    else()
+        set(_jpeg_libname jpeg)
+    endif()
+    set(_jpeg_lib ${_jpeg_prefix}/lib/${CMAKE_STATIC_LIBRARY_PREFIX}${_jpeg_libname}${CMAKE_STATIC_LIBRARY_SUFFIX})
+    ExternalProject_Add(libjpeg_turbo_ext
+        GIT_REPOSITORY https://github.com/libjpeg-turbo/libjpeg-turbo.git
+        GIT_TAG 3.0.4
+        GIT_SHALLOW TRUE
+        PREFIX ${_jpeg_prefix}
+        CMAKE_ARGS
+            -DCMAKE_INSTALL_PREFIX=${_jpeg_prefix}
+            -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}
+            -DCMAKE_POSITION_INDEPENDENT_CODE=ON
+            -DENABLE_SHARED=OFF
+            -DENABLE_STATIC=ON
+            -DWITH_TURBOJPEG=OFF
+            -DWITH_SIMD=OFF            # avoid a NASM build dependency
+        BUILD_BYPRODUCTS ${_jpeg_lib})
+    # The include dir must exist at configure time for the imported target check.
+    file(MAKE_DIRECTORY ${_jpeg_prefix}/include)
+    add_library(JPEG::JPEG STATIC IMPORTED GLOBAL)
+    set_target_properties(JPEG::JPEG PROPERTIES
+        IMPORTED_LOCATION ${_jpeg_lib}
+        INTERFACE_INCLUDE_DIRECTORIES ${_jpeg_prefix}/include)
+    add_dependencies(JPEG::JPEG libjpeg_turbo_ext)
+endif()
+
 find_package(Threads REQUIRED)
 
 # ── Vendor libraries ────────────────────────────────────────

@@ -77,9 +77,10 @@ inline void ensure_dir(const std::string& dir) {
 }
 
 // Create a directory and any missing parents (mkdir -p).
+// Splits on both separators so Windows-style "\" paths work too.
 inline void ensure_dirs(const std::string& dir) {
     for (size_t pos = 0; pos != std::string::npos; ) {
-        pos = dir.find('/', pos + 1);
+        pos = dir.find_first_of("/\\", pos + 1);
         std::string parent = dir.substr(0, pos);
         if (!parent.empty()) jdoc_mkdir(parent.c_str());
     }
