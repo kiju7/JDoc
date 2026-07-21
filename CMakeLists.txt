@@ -69,6 +69,7 @@ if(NOT JPEG_FOUND)
             -DENABLE_STATIC=ON
             -DWITH_TURBOJPEG=OFF
             -DWITH_SIMD=OFF            # avoid a NASM build dependency
+            -DWITH_CRT_DLL=ON         # use /MD to match this project (no LIBCMT clash)
         BUILD_BYPRODUCTS ${_jpeg_lib})
     # The include dir must exist at configure time for the imported target check.
     file(MAKE_DIRECTORY ${_jpeg_prefix}/include)
@@ -158,6 +159,11 @@ add_library(jdoc_lib STATIC
     $<TARGET_OBJECTS:lzma_sdk>
 )
 set_target_properties(jdoc_lib PROPERTIES OUTPUT_NAME jdoc)
+# On Windows the shared library's import lib is also jdoc.lib, which would
+# collide with the static jdoc.lib (LNK1149); give the static one its own name.
+if(WIN32)
+    set_target_properties(jdoc_lib PROPERTIES OUTPUT_NAME jdoc_static)
+endif()
 target_include_directories(jdoc_lib
     PUBLIC include
     PRIVATE src vendor vendor/pugixml vendor/lzma)
