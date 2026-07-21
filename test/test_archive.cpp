@@ -1371,6 +1371,45 @@ static void test_views_and_threads() {
         ASSERT(b && b->ok() && b->markdown == "tar view B");
     TEST_END
 
+    TEST(file_backed_tar_zero_copy)
+        // A tar ON DISK: members are uncompressed and contiguous, so the
+        // file-backed stream hands each one to the parser as a view instead
+        // of copying it through CapSink. Output must be identical to the
+        // materialized path either way.
+        std::string big(3 << 20, 'x');  // spans the 512-block padding boundary
+        auto path = write_tmp("disk.tar",
+                              make_tar({{"a.rtf", "{\\rtf1\\ansi Disk Tar A}"},
+                                        {"big.txt", big},
+                                        {"b.txt", "disk tar B"}}));
+        auto rs = jdoc::convert_archive(path);
+        auto* a = find_member(rs, "a.rtf");
+        auto* big_m = find_member(rs, "big.txt");
+        auto* b = find_member(rs, "b.txt");
+        ASSERT(a && a->ok() && a->markdown.find("Disk Tar A") != std::string::npos);
+        ASSERT(big_m && big_m->ok() && big_m->markdown.size() == big.size());
+        ASSERT(b && b->ok() && b->markdown == "disk tar B");
+    TEST_END
+
+    TEST(file_backed_tar_member_cap)
+        // The view path enforces max_member_bytes through precheck_view_member,
+        // not CapSink: an over-cap member is named and skipped while the walk
+        // continues — same observable behaviour as the file-backed zip store.
+        std::string big(2 << 20, 'x');  // 2 MiB
+        auto path = write_tmp("tarcap.tar",
+                              make_tar({{"big.txt", big}, {"after.txt", "tail"}}));
+
+        jdoc::ConvertOptions opts;
+        opts.archive.max_member_bytes = 1 << 20;
+        auto rs = jdoc::convert_archive(path, opts);
+        ASSERT(rs.size() == 2);
+        ASSERT(!rs[0].ok() && rs[0].error_code == jdoc::MemberErrorCode::MEMBER_LIMIT);
+        ASSERT(rs[1].ok() && rs[1].markdown == "tail");
+
+        opts.archive.max_member_bytes = static_cast<uint64_t>(-1);
+        rs = jdoc::convert_archive(path, opts);
+        ASSERT(rs.size() == 2 && rs[0].ok() && rs[0].markdown.size() == big.size());
+    TEST_END
+
     // Note: a view member can never trip max_member_bytes on its own — its
     // parent container materializes under the same cap first and a leaf is
     // always smaller than its container (the precheck's member branch is
