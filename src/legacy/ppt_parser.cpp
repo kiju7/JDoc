@@ -13,6 +13,7 @@
 #include <cstring>
 #include <fstream>
 #include <sstream>
+#include <string_view>
 #include <zlib.h>
 
 namespace jdoc {
@@ -514,71 +515,82 @@ void PptParser::parse_document() {
 
 // ── Slide to markdown ───────────────────────────────────────
 
-std::string PptParser::slide_to_markdown(const Slide& slide) {
-    std::ostringstream out;
+// Iterate '\n'-separated lines of `text` as views (trailing '\r'/' ' trimmed),
+// matching the previous getline-based loop without per-line allocation.
+template <typename Fn>
+static void for_each_line(std::string_view text, Fn&& fn) {
+    size_t start = 0;
+    while (start <= text.size()) {
+        size_t nl = text.find('\n', start);
+        std::string_view ln = (nl == std::string_view::npos)
+                                  ? text.substr(start)
+                                  : text.substr(start, nl - start);
+        while (!ln.empty() && (ln.back() == '\r' || ln.back() == ' '))
+            ln.remove_suffix(1);
+        if (nl == std::string_view::npos) {
+            if (start < text.size()) fn(ln);
+            break;
+        }
+        fn(ln);
+        start = nl + 1;
+    }
+}
 
-    if (slide.number > 1) out << "\n";
-    out << "--- Page " << slide.number << " ---\n\n";
+std::string PptParser::slide_to_markdown(const Slide& slide) {
+    std::string out;
+
+    if (slide.number > 1) out += "\n";
+    out += "--- Page " + std::to_string(slide.number) + " ---\n\n";
 
     if (!slide.title.empty()) {
-        out << "# " << slide.title << "\n\n";
+        out += "# " + slide.title + "\n\n";
     }
 
     if (!slide.body.empty()) {
-        std::istringstream iss(slide.body);
-        std::string line;
-        while (std::getline(iss, line)) {
-            while (!line.empty() && (line.back() == '\r' || line.back() == ' '))
-                line.pop_back();
-
+        for_each_line(slide.body, [&](std::string_view line) {
             if (line.empty()) {
-                out << "\n";
-            } else {
-                bool is_bullet = false;
-                char first = line[0];
-                if ((first == '-' || first == '*') && line.size() > 1 &&
-                    (line[1] == ' ' || line[1] == '\t')) {
-                    is_bullet = true;
-                }
-                // UTF-8 bullet: E2 80 A2
-                if (line.size() >= 3 &&
-                    static_cast<uint8_t>(line[0]) == 0xE2 &&
-                    static_cast<uint8_t>(line[1]) == 0x80 &&
-                    static_cast<uint8_t>(line[2]) == 0xA2) {
-                    is_bullet = true;
-                    line = line.substr(3);
-                    while (!line.empty() && line[0] == ' ') line = line.substr(1);
-                }
-                if (is_bullet) {
-                    out << "- " << line << "\n";
-                } else {
-                    out << line << "\n";
-                }
+                out += "\n";
+                return;
             }
-        }
+            bool is_bullet = false;
+            char first = line[0];
+            if ((first == '-' || first == '*') && line.size() > 1 &&
+                (line[1] == ' ' || line[1] == '\t')) {
+                is_bullet = true;
+            }
+            // UTF-8 bullet: E2 80 A2
+            if (line.size() >= 3 &&
+                static_cast<uint8_t>(line[0]) == 0xE2 &&
+                static_cast<uint8_t>(line[1]) == 0x80 &&
+                static_cast<uint8_t>(line[2]) == 0xA2) {
+                is_bullet = true;
+                line.remove_prefix(3);
+                while (!line.empty() && line[0] == ' ') line.remove_prefix(1);
+            }
+            if (is_bullet) out += "- ";
+            out += line;
+            out += '\n';
+        });
     }
 
     // Append notes (blockquote style, matching PPTX)
     if (!slide.notes.empty()) {
-        std::istringstream niss(slide.notes);
-        std::string nline;
         bool first = true;
-        while (std::getline(niss, nline)) {
-            while (!nline.empty() && (nline.back() == '\r' || nline.back() == ' '))
-                nline.pop_back();
-            if (!nline.empty()) {
-                if (first) {
-                    out << "\n> **Notes:** " << nline << "\n";
-                    first = false;
-                } else {
-                    out << "> " << nline << "\n";
-                }
+        for_each_line(slide.notes, [&](std::string_view nline) {
+            if (nline.empty()) return;
+            if (first) {
+                out += "\n> **Notes:** ";
+                first = false;
+            } else {
+                out += "> ";
             }
-        }
+            out += nline;
+            out += '\n';
+        });
     }
 
-    out << "\n";
-    return out.str();
+    out += "\n";
+    return out;
 }
 
 // ── Image extraction from Pictures stream ───────────────────
