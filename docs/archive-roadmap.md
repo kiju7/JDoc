@@ -28,11 +28,10 @@
    - 뷰의 수명 문제로 **단일 스레드(기본) 경로에서만 무복사**; 병렬 모드(3번)에서는
      워커에 넘길 때 사본 생성(병렬은 처리량 최적화, 제로카피는 기본 경로 최적화).
    - 후속 여지: alz/egg/rar store 멤버 뷰.
-   - ✅ **최상위 파일 mmap 완료(2026-07-21)**: 보류 사유였던 maxRSS 왜곡은 매핑을
-     `view_at` 전용으로 한정해 해소했다(`read_at`은 항상 pread). 압축 아카이브는
-     시간·RSS 모두 불변, store 아카이브는 **−82% / 피크 RSS −82%**.
-     `JDOC_USE_MMAP`은 Linux만 기본 ON — macOS는 매핑 읽기가 fread보다 8배 느리다
-     (`docs/decode-profile.md` 3번·부록 E).
+   - ❌ **최상위 파일 mmap 시도 후 폐기(2026-07-21)**: 이미지 추출 OFF 벤치에서는
+     store −82%가 나왔으나, 그건 파서가 이미지 스트림을 안 읽어서 생긴 이득이었다.
+     이미지 추출이 기본인 실사용에서는 시간 이득 0에 피크 RSS +37%라 되돌렸다.
+     (`docs/decode-profile.md` 부록 F). `fseek(long)`→`pread` 오프셋 수정만 남겼다.
    - **구현**: `DataSource::view_at`/`InputStream::view`/`ZipReader::stored_view`/
      `TarReader::view_data`/`SevenZipReader::read_entry_view` + walker 뷰 경로
      (`precheck_view_member`로 캡 회계 동일 유지). 7z는 캐시 해제를 멤버 처리
@@ -71,9 +70,10 @@
      테스트 76/76 그린(순서 보존·조기 중단·캡 강제 포함).
    - **정정(2026-07-21)**: 위 표의 "t≥4는 디코드 직렬 플로어"는 오진단이었다. 이
      워크로드는 store라 inflate가 아예 없다. 정본 머신(32코어) 재측정에서는 t=1부터
-     평탄했고(0.486→0.444s), 실제 플로어는 **멤버마다 새 버퍼를 할당하며 발생하는
-     익명 페이지 폴트**였다. 버퍼 재사용으로 store 워크로드 −16%, 피크 RSS −9~17%
-     확보(`docs/decode-profile.md`).
+     평탄했고(0.486→0.444s), 이미지 추출 OFF 기준 실제 플로어는 멤버 버퍼의 익명
+     페이지 폴트였다. 다만 이 플로어와 그 해법(버퍼 재사용)은 **이미지 추출을 끈
+     경우에만** 유의미했고, 이미지가 기본인 실사용에서는 이득이 사라져 폐기했다
+     (`docs/decode-profile.md` 부록 F).
 4. ✅ 검증 완료(2026-07-20): reference 대비 재벤치를 **PII 검출 파이프라인 벤치**로 확장
    수행 — 결과·방법론은 `docs/pii-bench-report.md`(정본: Rocky 8.10 x86_64 네이티브
    dev-gpu-4, 교차: 맥 에뮬레이션 동일 매트릭스). 하네스·Dockerfile은 `test/bench/pii/`.
