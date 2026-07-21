@@ -23,6 +23,7 @@
 #include <numeric>
 #include <stdexcept>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include <zlib.h>
 
@@ -6679,8 +6680,15 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
     // Collect all page objects
     std::vector<PdfObj> page_objs;
     std::vector<int> page_obj_nums;
-    std::function<void(const PdfObj&)> collect_pages;
-    collect_pages = [&](const PdfObj& node) {
+    // The page tree is attacker-controlled and its /Kids can form a cycle or
+    // nest arbitrarily deep, so cap the recursion and skip page nodes already
+    // seen by object number. The recovery scan below still finds every page if
+    // this bails out early on a malformed tree.
+    std::unordered_set<int> seen_pages;
+    std::function<void(const PdfObj&, int)> collect_pages;
+    collect_pages = [&](const PdfObj& node, int depth) {
+        if (depth > 256) return;
+        if (node.is_ref() && !seen_pages.insert(node.ref_num).second) return;
         auto n = doc.resolve(node);
         if (!n.is_dict()) return;
         auto& type = n.get("Type");
@@ -6692,10 +6700,10 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
         }
         auto& kids = n.get("Kids");
         if (kids.is_arr()) {
-            for (auto& kid : kids.arr) collect_pages(kid);
+            for (auto& kid : kids.arr) collect_pages(kid, depth + 1);
         }
     };
-    if (pages.is_dict()) collect_pages(pages);
+    if (pages.is_dict()) collect_pages(pages, 0);
 
     // Recovery: page tree missing or broken (truncated PDFs) — scan every
     // known object for /Type /Page and use them in object-number order.
