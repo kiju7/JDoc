@@ -5,6 +5,12 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
+# MSVC assumes the system code page for sources and literals; force UTF-8 so
+# the non-ASCII (Korean) string literals in sources and tests survive.
+if(MSVC)
+    add_compile_options(/utf-8)
+endif()
+
 # A bare `cmake -S . -B build` leaves CMAKE_BUILD_TYPE empty on single-config
 # generators, which means no optimization flags at all — a -O0 build that looks
 # normal. Release is the only sensible default for a conversion library.
