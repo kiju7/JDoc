@@ -18,9 +18,7 @@ endif()
 
 find_package(ZLIB REQUIRED)
 find_package(JPEG REQUIRED)
-find_package(Threads REQUIRED)  # opt-in archive conversion pipeline only
-                                # (ArchiveLimits::threads; default stays
-                                # fully single-threaded)
+find_package(Threads REQUIRED)
 
 # ── Vendor libraries ────────────────────────────────────────
 
@@ -127,8 +125,7 @@ target_link_libraries(jdoc_office PUBLIC pugixml jdoc_zip jdoc_common)
 
 # ── Unified API (auto-detect format) ─────────────────────────
 
-add_library(jdoc_all STATIC src/jdoc.cpp src/archive/archive_walker.cpp
-                            src/archive/member_pipeline.cpp)
+add_library(jdoc_all STATIC src/jdoc.cpp src/archive/archive_walker.cpp)
 target_include_directories(jdoc_all PUBLIC include PRIVATE src)
 target_link_libraries(jdoc_all PUBLIC jdoc_pdf jdoc_office jdoc_hwpx jdoc_hwp
                                       jdoc_zip jdoc_archive Threads::Threads)

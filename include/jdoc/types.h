@@ -55,14 +55,6 @@ struct ArchiveLimits {
     uint32_t max_entries = 200000;              // members visited incl. nested archives
     uint32_t max_ratio = 1000;                  // suspected-bomb compression ratio
     bool     include_unsupported = false;       // emit results for unsupported members
-    uint32_t threads = 1;                       // conversion worker threads (opt-in):
-                                                // 1 = fully single-threaded (default),
-                                                // 0 = hardware concurrency, N = N workers.
-                                                // Decoding and limit accounting always
-                                                // stay on the calling thread; results
-                                                // are delivered in walk order. Peak
-                                                // memory grows to ~2×threads in-flight
-                                                // members.
 };
 
 struct ConvertOptions {

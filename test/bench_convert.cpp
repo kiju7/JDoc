@@ -91,7 +91,7 @@ static void print_hash_line(const std::string& path, const std::string& markdown
 
 int main(int argc, char* argv[]) {
     if (argc < 3) {
-        fprintf(stderr, "Usage: %s <archive|dir> <path> [threads] [--hash]\n", argv[0]);
+        fprintf(stderr, "Usage: %s <archive|dir> <path> [--hash]\n", argv[0]);
         return 1;
     }
     std::string mode = argv[1];
@@ -105,7 +105,7 @@ int main(int argc, char* argv[]) {
     for (int i = 3; i < argc; i++) {
         std::string arg = argv[i];
         if (arg == "--hash") hash_mode = true;
-        else opts.archive.threads = static_cast<uint32_t>(atoi(argv[i]));
+        // Other positional args (e.g. a legacy thread count) are ignored.
     }
 
     auto t0 = std::chrono::steady_clock::now();

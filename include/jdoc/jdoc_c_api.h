@@ -29,7 +29,6 @@ typedef struct {
     int max_entries;                 /* members visited; default 200000 */
     int max_ratio;                   /* bomb-suspect compression ratio; default 1000 */
     int include_unsupported;         /* 1 = report unsupported members */
-    int threads;                     /* conversion workers; default 1, -1 = all cores */
 } JDocOptions;
 
 /* Returns default options: no images, markdown, all pages, min_size=50. */

@@ -9,14 +9,11 @@
 #include "jdoc/hwpx.h"
 #include "convert_internal.h"
 #include "zip_reader.h"
-#include "archive/member_pipeline.h"
 #include "legacy/ole_reader.h"
 
-#include <algorithm>
 #include <cstring>
 #include <fstream>
 #include <sstream>
-#include <thread>
 
 namespace jdoc {
 namespace {
@@ -354,23 +351,6 @@ void convert_archive(const std::string& file_path, const MemberCallback& cb,
     }
 
     WalkBudget budget;
-
-    // Opt-in member parallelism: decoding and limit accounting stay on this
-    // thread; leaf-document conversion fans out to workers and results come
-    // back through cb in walk order (see ArchiveLimits::threads).
-    unsigned workers = opts.archive.threads == 0
-        ? std::max(1u, std::thread::hardware_concurrency())
-        : opts.archive.threads;
-    if (workers > 1) {
-        MemberPipeline pipeline(workers, cb);
-        budget.pipeline = &pipeline;
-        MemberCallback ordered = [&pipeline](MemberResult&& r) {
-            return pipeline.emit(std::move(r));
-        };
-        walk_archive_path(file_path, fmt, "", 1, budget, opts, ordered);
-        pipeline.finish();
-        return;
-    }
     walk_archive_path(file_path, fmt, "", 1, budget, opts, cb);
 }
 

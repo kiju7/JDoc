@@ -10,8 +10,8 @@
 namespace jdoc {
 
 // Element nesting is attacker-controlled — pugixml's parser is iterative and
-// imposes no limit — so the recursive walkers below cap their depth. Worker
-// threads get a 512 KB default stack, far less than the main thread's.
+// imposes no limit — so the recursive walkers below cap their depth to defend
+// against stack overflow from malicious input.
 constexpr int kXmlMaxDepth = 256;
 
 // Collect all text content from a node and its descendants recursively.

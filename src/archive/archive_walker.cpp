@@ -13,7 +13,6 @@
 #include "archive/alz_reader.h"
 #include "archive/egg_reader.h"
 #include "archive/input_stream.h"
-#include "archive/member_pipeline.h"
 #include "archive/rar_reader.h"
 #include "archive/seven_zip_reader.h"
 #include "archive/tar_reader.h"
@@ -175,12 +174,10 @@ ConvertOptions member_convert_opts(const ConvertOptions& opts,
 
 // Process one materialized member: detect, recurse or convert, emit.
 // `bytes` need only stay valid for the duration of the call (zero-copy
-// views into a parent buffer or the 7z solid-block cache are fine);
-// `owned` is non-null when the caller can hand over ownership of the same
-// bytes, sparing the parallel pipeline a copy.
+// views into a parent buffer or the 7z solid-block cache are fine).
 // Returns false to stop the whole walk (budget exhausted or cb abort).
 bool handle_member_bytes(const std::string& member_path, const uint8_t* bytes,
-                         size_t size, std::vector<char>* owned, int depth,
+                         size_t size, int depth,
                          WalkBudget& budget, const ConvertOptions& opts,
                          const MemberCallback& cb) {
     FileFormat fmt = detect_format_mem(bytes, size, member_path);
@@ -212,18 +209,6 @@ bool handle_member_bytes(const std::string& member_path, const uint8_t* bytes,
 
     bool wants_images = opts.images && !opts.image_dir.empty();
 
-    if (budget.pipeline) {
-        // Leaf documents convert on the pipeline workers while this thread
-        // keeps decoding. Zero-copy views must be copied here — the buffer
-        // they point into may be released before a worker runs.
-        std::vector<char> data = owned
-            ? std::move(*owned)
-            : std::vector<char>(bytes, bytes + size);
-        return budget.pipeline->submit(
-            std::move(r), fmt, std::move(data),
-            wants_images ? member_convert_opts(opts, member_path) : opts);
-    }
-
     try {
         if (wants_images) {
             r.markdown = convert_from_memory_as(
@@ -245,7 +230,7 @@ bool handle_member(const std::string& member_path, std::vector<char>&& data,
                    const MemberCallback& cb) {
     return handle_member_bytes(member_path,
                                reinterpret_cast<const uint8_t*>(data.data()),
-                               data.size(), &data, depth, budget, opts, cb);
+                               data.size(), depth, budget, opts, cb);
 }
 
 // Count a member against the entry budget; emits a final error result and
@@ -370,7 +355,7 @@ bool walk_zip(const ZipReader& zip, const std::string& prefix, int depth,
                 case ViewCheck::PROCEED: break;
             }
             if (!handle_member_bytes(member_path, view, e.uncompressed_size,
-                                     nullptr, depth, budget, opts, cb))
+                                     depth, budget, opts, cb))
                 return false;
             continue;
         }
@@ -463,7 +448,7 @@ bool walk_7z(const SevenZipReader& sz, const std::string& prefix, int depth,
 
         bool ok = true;
         if (vc == ViewCheck::PROCEED)
-            ok = handle_member_bytes(member_path, view, view_size, nullptr,
+            ok = handle_member_bytes(member_path, view, view_size,
                                      depth, budget, opts, cb);
 
         // The view points into the block cache, so release only after the
@@ -526,7 +511,7 @@ bool walk_tar(InputStream& src, const std::string& prefix, int depth,
                 case ViewCheck::STOP: return false;
                 case ViewCheck::PROCEED: break;
             }
-            if (!handle_member_bytes(member_path, view, m.size, nullptr,
+            if (!handle_member_bytes(member_path, view, m.size,
                                      depth, budget, opts, cb))
                 return false;
             continue;

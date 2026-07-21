@@ -221,8 +221,7 @@ Returns:
                                  long long max_total_bytes,
                                  long long max_entries,
                                  long long max_ratio,
-                                 bool include_unsupported,
-                                 int threads)
+                                 bool include_unsupported)
                                  -> std::vector<jdoc::MemberResult> {
         jdoc::ConvertOptions opts;
         if (format == "text" || format == "plaintext" || format == "plain")
@@ -238,8 +237,6 @@ Returns:
         opts.archive.max_ratio =
             max_ratio < 0 ? 0 : (uint32_t)max_ratio;
         opts.archive.include_unsupported = include_unsupported;
-        // 1 = single-threaded (default), 0 = all cores, N = N workers.
-        opts.archive.threads = threads < 0 ? 0 : (uint32_t)threads;
         return jdoc::convert_archive(file_path, opts);
     },
     py::arg("file_path"),
@@ -250,17 +247,12 @@ Returns:
     py::arg("max_entries") = 200000,
     py::arg("max_ratio") = 1000,
     py::arg("include_unsupported") = false,
-    py::arg("threads") = 1,
     R"doc(Convert every supported document inside an archive (zip/gz/tar/tar.gz/
 7z/alz/egg) without extracting to disk. Members are decompressed into memory
 one at a time; nested archives are walked recursively up to max_depth.
 
 Limits: pass -1 to disable a limit (unlimited). Only do this for trusted
 inputs — archive-bomb protection is disabled with it.
-
-threads: conversion worker threads (default 1 = fully single-threaded,
-0 = all cores). Decoding stays on the calling thread; results keep walk
-order regardless of thread count.
 
 Returns:
     List of MemberResult (member_path, format, markdown, error, ok)

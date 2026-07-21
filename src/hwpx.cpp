@@ -49,7 +49,7 @@ static bool is_shape_element(const std::string& name) {
 }
 
 // Section XML nesting is file-controlled, so the recursive walkers below cap
-// their depth — worker threads run on a far smaller stack than the main thread.
+// their depth to defend against stack overflow from malicious input.
 static constexpr int kMaxShapeDepth = 64;
 
 // ── HWPX Document Parser ───────────────────────────────────

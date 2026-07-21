@@ -1302,10 +1302,9 @@ static void test_consistency() {
     TEST_END
 }
 
-// Zero-copy view paths (nested store zip / nested tar) and the opt-in
-// conversion pipeline (ArchiveLimits::threads).
-static void test_views_and_threads() {
-    std::cerr << "Zero-copy views and conversion threads:\n";
+// Zero-copy view paths (nested store zip / nested tar).
+static void test_views() {
+    std::cerr << "Zero-copy views:\n";
 
     // With JDOC_USE_MMAP, a stored member of a file-backed archive is handed to
     // the parser as a view instead of being copied through CapSink. These pin
@@ -1435,52 +1434,6 @@ static void test_views_and_threads() {
         ASSERT(!find_member(rs, "inner.zip/m3.txt"));  // walk stopped
     TEST_END
 
-    TEST(threads_match_single_thread_output)
-        // Mixed workload: documents, an unknown member, a nested archive,
-        // a corrupt member. Parallel conversion must produce the same
-        // results in the same order as the single-threaded walk.
-        std::string binary("\x00\x01\x02\x03genuinely-binary", 20);
-        ZipEntrySpec bad{"bad.txt", "truncated member, long enough to matter"};
-        bad.truncate_data = 8;
-        auto nested = make_zip({{"leaf.rtf", "{\\rtf1\\ansi Leaf}"}});
-        auto zip = make_zip({
-            {"d1.rtf", "{\\rtf1\\ansi Doc One}"},
-            {"d2.rtf", "{\\rtf1\\ansi Doc Two}"},
-            {"blob.bin", binary},
-            bad,
-            {"nested.zip", nested},
-            {"d3.txt", "third document"},
-        });
-        auto path = write_tmp("mt.zip", zip);
-
-        jdoc::ConvertOptions seq;
-        seq.archive.include_unsupported = true;
-        jdoc::ConvertOptions par = seq;
-        par.archive.threads = 4;
-
-        auto rs1 = jdoc::convert_archive(path, seq);
-        auto rs4 = jdoc::convert_archive(path, par);
-        ASSERT(rs1.size() == rs4.size());
-        for (size_t i = 0; i < rs1.size(); i++) {
-            ASSERT(rs1[i].member_path == rs4[i].member_path);  // order kept
-            ASSERT(rs1[i].markdown == rs4[i].markdown);
-            ASSERT(rs1[i].error_code == rs4[i].error_code);
-        }
-    TEST_END
-
-    TEST(threads_callback_early_stop)
-        auto zip = make_zip({{"1.txt", "one"}, {"2.txt", "two"},
-                             {"3.txt", "three"}, {"4.txt", "four"}});
-        auto path = write_tmp("mtstop.zip", zip);
-        jdoc::ConvertOptions opts;
-        opts.archive.threads = 4;
-        int seen = 0;
-        jdoc::convert_archive(path, [&](jdoc::MemberResult&&) {
-            return ++seen < 2;
-        }, opts);
-        ASSERT(seen == 2);  // no results delivered after the stop
-    TEST_END
-
     TEST(zip64_extra_fields_and_eocd64)
         // Python zipfile writes zip64 records for offsets past 2 GiB; this
         // checked-in fixture forces the same structure at small size
@@ -1495,22 +1448,6 @@ static void test_views_and_threads() {
         ASSERT(note && note->ok() && note->markdown == "zip64 second member");
     TEST_END
 
-    TEST(threads_limits_still_enforced)
-        std::string big(8 << 20, '\0');
-        big.insert(0, "text ");
-        ZipEntrySpec e{"bomb.txt", big};
-        e.lie_uncompressed_size = 10;
-        auto zip = make_zip({e, {"after.txt", "still here"}});
-        auto path = write_tmp("mtbomb.zip", zip);
-        jdoc::ConvertOptions opts;
-        opts.archive.threads = 4;
-        opts.archive.max_member_bytes = 1 << 20;
-        auto rs = jdoc::convert_archive(path, opts);
-        auto* bomb = find_member(rs, "bomb.txt");
-        auto* after = find_member(rs, "after.txt");
-        ASSERT(bomb && bomb->error_code == jdoc::MemberErrorCode::MEMBER_LIMIT);
-        ASSERT(after && after->ok());
-    TEST_END
 }
 
 int main(int argc, char* argv[]) {
@@ -1534,7 +1471,7 @@ int main(int argc, char* argv[]) {
     test_rar();
     test_limits();
     test_consistency();
-    test_views_and_threads();
+    test_views();
 
     std::cerr << "\n=== Results: " << tests_passed << " passed, "
               << tests_failed << " failed ===\n";

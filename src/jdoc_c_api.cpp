@@ -38,7 +38,7 @@ static jdoc::ConvertOptions to_cpp_opts(const JDocOptions* opts) {
                          strcmp(opts->format, "plaintext") == 0))
         o.format = jdoc::OutputFormat::PLAINTEXT;
     // Archive limits: 0 keeps the library default; negative disables the
-    // guard (threads: negative = all cores).
+    // guard.
     if (opts->max_depth > 0)
         o.archive.max_depth = opts->max_depth;
     else if (opts->max_depth < 0)
@@ -60,10 +60,6 @@ static jdoc::ConvertOptions to_cpp_opts(const JDocOptions* opts) {
     else if (opts->max_ratio < 0)
         o.archive.max_ratio = 0;  // ratio check off
     o.archive.include_unsupported = (opts->include_unsupported != 0);
-    if (opts->threads > 0)
-        o.archive.threads = (uint32_t)opts->threads;
-    else if (opts->threads < 0)
-        o.archive.threads = 0;  // 0 = hardware concurrency
     return o;
 }
 
@@ -77,7 +73,6 @@ JDocOptions jdoc_default_options(void) {
     JDocOptions o = {};
     o.tables = 1;
     o.min_image_size = 50;
-    o.threads = 1;
     return o;
 }
 

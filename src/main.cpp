@@ -30,7 +30,6 @@ void print_usage(const char* prog) {
               << "  --max-entries N      Max members visited (default: 200000, -1 = unlimited)\n"
               << "  --max-ratio N        Bomb-suspect compression ratio (default: 1000, 0 = off)\n"
               << "  --include-unsupported  Report unsupported members as errors\n"
-              << "  --threads N          Conversion worker threads (default: 1, 0 = all cores)\n"
               << "  --help          Show this help\n";
 }
 
@@ -110,10 +109,6 @@ int main(int argc, char* argv[]) {
         }
         else if (arg == "--include-unsupported") {
             opts.archive.include_unsupported = true;
-        }
-        else if (arg == "--threads" && i + 1 < argc) {
-            opts.archive.threads = static_cast<uint32_t>(
-                std::max(0, std::stoi(argv[++i])));
         }
         else if (input_path.empty()) {
             input_path = arg;
