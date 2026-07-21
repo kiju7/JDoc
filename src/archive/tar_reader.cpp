@@ -2,6 +2,7 @@
 // License: MIT
 
 #include "archive/tar_reader.h"
+#include "common/string_utils.h"
 #include <cstring>
 
 namespace jdoc {
@@ -122,7 +123,10 @@ bool TarReader::next(Member& out) {
             }
         }
 
-        out.name = std::move(name);
+        // Old tar headers store names in the system codepage (CP949 for the
+        // Korean archives here), never with a UTF-8 flag; normalize like the
+        // other archive readers so member paths leave the library as UTF-8.
+        out.name = util::legacy_name_to_utf8(name);
         out.size = size;
         out.is_file = (typeflag == '0' || typeflag == '\0');
         data_remaining_ = size;

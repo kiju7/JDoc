@@ -10,6 +10,7 @@
 #include "convert_internal.h"
 #include "zip_reader.h"
 #include "legacy/ole_reader.h"
+#include "common/string_utils.h"
 
 #include <cstring>
 #include <fstream>
@@ -144,7 +145,7 @@ static std::string read_text_file(const std::string& path) {
     if (!f) throw std::runtime_error("Cannot open file: " + path);
     std::ostringstream ss;
     ss << f.rdbuf();
-    return ss.str();
+    return util::plain_text_to_utf8(ss.str());
 }
 
 } // anonymous namespace
@@ -262,7 +263,8 @@ std::string convert_from_memory_as(FileFormat fmt,
         case FileFormat::HWPX:   return hwpx_to_markdown_mem(data, size, opts);
         case FileFormat::HWP:    return hwp_to_markdown_mem(data, size, opts);
         case FileFormat::TXT:
-            return std::string(reinterpret_cast<const char*>(data), size);
+            return util::plain_text_to_utf8(
+                std::string(reinterpret_cast<const char*>(data), size));
         default:
             if (is_archive_format(fmt))
                 throw std::runtime_error("Nested archive must be walked, not converted: " + name_hint);

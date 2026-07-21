@@ -72,6 +72,16 @@ std::string normalize_member_name(const std::string& name) {
 }
 
 std::string strip_gz_ext(const std::string& name) {
+    // ".tgz" is shorthand for ".tar.gz": map it back to a ".tar" name so the
+    // decompressed member is re-detected as a tar rather than re-fed to the
+    // gzip reader (which would fail on the already-inflated bytes). This path
+    // is reached for old (pre-POSIX) tars that carry no "ustar" magic, so the
+    // is_tar peek in walk_gz falls through to the single-member branch.
+    if (name.size() >= 4) {
+        std::string tail = name.substr(name.size() - 4);
+        for (auto& c : tail) c = std::tolower(static_cast<unsigned char>(c));
+        if (tail == ".tgz") return name.substr(0, name.size() - 4) + ".tar";
+    }
     if (name.size() > 3) {
         std::string tail = name.substr(name.size() - 3);
         for (auto& c : tail) c = std::tolower(static_cast<unsigned char>(c));
@@ -81,6 +91,13 @@ std::string strip_gz_ext(const std::string& name) {
 }
 
 std::string strip_bz2_ext(const std::string& name) {
+    // ".tbz2" is shorthand for ".tar.bz2": map it back to ".tar" (see
+    // strip_gz_ext for the rationale on the single-member fallback path).
+    if (name.size() >= 5) {
+        std::string tail = name.substr(name.size() - 5);
+        for (auto& c : tail) c = std::tolower(static_cast<unsigned char>(c));
+        if (tail == ".tbz2") return name.substr(0, name.size() - 5) + ".tar";
+    }
     if (name.size() > 4) {
         std::string tail = name.substr(name.size() - 4);
         for (auto& c : tail) c = std::tolower(static_cast<unsigned char>(c));

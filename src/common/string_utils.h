@@ -82,6 +82,14 @@ inline std::string legacy_name_to_utf8(const std::string& name) {
     return is_valid_utf8(name) ? name : cp949_string_to_utf8(name);
 }
 
+// Normalize plain-text bytes to UTF-8: already-valid UTF-8 (including pure
+// ASCII) is kept verbatim, anything else is decoded as CP949 — the encoding
+// legacy Korean .txt files and archive members use. Shared by the .txt reader
+// (path and in-memory) so plain text always leaves the library as UTF-8.
+inline std::string plain_text_to_utf8(const std::string& s) {
+    return is_valid_utf8(s) ? s : cp949_string_to_utf8(s);
+}
+
 // Sanitize a UTF-8 string: replace invalid sequences with U+FFFD.
 std::string sanitize_utf8(const char* data, size_t len);
 
