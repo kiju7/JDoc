@@ -10,7 +10,7 @@
 namespace jdoc {
 
 enum class DocFormat {
-    UNKNOWN, DOCX, XLSX, XLSB, PPTX, DOC, XLS, PPT, RTF, HTML,
+    UNKNOWN, DOCX, XLSX, XLSB, PPTX, DOC, XLS, PPT, RTF, HTML, MSG,
     // Encrypted OOXML wrapped in an OLE container (MS-OFFCRYPTO). We cannot
     // extract these, but we classify them so callers get a clear reason.
     ENCRYPTED_PASSWORD,  // password-based standard encryption (recoverable with the password)

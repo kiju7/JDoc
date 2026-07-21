@@ -164,6 +164,7 @@ add_library(jdoc_lib STATIC
     src/html/html_charset.cpp
     # mail
     src/mail/eml_parser.cpp
+    src/mail/msg_parser.cpp
     # OLE reader — shared by hwp and office, compiled once
     src/legacy/ole_reader.cpp
     # unified auto-detect API
@@ -225,7 +226,7 @@ option(JDOC_BUILD_TESTS "Build unit tests" OFF)
 if(JDOC_BUILD_TESTS)
     enable_testing()
     foreach(t IN ITEMS test_pdf test_pdf_crypt test_office test_archive
-                       test_hwp3 test_hwp5 test_hwpx test_eml)
+                       test_hwp3 test_hwp5 test_hwpx test_eml test_msg)
         add_executable(${t} test/${t}.cpp)
         target_link_libraries(${t} PRIVATE jdoc_lib)
         target_include_directories(${t} PRIVATE include src)

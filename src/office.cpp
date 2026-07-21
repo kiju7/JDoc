@@ -14,6 +14,7 @@
 #include "legacy/ppt_parser.h"
 #include "legacy/rtf_parser.h"
 #include "html/html_parser.h"
+#include "mail/msg_parser.h"
 
 #include <fstream>
 #include <cstring>
@@ -47,6 +48,16 @@ static DocFormat classify_ole_encryption(const OleReader& ole) {
             return DocFormat::ENCRYPTED_RIGHTS;
     }
     return DocFormat::ENCRYPTED_PASSWORD;
+}
+
+// An Outlook .msg holds its message properties in root "__substg1.0_*" streams
+// alongside "__properties_version1.0". No document format uses those, so the
+// marker is unambiguous (content-based, so a misnamed file is still caught).
+static bool is_msg_ole(const OleReader& ole) {
+    if (!ole.has_stream("__properties_version1.0")) return false;
+    for (const auto& s : ole.list_streams())
+        if (s.rfind("__substg1.0_", 0) == 0) return true;
+    return false;
 }
 
 DocFormat detect_office_format(const std::string& file_path) {
@@ -103,6 +114,7 @@ DocFormat detect_office_format(const std::string& file_path) {
         if (ole.is_open()) {
             DocFormat enc = classify_ole_encryption(ole);
             if (enc != DocFormat::UNKNOWN) return enc;
+            if (is_msg_ole(ole)) return DocFormat::MSG;
         }
 
         // Determine type from extension first (skip .hwp — handled by main)
@@ -204,6 +216,7 @@ DocFormat detect_office_format_mem(const uint8_t* data, size_t size,
         if (ole.is_open()) {
             DocFormat enc = classify_ole_encryption(ole);
             if (enc != DocFormat::UNKNOWN) return enc;
+            if (is_msg_ole(ole)) return DocFormat::MSG;
         }
 
         if (ext == ".doc") return DocFormat::DOC;
@@ -261,6 +274,7 @@ const char* format_name(DocFormat fmt) {
         case DocFormat::PPT:  return "PPT";
         case DocFormat::RTF:  return "RTF";
         case DocFormat::HTML: return "HTML";
+        case DocFormat::MSG:  return "MSG";
         case DocFormat::ENCRYPTED_PASSWORD: return "ENCRYPTED_PASSWORD";
         case DocFormat::ENCRYPTED_RIGHTS:   return "ENCRYPTED_RIGHTS";
         default: return "UNKNOWN";
@@ -339,6 +353,12 @@ static auto with_office_parser(DocFormat format, const DocInput& in, Fn&& fn) {
         auto ole = in.open_ole();
         if (!ole->is_open()) throw std::runtime_error("Cannot open PPT file: " + in.display());
         PptParser parser(*ole);
+        return fn(parser);
+    }
+    case DocFormat::MSG: {
+        auto ole = in.open_ole();
+        if (!ole->is_open()) throw std::runtime_error("Cannot open MSG file: " + in.display());
+        MsgParser parser(*ole);
         return fn(parser);
     }
     case DocFormat::RTF: {
