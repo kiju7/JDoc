@@ -13,6 +13,7 @@
 #include <cstring>
 #include <fstream>
 #include <sstream>
+#include <string_view>
 
 namespace jdoc {
 
@@ -1044,18 +1045,34 @@ std::string DocParser::extract_text_word8(const std::vector<char>& word_doc,
 // ── Text to Markdown ────────────────────────────────────────────
 
 std::string DocParser::text_to_markdown(const std::string& raw_text) {
-    std::vector<std::string> lines;
-    std::istringstream iss(raw_text);
-    std::string line;
-    while (std::getline(iss, line)) {
-        while (!line.empty() && (line.back() == '\r' || line.back() == '\0'))
-            line.pop_back();
-        lines.push_back(line);
+    // Split into line views (no per-line allocation): equivalent to getline on
+    // '\n' with trailing '\r'/'\0' stripped. A trailing '\n' yields no extra
+    // empty line, matching std::getline.
+    std::vector<std::string_view> lines;
+    lines.reserve(static_cast<size_t>(
+        std::count(raw_text.begin(), raw_text.end(), '\n')) + 1);
+    {
+        std::string_view sv(raw_text);
+        size_t start = 0;
+        while (start <= sv.size()) {
+            size_t nl = sv.find('\n', start);
+            std::string_view ln =
+                (nl == std::string_view::npos) ? sv.substr(start)
+                                               : sv.substr(start, nl - start);
+            while (!ln.empty() && (ln.back() == '\r' || ln.back() == '\0'))
+                ln.remove_suffix(1);
+            if (nl == std::string_view::npos) {
+                if (start < sv.size()) lines.push_back(ln);
+                break;
+            }
+            lines.push_back(ln);
+            start = nl + 1;
+        }
     }
 
     // Helper: count cell separators (\x1F from 0x07 cell marks).
     // Subtract one if the line ends with \x1F (trailing empty cell from row-end mark).
-    auto count_cells = [](const std::string& s) {
+    auto count_cells = [](std::string_view s) {
         int n = 0;
         for (char c : s) if (c == '\x1F') n++;
         if (n > 0 && !s.empty() && s.back() == '\x1F') n--;
@@ -1063,7 +1080,7 @@ std::string DocParser::text_to_markdown(const std::string& raw_text) {
     };
 
     // Helper: convert cell-separated line to markdown table row, pad to target_cols.
-    auto cells_to_row = [](const std::string& s, int target_cols) {
+    auto cells_to_row = [](std::string_view s, int target_cols) {
         std::vector<std::string> cells;
         std::string cell;
         for (char c : s) {
@@ -1098,7 +1115,7 @@ std::string DocParser::text_to_markdown(const std::string& raw_text) {
     int consecutive_empty = 0;
 
     for (size_t i = 0; i < lines.size(); ++i) {
-        const std::string& ln = lines[i];
+        std::string_view ln = lines[i];
 
         // Limit consecutive empty lines to 1
         if (ln.empty()) {
@@ -1130,7 +1147,7 @@ std::string DocParser::text_to_markdown(const std::string& raw_text) {
             while (i < lines.size()) {
                 int cc = count_cells(lines[i]);
                 if (cc >= 1) {
-                    std::string row = lines[i];
+                    std::string row(lines[i]);
                     if (!pending_prefix.empty()) {
                         row = pending_prefix + "\x1F" + row;
                         pending_prefix.clear();
@@ -1150,7 +1167,7 @@ std::string DocParser::text_to_markdown(const std::string& raw_text) {
                     bool is_short_fragment = (lines[i].size() <= 4);
                     if (is_short_fragment &&
                         i + 1 < lines.size() && count_cells(lines[i + 1]) >= 1) {
-                        pending_prefix = lines[i];
+                        pending_prefix.assign(lines[i]);
                         i++;
                     } else {
                         break;
@@ -1180,7 +1197,7 @@ std::string DocParser::text_to_markdown(const std::string& raw_text) {
 
         // Bullet detection
         bool is_bullet = false;
-        std::string content = ln;
+        std::string_view content = ln;
         char first = ln[0];
         if (first == '-' || first == '*') {
             if (ln.size() > 1 && (ln[1] == ' ' || ln[1] == '\t')) {
@@ -1193,10 +1210,12 @@ std::string DocParser::text_to_markdown(const std::string& raw_text) {
                    static_cast<uint8_t>(ln[2]) == 0xA2) {
             is_bullet = true;
             content = ln.substr(3);
-            while (!content.empty() && content[0] == ' ') content = content.substr(1);
+            while (!content.empty() && content.front() == ' ') content.remove_prefix(1);
         }
         if (is_bullet) {
-            md += "- " + content + "\n";
+            md += "- ";
+            md += content;
+            md += '\n';
             continue;
         }
 
@@ -1208,10 +1227,14 @@ std::string DocParser::text_to_markdown(const std::string& raw_text) {
                 // Skip if next char is also a digit (multi-level like "1.1.")
                 bool multi_level = (j + 1 < ln.size() && ln[j + 1] >= '0' && ln[j + 1] <= '9');
                 if (!multi_level) {
-                    std::string prefix = ln.substr(0, j + 1);
-                    std::string rest = (j + 1 < ln.size()) ? ln.substr(j + 1) : "";
-                    while (!rest.empty() && rest[0] == ' ') rest = rest.substr(1);
-                    md += prefix + " " + rest + "\n";
+                    std::string_view prefix = ln.substr(0, j + 1);
+                    std::string_view rest =
+                        (j + 1 < ln.size()) ? ln.substr(j + 1) : std::string_view();
+                    while (!rest.empty() && rest.front() == ' ') rest.remove_prefix(1);
+                    md += prefix;
+                    md += ' ';
+                    md += rest;
+                    md += '\n';
                     continue;
                 }
             }
@@ -1228,11 +1251,14 @@ std::string DocParser::text_to_markdown(const std::string& raw_text) {
         for (char c : ln) { if (c != ' ' && c != '\t') { has_nonws = true; break; } }
         if (prev_empty && next_empty && is_short && no_period && ln.size() > 1 && has_nonws) {
             // Looks like a heading — use ## (H2) for general section titles
-            md += "## " + ln + "\n";
+            md += "## ";
+            md += ln;
+            md += '\n';
             continue;
         }
 
-        md += ln + "\n";
+        md += ln;
+        md += '\n';
     }
 
     return md;
@@ -1442,6 +1468,10 @@ std::string DocParser::to_markdown(const ConvertOptions& opts) {
         }
     }
 
+    // No images and no object markers → nothing to rewrite; avoid a full copy
+    // of a potentially large body.
+    if (images.empty() && md.find("\xEF\xBF\xBC") == std::string::npos)
+        return md;
     return replace_image_markers(md, images, opts.image_ref_prefix);
 }
 
