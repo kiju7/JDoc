@@ -31,8 +31,14 @@ private:
     std::string build_header();
     std::string extract_body(const ConvertOptions& opts);
 
-    // Distinct "__attach_version1.0_#NNNN" storage prefixes.
-    std::vector<std::string> attachment_storages();
+    // Distinct sub-storage names (before the first '/') whose path starts with
+    // `prefix`, e.g. "__recip_version1.0_#" or "__attach_version1.0_#".
+    std::vector<std::string> storages_with_prefix(const std::string& prefix);
+
+    // Per-recipient "name <email>" strings from __recip_version1.0_#NNNN.
+    std::vector<std::string> read_recipients();
+    // Per-attachment file names from __attach_version1.0_#NNNN.
+    std::vector<std::string> read_attachment_names();
 };
 
 } // namespace jdoc

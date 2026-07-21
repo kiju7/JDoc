@@ -55,7 +55,18 @@ std::string MsgParser::build_header() {
     if (from_name.empty())  from_name  = read_prop_string(0x0042);
     if (from_email.empty()) from_email = read_prop_string(0x0065);
 
-    std::string to = read_prop_string(0x0E04);  // PR_DISPLAY_TO
+    // Prefer per-recipient details (name + email); fall back to the display
+    // string PR_DISPLAY_TO / PR_DISPLAY_CC.
+    std::vector<std::string> recips = read_recipients();
+    std::string to;
+    if (!recips.empty()) {
+        for (size_t i = 0; i < recips.size(); i++) {
+            if (i) to += "; ";
+            to += recips[i];
+        }
+    } else {
+        to = read_prop_string(0x0E04);  // PR_DISPLAY_TO
+    }
     std::string cc = read_prop_string(0x0E03);  // PR_DISPLAY_CC
 
     std::string h;
@@ -72,6 +83,32 @@ std::string MsgParser::build_header() {
     if (!cc.empty()) h += "- **Cc:** " + cc + "\n";
     h += "\n---\n\n";
     return h;
+}
+
+std::vector<std::string> MsgParser::read_recipients() {
+    std::vector<std::string> out;
+    for (const auto& st : storages_with_prefix("__recip_version1.0_#")) {
+        std::string name = read_prop_string(0x3001, st);   // display name
+        std::string email = read_prop_string(0x3003, st);  // email address
+        std::string entry;
+        if (!name.empty()) entry = name;
+        if (!email.empty()) {
+            if (!entry.empty()) entry += " ";
+            entry += "<" + email + ">";
+        }
+        if (!entry.empty()) out.push_back(entry);
+    }
+    return out;
+}
+
+std::vector<std::string> MsgParser::read_attachment_names() {
+    std::vector<std::string> out;
+    for (const auto& st : storages_with_prefix("__attach_version1.0_#")) {
+        std::string nm = read_prop_string(0x3707, st);   // long file name
+        if (nm.empty()) nm = read_prop_string(0x3704, st);  // short file name
+        if (!nm.empty()) out.push_back(nm);
+    }
+    return out;
 }
 
 std::string MsgParser::extract_body(const ConvertOptions& opts) {
@@ -97,10 +134,9 @@ std::string MsgParser::extract_body(const ConvertOptions& opts) {
     return {};
 }
 
-std::vector<std::string> MsgParser::attachment_storages() {
+std::vector<std::string> MsgParser::storages_with_prefix(const std::string& prefix) {
     std::set<std::string> seen;
     std::vector<std::string> out;
-    const std::string prefix = "__attach_version1.0_#";
     for (const auto& s : ole_.list_streams()) {
         if (s.rfind(prefix, 0) != 0) continue;
         std::string top = s.substr(0, s.find('/'));
@@ -114,16 +150,16 @@ std::string MsgParser::to_markdown(const ConvertOptions& opts) {
     std::string body = extract_body(opts);
     out += body.empty() ? "*(본문 없음)*\n" : body;
 
-    auto atts = attachment_storages();
-    if (!atts.empty()) {
-        out += "\n\n---\n\n**첨부(" + std::to_string(atts.size()) + ")**";
-        // A single attachment can be named unambiguously; with several, the
-        // OLE reader's flat name lookup can't reliably scope per storage, so
-        // only the count is reported (see docs/improvement-plans/03-msg.md §5).
-        if (atts.size() == 1) {
-            std::string nm = read_prop_string(0x3707, atts[0]);
-            if (nm.empty()) nm = read_prop_string(0x3704, atts[0]);
-            if (!nm.empty()) out += ": " + nm;
+    auto att_storages = storages_with_prefix("__attach_version1.0_#");
+    if (!att_storages.empty()) {
+        out += "\n\n---\n\n**첨부(" + std::to_string(att_storages.size()) + ")**";
+        auto names = read_attachment_names();
+        if (!names.empty()) {
+            out += ": ";
+            for (size_t i = 0; i < names.size(); i++) {
+                if (i) out += ", ";
+                out += names[i];
+            }
         }
         out += "\n";
     }

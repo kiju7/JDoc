@@ -359,24 +359,40 @@ void OleReader::traverse_dir(int id, std::vector<std::string>& names) const {
 
 // ---------- find_entry -------------------------------------------------------
 
+int OleReader::find_in_siblings(int sibling_root, const std::string& name) const {
+    // Iterative walk of the left/right sibling tree; never follows child links,
+    // so a deeper storage's like-named stream is not matched.
+    std::vector<int> stack;
+    if (sibling_root >= 0) stack.push_back(sibling_root);
+    while (!stack.empty()) {
+        int id = stack.back();
+        stack.pop_back();
+        if (id < 0 || id >= static_cast<int>(dirs_.size())) continue;
+        const DirEntry& e = dirs_[id];
+        if (e.name == name) return id;
+        stack.push_back(e.left_id);
+        stack.push_back(e.right_id);
+    }
+    return -1;
+}
+
 int OleReader::find_entry(const std::string& name) const {
-    // Support "/" separated paths like "BinData/BIN0001.png"
+    // Support "/" separated paths like "BinData/BIN0001.png".
     auto slash = name.find('/');
     if (slash != std::string::npos) {
         std::string parent = name.substr(0, slash);
         std::string child = name.substr(slash + 1);
         int storage_id = find_storage(parent);
         if (storage_id < 0) return -1;
-        // Search among children of this storage
-        int child_id = dirs_[storage_id].child_id;
-        if (child_id < 0) return -1;
-        // BFS/linear search in the subtree for the child stream
-        for (size_t i = 0; i < dirs_.size(); ++i) {
-            if (dirs_[i].name == child && dirs_[i].type == 2)
-                return static_cast<int>(i);
-        }
-        return -1;
+        // Scope the child lookup to this storage's own subtree. CFB packages
+        // (e.g. Outlook .msg with multiple recipient storages) reuse the same
+        // leaf name across sibling storages, so a global scan would return the
+        // wrong stream.
+        int found = find_in_siblings(dirs_[storage_id].child_id, child);
+        return (found >= 0 && dirs_[found].type == 2) ? found : -1;
     }
+    // Top-level stream: a global scan by name, tolerant of imperfect sibling
+    // links, which some writers (and our test fixtures) produce.
     for (size_t i = 0; i < dirs_.size(); ++i) {
         if (dirs_[i].name == name && dirs_[i].type == 2)
             return static_cast<int>(i);
