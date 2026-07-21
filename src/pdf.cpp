@@ -226,10 +226,18 @@ struct PdfLexer {
         return result;
     }
 
-    PdfObj parse_object();
+    PdfObj parse_object(int depth = 0);
 };
 
-PdfObj PdfLexer::parse_object() {
+PdfObj PdfLexer::parse_object(int depth) {
+    // Dicts and arrays nest arbitrarily in a malformed file; cap the recursion
+    // so a hostile PDF cannot overflow the stack. 64 is far deeper than any
+    // legitimate object nesting yet leaves ample headroom on any thread stack.
+    // Consume a byte before bailing: the enclosing array/dict loops only stop
+    // on a closing delimiter or end of input, so returning without advancing
+    // would spin forever.
+    if (depth > 64) { pos++; return {}; }
+
     skip_ws();
     if (pos >= len) return {};
 
@@ -249,7 +257,7 @@ PdfObj PdfLexer::parse_object() {
                 auto key_tok = read_token();
                 if (key_tok.empty() || key_tok[0] != '/') break;
                 std::string key = key_tok.substr(1);
-                auto val = parse_object();
+                auto val = parse_object(depth + 1);
                 obj.dict.push_back({key, std::move(val)});
             }
             return obj;
@@ -264,7 +272,7 @@ PdfObj PdfLexer::parse_object() {
             skip_ws();
             if (pos < len && data[pos] == ']') { pos++; break; }
             if (pos >= len) break;
-            obj.arr.push_back(parse_object());
+            obj.arr.push_back(parse_object(depth + 1));
         }
         return obj;
     }
