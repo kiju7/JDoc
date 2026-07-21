@@ -14,3 +14,4 @@ test_archive_tmp/
 .claude/
 .DS_Store
 build-release/
+docs/
