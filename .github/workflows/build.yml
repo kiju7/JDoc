@@ -6,9 +6,15 @@ name: build
 # and compiles the Windows-only I/O code paths under MSVC.
 on:
   push:
-    branches: [main, develop]
+    branches: [main]        # runs on merges to main, not on WIP develop pushes
   pull_request:
+    branches: [main]        # and on pull requests targeting main
   workflow_dispatch:
+
+# A newer push/PR update cancels an in-flight run on the same ref.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
