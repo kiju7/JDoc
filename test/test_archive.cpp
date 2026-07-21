@@ -11,6 +11,7 @@
 #include <cassert>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <string>
@@ -1454,9 +1455,10 @@ int main(int argc, char* argv[]) {
     g_tmpdir = (argc > 1) ? argv[1] : "test_archive_tmp";
     g_fixdir = (argc > 2) ? argv[2] : "test/fixtures/7z";
     g_rar_fixdir = (argc > 3) ? argv[3] : "test/fixtures/rar";
-    std::string mkdir_cmd = "mkdir -p '" + g_tmpdir + "'";
-    if (system(mkdir_cmd.c_str()) != 0) {
-        std::cerr << "cannot create tmp dir\n";
+    std::error_code mkdir_ec;
+    std::filesystem::create_directories(g_tmpdir, mkdir_ec);
+    if (mkdir_ec) {
+        std::cerr << "cannot create tmp dir: " << mkdir_ec.message() << "\n";
         return 1;
     }
 

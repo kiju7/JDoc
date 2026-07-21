@@ -90,7 +90,8 @@ void test_rtf_parser() {
         "This is a \\i test\\i0  document.\\par"
         "}";
 
-    std::string rtf_path = "/tmp/test_jdoc_office.rtf";
+    std::string rtf_path =
+        (std::filesystem::temp_directory_path() / "test_jdoc_office.rtf").string();
     {
         std::ofstream f(rtf_path, std::ios::binary);
         f.write(rtf_content, strlen(rtf_content));
