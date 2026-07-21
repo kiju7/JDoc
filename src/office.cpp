@@ -14,6 +14,8 @@
 #include "legacy/ppt_parser.h"
 #include "legacy/rtf_parser.h"
 #include "html/html_parser.h"
+#include "mail/msg_parser.h"
+#include "odf/odf_parser.h"
 
 #include <fstream>
 #include <cstring>
@@ -49,6 +51,28 @@ static DocFormat classify_ole_encryption(const OleReader& ole) {
     return DocFormat::ENCRYPTED_PASSWORD;
 }
 
+// An Outlook .msg holds its message properties in root "__substg1.0_*" streams
+// alongside "__properties_version1.0". No document format uses those, so the
+// marker is unambiguous (content-based, so a misnamed file is still caught).
+static bool is_msg_ole(const OleReader& ole) {
+    if (!ole.has_stream("__properties_version1.0")) return false;
+    for (const auto& s : ole.list_streams())
+        if (s.rfind("__substg1.0_", 0) == 0) return true;
+    return false;
+}
+
+// An ODF package names its kind in a top-level "mimetype" member. A substring
+// match also absorbs the template variants (…text-template etc.).
+static DocFormat classify_odf_zip(const ZipReader& zip) {
+    if (!zip.has_entry("mimetype")) return DocFormat::UNKNOWN;
+    auto mt = zip.read_entry("mimetype");
+    std::string s(mt.begin(), mt.end());
+    if (s.find("opendocument.text")         != std::string::npos) return DocFormat::ODT;
+    if (s.find("opendocument.spreadsheet")   != std::string::npos) return DocFormat::ODS;
+    if (s.find("opendocument.presentation")  != std::string::npos) return DocFormat::ODP;
+    return DocFormat::UNKNOWN;
+}
+
 DocFormat detect_office_format(const std::string& file_path) {
     // Read first 8 bytes for magic detection
     unsigned char magic[8] = {};
@@ -69,8 +93,11 @@ DocFormat detect_office_format(const std::string& file_path) {
         if (ext == ".xlsx") return DocFormat::XLSX;
         if (ext == ".xlsb") return DocFormat::XLSB;
         if (ext == ".pptx") return DocFormat::PPTX;
+        if (ext == ".odt") return DocFormat::ODT;
+        if (ext == ".ods") return DocFormat::ODS;
+        if (ext == ".odp") return DocFormat::ODP;
 
-        // Fallback: inspect [Content_Types].xml
+        // Fallback: inspect [Content_Types].xml, then the ODF mimetype member.
         ZipReader zip(file_path);
         if (zip.is_open()) {
             auto ct = zip.read_entry("[Content_Types].xml");
@@ -88,6 +115,8 @@ DocFormat detect_office_format(const std::string& file_path) {
                 if (content.find("presentationml") != std::string::npos)
                     return DocFormat::PPTX;
             }
+            DocFormat odf = classify_odf_zip(zip);
+            if (odf != DocFormat::UNKNOWN) return odf;
         }
         return DocFormat::UNKNOWN;
     }
@@ -103,6 +132,7 @@ DocFormat detect_office_format(const std::string& file_path) {
         if (ole.is_open()) {
             DocFormat enc = classify_ole_encryption(ole);
             if (enc != DocFormat::UNKNOWN) return enc;
+            if (is_msg_ole(ole)) return DocFormat::MSG;
         }
 
         // Determine type from extension first (skip .hwp — handled by main)
@@ -174,6 +204,9 @@ DocFormat detect_office_format_mem(const uint8_t* data, size_t size,
         if (ext == ".xlsx") return DocFormat::XLSX;
         if (ext == ".xlsb") return DocFormat::XLSB;
         if (ext == ".pptx") return DocFormat::PPTX;
+        if (ext == ".odt") return DocFormat::ODT;
+        if (ext == ".ods") return DocFormat::ODS;
+        if (ext == ".odp") return DocFormat::ODP;
 
         ZipReader zip(data, size);
         if (zip.is_open()) {
@@ -191,6 +224,8 @@ DocFormat detect_office_format_mem(const uint8_t* data, size_t size,
                 if (content.find("presentationml") != std::string::npos)
                     return DocFormat::PPTX;
             }
+            DocFormat odf = classify_odf_zip(zip);
+            if (odf != DocFormat::UNKNOWN) return odf;
         }
         return DocFormat::UNKNOWN;
     }
@@ -204,6 +239,7 @@ DocFormat detect_office_format_mem(const uint8_t* data, size_t size,
         if (ole.is_open()) {
             DocFormat enc = classify_ole_encryption(ole);
             if (enc != DocFormat::UNKNOWN) return enc;
+            if (is_msg_ole(ole)) return DocFormat::MSG;
         }
 
         if (ext == ".doc") return DocFormat::DOC;
@@ -261,6 +297,10 @@ const char* format_name(DocFormat fmt) {
         case DocFormat::PPT:  return "PPT";
         case DocFormat::RTF:  return "RTF";
         case DocFormat::HTML: return "HTML";
+        case DocFormat::MSG:  return "MSG";
+        case DocFormat::ODT:  return "ODT";
+        case DocFormat::ODS:  return "ODS";
+        case DocFormat::ODP:  return "ODP";
         case DocFormat::ENCRYPTED_PASSWORD: return "ENCRYPTED_PASSWORD";
         case DocFormat::ENCRYPTED_RIGHTS:   return "ENCRYPTED_RIGHTS";
         default: return "UNKNOWN";
@@ -341,6 +381,20 @@ static auto with_office_parser(DocFormat format, const DocInput& in, Fn&& fn) {
         PptParser parser(*ole);
         return fn(parser);
     }
+    case DocFormat::MSG: {
+        auto ole = in.open_ole();
+        if (!ole->is_open()) throw std::runtime_error("Cannot open MSG file: " + in.display());
+        MsgParser parser(*ole);
+        return fn(parser);
+    }
+    case DocFormat::ODT:
+    case DocFormat::ODS:
+    case DocFormat::ODP: {
+        auto zip = in.open_zip();
+        if (!zip->is_open()) throw std::runtime_error("Cannot open ODF file: " + in.display());
+        OdfParser parser(*zip, format);
+        return fn(parser);
+    }
     case DocFormat::RTF: {
         if (in.path) {
             RtfParser parser(*in.path);
@@ -386,7 +440,7 @@ static std::string to_markdown_impl(DocFormat format, const DocInput& in,
         if (chunks.size() <= 1 && !chunks.empty())
             return chunks[0].text;
         bool has_heading = (format == DocFormat::XLSX || format == DocFormat::XLSB ||
-                            format == DocFormat::XLS);
+                            format == DocFormat::XLS || format == DocFormat::ODS);
         const char* label = section_label(format);
         std::string result;
         for (size_t i = 0; i < chunks.size(); ++i) {

@@ -43,9 +43,13 @@ private:
     // Custom number formats: numFmtId -> formatCode
     std::map<int, std::string> custom_num_fmts_;
 
+    // Threaded-comment authors: personId (GUID) -> display name
+    std::map<std::string, std::string> persons_;
+
     void parse_shared_strings();
     void parse_workbook();
     void parse_workbook_rels();
+    void parse_persons();
     void parse_styles();
 
     // Parse a cell reference like "A1" -> (col_index, row_index) both 0-based
@@ -82,7 +86,12 @@ private:
     SheetData parse_sheet(const SheetInfo& info);
 
     // Parse comments for a sheet, return cell_ref -> comment_text
+    // (merges legacy xl/comments*.xml and modern threaded comments).
     std::map<std::string, std::string> parse_comments(const SheetInfo& info);
+    void parse_legacy_comments(const std::string& path,
+                               std::map<std::string, std::string>& out);
+    void parse_threaded_comments(const std::string& path,
+                                 std::map<std::string, std::string>& out);
 
     std::string format_sheet_as_table(const SheetData& sheet,
                                        int max_rows = 10000);

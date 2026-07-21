@@ -3,6 +3,8 @@
 
 #include "common/string_utils.h"
 
+#include <cctype>
+
 namespace jdoc { namespace util {
 
 const uint16_t kCp1252Table[32] = {
@@ -255,15 +257,19 @@ std::string sanitize_utf8(const char* data, size_t len) {
     return out;
 }
 
-bool is_valid_utf8(const std::string& s) {
+bool is_valid_utf8(const char* data, size_t len) {
     size_t pos = 0;
-    while (pos < s.size()) {
-        if (static_cast<unsigned char>(s[pos]) < 0x80) { pos++; continue; }
+    while (pos < len) {
+        if (static_cast<unsigned char>(data[pos]) < 0x80) { pos++; continue; }
         size_t before = pos;
-        if (decode_utf8(s.data(), s.size(), pos) == 0xFFFD) return false;
+        if (decode_utf8(data, len, pos) == 0xFFFD) return false;
         if (pos == before) return false;
     }
     return true;
+}
+
+bool is_valid_utf8(const std::string& s) {
+    return is_valid_utf8(s.data(), s.size());
 }
 
 std::string cp949_string_to_utf8(const std::string& s) {
@@ -283,6 +289,103 @@ std::string cp949_string_to_utf8(const std::string& s) {
         }
     }
     return out;
+}
+
+// ── MIME / mail codecs ──────────────────────────────────────
+
+std::string decode_base64(const std::string& in) {
+    static const int8_t kInv = -1;
+    auto val = [](unsigned char c) -> int8_t {
+        if (c >= 'A' && c <= 'Z') return static_cast<int8_t>(c - 'A');
+        if (c >= 'a' && c <= 'z') return static_cast<int8_t>(c - 'a' + 26);
+        if (c >= '0' && c <= '9') return static_cast<int8_t>(c - '0' + 52);
+        if (c == '+') return 62;
+        if (c == '/') return 63;
+        return kInv;
+    };
+
+    std::string out;
+    out.reserve(in.size() * 3 / 4 + 3);
+    uint32_t buf = 0;
+    int bits = 0;
+    for (unsigned char c : in) {
+        if (c == '=') break;             // padding — end of data
+        int8_t v = val(c);
+        if (v < 0) continue;             // skip whitespace / stray bytes
+        buf = (buf << 6) | static_cast<uint32_t>(v);
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            out.push_back(static_cast<char>((buf >> bits) & 0xFF));
+        }
+    }
+    return out;
+}
+
+std::string decode_quoted_printable(const std::string& in, bool q_encoding) {
+    auto hex = [](unsigned char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        return -1;
+    };
+
+    std::string out;
+    out.reserve(in.size());
+    for (size_t i = 0; i < in.size(); i++) {
+        unsigned char c = static_cast<unsigned char>(in[i]);
+        if (q_encoding && c == '_') {
+            out.push_back(' ');           // RFC 2047 'Q': '_' is space
+        } else if (c == '=') {
+            if (i + 2 < in.size()) {
+                int hi = hex(static_cast<unsigned char>(in[i + 1]));
+                int lo = hex(static_cast<unsigned char>(in[i + 2]));
+                if (hi >= 0 && lo >= 0) {
+                    out.push_back(static_cast<char>((hi << 4) | lo));
+                    i += 2;
+                    continue;
+                }
+            }
+            // "=\r\n" or "=\n" soft line break: drop the '=' and the newline
+            if (i + 1 < in.size() && in[i + 1] == '\r' &&
+                i + 2 < in.size() && in[i + 2] == '\n') {
+                i += 2;
+            } else if (i + 1 < in.size() && in[i + 1] == '\n') {
+                i += 1;
+            }
+            // else: stray '=', drop it
+        } else {
+            out.push_back(static_cast<char>(c));
+        }
+    }
+    return out;
+}
+
+std::string charset_to_utf8(const std::string& bytes, const std::string& charset) {
+    // Normalize the label: lower-case, strip '-'/'_'/' '.
+    std::string k;
+    k.reserve(charset.size());
+    for (char c : charset) {
+        unsigned char u = static_cast<unsigned char>(c);
+        if (u == '-' || u == '_' || u == ' ') continue;
+        k.push_back(static_cast<char>(std::tolower(u)));
+    }
+
+    if (k.empty())
+        return is_valid_utf8(bytes) ? bytes : cp949_string_to_utf8(bytes);
+    if (k == "utf8" || k == "usascii" || k == "ascii")
+        return sanitize_utf8(bytes);
+    if (k == "euckr" || k == "ksc56011987" || k == "ksc5601" || k == "cp949" ||
+        k == "uhc" || k == "ms949" || k == "windows949" || k == "korean")
+        return cp949_string_to_utf8(bytes);
+    if (k == "iso88591" || k == "latin1" || k == "l1") {
+        std::string out;
+        out.reserve(bytes.size() * 2);
+        for (unsigned char c : bytes) append_utf8(out, c);
+        return out;
+    }
+    // Unknown charset: keep valid UTF-8, otherwise assume CP949 (Korean corpus).
+    return is_valid_utf8(bytes) ? bytes : cp949_string_to_utf8(bytes);
 }
 
 }} // namespace jdoc::util

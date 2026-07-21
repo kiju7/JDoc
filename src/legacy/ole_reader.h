@@ -91,6 +91,10 @@ private:
     // Find a storage entry index by name, or -1.
     int find_storage(const std::string& name) const;
 
+    // Find a direct child named `name` within the sibling tree rooted at
+    // `sibling_root` (does not descend into grandchildren). Returns -1 if none.
+    int find_in_siblings(int sibling_root, const std::string& name) const;
+
     void init_from_source();
 };
 

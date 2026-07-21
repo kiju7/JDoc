@@ -66,17 +66,42 @@ static bool read_header(const char* data, size_t size, size_t pos, RecordHeader&
 
 // ── Text decoding ───────────────────────────────────────────
 
+// PowerPoint separates paragraphs with CR (0x0D) and soft lines with VT (0x0B);
+// normalize both to '\n' (they are single-byte controls, safe within UTF-8).
+static void normalize_ppt_breaks(std::string& s) {
+    std::string out;
+    out.reserve(s.size());
+    for (size_t i = 0; i < s.size(); ++i) {
+        char c = s[i];
+        if (c == '\r') {
+            out.push_back('\n');
+            if (i + 1 < s.size() && s[i + 1] == '\n') ++i;  // CRLF -> one '\n'
+        } else if (c == '\x0b') {
+            out.push_back('\n');
+        } else {
+            out.push_back(c);
+        }
+    }
+    s.swap(out);
+}
+
 static std::string decode_text_chars(const char* data, size_t len) {
-    return util::utf16le_to_utf8(data, len);
+    std::string s = util::utf16le_to_utf8(data, len);
+    normalize_ppt_breaks(s);
+    return s;
 }
 
 static std::string decode_text_bytes(const char* data, size_t len) {
     std::string text;
     for (size_t i = 0; i < len; ++i) {
         uint8_t ch = static_cast<uint8_t>(data[i]);
-        if (ch == 0x0D) text.push_back('\n');
-        else if (ch >= 0x20 || ch == '\t' || ch == '\n')
+        if (ch == 0x0D || ch == 0x0B) {
+            text.push_back('\n');
+            if (ch == 0x0D && i + 1 < len &&
+                static_cast<uint8_t>(data[i + 1]) == 0x0A) ++i;  // CRLF
+        } else if (ch >= 0x20 || ch == '\t' || ch == '\n') {
             text += util::cp1252_to_utf8(ch);
+        }
     }
     return text;
 }

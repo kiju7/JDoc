@@ -11,7 +11,7 @@
 namespace jdoc {
 
 enum class FileFormat {
-    PDF, OFFICE, HWP, HWPX, TXT,
+    PDF, OFFICE, HWP, HWPX, TXT, EML,
     ZIP, GZIP, BZIP2, TAR, SEVENZIP, ALZ, EGG, RAR,
     UNKNOWN
 };

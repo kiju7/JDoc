@@ -2,6 +2,7 @@
 // License: MIT
 
 #include "html_parser.h"
+#include "html_charset.h"
 #include "common/file_utils.h"
 
 #include <algorithm>
@@ -14,7 +15,9 @@ namespace jdoc {
 
 // ── Constructor ──────────────────────────────────────────
 
-HtmlParser::HtmlParser(const std::string& file_path) : file_path_(file_path) {
+HtmlParser::HtmlParser(const std::string& file_path,
+                       const std::string& charset_hint)
+    : file_path_(file_path), charset_hint_(charset_hint) {
     std::ifstream ifs(file_path, std::ios::binary);
     if (!ifs) return;
     ifs.seekg(0, std::ios::end);
@@ -22,10 +25,25 @@ HtmlParser::HtmlParser(const std::string& file_path) : file_path_(file_path) {
     ifs.seekg(0, std::ios::beg);
     raw_html_.resize(size);
     ifs.read(&raw_html_[0], size);
+    normalize_encoding_();
 }
 
-HtmlParser::HtmlParser(const char* data, size_t size)
-    : raw_html_(data, size) {}
+HtmlParser::HtmlParser(const char* data, size_t size,
+                       const std::string& charset_hint)
+    : raw_html_(data, size), charset_hint_(charset_hint) {
+    normalize_encoding_();
+}
+
+// Rewrite raw_html_ as UTF-8 based on the detected encoding. BOM-less UTF-8
+// documents (the common case) return without allocating or copying.
+void HtmlParser::normalize_encoding_() {
+    if (raw_html_.empty()) return;
+    auto dec = html::decide_charset(raw_html_.data(), raw_html_.size(),
+                                    charset_hint_);
+    if (dec.charset == html::Charset::UTF8 && dec.body_offset == 0) return;
+    raw_html_ = html::to_utf8(raw_html_.data() + dec.body_offset,
+                              raw_html_.size() - dec.body_offset, dec.charset);
+}
 
 // ── HTML entity decoding ─────────────────────────────────
 

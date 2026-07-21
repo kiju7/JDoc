@@ -7,6 +7,7 @@
 #include "jdoc/office.h"
 #include "jdoc/hwp.h"
 #include "jdoc/hwpx.h"
+#include "jdoc/eml.h"
 #include "convert_internal.h"
 #include "zip_reader.h"
 #include "legacy/ole_reader.h"
@@ -64,9 +65,11 @@ static FileFormat format_from_ext(const std::string& name) {
     if (ext == ".pdf") return FileFormat::PDF;
     if (ext == ".hwpx") return FileFormat::HWPX;
     if (ext == ".hwp") return FileFormat::HWP;
+    if (ext == ".eml") return FileFormat::EML;
     if (ext == ".docx" || ext == ".xlsx" || ext == ".pptx" ||
         ext == ".doc" || ext == ".xls" || ext == ".ppt" || ext == ".rtf" ||
-        ext == ".html" || ext == ".htm" || ext == ".xlsb")
+        ext == ".html" || ext == ".htm" || ext == ".xlsb" ||
+        ext == ".odt" || ext == ".ods" || ext == ".odp")
         return FileFormat::OFFICE;
     if (ext == ".zip") return FileFormat::ZIP;
     if (ext == ".gz" || ext == ".tgz") return FileFormat::GZIP;
@@ -131,6 +134,11 @@ static FileFormat classify_zip(const ZipReader& zip) {
         zip.has_entry("META-INF/container.xml"))
         return FileFormat::HWPX;
     if (zip.has_entry("[Content_Types].xml"))
+        return FileFormat::OFFICE;
+    // ODF (odt/ods/odp): no [Content_Types].xml — instead a top-level mimetype
+    // member plus META-INF/manifest.xml. The office layer splits the three
+    // kinds by the mimetype string.
+    if (zip.has_entry("mimetype") && zip.has_entry("META-INF/manifest.xml"))
         return FileFormat::OFFICE;
     return FileFormat::ZIP;
 }
@@ -247,6 +255,7 @@ const char* file_format_name(FileFormat fmt) {
         case FileFormat::HWP:      return "HWP";
         case FileFormat::HWPX:     return "HWPX";
         case FileFormat::TXT:      return "TXT";
+        case FileFormat::EML:      return "EML";
         case FileFormat::ZIP:      return "ZIP";
         case FileFormat::GZIP:     return "GZIP";
         case FileFormat::BZIP2:    return "BZIP2";
@@ -278,6 +287,7 @@ std::string convert_from_memory_as(FileFormat fmt,
         case FileFormat::TXT:
             return util::plain_text_to_utf8(
                 std::string(reinterpret_cast<const char*>(data), size));
+        case FileFormat::EML:    return eml_to_markdown_mem(data, size, opts);
         default:
             if (is_archive_format(fmt))
                 throw std::runtime_error("Nested archive must be walked, not converted: " + name_hint);
@@ -293,6 +303,7 @@ std::string convert(const std::string& file_path, ConvertOptions opts) {
         case FileFormat::HWPX:   return hwpx_to_markdown(file_path, opts);
         case FileFormat::HWP:    return hwp_to_markdown(file_path, opts);
         case FileFormat::TXT:    return read_text_file(file_path);
+        case FileFormat::EML:    return eml_to_markdown(file_path, opts);
         default:
             if (is_archive_format(fmt))
                 throw std::runtime_error("File is an archive; use convert_archive(): " + file_path);
@@ -320,6 +331,7 @@ std::vector<PageChunk> convert_chunks(const std::string& file_path,
             chunk.text = read_text_file(file_path);
             return {chunk};
         }
+        case FileFormat::EML:    return eml_to_markdown_chunks(file_path, opts);
         default:
             if (is_archive_format(fmt))
                 throw std::runtime_error("File is an archive; use convert_archive(): " + file_path);

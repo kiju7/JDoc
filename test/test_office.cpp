@@ -676,6 +676,216 @@ void test_docx_header_footer() {
     TEST_END
 }
 
+// ── XLSX rels/comment fixes ──────────────────────────────────
+
+static std::string convert_xlsx(const std::string& xlsx) {
+    return jdoc::office_to_markdown_mem(
+        reinterpret_cast<const uint8_t*>(xlsx.data()), xlsx.size(), "book.xlsx");
+}
+
+// Minimal one-sheet workbook. rel_target is the workbook->sheet relationship
+// Target (varied to exercise absolute vs relative paths). sheet_body is the
+// <sheetData> content; extra adds further parts (comments, persons, sheet rels).
+static std::string make_xlsx(
+    const std::string& rel_target, const std::string& sheet_body,
+    const std::vector<std::pair<std::string, std::string>>& extra = {}) {
+    std::vector<std::pair<std::string, std::string>> entries = {
+        {"[Content_Types].xml",
+         "<?xml version=\"1.0\"?><Types xmlns=\"http://schemas.openxmlformats.org/"
+         "package/2006/content-types\"><Default Extension=\"xml\" "
+         "ContentType=\"application/xml\"/></Types>"},
+        {"xl/workbook.xml",
+         "<?xml version=\"1.0\"?><workbook xmlns=\"http://schemas.openxmlformats.org/"
+         "spreadsheetml/2006/main\" xmlns:r=\"http://schemas.openxmlformats.org/"
+         "officeDocument/2006/relationships\"><sheets>"
+         "<sheet name=\"Sheet1\" sheetId=\"1\" r:id=\"rId1\"/></sheets></workbook>"},
+        {"xl/_rels/workbook.xml.rels",
+         "<?xml version=\"1.0\"?><Relationships xmlns=\"http://schemas.openxmlformats.org/"
+         "package/2006/relationships\"><Relationship Id=\"rId1\" Type=\""
+         "http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\""
+         " Target=\"" + rel_target + "\"/></Relationships>"},
+        {"xl/worksheets/sheet1.xml",
+         "<?xml version=\"1.0\"?><worksheet xmlns=\"http://schemas.openxmlformats.org/"
+         "spreadsheetml/2006/main\"><sheetData>" + sheet_body +
+         "</sheetData></worksheet>"},
+    };
+    for (const auto& e : extra) entries.push_back(e);
+    return make_zip(entries);
+}
+
+void test_xlsx_fixes() {
+    std::cerr << "\nXLSX rels/comments:\n";
+
+    TEST(absolute_rels_target_inlinestr)
+        // openpyxl-style absolute Target ("/xl/...") + inlineStr cells used to
+        // yield an empty sheet; the path must normalize and the value appear.
+        auto md = convert_xlsx(make_xlsx(
+            "/xl/worksheets/sheet1.xml",
+            "<row r=\"1\"><c r=\"A1\" t=\"inlineStr\"><is><t>InlineHello</t></is></c></row>"));
+        ASSERT(md.find("InlineHello") != std::string::npos);
+        ASSERT(md.find("Empty sheet") == std::string::npos);
+    TEST_END
+
+    TEST(comment_on_empty_cell)
+        // A comment anchored to a cell with no <c> element must still be emitted.
+        std::string sheet =
+            "<row r=\"1\"><c r=\"A1\" t=\"inlineStr\"><is><t>Val</t></is></c></row>";
+        std::string sheet_rels =
+            "<?xml version=\"1.0\"?><Relationships xmlns=\"http://schemas.openxmlformats.org/"
+            "package/2006/relationships\"><Relationship Id=\"rIdC\" Type=\""
+            "http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments\""
+            " Target=\"../comments1.xml\"/></Relationships>";
+        std::string comments =
+            "<?xml version=\"1.0\"?><comments xmlns=\"http://schemas.openxmlformats.org/"
+            "spreadsheetml/2006/main\"><authors><author>Rev</author></authors>"
+            "<commentList><comment ref=\"E1\" authorId=\"0\"><text><t>EmptyCellMemo"
+            "</t></text></comment></commentList></comments>";
+        auto md = convert_xlsx(make_xlsx(
+            "worksheets/sheet1.xml", sheet,
+            {{"xl/worksheets/_rels/sheet1.xml.rels", sheet_rels},
+             {"xl/comments1.xml", comments}}));
+        ASSERT(md.find("EmptyCellMemo") != std::string::npos);
+    TEST_END
+
+    TEST(threaded_comment_with_author)
+        // Threaded comments resolve personId -> displayName and join a thread.
+        std::string sheet =
+            "<row r=\"1\"><c r=\"A1\" t=\"inlineStr\"><is><t>Val</t></is></c></row>";
+        std::string sheet_rels =
+            "<?xml version=\"1.0\"?><Relationships xmlns=\"http://schemas.openxmlformats.org/"
+            "package/2006/relationships\"><Relationship Id=\"rIdT\" Type=\""
+            "http://schemas.microsoft.com/office/2017/10/relationships/threadedComment\""
+            " Target=\"../threadedComments/threadedComment1.xml\"/></Relationships>";
+        std::string persons =
+            "<?xml version=\"1.0\"?><personList xmlns=\"http://schemas.microsoft.com/"
+            "office/spreadsheetml/2018/threadedcomments\">"
+            "<person displayName=\"Kim\" id=\"{P1}\"/></personList>";
+        std::string tc =
+            "<?xml version=\"1.0\"?><ThreadedComments xmlns=\"http://schemas.microsoft.com/"
+            "office/spreadsheetml/2018/threadedcomments\">"
+            "<threadedComment ref=\"B2\" personId=\"{P1}\" id=\"{T1}\"><text>needs review"
+            "</text></threadedComment></ThreadedComments>";
+        auto md = convert_xlsx(make_xlsx(
+            "worksheets/sheet1.xml", sheet,
+            {{"xl/worksheets/_rels/sheet1.xml.rels", sheet_rels},
+             {"xl/persons/person1.xml", persons},
+             {"xl/threadedComments/threadedComment1.xml", tc}}));
+        ASSERT(md.find("Kim: needs review") != std::string::npos);
+    TEST_END
+}
+
+// ── HTML charset detection ───────────────────────────────────
+
+static std::string convert_html(const std::string& html) {
+    return jdoc::office_to_markdown_mem(
+        reinterpret_cast<const uint8_t*>(html.data()), html.size(), "page.html");
+}
+
+void test_html_charset() {
+    std::cerr << "\nHTML charset:\n";
+
+    // "주민번호" in EUC-KR bytes and in UTF-8 bytes.
+    const std::string euckr = "\xC1\xD6\xB9\xCE\xB9\xF8\xC8\xA3";
+    const std::string utf8  = "\xEC\xA3\xBC\xEB\xAF\xBC\xEB\xB2\x88\xED\x98\xB8";
+    const std::string replacement = "\xEF\xBF\xBD";  // U+FFFD
+
+    TEST(euckr_no_declaration_decoded)
+        // charset-less EUC-KR (the real sample) is rescued by the heuristic.
+        std::string html = "<html><body><p>" + euckr + "</p></body></html>";
+        auto md = convert_html(html);
+        ASSERT(md.find(utf8) != std::string::npos);
+        ASSERT(md.find(replacement) == std::string::npos);
+    TEST_END
+
+    TEST(euckr_meta_declaration_decoded)
+        std::string html =
+            "<html><head><meta http-equiv=\"Content-Type\" "
+            "content=\"text/html; charset=euc-kr\"></head><body><p>" + euckr +
+            "</p></body></html>";
+        auto md = convert_html(html);
+        ASSERT(md.find(utf8) != std::string::npos);
+    TEST_END
+
+    TEST(utf8_passthrough)
+        // Valid UTF-8 must pass through unchanged (fast path, no double-decode).
+        std::string html =
+            "<html><head><meta charset=\"utf-8\"></head><body><p>" + utf8 +
+            "</p></body></html>";
+        auto md = convert_html(html);
+        ASSERT(md.find(utf8) != std::string::npos);
+        ASSERT(md.find(replacement) == std::string::npos);
+    TEST_END
+
+    TEST(utf8_mislabeled_euckr_not_corrupted)
+        // A UTF-8 page carrying a stale charset=euc-kr meta must not be double-decoded.
+        std::string html =
+            "<html><head><meta charset=\"euc-kr\"></head><body><p>" + utf8 +
+            "</p></body></html>";
+        auto md = convert_html(html);
+        ASSERT(md.find(utf8) != std::string::npos);
+    TEST_END
+}
+
+// ── PPTX soft line breaks (<a:br>) ───────────────────────────
+
+void test_pptx_linebreak() {
+    std::cerr << "\nPPTX line breaks:\n";
+
+    TEST(explicit_break_splits_values)
+        // A single <a:p> whose lines are separated only by <a:br> (the shape
+        // PowerPoint's Shift+Enter produces) must not run together.
+        std::string body =
+            "<p:sp><p:txBody><a:p>"
+            "<a:r><a:t>label</a:t></a:r>"
+            "<a:br/>"
+            "<a:r><a:t>03-5595-6395</a:t></a:r>"
+            "<a:br/>"
+            "<a:r><a:t>03-6495-7208</a:t></a:r>"
+            "</a:p></p:txBody></p:sp>";
+        auto md = convert_pptx(make_pptx(body));
+        ASSERT(md.find("label\n03-5595-6395\n03-6495-7208") != std::string::npos);
+        ASSERT(md.find("label03-5595-6395") == std::string::npos);
+    TEST_END
+
+    TEST(runs_in_paragraph_not_broken)
+        // Consecutive runs in one paragraph (no <a:br>) stay on one line.
+        std::string body =
+            "<p:sp><p:txBody><a:p>"
+            "<a:r><a:t>#1. </a:t></a:r>"
+            "<a:r><a:t>national id</a:t></a:r>"
+            "</a:p></p:txBody></p:sp>";
+        auto md = convert_pptx(make_pptx(body));
+        ASSERT(md.find("#1. national id") != std::string::npos);
+        ASSERT(md.find("#1. \nnational id") == std::string::npos);
+    TEST_END
+
+    TEST(paragraphs_still_separated)
+        // Each value in its own <a:p> keeps splitting by newline (regression).
+        std::string body =
+            "<p:sp><p:txBody>"
+            "<a:p><a:r><a:t>first line</a:t></a:r></a:p>"
+            "<a:p><a:r><a:t>second line</a:t></a:r></a:p>"
+            "</p:txBody></p:sp>";
+        auto md = convert_pptx(make_pptx(body));
+        ASSERT(md.find("first line\nsecond line") != std::string::npos);
+    TEST_END
+
+    TEST(table_cell_break_becomes_space)
+        // <a:br> inside a table cell collapses to a space so the row stays intact.
+        std::string body =
+            "<p:graphicFrame><a:graphic><a:graphicData>"
+            "<a:tbl>"
+            "<a:tr><a:tc><a:txBody><a:p>"
+            "<a:r><a:t>x</a:t></a:r><a:br/><a:r><a:t>y</a:t></a:r>"
+            "</a:p></a:txBody></a:tc></a:tr>"
+            "</a:tbl>"
+            "</a:graphicData></a:graphic></p:graphicFrame>";
+        auto md = convert_pptx(make_pptx(body));
+        ASSERT(md.find("x y") != std::string::npos);   // joined by space in cell
+        ASSERT(md.find("x\ny") == std::string::npos);   // no newline leaks into row
+    TEST_END
+}
+
 // ── Main ────────────────────────────────────────────────────
 
 int main() {
@@ -689,6 +899,9 @@ int main() {
     test_pptx_master_layout();
     test_pptx_shared_media();
     test_docx_header_footer();
+    test_xlsx_fixes();
+    test_html_charset();
+    test_pptx_linebreak();
 
     std::cerr << "\n=== Results: " << tests_passed << " passed, "
               << tests_failed << " failed ===\n";
