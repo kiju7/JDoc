@@ -1592,8 +1592,8 @@ PdfFont load_font(PdfDoc& doc, const PdfObj& font_ref) {
 
     if (font_type == "Type0") {
         font.is_type0 = true;
-        // Check encoding
-        auto& enc = fobj.get("Encoding");
+        // Check encoding (may be an indirect reference)
+        auto enc = doc.resolve(fobj.get("Encoding"));
         if (enc.is_name()) {
             if (enc.str_val == "Identity-H" || enc.str_val == "Identity-V")
                 font.is_identity = true;
@@ -1645,17 +1645,19 @@ PdfFont load_font(PdfDoc& doc, const PdfObj& font_ref) {
         }
     }
 
-    // ToUnicode CMap
-    auto& tu = fobj.get("ToUnicode");
+    // ToUnicode CMap (may be an indirect reference)
+    auto tu = doc.resolve(fobj.get("ToUnicode"));
     if (!tu.is_none()) parse_tounicode_cmap(doc, tu, font);
 
-    // Simple fonts always use 1-byte codes regardless of the ToUnicode CMap's
-    // codespacerange (HWP exports Type3 fonts with a <0000><FFFF> codespace,
-    // which must not switch string decoding to 2-byte).
-    if (font.is_type3) font.cmap_code_bytes = 1;
+    // Simple fonts (everything but Type0 composite fonts) index glyphs with
+    // single-byte codes, whatever the ToUnicode CMap's codespacerange claims.
+    // Some producers ship a Type1/TrueType font with a 2-byte <0000><FFFF>
+    // codespace (and HWP does the same for Type3); honoring it would make the
+    // string decoder read one-byte text two bytes at a time and drop the body.
+    if (!font.is_type0) font.cmap_code_bytes = 1;
 
-    // Encoding
-    auto& enc_obj = fobj.get("Encoding");
+    // Encoding (may be an indirect reference to an encoding dictionary)
+    auto enc_obj = doc.resolve(fobj.get("Encoding"));
     if (enc_obj.is_name()) {
         if (enc_obj.str_val == "WinAnsiEncoding") font.encoding_table = kWinAnsi;
         else if (enc_obj.str_val == "MacRomanEncoding") font.encoding_table = kMacRoman;
