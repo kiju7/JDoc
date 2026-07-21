@@ -161,6 +161,7 @@ add_library(jdoc_lib STATIC
     src/legacy/ppt_parser.cpp
     src/legacy/rtf_parser.cpp
     src/html/html_parser.cpp
+    src/html/html_charset.cpp
     # OLE reader — shared by hwp and office, compiled once
     src/legacy/ole_reader.cpp
     # unified auto-detect API

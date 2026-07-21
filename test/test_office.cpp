@@ -774,6 +774,58 @@ void test_xlsx_fixes() {
     TEST_END
 }
 
+// ── HTML charset detection ───────────────────────────────────
+
+static std::string convert_html(const std::string& html) {
+    return jdoc::office_to_markdown_mem(
+        reinterpret_cast<const uint8_t*>(html.data()), html.size(), "page.html");
+}
+
+void test_html_charset() {
+    std::cerr << "\nHTML charset:\n";
+
+    // "주민번호" in EUC-KR bytes and in UTF-8 bytes.
+    const std::string euckr = "\xC1\xD6\xB9\xCE\xB9\xF8\xC8\xA3";
+    const std::string utf8  = "\xEC\xA3\xBC\xEB\xAF\xBC\xEB\xB2\x88\xED\x98\xB8";
+    const std::string replacement = "\xEF\xBF\xBD";  // U+FFFD
+
+    TEST(euckr_no_declaration_decoded)
+        // charset-less EUC-KR (the real sample) is rescued by the heuristic.
+        std::string html = "<html><body><p>" + euckr + "</p></body></html>";
+        auto md = convert_html(html);
+        ASSERT(md.find(utf8) != std::string::npos);
+        ASSERT(md.find(replacement) == std::string::npos);
+    TEST_END
+
+    TEST(euckr_meta_declaration_decoded)
+        std::string html =
+            "<html><head><meta http-equiv=\"Content-Type\" "
+            "content=\"text/html; charset=euc-kr\"></head><body><p>" + euckr +
+            "</p></body></html>";
+        auto md = convert_html(html);
+        ASSERT(md.find(utf8) != std::string::npos);
+    TEST_END
+
+    TEST(utf8_passthrough)
+        // Valid UTF-8 must pass through unchanged (fast path, no double-decode).
+        std::string html =
+            "<html><head><meta charset=\"utf-8\"></head><body><p>" + utf8 +
+            "</p></body></html>";
+        auto md = convert_html(html);
+        ASSERT(md.find(utf8) != std::string::npos);
+        ASSERT(md.find(replacement) == std::string::npos);
+    TEST_END
+
+    TEST(utf8_mislabeled_euckr_not_corrupted)
+        // A UTF-8 page carrying a stale charset=euc-kr meta must not be double-decoded.
+        std::string html =
+            "<html><head><meta charset=\"euc-kr\"></head><body><p>" + utf8 +
+            "</p></body></html>";
+        auto md = convert_html(html);
+        ASSERT(md.find(utf8) != std::string::npos);
+    TEST_END
+}
+
 // ── Main ────────────────────────────────────────────────────
 
 int main() {
@@ -788,6 +840,7 @@ int main() {
     test_pptx_shared_media();
     test_docx_header_footer();
     test_xlsx_fixes();
+    test_html_charset();
 
     std::cerr << "\n=== Results: " << tests_passed << " passed, "
               << tests_failed << " failed ===\n";

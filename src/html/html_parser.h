@@ -11,8 +11,10 @@ namespace jdoc {
 
 class HtmlParser {
 public:
-    explicit HtmlParser(const std::string& file_path);
-    HtmlParser(const char* data, size_t size);   // parse from memory
+    explicit HtmlParser(const std::string& file_path,
+                        const std::string& charset_hint = "");
+    HtmlParser(const char* data, size_t size,
+               const std::string& charset_hint = "");   // parse from memory
 
     std::string to_markdown(const ConvertOptions& opts);
     std::vector<PageChunk> to_chunks(const ConvertOptions& opts);
@@ -20,6 +22,11 @@ public:
 private:
     std::string file_path_;
     std::string raw_html_;
+    std::string charset_hint_;   // optional transport charset (e.g. from MIME)
+
+    // Detect the document's encoding and rewrite raw_html_ as UTF-8 in place.
+    // A no-op fast path leaves BOM-less UTF-8 untouched.
+    void normalize_encoding_();
 
     // Simple HTML tag representation
     struct Tag {
