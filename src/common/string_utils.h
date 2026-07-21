@@ -109,4 +109,21 @@ inline std::string sanitize_utf8(const std::string& s) {
     return sanitize_utf8(s.data(), s.size());
 }
 
+// ── MIME / mail codecs ──────────────────────────────────────
+// Base64 decode. Whitespace and '=' padding are skipped; other non-alphabet
+// bytes are ignored, so malformed input decodes as much as possible without
+// throwing.
+std::string decode_base64(const std::string& in);
+
+// Quoted-printable decode: "=\r\n"/"=\n" soft breaks are removed and "=XX" hex
+// escapes restored. When q_encoding is true (RFC 2047 'Q'), '_' maps to space.
+std::string decode_quoted_printable(const std::string& in, bool q_encoding = false);
+
+// Convert a byte string to UTF-8 for the named charset (case-insensitive):
+//   utf-8 / us-ascii            -> sanitized as UTF-8
+//   euc-kr / ks_c_5601-1987 / cp949 / uhc / korean -> cp949_string_to_utf8
+//   iso-8859-1 / latin1         -> byte value as code point
+//   otherwise / empty           -> valid UTF-8 kept, else CP949 fallback
+std::string charset_to_utf8(const std::string& bytes, const std::string& charset);
+
 }} // namespace jdoc::util
