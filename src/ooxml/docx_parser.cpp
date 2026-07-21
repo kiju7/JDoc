@@ -163,10 +163,52 @@ void DocxParser::parse_relationships() {
 
 // ── Header/Footer extraction ────────────────────────────
 
+// Header and footer text renders on every page but lives in its own part, so a
+// reader walking word/document.xml alone never sees it. Teams habitually park a
+// document classification, an owning department, a drafter's name or a contact
+// there, so it is extracted rather than skipped — matching what the HWP and
+// HWPX parsers already do for the same content.
+//
+// The same header part is referenced by several sections and by the first-page
+// and even-page variants, so identical text is emitted only once.
 std::string DocxParser::extract_headers_footers() {
-    // Headers/footers omitted — typically repetitive page-level content
-    // (page numbers, document title). reference also skips these.
-    return {};
+    std::vector<std::string> parts;
+    for (const char* prefix : {"word/header", "word/footer"}) {
+        std::vector<std::string> group;
+        for (auto* entry : zip_.entries_with_prefix(prefix)) {
+            const std::string& nm = entry->name;
+            if (nm.size() < 5 || nm.compare(nm.size() - 4, 4, ".xml") != 0) continue;
+            group.push_back(nm);
+        }
+        std::sort(group.begin(), group.end());
+        parts.insert(parts.end(), group.begin(), group.end());
+    }
+
+    std::string result;
+    std::set<std::string> seen;
+    for (const auto& part : parts) {
+        auto data = zip_.read_entry(part);
+        if (data.empty()) continue;
+        pugi::xml_document doc;
+        if (!doc.load_buffer(data.data(), data.size(),
+                             pugi::parse_default | pugi::parse_ws_pcdata))
+            continue;
+
+        // One line per paragraph, so a multi-line footer stays readable
+        std::vector<pugi::xml_node> paras;
+        xml_find_all(doc, "p", paras);
+        for (auto& p : paras) {
+            std::string text;
+            std::vector<pugi::xml_node> t_nodes;
+            xml_find_all(p, "t", t_nodes);
+            for (auto& t : t_nodes) text += xml_text_content(t);
+            text = util::trim(text);
+            if (text.empty()) continue;
+            if (!seen.insert(text).second) continue;
+            result += text + "\n";
+        }
+    }
+    return result;
 }
 
 // ── Footnote/Endnote extraction ─────────────────────────
@@ -785,7 +827,32 @@ std::string DocxParser::to_markdown(const ConvertOptions& opts) {
         out << "\n" << endnotes;
     }
 
-    return out.str();
+    std::string rendered = out.str();
+    rendered += format_header_footer_block(rendered);
+    return rendered;
+}
+
+// ── Header/footer trailing block ────────────────────────
+
+// Emit header/footer text the body did not already state, as one block at the
+// end of the document so the reading flow is untouched.
+std::string DocxParser::format_header_footer_block(const std::string& body) {
+    std::string hf = extract_headers_footers();
+    if (hf.empty()) return "";
+
+    std::string block;
+    size_t start = 0;
+    while (start < hf.size()) {
+        size_t nl = hf.find('\n', start);
+        if (nl == std::string::npos) nl = hf.size();
+        std::string line = hf.substr(start, nl - start);
+        start = nl + 1;
+        if (line.empty()) continue;
+        if (body.find(line) != std::string::npos) continue;
+        block += line + "\n";
+    }
+    if (block.empty()) return "";
+    return "\n--- Header / Footer ---\n\n" + block;
 }
 
 // ── to_chunks ───────────────────────────────────────────
@@ -918,6 +985,13 @@ std::vector<PageChunk> DocxParser::to_chunks(
     }
 
     flush_chunk();
+
+    // Header/footer text belongs to no single page — append it to the last one
+    if (!chunks.empty()) {
+        std::string body;
+        for (auto& c : chunks) body += c.text;
+        chunks.back().text += format_header_footer_block(body);
+    }
 
     // Attach images to first chunk (create one if needed)
     if (!all_images.empty()) {

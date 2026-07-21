@@ -46,6 +46,7 @@ private:
 
     // Extract text from header/footer XML parts.
     std::string extract_headers_footers();
+    std::string format_header_footer_block(const std::string& body);
 
     // Extract text from footnotes/endnotes XML parts.
     std::string extract_footnotes();

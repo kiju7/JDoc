@@ -6,6 +6,7 @@
 #include "jdoc/hwp_types.h"
 #include "common/file_utils.h"
 #include "common/image_utils.h"
+#include "common/media_cache.h"
 #include "common/png_encode.h"
 #include "common/string_utils.h"
 #include "zip_reader.h"
@@ -30,6 +31,26 @@ static std::string escape_md(const std::string& text) {
     }
     return out;
 }
+
+// ── Drawing object recognition ──────────────────────────────
+
+// Drawing objects (그리기 개체) that may carry a <hp:drawText> body, i.e. a
+// text box. <hp:container> groups other shapes and has no body of its own, but
+// must still be descended into. Namespace prefixes are always "hp:" inside a
+// section, so an exact match is enough.
+static bool is_shape_element(const std::string& name) {
+    return name == "hp:container" || name == "hp:rect" ||
+           name == "hp:ellipse"   || name == "hp:line" ||
+           name == "hp:arc"       || name == "hp:polygon" ||
+           name == "hp:curve"     || name == "hp:connectLine" ||
+           name == "hp:textart"   || name == "hp:ole" ||
+           name == "hp:video"     || name == "hp:chart" ||
+           name == "hp:compose"   || name == "hp:dutmal";
+}
+
+// Section XML nesting is file-controlled, so the recursive walkers below cap
+// their depth — worker threads run on a far smaller stack than the main thread.
+static constexpr int kMaxShapeDepth = 64;
 
 // ── HWPX Document Parser ───────────────────────────────────
 
@@ -103,6 +124,11 @@ public:
 private:
     std::unique_ptr<ZipReader> zip_;
     ConvertOptions opts_;
+
+    // BinData parts already extracted, keyed by ZIP path. One part is commonly
+    // referenced from several paragraphs — a figure reused across sections, a
+    // header logo — and is extracted only on the first of them.
+    util::MediaCache media_cache_;
 
     // Parsed metadata
     std::map<std::string, hwp::BinDataRef> bin_data_map_;  // id -> BinDataRef
@@ -430,10 +456,11 @@ private:
                 }
                 else if (in == "hp:pic") {
                     // Picture
+                    // A repeat reference carries the shared name and path but
+                    // no payload, so validity is judged on the name.
                     auto img = process_picture(item, chunk.page_number, image_idx);
-                    if (!img.data.empty() || !img.saved_path.empty()) {
+                    if (!img.name.empty()) {
                         chunk.images.push_back(std::move(img));
-                        image_idx++;
                         para_has_content = true;
                         // Add image reference in markdown
                         auto& saved = chunk.images.back();
@@ -447,7 +474,44 @@ private:
                         }
                     }
                 }
+                else if (is_shape_element(in)) {
+                    // Drawing object (글상자/도형): its <hp:drawText> body is a
+                    // paragraph list of its own, unrelated to the run's text.
+                    std::string shape_text;
+                    collect_shape_text(item, shape_text, 0);
+                    shape_text = util::trim(shape_text);
+                    if (!shape_text.empty()) {
+                        // Flush preceding text so the shape reads as its own block
+                        if (!para_text.empty()) {
+                            md += para_text + "\n\n";
+                            para_text.clear();
+                        }
+                        md += shape_text + "\n\n";
+                        para_has_content = true;
+                    }
+                }
                 else if (in == "hp:ctrl") {
+                    // Header/footer bodies hang off a ctrl in the paragraph that
+                    // opens the section, so emitting them inline already places
+                    // them at the top of the section.
+                    for (auto ctrl_child : item.children()) {
+                        std::string cn = ctrl_child.name();
+                        if (cn != "hp:header" && cn != "hp:footer") continue;
+                        std::string hf_text;
+                        for (auto sub : ctrl_child.children()) {
+                            if (std::string(sub.name()) != "hp:subList") continue;
+                            extract_sublist_text(sub, hf_text, nullptr, 0);
+                        }
+                        hf_text = util::trim(hf_text);
+                        if (!hf_text.empty()) {
+                            if (!para_text.empty()) {
+                                md += para_text + "\n\n";
+                                para_text.clear();
+                            }
+                            md += hf_text + "\n\n";
+                            para_has_content = true;
+                        }
+                    }
                     // Check for footnotes/endnotes inside ctrl
                     for (auto ctrl_child : item.children()) {
                         std::string cn = ctrl_child.name();
@@ -563,6 +627,19 @@ private:
         int declared_rows = tbl.attribute("rowCnt").as_int(0);
         int declared_cols = tbl.attribute("colCnt").as_int(0);
 
+        // <hp:caption> is a sibling of the <hp:tr> rows, so the row loop below
+        // never sees it. Emit it ahead of the table it labels.
+        std::string caption;
+        for (auto child : tbl.children()) {
+            if (std::string(child.name()) != "hp:caption") continue;
+            for (auto sub : child.children()) {
+                if (std::string(sub.name()) != "hp:subList") continue;
+                extract_sublist_text(sub, caption, nullptr, 0);
+            }
+        }
+        caption = util::trim(caption);
+        if (!caption.empty()) caption += "\n\n";
+
         // First pass: collect cells with their span info
         struct CellInfo {
             std::string text;
@@ -588,7 +665,7 @@ private:
             if (!row.empty()) raw_rows.push_back(std::move(row));
         }
 
-        if (raw_rows.empty()) return "";
+        if (raw_rows.empty()) return caption;
 
         // Determine grid size
         int num_rows = declared_rows > 0 ? declared_rows : (int)raw_rows.size();
@@ -626,7 +703,7 @@ private:
         }
 
         // Render markdown table
-        std::string md;
+        std::string md = caption;
         for (int r = 0; r < num_rows; r++) {
             md += "|";
             for (int c = 0; c < num_cols; c++) {
@@ -645,9 +722,15 @@ private:
             for (auto& pic : table_pics) {
                 ImageData idata = process_picture(pic, page_number, *p_image_idx);
                 if (!idata.name.empty()) {
-                    std::string ref = idata.name + "." + idata.format;
+                    // Name the file that was actually written: save_image_to_file
+                    // settles the extension from the magic bytes (a "jpeg"
+                    // format lands as .jpg), so deriving the reference from the
+                    // format string alone points at a file that is not there.
+                    std::string ref = idata.saved_path.empty()
+                        ? idata.name + "." +
+                          (idata.format == "jpeg" ? "jpg" : idata.format)
+                        : util::get_filename(idata.saved_path);
                     md += "\n![" + idata.name + "](" + opts_.image_ref_prefix + ref + ")\n";
-                    (*p_image_idx)++;
                 }
             }
         }
@@ -665,8 +748,48 @@ private:
         }
     }
 
+    // Flatten a nested table into running text. Nested tables live inside a
+    // cell's <hp:subList>; rendering them as markdown there would break the
+    // enclosing grid, so their cell text is inlined instead. Each cell is
+    // visited exactly once — only <hp:tr>/<hp:tc> children are descended.
+    void flatten_table_text(pugi::xml_node tbl, std::string& out,
+                            std::vector<pugi::xml_node>* cell_pics, int depth) {
+        if (depth > kMaxShapeDepth) return;
+        for (auto tr : tbl.children()) {
+            if (std::string(tr.name()) != "hp:tr") continue;
+            for (auto tc : tr.children()) {
+                if (std::string(tc.name()) != "hp:tc") continue;
+                for (auto sub : tc.children()) {
+                    if (std::string(sub.name()) != "hp:subList") continue;
+                    extract_sublist_text(sub, out, cell_pics, depth + 1);
+                }
+            }
+        }
+    }
+
+    // Collect the text of a drawing object: its own <hp:drawText> body plus
+    // that of every shape nested under it (a <hp:container> groups shapes and
+    // has no body of its own). Descent is strictly downward, so no subtree is
+    // visited twice.
+    void collect_shape_text(pugi::xml_node shape, std::string& out, int depth) {
+        if (depth > kMaxShapeDepth) return;
+        for (auto child : shape.children()) {
+            std::string cn = child.name();
+            if (cn == "hp:drawText") {
+                for (auto sub : child.children()) {
+                    if (std::string(sub.name()) != "hp:subList") continue;
+                    extract_sublist_text(sub, out, nullptr, depth + 1);
+                }
+            } else if (is_shape_element(cn)) {
+                collect_shape_text(child, out, depth + 1);
+            }
+        }
+    }
+
     void extract_sublist_text(pugi::xml_node sublist, std::string& out,
-                              std::vector<pugi::xml_node>* cell_pics = nullptr) {
+                              std::vector<pugi::xml_node>* cell_pics = nullptr,
+                              int depth = 0) {
+        if (depth > kMaxShapeDepth) return;
         for (auto para : sublist.children()) {
             if (std::string(para.name()) != "hp:p") continue;
             if (!out.empty()) out += " ";
@@ -679,6 +802,10 @@ private:
                             out += extract_text(item);
                         } else if (iname == "hp:pic" && cell_pics) {
                             cell_pics->push_back(item);
+                        } else if (iname == "hp:tbl") {
+                            flatten_table_text(item, out, cell_pics, depth + 1);
+                        } else if (is_shape_element(iname)) {
+                            collect_shape_text(item, out, depth + 1);
                         } else if (iname == "hp:ctrl") {
                             for (auto ctrl_child : item.children()) {
                                 std::string cn = ctrl_child.name();
@@ -703,7 +830,11 @@ private:
     }
 
     // ── Picture processing ──────────────────────────────────
-    ImageData process_picture(pugi::xml_node pic, int page_number, int image_idx) {
+    // Resolve one <hp:pic> to its image. `image_idx` is consumed (and advanced)
+    // only when this reference is the first to reach the underlying BinData
+    // part; a later reference to the same part reuses the original name and
+    // file, so the markdown links converge on one extracted image.
+    ImageData process_picture(pugi::xml_node pic, int page_number, int& image_idx) {
         ImageData img;
         img.page_number = page_number;
 
@@ -756,27 +887,34 @@ private:
 
         if (file_path.empty() || !zip_->has_entry(file_path)) return img;
 
+        // A part already extracted is handed back by name and path, without a
+        // second read or a second copy of the bytes.
+        auto hit = media_cache_.find(file_path);
+        if (hit.known) {
+            if (hit.skipped) return {};
+            return util::MediaCache::reference(hit.image, page_number);
+        }
+
         // Read image data from ZIP
         auto raw = zip_->read_entry(file_path);
         if (raw.empty()) return img;
 
         img.data.assign(raw.begin(), raw.end());
         img.format = util::image_format_from_ext(util::get_extension(file_path));
-        std::string ext = (img.format == "jpeg") ? "jpg" : img.format;
         img.name = "page" + std::to_string(page_number) +
                    "_img" + std::to_string(image_idx);
         img.width = width;
         img.height = height;
         util::populate_image_dimensions(img);
-        if (util::is_image_too_small(img, opts_.min_image_size))
+        if (util::is_image_too_small(img, opts_.min_image_size)) {
+            media_cache_.insert_skipped(file_path);
             return {};
+        }
 
         // Save to disk if requested (BMP -> PNG for compression)
         if (opts_.images) {
-            std::string save_name = "page" + std::to_string(page_number) +
-                                    "_img" + std::to_string(image_idx);
             img.saved_path = util::save_image_to_file(
-                opts_.image_dir, save_name, img.format,
+                opts_.image_dir, img.name, img.format,
                 img.data.data(), img.data.size());
             if (!img.saved_path.empty()) {
                 img.data.clear();
@@ -784,6 +922,8 @@ private:
             }
         }
 
+        media_cache_.insert(file_path, img, util::get_filename(img.saved_path));
+        ++image_idx;
         return img;
     }
 };

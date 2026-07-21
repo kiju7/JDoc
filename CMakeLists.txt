@@ -188,6 +188,10 @@ add_executable(test_hwp5 test/test_hwp5.cpp)
 target_link_libraries(test_hwp5 PRIVATE jdoc_all ZLIB::ZLIB)
 target_include_directories(test_hwp5 PRIVATE include src)
 
+add_executable(test_hwpx test/test_hwpx.cpp)
+target_link_libraries(test_hwpx PRIVATE jdoc_all ZLIB::ZLIB)
+target_include_directories(test_hwpx PRIVATE include src)
+
 add_executable(bench_convert test/bench_convert.cpp)
 target_link_libraries(bench_convert PRIVATE jdoc_all)
 target_include_directories(bench_convert PRIVATE include)

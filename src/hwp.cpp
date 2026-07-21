@@ -9,6 +9,7 @@
 #include "legacy/ole_reader.h"
 #include "common/file_utils.h"
 #include "common/image_utils.h"
+#include "common/media_cache.h"
 #include "common/png_encode.h"
 #include "common/string_utils.h"
 #include <zlib.h>
@@ -227,6 +228,9 @@ private:
     std::map<std::string, HWPEmbeddedImage> embedded_images_;
     // Ordered list of image names for index-based fallback
     std::vector<std::string> embedded_image_keys_;
+    // BinData streams already extracted, keyed by stream name. The same figure
+    // referenced from several paragraphs is decompressed and written once.
+    util::MediaCache media_cache_;
 
     // ── FileHeader parsing ──────────────────────────────────
     void parse_file_header() {
@@ -1327,6 +1331,22 @@ private:
             return "![" + unified + "](" + opts_.image_ref_prefix + filename + ")\n\n";
         }
 
+        // A stream already extracted is reused: the same file, the same name in
+        // the reference, and the page still records that it shows this image.
+        std::string cache_key = "BinData/" + entry->name;
+        auto hit = media_cache_.find(cache_key);
+        if (hit.known) {
+            if (hit.skipped) return "";
+            bool listed = false;
+            for (auto& seen : chunk.images)
+                if (seen.name == hit.image.name) { listed = true; break; }
+            if (!listed)
+                chunk.images.push_back(
+                    util::MediaCache::reference(hit.image, chunk.page_number));
+            return "![" + hit.image.name + "](" + opts_.image_ref_prefix +
+                   hit.ref_name + ")\n\n";
+        }
+
         // Detect format from file extension in OLE name
         {
             auto dot = entry->name.rfind('.');
@@ -1387,6 +1407,7 @@ private:
             idata.data.assign(reinterpret_cast<const char*>(image_data.data()),
                               reinterpret_cast<const char*>(image_data.data()) + image_data.size());
         }
+        media_cache_.insert(cache_key, idata, filename);
         chunk.images.push_back(std::move(idata));
 
         image_idx++;

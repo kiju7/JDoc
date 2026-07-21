@@ -5,6 +5,7 @@
 #include "zip_reader.h"
 #include "xml_utils.h"
 #include "jdoc/types.h"
+#include "common/media_cache.h"
 #include <map>
 #include <string>
 #include <vector>
@@ -46,9 +47,9 @@ private:
     void extract_shape(const pugi::xml_node& sp,
                        const std::map<std::string, std::string>& rels,
                        SlideContent& content);
-    void extract_group(const pugi::xml_node& grp_sp,
-                       const std::map<std::string, std::string>& rels,
-                       SlideContent& content);
+    void extract_shape_tree(const pugi::xml_node& parent,
+                            const std::map<std::string, std::string>& rels,
+                            SlideContent& content, int depth);
     void extract_graphic_frame(const pugi::xml_node& gf,
                                const std::map<std::string, std::string>& rels,
                                SlideContent& content);
@@ -61,9 +62,28 @@ private:
     std::string extract_diagram_text(const std::string& diagram_data_path);
     std::string extract_notes_text(const std::string& notes_path);
 
+    // Authored (non-placeholder) text from slide masters and layouts
+    void collect_layout_shape_text(const pugi::xml_node& parent,
+                                   std::vector<std::string>& out, int depth);
+    std::vector<std::string> collect_master_layout_text();
+    std::string format_master_layout_block(const std::string& body);
+
     ImageData extract_image_data(const std::string& media_path,
                                  int page_number,
                                  const ConvertOptions& opts);
+
+    // Resolve a media part to its single extraction. The first reference reads,
+    // measures and writes it; later references — the logo that recurs on every
+    // slide — reuse that one file and its name. Returns false when the part is
+    // absent from the package or filtered out by the minimum-size rule.
+    // `out.name`/`ref_name` are the same on every reference, so the markdown
+    // links all resolve to one file.
+    bool resolve_image(const std::string& media_path, int page_number,
+                       const ConvertOptions& opts,
+                       ImageData& out, std::string& ref_name);
+
+    // Media parts already extracted, keyed by part path
+    util::MediaCache media_cache_;
 
     // Per-slide image index counter for unified naming
     std::map<int, int> slide_image_idx_;

@@ -9,10 +9,16 @@
 
 namespace jdoc {
 
+// Element nesting is attacker-controlled — pugixml's parser is iterative and
+// imposes no limit — so the recursive walkers below cap their depth. Worker
+// threads get a 512 KB default stack, far less than the main thread's.
+constexpr int kXmlMaxDepth = 256;
+
 // Collect all text content from a node and its descendants recursively.
 // Skips mc:Fallback branches to avoid duplicate text.
-inline std::string xml_text_content(const pugi::xml_node& node) {
+inline std::string xml_text_content(const pugi::xml_node& node, int depth = 0) {
     std::string result;
+    if (depth > kXmlMaxDepth) return result;
     for (auto child = node.first_child(); child; child = child.next_sibling()) {
         if (child.type() == pugi::node_pcdata || child.type() == pugi::node_cdata) {
             result += child.value();
@@ -21,7 +27,7 @@ inline std::string xml_text_content(const pugi::xml_node& node) {
             const char* colon = strchr(name, ':');
             const char* local = colon ? colon + 1 : name;
             if (strcmp(local, "Fallback") == 0) continue;
-            result += xml_text_content(child);
+            result += xml_text_content(child, depth + 1);
         }
     }
     return result;
@@ -30,7 +36,8 @@ inline std::string xml_text_content(const pugi::xml_node& node) {
 // Find all descendant nodes with a given name (ignoring namespace prefixes).
 // Skips mc:Fallback branches inside mc:AlternateContent to avoid duplicates.
 inline void xml_find_all(const pugi::xml_node& node, const char* local_name,
-                          std::vector<pugi::xml_node>& results) {
+                          std::vector<pugi::xml_node>& results, int depth = 0) {
+    if (depth > kXmlMaxDepth) return;
     for (auto child = node.first_child(); child; child = child.next_sibling()) {
         const char* name = child.name();
         const char* colon = strchr(name, ':');
@@ -40,7 +47,7 @@ inline void xml_find_all(const pugi::xml_node& node, const char* local_name,
         if (strcmp(local, local_name) == 0) {
             results.push_back(child);
         }
-        xml_find_all(child, local_name, results);
+        xml_find_all(child, local_name, results, depth + 1);
     }
 }
 

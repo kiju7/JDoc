@@ -253,14 +253,20 @@ std::string PptxParser::extract_notes_text(const std::string& notes_path) {
         const char* local = colon ? colon + 1 : name;
         if (strcmp(local, "sp") != 0) continue;
 
+        // Take every text-bearing shape on the notes page, not just the body
+        // placeholder — speaker notes are often typed into a plain text box.
+        // Only the furniture placeholders are skipped: the slide thumbnail
+        // carries no text, and slide number / date / footer restate the deck
+        // chrome rather than the note.
         auto nvSpPr = xml_child(sp, "nvSpPr");
-        if (!nvSpPr) continue;
-        auto nvPr = xml_child(nvSpPr, "nvPr");
-        if (!nvPr) continue;
-        auto ph = xml_child(nvPr, "ph");
-        if (!ph) continue;
-        const char* type = xml_attr(ph, "type");
-        if (strcmp(type, "body") != 0) continue;
+        auto nvPr = nvSpPr ? xml_child(nvSpPr, "nvPr") : pugi::xml_node();
+        auto ph = nvPr ? xml_child(nvPr, "ph") : pugi::xml_node();
+        if (ph) {
+            const char* type = xml_attr(ph, "type");
+            if (strcmp(type, "sldImg") == 0 || strcmp(type, "sldNum") == 0 ||
+                strcmp(type, "dt") == 0 || strcmp(type, "ftr") == 0)
+                continue;
+        }
 
         auto txBody = xml_child(sp, "txBody");
         if (!txBody) continue;
@@ -272,6 +278,111 @@ std::string PptxParser::extract_notes_text(const std::string& notes_path) {
         }
     }
     return result;
+}
+
+// ── Slide master / layout text extraction ───────────────
+
+// True for a placeholder that merely prompts the author ("Click to edit Master
+// title style", "마스터 제목 스타일 편집"). A <p:ph> in a master or layout is by
+// definition an empty slot: whatever the author actually types lands in the
+// slide, so the layout copy is template furniture that would otherwise be
+// injected into every document. Keying on the placeholder *type* rather than on
+// a list of known prompt strings keeps this working for any authoring locale.
+//
+// ftr/hdr are deliberately NOT treated as prompts — a footer authored into the
+// layout is real content that appears on every slide, and is a place teams
+// habitually park a team name or contact.
+static bool is_prompt_placeholder(const pugi::xml_node& sp) {
+    auto nvSpPr = xml_child(sp, "nvSpPr");
+    auto nvPr = nvSpPr ? xml_child(nvSpPr, "nvPr") : pugi::xml_node();
+    auto ph = nvPr ? xml_child(nvPr, "ph") : pugi::xml_node();
+    if (!ph) return false;  // a plain text box holds authored content
+
+    const char* type = xml_attr(ph, "type");
+    // An absent type attribute defaults to "body" per ECMA-376
+    if (!type[0]) return true;
+    return strcmp(type, "title")   == 0 || strcmp(type, "ctrTitle") == 0 ||
+           strcmp(type, "subTitle") == 0 || strcmp(type, "body")    == 0 ||
+           strcmp(type, "pic")     == 0 || strcmp(type, "chart")    == 0 ||
+           strcmp(type, "tbl")     == 0 || strcmp(type, "dgm")      == 0 ||
+           strcmp(type, "media")   == 0 || strcmp(type, "clipArt")  == 0;
+}
+
+// Walk a master/layout shape tree, appending authored text to `out`.
+void PptxParser::collect_layout_shape_text(const pugi::xml_node& parent,
+                                            std::vector<std::string>& out,
+                                            int depth) {
+    if (depth > kXmlMaxDepth) return;
+
+    for (auto child = parent.first_child(); child; child = child.next_sibling()) {
+        const char* name = child.name();
+        const char* colon = strchr(name, ':');
+        const char* local = colon ? colon + 1 : name;
+
+        if (strcmp(local, "sp") == 0 || strcmp(local, "cxnSp") == 0) {
+            if (is_prompt_placeholder(child)) continue;
+            auto txBody = xml_child(child, "txBody");
+            if (!txBody) continue;
+            std::string text = extract_textbody_text(txBody);
+            if (!text.empty()) out.push_back(std::move(text));
+        } else if (strcmp(local, "grpSp") == 0) {
+            collect_layout_shape_text(child, out, depth + 1);
+        } else if (strcmp(local, "AlternateContent") == 0) {
+            for (auto alt = child.first_child(); alt; alt = alt.next_sibling()) {
+                const char* an = alt.name();
+                const char* acolon = strchr(an, ':');
+                const char* alocal = acolon ? acolon + 1 : an;
+                if (strcmp(alocal, "Choice") != 0) continue;
+                collect_layout_shape_text(alt, out, depth + 1);
+            }
+        }
+    }
+}
+
+// Text authored into the slide masters and layouts. It renders on every slide
+// that uses them but lives in no slide part, so a reader scanning slide XML
+// alone never sees it — a common hiding place for a team name, an author or a
+// contact address. Returned de-duplicated and in package order; the caller is
+// responsible for dropping anything the slides already said.
+std::vector<std::string> PptxParser::collect_master_layout_text() {
+    std::vector<std::string> out;
+    std::set<std::string> seen;
+
+    // Masters first, then layouts — both sorted so output is deterministic
+    std::vector<std::string> parts;
+    for (const char* prefix : {"ppt/slideMasters/slideMaster",
+                               "ppt/slideLayouts/slideLayout"}) {
+        std::vector<std::string> group;
+        for (auto* entry : zip_.entries_with_prefix(prefix)) {
+            const std::string& nm = entry->name;
+            if (nm.size() < 5 || nm.compare(nm.size() - 4, 4, ".xml") != 0) continue;
+            group.push_back(nm);
+        }
+        std::sort(group.begin(), group.end());
+        parts.insert(parts.end(), group.begin(), group.end());
+    }
+
+    for (const auto& part : parts) {
+        auto data = zip_.read_entry(part);
+        if (data.empty()) continue;
+        pugi::xml_document doc;
+        if (!doc.load_buffer(data.data(), data.size(),
+                             pugi::parse_default | pugi::parse_ws_pcdata))
+            continue;
+
+        auto cSld = xml_child(doc.first_child(), "cSld");
+        if (!cSld) continue;
+        auto spTree = xml_child(cSld, "spTree");
+        if (!spTree) continue;
+
+        std::vector<std::string> texts;
+        collect_layout_shape_text(spTree, texts, 0);
+        for (auto& t : texts) {
+            // The same footer or logo is repeated across every layout
+            if (seen.insert(t).second) out.push_back(std::move(t));
+        }
+    }
+    return out;
 }
 
 // ── Shape text extraction ───────────────────────────────
@@ -307,6 +418,9 @@ static std::string extract_textbody_text(const pugi::xml_node& txBody) {
         if (!first_para) result += "\n";
         first_para = false;
 
+        // <a:fld> is deliberately not walked: in a presentation it only ever
+        // renders deck chrome (slide number, date, footer), which would land in
+        // the output as stray digits between real paragraphs.
         std::vector<StyledRun> runs;
         std::vector<pugi::xml_node> r_nodes;
         xml_find_all(child, "r", r_nodes);
@@ -473,27 +587,46 @@ void PptxParser::extract_graphic_frame(
     }
 }
 
-// ── Group shape extraction ──────────────────────────────
+// ── Shape tree dispatch ─────────────────────────────────
 
-void PptxParser::extract_group(const pugi::xml_node& grp_sp,
-                                const std::map<std::string, std::string>& rels,
-                                SlideContent& content) {
-    for (auto child = grp_sp.first_child(); child; child = child.next_sibling()) {
+// Dispatch every shape-tree child of `parent` to its extractor. Used for both
+// <p:spTree> and <p:grpSp>, which hold the same set of child elements.
+//
+// <mc:AlternateContent> wraps a shape when it needs a legacy rendering (ink,
+// WordArt, newer chart types); the shape itself lives in <mc:Choice>, so the
+// wrapper must be descended into or the whole shape is lost. Only <mc:Choice>
+// is followed — <mc:Fallback> restates the same content and would duplicate it.
+void PptxParser::extract_shape_tree(const pugi::xml_node& parent,
+                                     const std::map<std::string, std::string>& rels,
+                                     SlideContent& content, int depth) {
+    if (depth > kXmlMaxDepth) return;
+
+    for (auto child = parent.first_child(); child; child = child.next_sibling()) {
         const char* name = child.name();
         const char* colon = strchr(name, ':');
         const char* local = colon ? colon + 1 : name;
 
-        if (strcmp(local, "sp") == 0) {
+        if (strcmp(local, "sp") == 0 || strcmp(local, "cxnSp") == 0) {
+            // A connector (cxnSp) carries an optional label in its own txBody
             extract_shape(child, rels, content);
         } else if (strcmp(local, "pic") == 0) {
             extract_picture(child, rels, content);
         } else if (strcmp(local, "grpSp") == 0) {
-            extract_group(child, rels, content);
+            extract_shape_tree(child, rels, content, depth + 1);
         } else if (strcmp(local, "graphicFrame") == 0) {
             extract_graphic_frame(child, rels, content);
+        } else if (strcmp(local, "AlternateContent") == 0) {
+            for (auto alt = child.first_child(); alt; alt = alt.next_sibling()) {
+                const char* an = alt.name();
+                const char* acolon = strchr(an, ':');
+                const char* alocal = acolon ? acolon + 1 : an;
+                if (strcmp(alocal, "Choice") != 0) continue;
+                extract_shape_tree(alt, rels, content, depth + 1);
+            }
         }
     }
 }
+
 
 // ── Slide parsing ───────────────────────────────────────
 
@@ -518,21 +651,7 @@ PptxParser::SlideContent PptxParser::parse_slide(
     auto spTree = xml_child(cSld, "spTree");
     if (!spTree) return content;
 
-    for (auto child = spTree.first_child(); child; child = child.next_sibling()) {
-        const char* name = child.name();
-        const char* colon = strchr(name, ':');
-        const char* local = colon ? colon + 1 : name;
-
-        if (strcmp(local, "sp") == 0) {
-            extract_shape(child, rels, content);
-        } else if (strcmp(local, "pic") == 0) {
-            extract_picture(child, rels, content);
-        } else if (strcmp(local, "grpSp") == 0) {
-            extract_group(child, rels, content);
-        } else if (strcmp(local, "graphicFrame") == 0) {
-            extract_graphic_frame(child, rels, content);
-        }
-    }
+    extract_shape_tree(spTree, rels, content, 0);
 
     for (auto& [rid, target] : rels) {
         if (target.find("notesSlide") != std::string::npos) {
@@ -597,30 +716,66 @@ ImageData PptxParser::extract_image_data(const std::string& media_path,
     // Assign unified name: page{N}_img{M}
     int& idx = slide_image_idx_[page_number];
     img.name = "page" + std::to_string(page_number) + "_img" + std::to_string(idx);
-    std::string filename = img.name + (ext.empty() ? ".png" : ext);
     idx++;
 
+    // Read and measure only — the write happens in resolve_image, after the
+    // minimum-size rule has had its say, so a filtered image never leaves an
+    // orphaned file behind on disk.
     if (opts.images) {
         img.data = zip_.read_entry(media_path);
         util::populate_image_dimensions(img);
+    }
 
+    return img;
+}
+
+// ── Media part resolution (one extraction per part) ─────
+
+bool PptxParser::resolve_image(const std::string& media_path, int page_number,
+                                const ConvertOptions& opts,
+                                ImageData& out, std::string& ref_name) {
+    auto hit = media_cache_.find(media_path);
+    if (hit.known) {
+        if (hit.skipped) return false;
+        out = util::MediaCache::reference(hit.image, page_number);
+        ref_name = hit.ref_name;
+        return true;
+    }
+
+    if (!zip_.has_entry(media_path)) {
+        media_cache_.insert_skipped(media_path);
+        return false;
+    }
+
+    ImageData img = extract_image_data(media_path, page_number, opts);
+    if (util::is_image_too_small(img, opts.min_image_size)) {
+        media_cache_.insert_skipped(media_path);
+        return false;
+    }
+
+    std::string ext = util::get_extension(media_path);
+    ref_name = img.name + (ext.empty() ? ".png" : ext);
+
+    if (opts.images) {
         img.saved_path = util::save_image_to_file(
             opts.image_dir, img.name, img.format,
             img.data.data(), img.data.size());
         if (!img.saved_path.empty()) {
+            ref_name = util::get_filename(img.saved_path);
             img.data.clear();
             img.data.shrink_to_fit();
         }
     }
 
-    return img;
+    media_cache_.insert(media_path, img, ref_name);
+    out = std::move(img);
+    return true;
 }
 
 // ── to_markdown ─────────────────────────────────────────
 
 std::string PptxParser::to_markdown(const ConvertOptions& opts) {
     std::ostringstream out;
-    std::set<std::string> extracted;
     bool first_slide = true;
 
     for (size_t i = 0; i < slide_paths_.size(); ++i) {
@@ -650,19 +805,14 @@ std::string PptxParser::to_markdown(const ConvertOptions& opts) {
                     out << elem.text << "\n\n";
                     break;
                 case SlideElement::IMAGE: {
-                    if (!extracted.count(elem.text) && zip_.has_entry(elem.text)) {
-                        extracted.insert(elem.text);
-                        ImageData img = extract_image_data(elem.text, slide_num, opts);
-                        if (util::is_image_too_small(img, opts.min_image_size))
-                            break;
-                        std::string ref_name = img.name;
-                        if (!img.saved_path.empty()) {
-                            auto sl = img.saved_path.find_last_of('/');
-                            ref_name = (sl != std::string::npos)
-                                ? img.saved_path.substr(sl + 1) : img.saved_path;
-                        }
-                        out << "![" << img.name << "](" << opts.image_ref_prefix << ref_name << ")\n\n";
-                    }
+                    // Every reference is rendered, including the second and
+                    // later ones — a logo shown on ten slides appears in all
+                    // ten — but they all link to the one extracted file.
+                    ImageData img;
+                    std::string ref_name;
+                    if (!resolve_image(elem.text, slide_num, opts, img, ref_name))
+                        break;
+                    out << "![" << img.name << "](" << opts.image_ref_prefix << ref_name << ")\n\n";
                     break;
                 }
                 case SlideElement::TABLE:
@@ -677,7 +827,34 @@ std::string PptxParser::to_markdown(const ConvertOptions& opts) {
         }
     }
 
-    return out.str();
+    // Master/layout text closes the document as one block rather than being
+    // repeated per slide: it is authored once and would otherwise swamp the
+    // body flow of a long deck.
+    std::string body = out.str();
+    std::string extra = format_master_layout_block(body);
+    if (!extra.empty()) {
+        if (!body.empty() && body.back() != '\n') body += "\n";
+        body += extra;
+    }
+    return body;
+}
+
+// ── Master/layout trailing block ────────────────────────
+
+// Render the master/layout text that the slides did not already state. A layout
+// placeholder the author filled in is emitted by the slide itself, so anything
+// already present in `body` is dropped rather than repeated.
+std::string PptxParser::format_master_layout_block(const std::string& body) {
+    auto texts = collect_master_layout_text();
+    if (texts.empty()) return "";
+
+    std::string block;
+    for (auto& t : texts) {
+        if (body.find(t) != std::string::npos) continue;
+        block += t + "\n";
+    }
+    if (block.empty()) return "";
+    return "\n--- Slide Master / Layout ---\n\n" + block;
 }
 
 // ── to_chunks ───────────────────────────────────────────
@@ -686,7 +863,6 @@ std::vector<PageChunk> PptxParser::to_chunks(
     const ConvertOptions& opts) {
 
     std::vector<PageChunk> chunks;
-    std::set<std::string> extracted;
     ConvertOptions img_opts = opts;
     img_opts.images = true;
 
@@ -706,6 +882,10 @@ std::vector<PageChunk> PptxParser::to_chunks(
         PageChunk chunk;
         chunk.page_number = slide_num;
 
+        // Distinct media parts already listed for this page — a shape group
+        // that repeats one picture should list it once per page, not per shape
+        std::set<std::string> page_media;
+
         std::ostringstream text;
 
         if (!content.title.empty()) {
@@ -718,23 +898,17 @@ std::vector<PageChunk> PptxParser::to_chunks(
                     text << elem.text << "\n\n";
                     break;
                 case SlideElement::IMAGE: {
-                    if (!zip_.has_entry(elem.text)) break;
-                    bool first_ref = !extracted.count(elem.text);
-                    if (first_ref) extracted.insert(elem.text);
-
-                    ImageData img = extract_image_data(elem.text, slide_num, img_opts);
-                    if (util::is_image_too_small(img, opts.min_image_size))
+                    ImageData img;
+                    std::string ref_name;
+                    if (!resolve_image(elem.text, slide_num, img_opts, img, ref_name))
                         break;
-
-                    std::string ref_name = img.name;
-                    if (!img.saved_path.empty()) {
-                        auto slash = img.saved_path.find_last_of('/');
-                        ref_name = (slash != std::string::npos)
-                            ? img.saved_path.substr(slash + 1) : img.saved_path;
-                    }
                     text << "![" << img.name << "](" << opts.image_ref_prefix << ref_name << ")\n\n";
 
-                    if (first_ref)
+                    // The page lists every distinct image it shows, so the
+                    // page-to-image association survives deduplication. A page
+                    // that reuses an image extracted earlier gets the shared
+                    // name and path with no second copy of the bytes.
+                    if (page_media.insert(elem.text).second)
                         chunk.images.push_back(std::move(img));
                     break;
                 }
@@ -752,6 +926,17 @@ std::vector<PageChunk> PptxParser::to_chunks(
         }
 
         chunk.text = text.str();
+        chunks.push_back(std::move(chunk));
+    }
+
+    // Master/layout text belongs to no slide, so it becomes a trailing chunk
+    std::string body;
+    for (auto& c : chunks) body += c.text;
+    std::string extra = format_master_layout_block(body);
+    if (!extra.empty()) {
+        PageChunk chunk;
+        chunk.page_number = static_cast<int>(slide_paths_.size()) + 1;
+        chunk.text = extra;
         chunks.push_back(std::move(chunk));
     }
 
