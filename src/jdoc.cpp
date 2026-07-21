@@ -14,6 +14,7 @@
 
 #include <cstring>
 #include <fstream>
+#include <iterator>
 #include <sstream>
 
 namespace jdoc {
@@ -141,11 +142,23 @@ static FileFormat classify_ole_hwp(const OleReader& ole) {
 }
 
 static std::string read_text_file(const std::string& path) {
-    std::ifstream f(path, std::ios::binary);
+    std::ifstream f(path, std::ios::binary | std::ios::ate);
     if (!f) throw std::runtime_error("Cannot open file: " + path);
-    std::ostringstream ss;
-    ss << f.rdbuf();
-    return util::plain_text_to_utf8(ss.str());
+    // Read the whole file into a single buffer, then move it through the
+    // valid-UTF-8 fast path — no intermediate stringstream copy.
+    std::string buf;
+    std::streamoff size = f.tellg();
+    if (size > 0) {
+        buf.resize(static_cast<size_t>(size));
+        f.seekg(0);
+        f.read(buf.data(), static_cast<std::streamsize>(size));
+        buf.resize(static_cast<size_t>(f.gcount()));  // guard short reads
+    } else if (size < 0) {
+        // Seek/tell unsupported (rare): read via streambuf directly into buf.
+        buf.assign(std::istreambuf_iterator<char>(f),
+                   std::istreambuf_iterator<char>());
+    }
+    return util::plain_text_to_utf8(std::move(buf));
 }
 
 } // anonymous namespace

@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <utility>
 
 namespace jdoc { namespace util {
 
@@ -81,6 +82,11 @@ bool is_valid_utf8(const std::string& s);  // defined below with decode_utf8
 inline std::string legacy_name_to_utf8(const std::string& name) {
     return is_valid_utf8(name) ? name : cp949_string_to_utf8(name);
 }
+// rvalue overload: when the caller passes a temporary, move the already-valid
+// UTF-8 through instead of copying it.
+inline std::string legacy_name_to_utf8(std::string&& name) {
+    return is_valid_utf8(name) ? std::move(name) : cp949_string_to_utf8(name);
+}
 
 // Normalize plain-text bytes to UTF-8: already-valid UTF-8 (including pure
 // ASCII) is kept verbatim, anything else is decoded as CP949 — the encoding
@@ -88,6 +94,12 @@ inline std::string legacy_name_to_utf8(const std::string& name) {
 // (path and in-memory) so plain text always leaves the library as UTF-8.
 inline std::string plain_text_to_utf8(const std::string& s) {
     return is_valid_utf8(s) ? s : cp949_string_to_utf8(s);
+}
+// rvalue overload: the .txt readers pass the whole-file buffer as a temporary
+// (ss.str() / std::string(data, size)); move it through the valid-UTF-8 fast
+// path instead of copying the entire document.
+inline std::string plain_text_to_utf8(std::string&& s) {
+    return is_valid_utf8(s) ? std::move(s) : cp949_string_to_utf8(s);
 }
 
 // Sanitize a UTF-8 string: replace invalid sequences with U+FFFD.
