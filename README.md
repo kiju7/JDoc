@@ -149,7 +149,7 @@ for (auto& chunk : chunks) {
 CMake:
 ```cmake
 add_subdirectory(jdoc)
-target_link_libraries(your_app PRIVATE jdoc_all)
+target_link_libraries(your_app PRIVATE jdoc_lib)  # 단일 정적 라이브러리 libjdoc.a
 ```
 
 ### C API

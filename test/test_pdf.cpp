@@ -7,7 +7,7 @@
 #include <chrono>
 
 int main(int argc, char* argv[]) {
-    const char* test_pdf = (argc > 1) ? argv[1] : "test/sample.pdf";
+    const char* test_pdf = (argc > 1) ? argv[1] : "test/fixtures/pdf/sample.pdf";
 
     std::cout << "=== jdoc PDF Test ===\n\n";
 
