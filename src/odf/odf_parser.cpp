@@ -252,7 +252,7 @@ std::vector<PageChunk> OdfParser::parse_text(const pugi::xml_node& body,
 
     PageChunk chunk;
     chunk.page_number = 1;
-    chunk.text = rstrip(md);
+    chunk.text = rstrip(std::move(md));
     return {chunk};
 }
 
@@ -275,7 +275,7 @@ std::vector<PageChunk> OdfParser::parse_spreadsheet(const pugi::xml_node& body,
 
         PageChunk chunk;
         chunk.page_number = sheet_num;
-        chunk.text = rstrip(md);
+        chunk.text = rstrip(std::move(md));
         chunks.push_back(std::move(chunk));
     }
     return chunks;
@@ -347,7 +347,7 @@ std::vector<PageChunk> OdfParser::parse_presentation(const pugi::xml_node& body,
 
         PageChunk chunk;
         chunk.page_number = page_num;
-        chunk.text = rstrip(body_md);
+        chunk.text = rstrip(std::move(body_md));
         chunks.push_back(std::move(chunk));
     }
     return chunks;

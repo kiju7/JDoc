@@ -11,6 +11,7 @@
 #include <cctype>
 #include <fstream>
 #include <sstream>
+#include <string_view>
 
 namespace jdoc {
 
@@ -227,18 +228,21 @@ void EmlParser::split_multipart(MimePart& parent, size_t body_begin,
     std::vector<std::pair<size_t, size_t>> segments;  // [body_start, body_end)
     size_t cur_start = std::string::npos;
     size_t pos = body_begin;
+    std::string_view all(raw_);
     while (pos < body_end) {
         size_t nl = raw_.find('\n', pos);
         size_t line_end = (nl == std::string::npos || nl >= body_end) ? body_end : nl;
         size_t content_end = line_end;
         if (content_end > pos && raw_[content_end - 1] == '\r') content_end--;
-        std::string line = raw_.substr(pos, content_end - pos);
+        // A view over the line — the whole body is scanned here, so avoid a
+        // per-line allocation just to test the boundary delimiter.
+        std::string_view line = all.substr(pos, content_end - pos);
         size_t next = (line_end == body_end) ? body_end : line_end + 1;
 
         if (line.rfind(delim, 0) == 0) {  // boundary delimiter line
             if (cur_start != std::string::npos)
                 segments.emplace_back(cur_start, pos);
-            std::string rest = line.substr(delim.size());
+            std::string_view rest = line.substr(delim.size());
             if (rest.rfind("--", 0) == 0) break;  // closing delimiter
             cur_start = next;
         }
