@@ -14,6 +14,10 @@
 
 namespace jdoc {
 
+// Render one <a:p> paragraph to text (<a:br> -> '\n'); defined below, used by
+// both parse_table and extract_textbody_text.
+static std::string extract_paragraph_text(const pugi::xml_node& p, bool markdown);
+
 // ── Constructor ─────────────────────────────────────────
 
 PptxParser::PptxParser(ZipReader& zip) : zip_(zip) {
@@ -89,12 +93,10 @@ std::vector<std::vector<std::string>> PptxParser::parse_table(
             xml_find_all(tc, "p", paras);
             for (size_t i = 0; i < paras.size(); ++i) {
                 if (i > 0) cell_text += " ";
-                std::vector<pugi::xml_node> t_nodes;
-                xml_find_all(paras[i], "t", t_nodes);
-                for (auto& t : t_nodes) {
-                    cell_text += xml_text_content(t);
-                }
+                cell_text += extract_paragraph_text(paras[i], /*markdown=*/false);
             }
+            // Any '\n' (paragraph or <a:br>) collapses to a space so the cell
+            // stays on one markdown table row; '|' is escaped.
             for (auto& ch : cell_text) {
                 if (ch == '|') ch = '/';
                 if (ch == '\n') ch = ' ';
@@ -402,10 +404,72 @@ static bool is_title_shape(const pugi::xml_node& sp) {
             strcmp(type, "ctrTitle") == 0);
 }
 
-static std::string extract_textbody_text(const pugi::xml_node& txBody) {
+// Render one <a:p> paragraph to plain text. Consecutive runs of the same style
+// are merged (with emphasis markup when markdown=true); an explicit <a:br> soft
+// line break becomes '\n'. <a:fld> fields are skipped — in a presentation they
+// only render deck chrome (slide number, date, footer).
+static std::string extract_paragraph_text(const pugi::xml_node& p, bool markdown) {
     enum RunStyle : uint8_t { PLAIN = 0, BOLD = 1, ITALIC = 2, BOLD_ITALIC = 3 };
-    struct StyledRun { std::string text; RunStyle style; };
+    struct Token { std::string text; RunStyle style; bool is_break; };
 
+    std::vector<Token> tokens;
+    // Walk direct children in document order (not a recursive xml_find_all) so a
+    // <a:br> keeps its position between the runs it separates.
+    for (auto node = p.first_child(); node; node = node.next_sibling()) {
+        const char* name = node.name();
+        const char* colon = strchr(name, ':');
+        const char* local = colon ? colon + 1 : name;
+
+        if (strcmp(local, "br") == 0) {
+            tokens.push_back({"", PLAIN, true});
+        } else if (strcmp(local, "r") == 0) {
+            auto rPr = xml_child(node, "rPr");
+            bool bold = false, italic = false;
+            if (rPr) {
+                const char* b_val = xml_attr(rPr, "b");
+                const char* i_val = xml_attr(rPr, "i");
+                bold = (b_val[0] && strcmp(b_val, "0") != 0);
+                italic = (i_val[0] && strcmp(i_val, "0") != 0);
+            }
+            std::string run_text;
+            std::vector<pugi::xml_node> t_nodes;
+            xml_find_all(node, "t", t_nodes);
+            for (auto& t : t_nodes) run_text += xml_text_content(t);
+            if (run_text.empty()) continue;
+
+            RunStyle s = PLAIN;
+            if (bold && italic) s = BOLD_ITALIC;
+            else if (bold) s = BOLD;
+            else if (italic) s = ITALIC;
+            tokens.push_back({std::move(run_text), s, false});
+        }
+        // Other children (<a:fld>, etc.) are intentionally skipped.
+    }
+
+    std::string result;
+    for (size_t i = 0; i < tokens.size(); ) {
+        if (tokens[i].is_break) { result += "\n"; ++i; continue; }
+        size_t j = i + 1;
+        while (j < tokens.size() && !tokens[j].is_break &&
+               tokens[j].style == tokens[i].style) ++j;
+        std::string merged;
+        for (size_t k = i; k < j; ++k) merged += tokens[k].text;
+        if (markdown) {
+            switch (tokens[i].style) {
+                case BOLD_ITALIC: result += "***" + merged + "***"; break;
+                case BOLD:        result += "**" + merged + "**"; break;
+                case ITALIC:      result += "*" + merged + "*"; break;
+                default:          result += merged; break;
+            }
+        } else {
+            result += merged;
+        }
+        i = j;
+    }
+    return result;
+}
+
+static std::string extract_textbody_text(const pugi::xml_node& txBody) {
     std::string result;
     bool first_para = true;
 
@@ -417,49 +481,7 @@ static std::string extract_textbody_text(const pugi::xml_node& txBody) {
 
         if (!first_para) result += "\n";
         first_para = false;
-
-        // <a:fld> is deliberately not walked: in a presentation it only ever
-        // renders deck chrome (slide number, date, footer), which would land in
-        // the output as stray digits between real paragraphs.
-        std::vector<StyledRun> runs;
-        std::vector<pugi::xml_node> r_nodes;
-        xml_find_all(child, "r", r_nodes);
-
-        for (auto& run : r_nodes) {
-            auto rPr = xml_child(run, "rPr");
-            bool bold = false, italic = false;
-            if (rPr) {
-                const char* b_val = xml_attr(rPr, "b");
-                const char* i_val = xml_attr(rPr, "i");
-                bold = (b_val[0] && strcmp(b_val, "0") != 0);
-                italic = (i_val[0] && strcmp(i_val, "0") != 0);
-            }
-            std::string run_text;
-            std::vector<pugi::xml_node> t_nodes;
-            xml_find_all(run, "t", t_nodes);
-            for (auto& t : t_nodes) run_text += xml_text_content(t);
-            if (run_text.empty()) continue;
-
-            RunStyle s = PLAIN;
-            if (bold && italic) s = BOLD_ITALIC;
-            else if (bold) s = BOLD;
-            else if (italic) s = ITALIC;
-            runs.push_back({std::move(run_text), s});
-        }
-
-        for (size_t ri = 0; ri < runs.size(); ) {
-            size_t rj = ri + 1;
-            while (rj < runs.size() && runs[rj].style == runs[ri].style) ++rj;
-            std::string merged;
-            for (size_t rk = ri; rk < rj; ++rk) merged += runs[rk].text;
-            switch (runs[ri].style) {
-                case BOLD_ITALIC: result += "***" + merged + "***"; break;
-                case BOLD:        result += "**" + merged + "**"; break;
-                case ITALIC:      result += "*" + merged + "*"; break;
-                default:          result += merged; break;
-            }
-            ri = rj;
-        }
+        result += extract_paragraph_text(child, /*markdown=*/true);
     }
 
     return result;

@@ -826,6 +826,66 @@ void test_html_charset() {
     TEST_END
 }
 
+// ── PPTX soft line breaks (<a:br>) ───────────────────────────
+
+void test_pptx_linebreak() {
+    std::cerr << "\nPPTX line breaks:\n";
+
+    TEST(explicit_break_splits_values)
+        // A single <a:p> whose lines are separated only by <a:br> (the shape
+        // PowerPoint's Shift+Enter produces) must not run together.
+        std::string body =
+            "<p:sp><p:txBody><a:p>"
+            "<a:r><a:t>label</a:t></a:r>"
+            "<a:br/>"
+            "<a:r><a:t>03-5595-6395</a:t></a:r>"
+            "<a:br/>"
+            "<a:r><a:t>03-6495-7208</a:t></a:r>"
+            "</a:p></p:txBody></p:sp>";
+        auto md = convert_pptx(make_pptx(body));
+        ASSERT(md.find("label\n03-5595-6395\n03-6495-7208") != std::string::npos);
+        ASSERT(md.find("label03-5595-6395") == std::string::npos);
+    TEST_END
+
+    TEST(runs_in_paragraph_not_broken)
+        // Consecutive runs in one paragraph (no <a:br>) stay on one line.
+        std::string body =
+            "<p:sp><p:txBody><a:p>"
+            "<a:r><a:t>#1. </a:t></a:r>"
+            "<a:r><a:t>national id</a:t></a:r>"
+            "</a:p></p:txBody></p:sp>";
+        auto md = convert_pptx(make_pptx(body));
+        ASSERT(md.find("#1. national id") != std::string::npos);
+        ASSERT(md.find("#1. \nnational id") == std::string::npos);
+    TEST_END
+
+    TEST(paragraphs_still_separated)
+        // Each value in its own <a:p> keeps splitting by newline (regression).
+        std::string body =
+            "<p:sp><p:txBody>"
+            "<a:p><a:r><a:t>first line</a:t></a:r></a:p>"
+            "<a:p><a:r><a:t>second line</a:t></a:r></a:p>"
+            "</p:txBody></p:sp>";
+        auto md = convert_pptx(make_pptx(body));
+        ASSERT(md.find("first line\nsecond line") != std::string::npos);
+    TEST_END
+
+    TEST(table_cell_break_becomes_space)
+        // <a:br> inside a table cell collapses to a space so the row stays intact.
+        std::string body =
+            "<p:graphicFrame><a:graphic><a:graphicData>"
+            "<a:tbl>"
+            "<a:tr><a:tc><a:txBody><a:p>"
+            "<a:r><a:t>x</a:t></a:r><a:br/><a:r><a:t>y</a:t></a:r>"
+            "</a:p></a:txBody></a:tc></a:tr>"
+            "</a:tbl>"
+            "</a:graphicData></a:graphic></p:graphicFrame>";
+        auto md = convert_pptx(make_pptx(body));
+        ASSERT(md.find("x y") != std::string::npos);   // joined by space in cell
+        ASSERT(md.find("x\ny") == std::string::npos);   // no newline leaks into row
+    TEST_END
+}
+
 // ── Main ────────────────────────────────────────────────────
 
 int main() {
@@ -841,6 +901,7 @@ int main() {
     test_docx_header_footer();
     test_xlsx_fixes();
     test_html_charset();
+    test_pptx_linebreak();
 
     std::cerr << "\n=== Results: " << tests_passed << " passed, "
               << tests_failed << " failed ===\n";
