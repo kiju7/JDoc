@@ -10,7 +10,11 @@
 namespace jdoc {
 
 enum class DocFormat {
-    UNKNOWN, DOCX, XLSX, XLSB, PPTX, DOC, XLS, PPT, RTF, HTML
+    UNKNOWN, DOCX, XLSX, XLSB, PPTX, DOC, XLS, PPT, RTF, HTML,
+    // Encrypted OOXML wrapped in an OLE container (MS-OFFCRYPTO). We cannot
+    // extract these, but we classify them so callers get a clear reason.
+    ENCRYPTED_PASSWORD,  // password-based standard encryption (recoverable with the password)
+    ENCRYPTED_RIGHTS     // rights-managed / IRM (Azure RMS, Microsoft Information Protection)
 };
 
 DocFormat detect_office_format(const std::string& file_path);

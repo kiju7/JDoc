@@ -92,6 +92,8 @@ PYBIND11_MODULE(_jdoc, m) {
         .value("PPT", jdoc::DocFormat::PPT)
         .value("RTF", jdoc::DocFormat::RTF)
         .value("HTML", jdoc::DocFormat::HTML)
+        .value("ENCRYPTED_PASSWORD", jdoc::DocFormat::ENCRYPTED_PASSWORD)
+        .value("ENCRYPTED_RIGHTS", jdoc::DocFormat::ENCRYPTED_RIGHTS)
         .export_values();
 
     // ── Top-level convenience functions ──────────────────

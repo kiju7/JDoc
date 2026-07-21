@@ -33,6 +33,22 @@ static std::string lowercase_ext(const std::string& path) {
     return ext;
 }
 
+// Classify OOXML-in-OLE encryption (MS-OFFCRYPTO). Encrypted Office documents
+// are wrapped in an OLE container whose ciphertext lives in an "EncryptedPackage"
+// stream; the "\x06DataSpaces" transform names the scheme. A "DRMEncryptedTransform"
+// storage marks rights-managed (IRM/RMS) protection, which cannot be undone with a
+// password; anything else is password-based standard encryption.
+// Returns UNKNOWN when the container is not an encrypted package.
+static DocFormat classify_ole_encryption(const OleReader& ole) {
+    if (!ole.has_stream("EncryptedPackage")) return DocFormat::UNKNOWN;
+    for (const auto& s : ole.list_streams()) {
+        // Storage names appear with a trailing "/" in list_streams().
+        if (s.find("DRMEncryptedTransform") != std::string::npos)
+            return DocFormat::ENCRYPTED_RIGHTS;
+    }
+    return DocFormat::ENCRYPTED_PASSWORD;
+}
+
 DocFormat detect_office_format(const std::string& file_path) {
     // Read first 8 bytes for magic detection
     unsigned char magic[8] = {};
@@ -79,13 +95,22 @@ DocFormat detect_office_format(const std::string& file_path) {
     // OLE magic: D0 CF 11 E0 A1 B1 1A E1
     static const unsigned char OLE_MAGIC[] = {0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1};
     if (memcmp(magic, OLE_MAGIC, 8) == 0) {
+        OleReader ole(file_path);
+        // Encrypted OOXML is wrapped in an OLE container, so classify it before
+        // trusting the extension — a rights-protected package is often misnamed
+        // (e.g. a .xlsx that is really an EncryptedPackage) and would otherwise
+        // be reported as a corrupt legacy file.
+        if (ole.is_open()) {
+            DocFormat enc = classify_ole_encryption(ole);
+            if (enc != DocFormat::UNKNOWN) return enc;
+        }
+
         // Determine type from extension first (skip .hwp — handled by main)
         if (ext == ".doc") return DocFormat::DOC;
         if (ext == ".xls") return DocFormat::XLS;
         if (ext == ".ppt") return DocFormat::PPT;
 
         // Fallback: inspect internal streams
-        OleReader ole(file_path);
         if (ole.is_open()) {
             // HWP check: skip it here, let the main dispatcher handle HWP
             if (ole.has_stream("FileHeader")) return DocFormat::UNKNOWN;
@@ -173,11 +198,18 @@ DocFormat detect_office_format_mem(const uint8_t* data, size_t size,
     // OLE magic: D0 CF 11 E0 A1 B1 1A E1
     static const unsigned char OLE_MAGIC[] = {0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1};
     if (memcmp(data, OLE_MAGIC, 8) == 0) {
+        OleReader ole(data, size);
+        // Encrypted OOXML is wrapped in an OLE container; classify it before
+        // trusting the extension (see detect_office_format for rationale).
+        if (ole.is_open()) {
+            DocFormat enc = classify_ole_encryption(ole);
+            if (enc != DocFormat::UNKNOWN) return enc;
+        }
+
         if (ext == ".doc") return DocFormat::DOC;
         if (ext == ".xls") return DocFormat::XLS;
         if (ext == ".ppt") return DocFormat::PPT;
 
-        OleReader ole(data, size);
         if (ole.is_open()) {
             // HWP check: skip it here, let the main dispatcher handle HWP
             if (ole.has_stream("FileHeader")) return DocFormat::UNKNOWN;
@@ -229,6 +261,8 @@ const char* format_name(DocFormat fmt) {
         case DocFormat::PPT:  return "PPT";
         case DocFormat::RTF:  return "RTF";
         case DocFormat::HTML: return "HTML";
+        case DocFormat::ENCRYPTED_PASSWORD: return "ENCRYPTED_PASSWORD";
+        case DocFormat::ENCRYPTED_RIGHTS:   return "ENCRYPTED_RIGHTS";
         default: return "UNKNOWN";
     }
 }
@@ -323,6 +357,10 @@ static auto with_office_parser(DocFormat format, const DocInput& in, Fn&& fn) {
         HtmlParser parser(reinterpret_cast<const char*>(in.data), in.size);
         return fn(parser);
     }
+    case DocFormat::ENCRYPTED_PASSWORD:
+        throw std::runtime_error("Password-protected document is not supported: " + in.display());
+    case DocFormat::ENCRYPTED_RIGHTS:
+        throw std::runtime_error("Rights-protected (IRM/RMS) document is not supported: " + in.display());
     default:
         throw std::runtime_error("Unsupported document format: " + in.display());
     }
