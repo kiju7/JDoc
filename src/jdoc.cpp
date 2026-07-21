@@ -68,7 +68,8 @@ static FileFormat format_from_ext(const std::string& name) {
     if (ext == ".eml") return FileFormat::EML;
     if (ext == ".docx" || ext == ".xlsx" || ext == ".pptx" ||
         ext == ".doc" || ext == ".xls" || ext == ".ppt" || ext == ".rtf" ||
-        ext == ".html" || ext == ".htm" || ext == ".xlsb")
+        ext == ".html" || ext == ".htm" || ext == ".xlsb" ||
+        ext == ".odt" || ext == ".ods" || ext == ".odp")
         return FileFormat::OFFICE;
     if (ext == ".zip") return FileFormat::ZIP;
     if (ext == ".gz" || ext == ".tgz") return FileFormat::GZIP;
@@ -133,6 +134,11 @@ static FileFormat classify_zip(const ZipReader& zip) {
         zip.has_entry("META-INF/container.xml"))
         return FileFormat::HWPX;
     if (zip.has_entry("[Content_Types].xml"))
+        return FileFormat::OFFICE;
+    // ODF (odt/ods/odp): no [Content_Types].xml — instead a top-level mimetype
+    // member plus META-INF/manifest.xml. The office layer splits the three
+    // kinds by the mimetype string.
+    if (zip.has_entry("mimetype") && zip.has_entry("META-INF/manifest.xml"))
         return FileFormat::OFFICE;
     return FileFormat::ZIP;
 }

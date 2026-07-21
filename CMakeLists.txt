@@ -156,6 +156,7 @@ add_library(jdoc_lib STATIC
     src/ooxml/pptx_parser.cpp
     src/ooxml/xlsx_parser.cpp
     src/ooxml/xlsb_parser.cpp
+    src/odf/odf_parser.cpp
     src/legacy/doc_parser.cpp
     src/legacy/xls_parser.cpp
     src/legacy/ppt_parser.cpp
@@ -226,7 +227,7 @@ option(JDOC_BUILD_TESTS "Build unit tests" OFF)
 if(JDOC_BUILD_TESTS)
     enable_testing()
     foreach(t IN ITEMS test_pdf test_pdf_crypt test_office test_archive
-                       test_hwp3 test_hwp5 test_hwpx test_eml test_msg)
+                       test_hwp3 test_hwp5 test_hwpx test_eml test_msg test_odf)
         add_executable(${t} test/${t}.cpp)
         target_link_libraries(${t} PRIVATE jdoc_lib)
         target_include_directories(${t} PRIVATE include src)
