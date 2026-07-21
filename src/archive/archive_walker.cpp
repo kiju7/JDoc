@@ -519,6 +519,23 @@ bool walk_tar(InputStream& src, const std::string& prefix, int depth,
             continue;
         }
 
+        // The tar header carries the member size, so enforce the per-member
+        // cap before touching the data. An over-cap member is reported and
+        // skipped while the walk continues — matching the zero-copy view path.
+        // Without this, the read/stream fallback (non-mmap file, or a .tar.gz)
+        // would stop mid-member and abort the whole tar, dropping every member
+        // after the oversized one.
+        if (m.size > opts.archive.max_member_bytes) {
+            MemberResult r;
+            r.member_path = member_path;
+            r.uncompressed_size = m.size;
+            r.error_code = MemberErrorCode::MEMBER_LIMIT;
+            r.error = member_limit_msg(opts.archive, m.size);
+            if (!cb(std::move(r))) return false;
+            if (!tar.skip_data()) break;
+            continue;
+        }
+
         // Zero-copy: a memory-backed tar (nested archive) exposes the
         // member's bytes in place — no materialization needed.
         if (const uint8_t* view = tar.view_data()) {
