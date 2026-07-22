@@ -28,9 +28,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Compiler cache — reuses object files across runs (incl. the bundled
+      # zlib/libjpeg-turbo). Fail-safe: if sccache is unavailable the launcher
+      # is just a passthrough, so the build still succeeds.
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@v0.0.6
+
       - name: Build
+        env:
+          SCCACHE_GHA_ENABLED: "true"
         run: |
-          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_COMPILER_LAUNCHER=sccache
           cmake --build build --config Release -j 4 --target jdoc
 
       - name: Package
@@ -61,9 +69,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Compiler cache for the native (macOS/Windows) wheel builds, where
+      # zlib + libjpeg-turbo are compiled from source once per Python version.
+      # sccache lets the 2nd–4th builds (and later runs) reuse objects. Linux
+      # wheels build in a manylinux container and use yum deps, so they skip it.
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@v0.0.6
+
       - name: Build wheels
         uses: pypa/cibuildwheel@v2.21
         env:
+          SCCACHE_GHA_ENABLED: "true"
           # CPython 3.9–3.12, 64-bit only; skip musl and 32-bit.
           CIBW_BUILD: "cp39-* cp310-* cp311-* cp312-*"
           CIBW_SKIP: "*-musllinux* *_i686 *-win32"
@@ -77,7 +93,10 @@ jobs:
           # path (as Windows does) — no external dylib for delocate to bundle.
           CIBW_BEFORE_ALL_LINUX: yum install -y zlib-devel libjpeg-turbo-devel
           CIBW_BEFORE_ALL_MACOS: brew unlink jpeg jpeg-turbo 2>/dev/null || true
-          CIBW_ENVIRONMENT_MACOS: "MACOSX_DEPLOYMENT_TARGET=11.0 CMAKE_ARGS=-DCMAKE_DISABLE_FIND_PACKAGE_JPEG=ON"
+          # macOS/Windows forward the sccache launchers (setup.py splits
+          # CMAKE_ARGS); CMakeLists relays them to the libjpeg-turbo subbuild.
+          CIBW_ENVIRONMENT_MACOS: "MACOSX_DEPLOYMENT_TARGET=11.0 SCCACHE_GHA_ENABLED=true CMAKE_ARGS='-DCMAKE_DISABLE_FIND_PACKAGE_JPEG=ON -DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_COMPILER_LAUNCHER=sccache'"
+          CIBW_ENVIRONMENT_WINDOWS: "SCCACHE_GHA_ENABLED=true CMAKE_ARGS='-DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_COMPILER_LAUNCHER=sccache'"
 
       - name: Upload wheels to release
         if: startsWith(github.ref, 'refs/tags/')

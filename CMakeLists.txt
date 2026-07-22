@@ -76,6 +76,9 @@ if(NOT JPEG_FOUND)
             -DWITH_TURBOJPEG=OFF
             -DWITH_SIMD=OFF            # avoid a NASM build dependency
             -DWITH_CRT_DLL=ON         # use /MD to match this project (no LIBCMT clash)
+            # Relay any compiler-cache launcher (sccache in CI); empty = no-op.
+            -DCMAKE_C_COMPILER_LAUNCHER=${CMAKE_C_COMPILER_LAUNCHER}
+            -DCMAKE_CXX_COMPILER_LAUNCHER=${CMAKE_CXX_COMPILER_LAUNCHER}
         BUILD_BYPRODUCTS ${_jpeg_lib})
     # The include dir must exist at configure time for the imported target check.
     file(MAKE_DIRECTORY ${_jpeg_prefix}/include)
