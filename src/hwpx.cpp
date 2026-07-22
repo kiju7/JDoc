@@ -145,7 +145,8 @@ private:
         if (data.empty()) return;
 
         pugi::xml_document doc;
-        doc.load_buffer(data.data(), data.size());
+        // data outlives doc and is not reused, so parse in place (no copy).
+        doc.load_buffer_inplace(data.data(), data.size());
 
         // Find manifest items: <opf:item id="..." href="..." media-type="..."/>
         for (auto item : doc.select_nodes("//item")) {
@@ -189,7 +190,8 @@ private:
         if (data.empty()) return;
 
         pugi::xml_document doc;
-        doc.load_buffer(data.data(), data.size());
+        // data outlives doc and is not reused, so parse in place (no copy).
+        doc.load_buffer_inplace(data.data(), data.size());
 
         // Parse font faces
         parse_font_faces(doc);
@@ -305,7 +307,8 @@ private:
         if (data.empty()) return;
 
         pugi::xml_document doc;
-        doc.load_buffer(data.data(), data.size());
+        // data outlives doc and is not reused, so parse in place (no copy).
+        doc.load_buffer_inplace(data.data(), data.size());
 
         // Find <hs:sec> root
         auto sec = doc.first_child();
@@ -691,7 +694,7 @@ private:
             for (int c = 0; c < num_cols && ci_idx < (int)raw_rows[ri].size(); c++) {
                 if (occupied[ri][c]) continue;
                 auto& ci = raw_rows[ri][ci_idx++];
-                grid[ri][c] = ci.text;
+                grid[ri][c] = std::move(ci.text);  // ci.text unused after this
                 // Mark spanned cells as occupied
                 for (int dr = 0; dr < ci.row_span && ri + dr < num_rows; dr++) {
                     for (int dc = 0; dc < ci.col_span && c + dc < num_cols; dc++) {

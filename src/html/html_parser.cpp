@@ -48,6 +48,9 @@ void HtmlParser::normalize_encoding_() {
 // ── HTML entity decoding ─────────────────────────────────
 
 std::string HtmlParser::decode_entities(const std::string& text) {
+    // Most text runs carry no entity; skip the char-by-char rebuild for them.
+    if (text.find('&') == std::string::npos) return text;
+
     std::string result;
     result.reserve(text.size());
     size_t i = 0;
@@ -284,13 +287,11 @@ bool HtmlParser::read_tag(size_t& pos, Tag& tag) const {
 }
 
 std::string HtmlParser::read_text(size_t& pos) const {
-    std::string text;
     size_t len = raw_html_.size();
-    while (pos < len && raw_html_[pos] != '<') {
-        text += raw_html_[pos];
-        pos++;
-    }
-    return text;
+    size_t start = pos;
+    while (pos < len && raw_html_[pos] != '<') pos++;
+    // One allocation over the whole run instead of char-by-char growth.
+    return raw_html_.substr(start, pos - start);
 }
 
 // ── Main conversion ──────────────────────────────────────

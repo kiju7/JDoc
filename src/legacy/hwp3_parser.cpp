@@ -344,6 +344,9 @@ private:
         } else {
             body_ = Reader{file_.data + file_.pos, file_.size - file_.pos, 0};
         }
+        // The markdown output tracks the body text size; reserve up front to
+        // avoid the realloc chain from growing out_ one paragraph at a time.
+        out_.reserve(body_.size);
     }
 
     // Inflate the raw-deflate compressed body.
@@ -619,7 +622,7 @@ private:
         std::string saved;
         saved.swap(para_);
         parse_para_list_nested(depth + 1);
-        std::string sub = para_;
+        std::string sub = std::move(para_);  // para_ is overwritten by the swap below
         para_.swap(saved);
         return sub;
     }

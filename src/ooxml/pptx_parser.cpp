@@ -953,6 +953,9 @@ std::vector<PageChunk> PptxParser::to_chunks(
 
     // Master/layout text belongs to no slide, so it becomes a trailing chunk
     std::string body;
+    size_t body_total = 0;
+    for (auto& c : chunks) body_total += c.text.size();
+    body.reserve(body_total);
     for (auto& c : chunks) body += c.text;
     std::string extra = format_master_layout_block(body);
     if (!extra.empty()) {

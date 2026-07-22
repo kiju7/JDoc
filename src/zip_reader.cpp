@@ -116,12 +116,11 @@ bool ZipReader::parse_central_directory() {
         uint16_t comment_len = util::read_u16_le(&hdr[32]);
         e.local_header_offset = util::read_u32_le(&hdr[42]);
 
-        // Read filename
-        std::vector<char> name_buf(name_len);
+        // Read filename directly into e.name (no intermediate buffer).
+        e.name.resize(name_len);
         if (name_len > 0 &&
-            src_->read_at(pos, name_buf.data(), name_len) != name_len)
+            src_->read_at(pos, e.name.data(), name_len) != name_len)
             return false;
-        e.name.assign(name_buf.data(), name_len);
         pos += name_len;
 
         // Legacy Korean zips (ALZip, Windows explorer) store names in CP949.

@@ -681,7 +681,7 @@ XlsxParser::SheetData XlsxParser::parse_sheet(const SheetInfo& info) {
             int style_idx = style_str[0] ? std::atoi(style_str) : -1;
             std::string value;
 
-            if (std::string(cell_type) == "s") {
+            if (strcmp(cell_type, "s") == 0) {
                 // Shared string reference
                 auto v_node = xml_child(cell, "v");
                 if (v_node) {
@@ -694,7 +694,7 @@ XlsxParser::SheetData XlsxParser::parse_sheet(const SheetInfo& info) {
                         }
                     }
                 }
-            } else if (std::string(cell_type) == "inlineStr") {
+            } else if (strcmp(cell_type, "inlineStr") == 0) {
                 // Inline string: <is><t>text</t></is>
                 auto is_node = xml_child(cell, "is");
                 if (is_node) {
@@ -710,14 +710,14 @@ XlsxParser::SheetData XlsxParser::parse_sheet(const SheetInfo& info) {
                         }
                     }
                 }
-            } else if (std::string(cell_type) == "b") {
+            } else if (strcmp(cell_type, "b") == 0) {
                 // Boolean
                 auto v_node = xml_child(cell, "v");
                 if (v_node) {
                     std::string v = xml_text_content(v_node);
                     value = (v == "1") ? "TRUE" : "FALSE";
                 }
-            } else if (std::string(cell_type) == "e") {
+            } else if (strcmp(cell_type, "e") == 0) {
                 // Error
                 auto v_node = xml_child(cell, "v");
                 if (v_node) {
@@ -746,7 +746,7 @@ XlsxParser::SheetData XlsxParser::parse_sheet(const SheetInfo& info) {
                     if (ch == '\n') ch = ' ';
                 }
                 bool bold = is_bold_style(style_idx);
-                sheet.cells[row][col] = {value, bold};
+                sheet.cells[row][col] = {std::move(value), bold};
                 sheet.max_row = std::max(sheet.max_row, row);
                 sheet.max_col = std::max(sheet.max_col, col);
             }

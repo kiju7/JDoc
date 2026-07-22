@@ -74,6 +74,7 @@ std::string XlsbParser::read_xl_widestring(const uint8_t* data, size_t& offset,
     if (offset + char_count * 2 > end) return "";
 
     std::string result;
+    result.reserve(char_count);  // ≥1 byte/char; avoids realloc growth
     for (uint32_t i = 0; i < char_count; i++) {
         uint16_t ch;
         memcpy(&ch, data + offset, 2);

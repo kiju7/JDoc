@@ -989,6 +989,9 @@ std::vector<PageChunk> DocxParser::to_chunks(
     // Header/footer text belongs to no single page — append it to the last one
     if (!chunks.empty()) {
         std::string body;
+        size_t body_total = 0;
+        for (auto& c : chunks) body_total += c.text.size();
+        body.reserve(body_total);
         for (auto& c : chunks) body += c.text;
         chunks.back().text += format_header_footer_block(body);
     }

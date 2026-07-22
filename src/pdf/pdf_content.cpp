@@ -600,7 +600,7 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
             else if (tok_eq("S")) {
                 if (!filter_white_stroke() && !filter_small_rect())
                     flush_path_segments();
-                { RenderPath rp; rp.points = current_path;
+                { RenderPath rp; rp.points = std::move(current_path);
                   rp.stroke_r = gs.stroke_r; rp.stroke_g = gs.stroke_g; rp.stroke_b = gs.stroke_b;
                   rp.fill_r = gs.fill_r; rp.fill_g = gs.fill_g; rp.fill_b = gs.fill_b;
                   rp.line_width = gs.line_width; rp.do_fill = false; rp.do_stroke = true;
@@ -610,7 +610,7 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
                 current_path.push_back({0, 0, PathPoint::CLOSE});
                 if (!filter_white_stroke() && !filter_small_rect())
                     flush_path_segments();
-                { RenderPath rp; rp.points = current_path;
+                { RenderPath rp; rp.points = std::move(current_path);
                   rp.stroke_r = gs.stroke_r; rp.stroke_g = gs.stroke_g; rp.stroke_b = gs.stroke_b;
                   rp.fill_r = gs.fill_r; rp.fill_g = gs.fill_g; rp.fill_b = gs.fill_b;
                   rp.line_width = gs.line_width; rp.do_fill = false; rp.do_stroke = true;
@@ -618,7 +618,7 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
                 current_path.clear();
             } else if (tok_eq("f") || tok_eq("F") || tok_eq("f*")) {
                 if (!filter_small_rect()) flush_path_segments();
-                { RenderPath rp; rp.points = current_path;
+                { RenderPath rp; rp.points = std::move(current_path);
                   rp.fill_r = gs.fill_r; rp.fill_g = gs.fill_g; rp.fill_b = gs.fill_b;
                   rp.stroke_r = gs.stroke_r; rp.stroke_g = gs.stroke_g; rp.stroke_b = gs.stroke_b;
                   rp.line_width = gs.line_width; rp.do_fill = true; rp.do_stroke = false;
@@ -629,7 +629,7 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
                     current_path.push_back({0, 0, PathPoint::CLOSE});
                 if (!filter_white_stroke() && !filter_small_rect())
                     flush_path_segments();
-                { RenderPath rp; rp.points = current_path;
+                { RenderPath rp; rp.points = std::move(current_path);
                   rp.fill_r = gs.fill_r; rp.fill_g = gs.fill_g; rp.fill_b = gs.fill_b;
                   rp.stroke_r = gs.stroke_r; rp.stroke_g = gs.stroke_g; rp.stroke_b = gs.stroke_b;
                   rp.line_width = gs.line_width; rp.do_fill = true; rp.do_stroke = true;
@@ -668,14 +668,20 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
                                 auto sub = parse_content_stream(
                                     doc, form_stream, sub_res, page_height,
                                     font_cache, skip_graphics, form_ctm, depth + 1);
+                                // sub is a temporary discarded right after — move
+                                // its elements into the parent instead of copying.
                                 result.chars.insert(result.chars.end(),
-                                    sub.chars.begin(), sub.chars.end());
+                                    std::make_move_iterator(sub.chars.begin()),
+                                    std::make_move_iterator(sub.chars.end()));
                                 result.segments.insert(result.segments.end(),
-                                    sub.segments.begin(), sub.segments.end());
+                                    std::make_move_iterator(sub.segments.begin()),
+                                    std::make_move_iterator(sub.segments.end()));
                                 result.images.insert(result.images.end(),
-                                    sub.images.begin(), sub.images.end());
+                                    std::make_move_iterator(sub.images.begin()),
+                                    std::make_move_iterator(sub.images.end()));
                                 result.paths.insert(result.paths.end(),
-                                    sub.paths.begin(), sub.paths.end());
+                                    std::make_move_iterator(sub.paths.begin()),
+                                    std::make_move_iterator(sub.paths.end()));
                             }
                         } else {
                             ImagePlacement ip;
