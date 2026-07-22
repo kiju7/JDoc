@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "jdoc"
-version = "2.0.0"
+version = "1.1.0"
 description = "JDoc - Universal document converter (PDF, Office, HTML, HWP/HWPX) to Markdown/Text"
 readme = "README.md"
 license = {text = "MIT"}
