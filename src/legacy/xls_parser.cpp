@@ -660,9 +660,9 @@ std::string XlsParser::sheet_to_markdown(const Sheet& sheet, int sheet_num) {
         max_col = std::max(max_col, c.col);
     }
 
-    // Limit to reasonable size (avoid massive sparse sheets).
-    uint16_t limit_row = std::min(max_row, uint16_t(10000));
-    uint16_t limit_col = std::min(max_col, uint16_t(100));
+    // No size limit — emit the full grid (BIFF rows/cols are 16-bit bounded).
+    uint16_t limit_row = max_row;
+    uint16_t limit_col = max_col;
 
     // Build grid with formatting.
     struct GridCell { std::string value; bool bold = false; bool italic = false; };
@@ -875,9 +875,6 @@ std::vector<PageChunk> XlsParser::to_chunks(const ConvertOptions& opts) {
                 max_row = std::max(max_row, c.row);
                 max_col = std::max(max_col, c.col);
             }
-            max_row = std::min(max_row, uint16_t(10000));
-            max_col = std::min(max_col, uint16_t(100));
-
             std::vector<std::vector<std::string>> grid(max_row + 1,
                                                        std::vector<std::string>(max_col + 1));
             for (const auto& c : sheets_[i].cells) {

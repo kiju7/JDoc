@@ -482,8 +482,9 @@ std::string XlsbParser::format_sheet_as_table(const SheetData& sheet,
 
     int total_rows = sheet.max_row + 1;
     int total_cols = sheet.max_col + 1;
-    bool truncated = total_rows > max_rows;
-    int display_rows = std::min(total_rows, max_rows);
+    // max_rows <= 0 means no limit — extract every row.
+    bool truncated = max_rows > 0 && total_rows > max_rows;
+    int display_rows = truncated ? max_rows : total_rows;
 
     std::ostringstream out;
 

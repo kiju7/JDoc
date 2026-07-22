@@ -94,9 +94,13 @@ int OdfParser::heading_level(const pugi::xml_node& p) const {
 }
 
 std::string OdfParser::format_table(const pugi::xml_node& table) const {
-    constexpr int kMaxRepeat = 512;
-    constexpr int kMaxCols = 256;
-    constexpr size_t kMaxRows = 10000;
+    // No row limit — every row is extracted. Columns are bounded only by the
+    // spreadsheet ceiling so a huge `number-columns-repeated`/`-rows-repeated`
+    // on an empty filler cell can't blow up memory; real data (a sheet has at
+    // most 16384 columns) is never truncated. Empty cells/rows are deferred so
+    // trailing padding costs nothing.
+    constexpr int kMaxCols = 16384;
+    constexpr int kMaxRowRepeat = 1 << 20;  // spreadsheet row ceiling
 
     std::vector<std::vector<std::string>> rows;
     std::vector<pugi::xml_node> trs;
@@ -104,6 +108,7 @@ std::string OdfParser::format_table(const pugi::xml_node& table) const {
 
     for (auto& tr : trs) {
         std::vector<std::string> row;
+        int pending_empty = 0;  // deferred empty columns; trailing ones vanish
         for (auto cell = tr.first_child(); cell; cell = cell.next_sibling()) {
             const char* nm = loc(cell);
             bool covered = strcmp(nm, "covered-table-cell") == 0;
@@ -126,18 +131,30 @@ std::string OdfParser::format_table(const pugi::xml_node& table) const {
             int rep = 1;
             const char* r = xml_attr(cell, "number-columns-repeated");
             if (r[0]) rep = std::atoi(r);
-            rep = std::max(1, std::min(rep, kMaxRepeat));
-            for (int i = 0; i < rep && (int)row.size() < kMaxCols; i++)
-                row.push_back(text);
+            if (rep < 1) rep = 1;
+            if (rep > kMaxCols) rep = kMaxCols;  // clamp guards int overflow
+            if (text.empty()) {
+                pending_empty += rep;  // hold back; may be trailing padding
+                if (pending_empty > kMaxCols) pending_empty = kMaxCols;
+            } else {
+                // Materialize any interior empties that precede real content,
+                // then the repeated content — both bounded by the ceiling.
+                for (; pending_empty > 0 && (int)row.size() < kMaxCols; --pending_empty)
+                    row.push_back("");
+                pending_empty = 0;
+                for (int i = 0; i < rep && (int)row.size() < kMaxCols; i++)
+                    row.push_back(text);
+            }
         }
-        while (!row.empty() && row.back().empty()) row.pop_back();  // trailing pad
+        // Any pending_empty left here was trailing padding — dropped.
 
         int rrep = 1;
         const char* rr = xml_attr(tr, "number-rows-repeated");
         if (rr[0]) rrep = std::atoi(rr);
-        rrep = std::max(1, std::min(rrep, kMaxRepeat));
+        if (rrep < 1) rrep = 1;
+        if (rrep > kMaxRowRepeat) rrep = kMaxRowRepeat;
         bool empty_row = row.empty();
-        for (int i = 0; i < rrep && rows.size() < kMaxRows; i++) {
+        for (int i = 0; i < rrep; i++) {
             rows.push_back(row);
             if (empty_row) break;  // a repeated blank row is one line, not thousands
         }

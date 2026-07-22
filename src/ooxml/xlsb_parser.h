@@ -59,7 +59,7 @@ private:
     };
 
     SheetData parse_sheet(const SheetInfo& info);
-    std::string format_sheet_as_table(const SheetData& sheet, int max_rows = 10000);
+    std::string format_sheet_as_table(const SheetData& sheet, int max_rows = 0);  // 0 = no limit
 };
 
 } // namespace jdoc

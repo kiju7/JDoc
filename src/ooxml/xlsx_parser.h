@@ -94,7 +94,7 @@ private:
                                  std::map<std::string, std::string>& out);
 
     std::string format_sheet_as_table(const SheetData& sheet,
-                                       int max_rows = 10000);
+                                       int max_rows = 0);  // 0 = no limit
 
     std::vector<ImageData> extract_images(
         const ConvertOptions& opts);

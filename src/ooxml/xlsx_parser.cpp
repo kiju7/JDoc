@@ -781,8 +781,9 @@ std::string XlsxParser::format_sheet_as_table(const SheetData& sheet,
 
     int total_rows = sheet.max_row + 1;
     int total_cols = sheet.max_col + 1;
-    bool truncated = total_rows > max_rows;
-    int display_rows = std::min(total_rows, max_rows);
+    // max_rows <= 0 means no limit — extract every row.
+    bool truncated = max_rows > 0 && total_rows > max_rows;
+    int display_rows = truncated ? max_rows : total_rows;
 
     std::ostringstream out;
 
@@ -1059,7 +1060,7 @@ std::vector<PageChunk> XlsxParser::to_chunks(
             if (opts.tables) {
                 int total_rows = sheet.max_row + 1;
                 int total_cols = sheet.max_col + 1;
-                int display_rows = std::min(total_rows, 10000);
+                int display_rows = total_rows;  // no row limit
 
                 std::vector<std::vector<std::string>> table;
                 table.reserve(display_rows);
