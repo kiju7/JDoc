@@ -1,6 +1,7 @@
 """Build script for jdoc Python extension module."""
 
 import os
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -28,6 +29,9 @@ class CMakeBuild(build_ext):
             f"-DCMAKE_BUILD_TYPE={cfg}",
             "-DBUILD_PYTHON=ON",
         ]
+        # Honor extra -D flags from the environment (used by the macOS wheel
+        # build to force the static libjpeg-turbo path).
+        cmake_args += shlex.split(os.environ.get("CMAKE_ARGS", ""))
 
         build_args = ["--config", cfg, "--target", "_jdoc"]
 
