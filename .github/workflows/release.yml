@@ -1,6 +1,6 @@
 name: release
 
-# Push a version tag (e.g. `git tag v2.0.0 && git push origin v2.0.0`) to build
+# Push a version tag (e.g. `git tag v1.1.0 && git push origin v1.1.0`) to build
 # CLI binaries and Python wheels for Linux/macOS/Windows and attach them to the
 # GitHub Release. workflow_dispatch builds the same artifacts without releasing.
 on:
@@ -68,10 +68,13 @@ jobs:
           CIBW_BUILD: "cp39-* cp310-* cp311-* cp312-*"
           CIBW_SKIP: "*-musllinux* *_i686 *-win32"
           CIBW_ARCHS_MACOS: arm64
-          # zlib/libjpeg from the system where a package manager makes it easy;
-          # Windows falls back to the CMake FetchContent path.
+          # Linux pulls zlib/libjpeg from yum. macOS and Windows have no dev
+          # package step, so CMake builds libjpeg-turbo statically via its
+          # ExternalProject path — nothing external for delocate to bundle.
+          # (Homebrew's jpeg is compiled for the runner's macOS and tripped
+          # delocate's minimum-target check, which dropped the macOS wheels.)
           CIBW_BEFORE_ALL_LINUX: yum install -y zlib-devel libjpeg-turbo-devel
-          CIBW_BEFORE_ALL_MACOS: brew install jpeg
+          CIBW_ENVIRONMENT_MACOS: "MACOSX_DEPLOYMENT_TARGET=11.0"
 
       - name: Upload wheels to release
         if: startsWith(github.ref, 'refs/tags/')
