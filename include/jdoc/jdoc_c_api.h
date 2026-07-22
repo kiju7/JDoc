@@ -27,7 +27,7 @@ typedef struct {
     long long max_member_bytes;      /* per-member uncompressed cap; default 512 MiB */
     long long max_total_bytes;       /* cumulative cap per call; default 64 GiB */
     int max_entries;                 /* members visited; default 200000 */
-    int max_ratio;                   /* bomb-suspect compression ratio; default 1000 */
+    int max_ratio;                   /* bomb-suspect compression ratio; default 10000 */
     int include_unsupported;         /* 1 = report unsupported members */
 } JDocOptions;
 

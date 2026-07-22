@@ -28,7 +28,7 @@ void print_usage(const char* prog) {
               << "  --max-member-mb N    Per-member uncompressed cap in MiB (default: 512, -1 = unlimited)\n"
               << "  --max-total-mb N     Cumulative uncompressed cap in MiB (default: 65536, -1 = unlimited)\n"
               << "  --max-entries N      Max members visited (default: 200000, -1 = unlimited)\n"
-              << "  --max-ratio N        Bomb-suspect compression ratio (default: 1000, 0 = off)\n"
+              << "  --max-ratio N        Bomb-suspect compression ratio (default: 10000, 0 = off)\n"
               << "  --include-unsupported  Report unsupported members as errors\n"
               << "  --help          Show this help\n";
 }

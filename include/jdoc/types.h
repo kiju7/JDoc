@@ -53,7 +53,13 @@ struct ArchiveLimits {
                                                 // CPU-time guard, not memory — bounds the
                                                 // damage of ratio-limit-evading bombs
     uint32_t max_entries = 200000;              // members visited incl. nested archives
-    uint32_t max_ratio = 1000;                  // suspected-bomb compression ratio
+    uint32_t max_ratio = 10000;                 // suspected-bomb compression ratio.
+                                                // Above DEFLATE's ~1032:1 ceiling so
+                                                // legitimate maximally-compressible
+                                                // members never trip; genuine bombs
+                                                // (nested / high-ratio codecs) are
+                                                // still caught, and max_member_bytes/
+                                                // max_total_bytes remain the hard caps.
     bool     include_unsupported = false;       // emit results for unsupported members
 };
 

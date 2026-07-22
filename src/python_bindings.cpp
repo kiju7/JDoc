@@ -247,7 +247,7 @@ Returns:
     py::arg("max_member_bytes") = (long long)(512) << 20,
     py::arg("max_total_bytes") = (long long)(64) << 30,
     py::arg("max_entries") = 200000,
-    py::arg("max_ratio") = 1000,
+    py::arg("max_ratio") = 10000,
     py::arg("include_unsupported") = false,
     R"doc(Convert every supported document inside an archive (zip/gz/tar/tar.gz/
 7z/alz/egg) without extracting to disk. Members are decompressed into memory
