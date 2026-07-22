@@ -5,6 +5,7 @@
 
 #include "archive/rar_reader.h"
 #include "common/string_utils.h"
+#include "common/binary_utils.h"
 
 #include <zlib.h>
 #include <algorithm>
@@ -57,14 +58,6 @@ constexpr uint64_t kV5FileHasCrc      = 0x0004;
 constexpr uint64_t kV5FileSizeUnknown = 0x0008;
 constexpr uint64_t kV5ExtraCrypt      = 0x01;  // extra record: file encryption
 
-uint16_t get_u16(const unsigned char* p) {
-    return static_cast<uint16_t>(p[0] | (p[1] << 8));
-}
-uint32_t get_u32(const unsigned char* p) {
-    return static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) |
-           (static_cast<uint32_t>(p[2]) << 16) | (static_cast<uint32_t>(p[3]) << 24);
-}
-
 bool get_vint(const unsigned char*& p, const unsigned char* end, uint64_t& v) {
     v = 0;
     for (int shift = 0; shift < 70; shift += 7) {
@@ -114,7 +107,7 @@ std::string decode_v4_unicode_name(const unsigned char* raw, size_t raw_len,
                 break;
             case 2:
                 if (ep + 2 > enc_len) return std::string();
-                push(get_u16(enc + ep));
+                push(util::read_u16_le(enc + ep));
                 ep += 2;
                 dp++;
                 break;
@@ -170,8 +163,8 @@ RarReader::RarReader(InputStream& src) : src_(src) {
     // rar4: the main archive header must follow the marker.
     unsigned char hdr[7];
     if (!read_full(hdr, sizeof(hdr)) || hdr[2] != kV4Main) return;
-    uint16_t flags = get_u16(hdr + 3);
-    uint16_t head_size = get_u16(hdr + 5);
+    uint16_t flags = util::read_u16_le(hdr + 3);
+    uint16_t head_size = util::read_u16_le(hdr + 5);
     if (head_size < 7) return;
     headers_encrypted_ = (flags & kV4MainPassword) != 0;
     if (!headers_encrypted_ && !discard_stream(src_, head_size - 7)) return;
@@ -201,8 +194,8 @@ bool RarReader::next_v4(Member& out) {
         unsigned char hdr[7];
         if (!read_full(hdr, sizeof(hdr))) return false;  // EOF: archives may
         uint8_t type = hdr[2];                           // lack an end block
-        uint16_t flags = get_u16(hdr + 3);
-        uint16_t head_size = get_u16(hdr + 5);
+        uint16_t flags = util::read_u16_le(hdr + 3);
+        uint16_t head_size = util::read_u16_le(hdr + 5);
         if (type == kV4End || head_size < 7) return false;
 
         if (type != kV4File && type != kV4NewSub) {
@@ -211,7 +204,7 @@ bool RarReader::next_v4(Member& out) {
             if (flags & kV4LongBlock) {
                 unsigned char a[4];
                 if (head_size < 11 || !read_full(a, 4)) return false;
-                add = get_u32(a);
+                add = util::read_u32_le(a);
                 consumed = 11;
             }
             if (!discard_stream(src_, head_size - consumed + add)) return false;
@@ -222,18 +215,18 @@ bool RarReader::next_v4(Member& out) {
         // FILE_CRC(4) FTIME(4) UNP_VER(1) METHOD(1) NAME_SIZE(2) ATTR(4)
         unsigned char f[25];
         if (!read_full(f, sizeof(f))) return false;
-        uint64_t pack = get_u32(f);
-        uint64_t unp = get_u32(f + 4);
-        uint32_t crc = get_u32(f + 9);
+        uint64_t pack = util::read_u32_le(f);
+        uint64_t unp = util::read_u32_le(f + 4);
+        uint32_t crc = util::read_u32_le(f + 9);
         uint8_t method = f[18];
-        uint16_t name_size = get_u16(f + 19);
+        uint16_t name_size = util::read_u16_le(f + 19);
         uint64_t consumed = 7 + 25;
 
         if (flags & kV4FileLarge) {
             unsigned char hi[8];
             if (!read_full(hi, sizeof(hi))) return false;
-            pack |= static_cast<uint64_t>(get_u32(hi)) << 32;
-            unp |= static_cast<uint64_t>(get_u32(hi + 4)) << 32;
+            pack |= static_cast<uint64_t>(util::read_u32_le(hi)) << 32;
+            unp |= static_cast<uint64_t>(util::read_u32_le(hi + 4)) << 32;
             consumed += 8;
         }
 
@@ -296,7 +289,7 @@ bool RarReader::next_v5(Member& out) {
         uLong crc = crc32(0, nullptr, 0);
         crc = crc32(crc, size_bytes, static_cast<uInt>(size_len));
         crc = crc32(crc, buf.data(), static_cast<uInt>(buf.size()));
-        if (static_cast<uint32_t>(crc) != get_u32(crc_buf)) return false;
+        if (static_cast<uint32_t>(crc) != util::read_u32_le(crc_buf)) return false;
 
         const unsigned char* p = buf.data();
         const unsigned char* end = p + buf.size();
@@ -328,7 +321,7 @@ bool RarReader::next_v5(Member& out) {
         uint32_t crc32_field = 0;
         if (file_flags & kV5FileHasCrc) {
             if (end - p < 4) return false;
-            crc32_field = get_u32(p);
+            crc32_field = util::read_u32_le(p);
             p += 4;
         }
         if (!get_vint(p, end, comp_info) || !get_vint(p, end, host) ||

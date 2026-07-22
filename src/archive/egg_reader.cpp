@@ -3,6 +3,7 @@
 
 #include "archive/egg_reader.h"
 #include "common/string_utils.h"
+#include "common/binary_utils.h"
 
 #include <zlib.h>
 #include <algorithm>
@@ -32,30 +33,19 @@ constexpr uint8_t kNameFlagRelPath  = 0x10;  // 4-byte parent path id before the
 
 constexpr size_t kMaxNameLen = 4096;
 
-uint32_t get_u32(const unsigned char* p) {
-    return static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) |
-           (static_cast<uint32_t>(p[2]) << 16) | (static_cast<uint32_t>(p[3]) << 24);
-}
-uint16_t get_u16(const unsigned char* p) {
-    return static_cast<uint16_t>(p[0] | (p[1] << 8));
-}
-uint64_t get_u64(const unsigned char* p) {
-    return static_cast<uint64_t>(get_u32(p)) |
-           (static_cast<uint64_t>(get_u32(p + 4)) << 32);
-}
 
 } // anonymous namespace
 
 EggReader::EggReader(InputStream& src) : src_(src) {
     unsigned char hdr[14];  // magic(4) version(2) header_id(4) reserved(4)
     if (!read_full(hdr, sizeof(hdr))) return;
-    if (get_u32(hdr) != kEggMagic) return;
+    if (util::read_u32_le(hdr) != kEggMagic) return;
 
     // Extra Field 1: split / solid / global encryption, until EOFARC.
     for (;;) {
         unsigned char magic[4];
         if (!read_full(magic, 4)) return;
-        uint32_t sig = get_u32(magic);
+        uint32_t sig = util::read_u32_le(magic);
         if (sig == kEofArc) break;
         if (sig == kSolidMagic) solid_ = true;
         if (sig == kSplitMagic) split_ = true;
@@ -85,12 +75,12 @@ bool EggReader::skip_extra_field() {
     if (flag & kFlagSize32) {
         unsigned char sz[4];
         if (!read_full(sz, 4)) return false;
-        size = get_u32(sz);
+        size = util::read_u32_le(sz);
         if (size > (64u << 20)) return false;  // implausible field
     } else {
         unsigned char sz[2];
         if (!read_full(sz, 2)) return false;
-        size = get_u16(sz);
+        size = util::read_u16_le(sz);
     }
     return size == 0 || discard_stream(src_, size);
 }
@@ -105,18 +95,18 @@ bool EggReader::parse_filename(Member& m) {
     if (flag & kFlagSize32) {
         unsigned char sz[4];
         if (!read_full(sz, 4)) return false;
-        size = get_u32(sz);
+        size = util::read_u32_le(sz);
     } else {
         unsigned char sz[2];
         if (!read_full(sz, 2)) return false;
-        size = get_u16(sz);
+        size = util::read_u16_le(sz);
     }
 
     uint16_t locale = 0;
     if (flag & kNameFlagAreaCode) {
         unsigned char lb[2];
         if (size < 2 || !read_full(lb, 2)) return false;
-        locale = get_u16(lb);
+        locale = util::read_u16_le(lb);
         size -= 2;
     }
     if (flag & kNameFlagRelPath) {
@@ -159,7 +149,7 @@ bool EggReader::next(Member& out) {
     uint32_t sig;
     for (;;) {
         if (!read_full(magic, 4)) return false;
-        sig = get_u32(magic);
+        sig = util::read_u32_le(magic);
         if (sig == kFileMagic) break;
         if (sig == kEofArc) return false;  // end of archive
         if (sig == kBlockMagic) {
@@ -177,14 +167,14 @@ bool EggReader::next(Member& out) {
     if (!read_full(fh, sizeof(fh))) return false;
 
     cur_ = Member{};
-    cur_.uncompressed_size = get_u64(fh + 4);
+    cur_.uncompressed_size = util::read_u64_le(fh + 4);
 
     // Extra Field 2 until EOFARC. Some writers start the first block
     // without an end marker; the stream cannot rewind, so remember that
     // the block magic was already consumed.
     for (;;) {
         if (!read_full(magic, 4)) return false;
-        sig = get_u32(magic);
+        sig = util::read_u32_le(magic);
         if (sig == kEofArc) break;
         if (sig == kBlockMagic) {
             block_magic_consumed_ = true;
@@ -245,7 +235,7 @@ bool EggReader::read_solid_stream(const CodecSink& sink, std::string* err) {
                 if (err) *err = "truncated solid data";
                 return false;
             }
-            uint32_t sig = get_u32(magic);
+            uint32_t sig = util::read_u32_le(magic);
             if (sig == kEofArc) return true;
             if (sig != kBlockMagic) {
                 if (err) *err = "corrupt egg block header";
@@ -267,7 +257,7 @@ bool EggReader::consume_blocks(uint64_t remaining, const CodecSink* sink,
                 if (err) *err = "truncated member data";
                 return false;
             }
-            if (get_u32(magic) != kBlockMagic) {
+            if (util::read_u32_le(magic) != kBlockMagic) {
                 if (err) *err = "corrupt egg block header";
                 return false;
             }
@@ -292,9 +282,9 @@ bool EggReader::decode_block(uint64_t remaining, uint64_t& produced_out,
         return false;
     }
     uint8_t method = bh[0];
-    uint64_t block_usize = get_u32(bh + 2);
-    uint64_t block_csize = get_u32(bh + 6);
-    uint32_t block_crc = get_u32(bh + 10);
+    uint64_t block_usize = util::read_u32_le(bh + 2);
+    uint64_t block_csize = util::read_u32_le(bh + 6);
+    uint32_t block_crc = util::read_u32_le(bh + 10);
 
     for (;;) {
         unsigned char magic[4];
@@ -302,7 +292,7 @@ bool EggReader::decode_block(uint64_t remaining, uint64_t& produced_out,
             if (err) *err = "truncated member data";
             return false;
         }
-        uint32_t sig = get_u32(magic);
+        uint32_t sig = util::read_u32_le(magic);
         if (sig == kEofArc) break;
         if (!skip_extra_field()) {
             if (err) *err = "corrupt egg block header";

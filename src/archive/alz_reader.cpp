@@ -3,6 +3,7 @@
 
 #include "archive/alz_reader.h"
 #include "common/string_utils.h"
+#include "common/binary_utils.h"
 
 #include <zlib.h>
 #include <algorithm>
@@ -20,14 +21,6 @@ constexpr uint16_t kFlagEncrypted = 0x0001;
 constexpr size_t   kEncHeaderSize = 12;          // precedes data of encrypted members
 constexpr size_t   kMaxNameLen    = 4096;
 
-uint32_t get_u32(const unsigned char* p) {
-    return static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) |
-           (static_cast<uint32_t>(p[2]) << 16) | (static_cast<uint32_t>(p[3]) << 24);
-}
-uint16_t get_u16(const unsigned char* p) {
-    return static_cast<uint16_t>(p[0] | (p[1] << 8));
-}
-
 uint64_t get_var_size(const unsigned char* p, int width) {
     uint64_t v = 0;
     for (int i = 0; i < width; i++)
@@ -40,7 +33,7 @@ uint64_t get_var_size(const unsigned char* p, int width) {
 AlzReader::AlzReader(InputStream& src) : src_(src) {
     unsigned char hdr[8];  // magic(4) + version(2) + header id(2)
     if (!read_full(hdr, sizeof(hdr))) return;
-    open_ = get_u32(hdr) == kAlzMagic;
+    open_ = util::read_u32_le(hdr) == kAlzMagic;
 }
 
 bool AlzReader::read_full(void* buf, size_t len) {
@@ -59,14 +52,14 @@ bool AlzReader::next(Member& out) {
 
     unsigned char magic[4];
     if (!read_full(magic, 4)) return false;
-    uint32_t sig = get_u32(magic);
+    uint32_t sig = util::read_u32_le(magic);
     if (sig != kLocalMagic) return false;  // kEndMagic/kCentralMagic/garbage: stop
     (void)kEndMagic; (void)kCentralMagic;
 
     unsigned char fixed[9];  // name_len(2) attr(1) time(4) bit_flags(2)
     if (!read_full(fixed, sizeof(fixed))) return false;
-    uint16_t name_len = get_u16(fixed);
-    uint16_t flags = get_u16(fixed + 7);
+    uint16_t name_len = util::read_u16_le(fixed);
+    uint16_t flags = util::read_u16_le(fixed + 7);
     if (name_len == 0 || name_len > kMaxNameLen) return false;
 
     cur_ = Member{};
@@ -81,8 +74,8 @@ bool AlzReader::next(Member& out) {
         // method(2) crc(4) csize(width) usize(width)
         unsigned char info[6 + 16];
         if (!read_full(info, 6 + 2 * static_cast<size_t>(width))) return false;
-        cur_.method = static_cast<uint8_t>(get_u16(info));
-        cur_.crc32 = get_u32(info + 2);
+        cur_.method = static_cast<uint8_t>(util::read_u16_le(info));
+        cur_.crc32 = util::read_u32_le(info + 2);
         cur_.compressed_size = get_var_size(info + 6, width);
         cur_.uncompressed_size = get_var_size(info + 6 + width, width);
         cur_.has_data_fields = true;

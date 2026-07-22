@@ -35,19 +35,6 @@ static constexpr uint16_t RT_OUTLINE_TEXT_REF_ATOM   = 0x0F9E;
 static constexpr uint16_t RT_USER_EDIT_ATOM          = 0x0FF5;
 static constexpr uint16_t RT_PERSIST_PTR_INCR_BLOCK  = 0x1772;
 
-// ── Binary read helpers ─────────────────────────────────────
-
-static uint16_t rd16(const char* p) {
-    auto b = reinterpret_cast<const uint8_t*>(p);
-    return uint16_t(b[0]) | (uint16_t(b[1]) << 8);
-}
-
-static uint32_t rd32(const char* p) {
-    auto b = reinterpret_cast<const uint8_t*>(p);
-    return uint32_t(b[0]) | (uint32_t(b[1]) << 8) |
-           (uint32_t(b[2]) << 16) | (uint32_t(b[3]) << 24);
-}
-
 // ── Record header ───────────────────────────────────────────
 
 struct RecordHeader {
@@ -59,9 +46,9 @@ struct RecordHeader {
 
 static bool read_header(const char* data, size_t size, size_t pos, RecordHeader& hdr) {
     if (pos + 8 > size) return false;
-    hdr.ver_inst = rd16(data + pos);
-    hdr.rec_type = rd16(data + pos + 2);
-    hdr.rec_len  = rd32(data + pos + 4);
+    hdr.ver_inst = util::read_u16_le(data + pos);
+    hdr.rec_type = util::read_u16_le(data + pos + 2);
+    hdr.rec_len  = util::read_u32_le(data + pos + 4);
     return true;
 }
 
@@ -121,13 +108,13 @@ struct SlidePersistAtom {
 
 static SlidePersistAtom read_spa(const char* data, size_t len) {
     SlidePersistAtom spa{};
-    spa.psr_reference = rd32(data);
-    if (len >= 8)  spa.flags       = rd32(data + 4);
-    if (len >= 12) spa.num_texts   = static_cast<int32_t>(rd32(data + 8));
-    if (len >= 16) spa.slide_id    = rd32(data + 12);
-    if (len >= 20) spa.reserved    = rd32(data + 16);
-    if (len >= 24) spa.start_offset = rd32(data + 20);
-    if (len >= 28) spa.end_offset  = rd32(data + 24);
+    spa.psr_reference = util::read_u32_le(data);
+    if (len >= 8)  spa.flags       = util::read_u32_le(data + 4);
+    if (len >= 12) spa.num_texts   = static_cast<int32_t>(util::read_u32_le(data + 8));
+    if (len >= 16) spa.slide_id    = util::read_u32_le(data + 12);
+    if (len >= 20) spa.reserved    = util::read_u32_le(data + 16);
+    if (len >= 24) spa.start_offset = util::read_u32_le(data + 20);
+    if (len >= 28) spa.end_offset  = util::read_u32_le(data + 24);
     return spa;
 }
 
@@ -157,8 +144,8 @@ static std::vector<uint32_t> build_persist_directory(
 
         // UserEditAtom layout: [0] lastSlideIdRef, [4] version/minor/major,
         // [8] offsetLastEdit, [12] offsetPersistDirectory, [16] docPersistIdRef, ...
-        uint32_t last_edit_offset = rd32(atom + 8);
-        uint32_t persist_dir_offset = rd32(atom + 12);
+        uint32_t last_edit_offset = util::read_u32_le(atom + 8);
+        uint32_t persist_dir_offset = util::read_u32_le(atom + 12);
 
         // Read PersistPtrIncrementalBlock at persist_dir_offset
         RecordHeader phdr{};
@@ -171,13 +158,13 @@ static std::vector<uint32_t> build_persist_directory(
             size_t ppos = persist_dir_offset + 8;
 
             while (ppos + 4 <= pend) {
-                uint32_t info = rd32(data + ppos);
+                uint32_t info = util::read_u32_le(data + ppos);
                 ppos += 4;
                 uint32_t start_id = info & 0x000FFFFF;
                 uint32_t count = (info >> 20) & 0xFFF;
 
                 for (uint32_t i = 0; i < count && ppos + 4 <= pend; ++i) {
-                    uint32_t offset = rd32(data + ppos);
+                    uint32_t offset = util::read_u32_le(data + ppos);
                     ppos += 4;
                     uint32_t id = start_id + i;
                     if (id >= dir.size()) dir.resize(id + 1, 0);
@@ -212,7 +199,7 @@ static uint32_t find_edit_offset_from_current_user(OleReader& ole) {
     // CurrentUser stream: RecordHeader(8) + CurrentUserAtom
     // CurrentUserAtom: size(4) + headerToken(4) + offsetToCurrentEdit(4) + ...
     if (cu.size() >= 20) {
-        return rd32(cu.data() + 16);
+        return util::read_u32_le(cu.data() + 16);
     }
     return 0;
 }
@@ -235,13 +222,13 @@ static void collect_blip_refs(const char* data, size_t opt_data_start,
     // Bit 14 (0x4000) = complex flag, bit 15 (0x8000) = blipId flag — mask both
     size_t pos = opt_data_start;
     size_t end = opt_data_start + opt_len;
-    uint16_t inst = rd16(data + opt_data_start - 8) >> 4;
+    uint16_t inst = util::read_u16_le(data + opt_data_start - 8) >> 4;
     uint32_t fill_type = 0xFFFFFFFF;
     uint32_t fill_blip = 0;
     uint32_t pib = 0;
     for (uint16_t i = 0; i < inst && pos + 6 <= end; ++i) {
-        uint16_t raw_id = rd16(data + pos);
-        uint32_t val = rd32(data + pos + 2);
+        uint16_t raw_id = util::read_u16_le(data + pos);
+        uint32_t val = util::read_u32_le(data + pos + 2);
         pos += 6;
         uint16_t prop_id = raw_id & 0x3FFF;  // strip complex + blipId flags
         if (prop_id == 0x0104) pib = val;
@@ -276,9 +263,9 @@ static SlideText extract_slide_text(const char* data, size_t size,
 
         if (hdr.rec_type == RT_SLIDE_ATOM && hdr.rec_len >= 24) {
             // notesIdRef is at offset 16 in SlideAtom (after geometry, colors, etc.)
-            result.notes_id = rd32(atom + 16);
+            result.notes_id = util::read_u32_le(atom + 16);
         } else if (hdr.rec_type == RT_TEXT_HEADER_ATOM && hdr.rec_len >= 4) {
-            text_type = rd32(atom);
+            text_type = util::read_u32_le(atom);
         } else if (hdr.rec_type == RT_TEXT_CHARS_ATOM) {
             std::string text = decode_text_chars(atom, hdr.rec_len);
             if (!text.empty()) {
@@ -474,7 +461,7 @@ void PptParser::parse_document() {
             const char* atom = data + pos + 8;
 
             if (hdr.rec_type == RT_TEXT_HEADER_ATOM && hdr.rec_len >= 4) {
-                text_type = rd32(atom);
+                text_type = util::read_u32_le(atom);
             } else if (hdr.rec_type == RT_TEXT_CHARS_ATOM && hdr.rec_len > 0) {
                 std::string text = decode_text_chars(atom, hdr.rec_len);
                 if (text_type == 0) {
@@ -607,9 +594,9 @@ std::vector<ImageData> PptParser::extract_images(unsigned min_image_size) {
     size_t pos = 0;
 
     while (pos + 8 <= pics.size()) {
-        uint16_t ver_inst = rd16(pics.data() + pos);
-        uint16_t rec_type = rd16(pics.data() + pos + 2);
-        uint32_t rec_len  = rd32(pics.data() + pos + 4);
+        uint16_t ver_inst = util::read_u16_le(pics.data() + pos);
+        uint16_t rec_type = util::read_u16_le(pics.data() + pos + 2);
+        uint32_t rec_len  = util::read_u32_le(pics.data() + pos + 4);
 
         if (rec_len == 0) break;
         if (pos + 8 + rec_len > pics.size()) break;
@@ -654,7 +641,7 @@ std::vector<ImageData> PptParser::extract_images(unsigned min_image_size) {
                 if (is_metafile) {
                     uLong decomp_size = 0;
                     if (header_skip >= 38)
-                        decomp_size = rd32(pics.data() + blip_start + 34);
+                        decomp_size = util::read_u32_le(pics.data() + blip_start + 34);
                     if (decomp_size == 0 || decomp_size > 100 * 1024 * 1024)
                         decomp_size = img_size * 10;
 

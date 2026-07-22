@@ -35,24 +35,6 @@ static constexpr uint16_t RT_FILEPASS   = 0x002F;
 static constexpr uint16_t RT_FONT      = 0x0031;
 static constexpr uint16_t RT_MSODRAWING = 0x00EC;
 
-// ---------- helpers ----------------------------------------------------------
-
-static uint16_t rd16(const char* p) {
-    const uint8_t* b = reinterpret_cast<const uint8_t*>(p);
-    return static_cast<uint16_t>(b[0]) | (static_cast<uint16_t>(b[1]) << 8);
-}
-
-static uint32_t rd32(const char* p) {
-    const uint8_t* b = reinterpret_cast<const uint8_t*>(p);
-    return uint32_t(b[0]) | (uint32_t(b[1]) << 8) | (uint32_t(b[2]) << 16) | (uint32_t(b[3]) << 24);
-}
-
-static double rd_double(const char* p) {
-    double val;
-    std::memcpy(&val, p, 8);
-    return val;
-}
-
 // ---------- XlsParser --------------------------------------------------------
 
 XlsParser::XlsParser(OleReader& ole) : ole_(ole) {
@@ -272,7 +254,7 @@ std::string XlsParser::parse_xl_string(const char* data, size_t len, size_t& pos
                                         bool* crossed_continue) const {
     if (pos + 3 > len) { pos = len; return ""; }
 
-    uint16_t cch = rd16(data + pos); pos += 2;
+    uint16_t cch = util::read_u16_le(data + pos); pos += 2;
     uint8_t flags = static_cast<uint8_t>(data[pos]); pos += 1;
 
     bool high_byte = (flags & 0x01) != 0;
@@ -284,11 +266,11 @@ std::string XlsParser::parse_xl_string(const char* data, size_t len, size_t& pos
 
     if (rich) {
         if (pos + 2 > len) { pos = len; return ""; }
-        run_count = rd16(data + pos); pos += 2;
+        run_count = util::read_u16_le(data + pos); pos += 2;
     }
     if (ext_st) {
         if (pos + 4 > len) { pos = len; return ""; }
-        ext_size = rd32(data + pos); pos += 4;
+        ext_size = util::read_u32_le(data + pos); pos += 4;
     }
 
     std::string result;
@@ -326,7 +308,7 @@ void XlsParser::parse_sst(const char* data, size_t len,
                            const std::vector<std::vector<char>>& continues) {
     if (len < 8) return;
 
-    uint32_t unique_count = rd32(data + 4);
+    uint32_t unique_count = util::read_u32_le(data + 4);
 
     // Concatenate the SST record data with all CONTINUE records to form one buffer.
     std::vector<char> buf(data + 8, data + len);
@@ -362,8 +344,8 @@ void XlsParser::parse_workbook() {
 
     // Pass 1: globals (SST, BoundSheet, FORMAT, XF, FILEPASS)
     while (pos + 4 <= wb.size()) {
-        uint16_t rec_type = rd16(wb.data() + pos);
-        uint16_t rec_size = rd16(wb.data() + pos + 2);
+        uint16_t rec_type = util::read_u16_le(wb.data() + pos);
+        uint16_t rec_size = util::read_u16_le(wb.data() + pos + 2);
         pos += 4;
 
         if (pos + rec_size > wb.size()) break;
@@ -399,9 +381,9 @@ void XlsParser::parse_workbook() {
 
             // FORMAT record: numFmtId (2 bytes) + formatCode string
             if (rec_type == RT_FORMAT && rec_size >= 5) {
-                uint16_t fmt_id = rd16(rec_data);
+                uint16_t fmt_id = util::read_u16_le(rec_data);
                 // Format string is an XLUnicodeString starting at offset 2
-                uint16_t cch = rd16(rec_data + 2);
+                uint16_t cch = util::read_u16_le(rec_data + 2);
                 uint8_t flags = static_cast<uint8_t>(rec_data[4]);
                 bool high_byte = (flags & 0x01) != 0;
 
@@ -424,11 +406,11 @@ void XlsParser::parse_workbook() {
             // FONT record: bytes 2-3 = options (bit 0=bold weight>=700, bit 1=italic)
             if (rec_type == RT_FONT && rec_size >= 4) {
                 FontInfo fi;
-                uint16_t options = rd16(rec_data + 2);
+                uint16_t options = util::read_u16_le(rec_data + 2);
                 fi.italic = (options & 0x02) != 0;
                 // Bold detection: weight field at offset 6 (BIFF8) >= 700
                 if (rec_size >= 8) {
-                    uint16_t weight = rd16(rec_data + 6);
+                    uint16_t weight = util::read_u16_le(rec_data + 6);
                     fi.bold = (weight >= 700);
                 } else {
                     fi.bold = (options & 0x01) != 0;
@@ -438,8 +420,8 @@ void XlsParser::parse_workbook() {
 
             // XF record: bytes 0-1 = fontId, bytes 2-3 = numFmtId
             if (rec_type == RT_XF && rec_size >= 4) {
-                uint16_t font_id = rd16(rec_data);
-                uint16_t fmt_id = rd16(rec_data + 2);
+                uint16_t font_id = util::read_u16_le(rec_data);
+                uint16_t fmt_id = util::read_u16_le(rec_data + 2);
                 xf_num_fmt_ids_.push_back(static_cast<int>(fmt_id));
                 xf_font_ids_.push_back(static_cast<int>(font_id));
             }
@@ -448,8 +430,8 @@ void XlsParser::parse_workbook() {
                 continue_blocks.clear();
                 size_t look = pos + rec_size;
                 while (look + 4 <= wb.size()) {
-                    uint16_t ct = rd16(wb.data() + look);
-                    uint16_t cs = rd16(wb.data() + look + 2);
+                    uint16_t ct = util::read_u16_le(wb.data() + look);
+                    uint16_t cs = util::read_u16_le(wb.data() + look + 2);
                     if (ct != RT_CONTINUE) break;
                     look += 4;
                     if (look + cs > wb.size()) break;
@@ -478,8 +460,8 @@ void XlsParser::parse_workbook() {
     int formula_sheet = -1;
 
     while (pos + 4 <= wb.size()) {
-        uint16_t rec_type = rd16(wb.data() + pos);
-        uint16_t rec_size = rd16(wb.data() + pos + 2);
+        uint16_t rec_type = util::read_u16_le(wb.data() + pos);
+        uint16_t rec_size = util::read_u16_le(wb.data() + pos + 2);
         pos += 4;
         if (pos + rec_size > wb.size()) break;
         const char* rec_data = wb.data() + pos;
@@ -495,7 +477,7 @@ void XlsParser::parse_workbook() {
         if (expect_string && rec_type == RT_STRING && rec_size >= 3) {
             expect_string = false;
             if (formula_sheet >= 0 && formula_sheet < static_cast<int>(sheets_.size())) {
-                uint16_t cch = rd16(rec_data);
+                uint16_t cch = util::read_u16_le(rec_data);
                 uint8_t flags = static_cast<uint8_t>(rec_data[2]);
                 bool high_byte = (flags & 0x01) != 0;
                 size_t str_start = 3;
@@ -535,18 +517,18 @@ void XlsParser::parse_workbook() {
             Sheet& sheet = sheets_[current_sheet];
 
             if (rec_type == RT_LABELSST && rec_size >= 10) {
-                uint16_t row = rd16(rec_data);
-                uint16_t col = rd16(rec_data + 2);
-                uint16_t xf_idx = rd16(rec_data + 4);
-                uint32_t sst_idx = rd32(rec_data + 6);
+                uint16_t row = util::read_u16_le(rec_data);
+                uint16_t col = util::read_u16_le(rec_data + 2);
+                uint16_t xf_idx = util::read_u16_le(rec_data + 4);
+                uint32_t sst_idx = util::read_u32_le(rec_data + 6);
                 if (sst_idx < sst_.size()) {
                     auto [b, it] = get_font_info(xf_idx);
                     sheet.cells.push_back({row, col, sst_[sst_idx], b, it});
                 }
             } else if (rec_type == RT_BOOLERR && rec_size >= 8) {
                 // BOOLERR record: boolean or error cell
-                uint16_t row = rd16(rec_data);
-                uint16_t col = rd16(rec_data + 2);
+                uint16_t row = util::read_u16_le(rec_data);
+                uint16_t col = util::read_u16_le(rec_data + 2);
                 // XF index at offset 4 (2 bytes) — skip
                 uint8_t val = static_cast<uint8_t>(rec_data[6]);
                 uint8_t is_error = static_cast<uint8_t>(rec_data[7]);
@@ -568,10 +550,10 @@ void XlsParser::parse_workbook() {
                 sheet.cells.push_back({row, col, cell_val});
             } else if (rec_type == RT_LABEL && rec_size >= 9) {
                 // LABEL record: inline string cell (BIFF8)
-                uint16_t row = rd16(rec_data);
-                uint16_t col = rd16(rec_data + 2);
+                uint16_t row = util::read_u16_le(rec_data);
+                uint16_t col = util::read_u16_le(rec_data + 2);
                 // XF index at offset 4 (2 bytes) — skip
-                uint16_t cch = rd16(rec_data + 6);
+                uint16_t cch = util::read_u16_le(rec_data + 6);
                 uint8_t flags = static_cast<uint8_t>(rec_data[8]);
                 bool high_byte = (flags & 0x01) != 0;
                 size_t str_start = 9;
@@ -591,39 +573,39 @@ void XlsParser::parse_workbook() {
                     sheet.cells.push_back({row, col, val});
                 }
             } else if (rec_type == RT_NUMBER && rec_size >= 14) {
-                uint16_t row = rd16(rec_data);
-                uint16_t col = rd16(rec_data + 2);
-                uint16_t xf_idx = rd16(rec_data + 4);
-                double val = rd_double(rec_data + 6);
+                uint16_t row = util::read_u16_le(rec_data);
+                uint16_t col = util::read_u16_le(rec_data + 2);
+                uint16_t xf_idx = util::read_u16_le(rec_data + 4);
+                double val = util::read_f64_le(rec_data + 6);
                 sheet.cells.push_back({row, col, format_cell_number(val, xf_idx)});
             } else if (rec_type == RT_RK && rec_size >= 10) {
-                uint16_t row = rd16(rec_data);
-                uint16_t col = rd16(rec_data + 2);
-                uint16_t xf_idx = rd16(rec_data + 4);
-                uint32_t rk = rd32(rec_data + 6);
+                uint16_t row = util::read_u16_le(rec_data);
+                uint16_t col = util::read_u16_le(rec_data + 2);
+                uint16_t xf_idx = util::read_u16_le(rec_data + 4);
+                uint32_t rk = util::read_u32_le(rec_data + 6);
                 double val = decode_rk(rk);
                 sheet.cells.push_back({row, col, format_cell_number(val, xf_idx)});
             } else if (rec_type == RT_MULRK && rec_size >= 6) {
-                uint16_t row = rd16(rec_data);
-                uint16_t first_col = rd16(rec_data + 2);
-                uint16_t last_col = rd16(rec_data + rec_size - 2);
+                uint16_t row = util::read_u16_le(rec_data);
+                uint16_t first_col = util::read_u16_le(rec_data + 2);
+                uint16_t last_col = util::read_u16_le(rec_data + rec_size - 2);
                 size_t pair_offset = 4;
                 for (uint16_t c = first_col; c <= last_col && pair_offset + 6 <= rec_size - 2u; ++c) {
-                    uint16_t xf_idx = rd16(rec_data + pair_offset);
-                    uint32_t rk = rd32(rec_data + pair_offset + 2);
+                    uint16_t xf_idx = util::read_u16_le(rec_data + pair_offset);
+                    uint32_t rk = util::read_u32_le(rec_data + pair_offset + 2);
                     double val = decode_rk(rk);
                     sheet.cells.push_back({row, c, format_cell_number(val, xf_idx)});
                     pair_offset += 6;
                 }
             } else if (rec_type == RT_FORMULA && rec_size >= 20) {
                 // FORMULA record: row(2) + col(2) + xf(2) + result(8) + options(2) + reserved(4)
-                uint16_t row = rd16(rec_data);
-                uint16_t col = rd16(rec_data + 2);
-                uint16_t xf_idx = rd16(rec_data + 4);
+                uint16_t row = util::read_u16_le(rec_data);
+                uint16_t col = util::read_u16_le(rec_data + 2);
+                uint16_t xf_idx = util::read_u16_le(rec_data + 4);
 
                 // Result value is 8 bytes at offset 6.
                 // Check if it's a special type: bytes 6-7 = 0xFFFF means not a number.
-                uint16_t marker = rd16(rec_data + 12);
+                uint16_t marker = util::read_u16_le(rec_data + 12);
                 if (marker == 0xFFFF) {
                     // Special value: byte at offset 6 indicates type.
                     uint8_t result_type = static_cast<uint8_t>(rec_data[6]);
@@ -656,7 +638,7 @@ void XlsParser::parse_workbook() {
                     // result_type == 3: empty cell, skip
                 } else {
                     // Numeric result (IEEE 754 double).
-                    double val = rd_double(rec_data + 6);
+                    double val = util::read_f64_le(rec_data + 6);
                     sheet.cells.push_back({row, col, format_cell_number(val, xf_idx)});
                 }
             }
@@ -762,8 +744,8 @@ std::vector<ImageData> XlsParser::extract_images(unsigned min_image_size) {
     size_t pos = 0;
 
     while (pos + 4 <= wb.size()) {
-        uint16_t rec_type = rd16(wb.data() + pos);
-        uint16_t rec_size = rd16(wb.data() + pos + 2);
+        uint16_t rec_type = util::read_u16_le(wb.data() + pos);
+        uint16_t rec_size = util::read_u16_le(wb.data() + pos + 2);
         pos += 4;
         if (pos + rec_size > wb.size()) break;
 
@@ -771,8 +753,8 @@ std::vector<ImageData> XlsParser::extract_images(unsigned min_image_size) {
             drawing_data.insert(drawing_data.end(), wb.data() + pos, wb.data() + pos + rec_size);
             size_t look = pos + rec_size;
             while (look + 4 <= wb.size()) {
-                uint16_t ct = rd16(wb.data() + look);
-                uint16_t cs = rd16(wb.data() + look + 2);
+                uint16_t ct = util::read_u16_le(wb.data() + look);
+                uint16_t cs = util::read_u16_le(wb.data() + look + 2);
                 if (ct != RT_CONTINUE) break;
                 look += 4;
                 if (look + cs > wb.size()) break;
@@ -790,9 +772,9 @@ std::vector<ImageData> XlsParser::extract_images(unsigned min_image_size) {
     int img_idx = 0;
     pos = 0;
     while (pos + 8 <= drawing_data.size()) {
-        uint16_t ver_inst = rd16(drawing_data.data() + pos);
-        uint16_t rec_type = rd16(drawing_data.data() + pos + 2);
-        uint32_t rec_len  = rd32(drawing_data.data() + pos + 4);
+        uint16_t ver_inst = util::read_u16_le(drawing_data.data() + pos);
+        uint16_t rec_type = util::read_u16_le(drawing_data.data() + pos + 2);
+        uint32_t rec_len  = util::read_u32_le(drawing_data.data() + pos + 4);
 
         uint8_t ver = ver_inst & 0x0F;
 

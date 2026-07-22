@@ -3,6 +3,7 @@
 // License: MIT
 
 #include <cstdint>
+#include <cstring>
 
 namespace jdoc { namespace util {
 
@@ -28,6 +29,12 @@ inline int16_t read_i16_le(const void* p) {
 
 inline int32_t read_i32_le(const void* p) {
     return static_cast<int32_t>(read_u32_le(p));
+}
+
+inline double read_f64_le(const void* p) {
+    double v;
+    std::memcpy(&v, p, sizeof v);
+    return v;
 }
 
 }} // namespace jdoc::util
