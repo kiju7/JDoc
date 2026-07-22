@@ -15,3 +15,5 @@ test_archive_tmp/
 .DS_Store
 build-release/
 docs/
+test/bench/
+test/bench_with_rss.sh
