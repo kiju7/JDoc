@@ -126,6 +126,16 @@ PYBIND11_MODULE(_jdoc, m) {
         .value("PLAINTEXT", jdoc::OutputFormat::PLAINTEXT)
         .export_values();
 
+    py::class_<jdoc::ArchiveLimits>(m, "ArchiveLimits")
+        .def(py::init<>())
+        .def_readwrite("max_depth", &jdoc::ArchiveLimits::max_depth)
+        .def_readwrite("max_member_bytes", &jdoc::ArchiveLimits::max_member_bytes)
+        .def_readwrite("max_total_bytes", &jdoc::ArchiveLimits::max_total_bytes)
+        .def_readwrite("max_entries", &jdoc::ArchiveLimits::max_entries)
+        .def_readwrite("max_ratio", &jdoc::ArchiveLimits::max_ratio)
+        .def_readwrite("include_unsupported",
+                       &jdoc::ArchiveLimits::include_unsupported);
+
     // ImageData
     py::class_<jdoc::ImageData>(m, "ImageData")
         .def(py::init<>())
@@ -133,6 +143,8 @@ PYBIND11_MODULE(_jdoc, m) {
         .def_readwrite("name", &jdoc::ImageData::name)
         .def_readwrite("width", &jdoc::ImageData::width)
         .def_readwrite("height", &jdoc::ImageData::height)
+        .def_readwrite("components", &jdoc::ImageData::components)
+        .def_readwrite("pixels", &jdoc::ImageData::pixels)
         .def_readwrite("format", &jdoc::ImageData::format)
         .def_readwrite("saved_path", &jdoc::ImageData::saved_path)
         .def_readwrite("embedded_text", &jdoc::ImageData::embedded_text)
@@ -172,10 +184,14 @@ PYBIND11_MODULE(_jdoc, m) {
         .def(py::init<>())
         .def_readwrite("pages", &jdoc::ConvertOptions::pages)
         .def_readwrite("tables", &jdoc::ConvertOptions::tables)
+        .def_readwrite("page_chunks", &jdoc::ConvertOptions::page_chunks)
         .def_readwrite("images", &jdoc::ConvertOptions::images)
         .def_readwrite("image_dir", &jdoc::ConvertOptions::image_dir)
+        .def_readwrite("image_ref_prefix",
+                       &jdoc::ConvertOptions::image_ref_prefix)
         .def_readwrite("min_image_size", &jdoc::ConvertOptions::min_image_size)
-        .def_readwrite("format", &jdoc::ConvertOptions::format);
+        .def_readwrite("format", &jdoc::ConvertOptions::format)
+        .def_readwrite("archive", &jdoc::ConvertOptions::archive);
 
     // DocFormat enum
     py::enum_<jdoc::DocFormat>(m, "DocFormat")
@@ -254,6 +270,7 @@ PYBIND11_MODULE(_jdoc, m) {
     py::arg("image_dir") = "",
     py::arg("image_ref_prefix") = "",
     py::arg("min_image_size") = 50,
+    py::call_guard<py::gil_scoped_release>(),
     R"doc(Convert a document file to text.
 
 Args:
@@ -298,6 +315,7 @@ Returns:
     py::arg("image_dir") = "",
     py::arg("image_ref_prefix") = "",
     py::arg("min_image_size") = 50,
+    py::call_guard<py::gil_scoped_release>(),
     R"doc(Convert a document file to per-page chunks.
 
 Args:
@@ -431,6 +449,7 @@ Yields:
     py::arg("max_entries") = 200000,
     py::arg("max_ratio") = 10000,
     py::arg("include_unsupported") = false,
+    py::call_guard<py::gil_scoped_release>(),
     R"doc(Convert every supported document inside an archive (zip/gz/tar/tar.gz/
 7z/alz/egg) without extracting to disk. Members are decompressed into memory
 one at a time; nested archives are walked recursively up to max_depth.
@@ -443,6 +462,7 @@ Returns:
 )doc");
 
     m.def("is_archive", &jdoc::is_archive_file, py::arg("file_path"),
+          py::call_guard<py::gil_scoped_release>(),
           "True if the file is an archive container rather than a document.");
 
     m.def("convert_bytes", [](py::bytes data, const std::string& name_hint,
@@ -450,8 +470,13 @@ Returns:
         jdoc::ConvertOptions opts;
         if (format == "text" || format == "plaintext" || format == "plain")
             opts.format = jdoc::OutputFormat::PLAINTEXT;
-        std::string buf = data;  // copy out of the Python object
-        return jdoc::convert(buf.data(), buf.size(), name_hint, opts);
+        char* buffer = nullptr;
+        Py_ssize_t length = 0;
+        if (PyBytes_AsStringAndSize(data.ptr(), &buffer, &length) != 0)
+            throw py::error_already_set();
+        py::gil_scoped_release release;
+        return jdoc::convert(buffer, static_cast<size_t>(length),
+                             name_hint, opts);
     },
     py::arg("data"), py::arg("name_hint") = "", py::arg("format") = "markdown",
     "Convert a document held in bytes (no file I/O).");
@@ -459,27 +484,35 @@ Returns:
     // ── Per-format functions (for advanced usage) ────────
 
     m.def("pdf_to_markdown", &jdoc::pdf_to_markdown,
-          py::arg("pdf_path"), py::arg("opts") = jdoc::ConvertOptions{});
+          py::arg("pdf_path"), py::arg("opts") = jdoc::ConvertOptions{},
+          py::call_guard<py::gil_scoped_release>());
     m.def("pdf_to_markdown_chunks", &jdoc::pdf_to_markdown_chunks,
-          py::arg("pdf_path"), py::arg("opts") = jdoc::ConvertOptions{});
+          py::arg("pdf_path"), py::arg("opts") = jdoc::ConvertOptions{},
+          py::call_guard<py::gil_scoped_release>());
 
     m.def("office_to_markdown", &jdoc::office_to_markdown,
-          py::arg("file_path"), py::arg("opts") = jdoc::ConvertOptions{});
+          py::arg("file_path"), py::arg("opts") = jdoc::ConvertOptions{},
+          py::call_guard<py::gil_scoped_release>());
     m.def("office_to_markdown_chunks", &jdoc::office_to_markdown_chunks,
-          py::arg("file_path"), py::arg("opts") = jdoc::ConvertOptions{});
+          py::arg("file_path"), py::arg("opts") = jdoc::ConvertOptions{},
+          py::call_guard<py::gil_scoped_release>());
 
     m.def("hwp_to_markdown", &jdoc::hwp_to_markdown,
-          py::arg("hwp_path"), py::arg("opts") = jdoc::ConvertOptions{});
+          py::arg("hwp_path"), py::arg("opts") = jdoc::ConvertOptions{},
+          py::call_guard<py::gil_scoped_release>());
     m.def("hwp_to_markdown_chunks", &jdoc::hwp_to_markdown_chunks,
-          py::arg("hwp_path"), py::arg("opts") = jdoc::ConvertOptions{});
+          py::arg("hwp_path"), py::arg("opts") = jdoc::ConvertOptions{},
+          py::call_guard<py::gil_scoped_release>());
 
     m.def("hwpx_to_markdown", &jdoc::hwpx_to_markdown,
-          py::arg("hwpx_path"), py::arg("opts") = jdoc::ConvertOptions{});
+          py::arg("hwpx_path"), py::arg("opts") = jdoc::ConvertOptions{},
+          py::call_guard<py::gil_scoped_release>());
     m.def("hwpx_to_markdown_chunks", &jdoc::hwpx_to_markdown_chunks,
-          py::arg("hwpx_path"), py::arg("opts") = jdoc::ConvertOptions{});
+          py::arg("hwpx_path"), py::arg("opts") = jdoc::ConvertOptions{},
+          py::call_guard<py::gil_scoped_release>());
 
     m.def("detect_office_format", &jdoc::detect_office_format,
-          py::arg("file_path"));
+          py::arg("file_path"), py::call_guard<py::gil_scoped_release>());
     m.def("format_name", &jdoc::format_name,
           py::arg("fmt"));
 
@@ -487,6 +520,7 @@ Returns:
     m.def("detect",
           [](const std::string& file_path) { return jdoc::detect(file_path); },
           py::arg("file_path"),
+          py::call_guard<py::gil_scoped_release>(),
           R"doc(Detect a file's format without running a full extraction.
 
 Returns:
@@ -495,8 +529,13 @@ Returns:
 
     m.def("detect_bytes",
           [](py::bytes data, const std::string& name_hint) {
-              std::string buf = data;  // copy out of the Python object
-              return jdoc::detect(buf.data(), buf.size(), name_hint);
+              char* buffer = nullptr;
+              Py_ssize_t length = 0;
+              if (PyBytes_AsStringAndSize(data.ptr(), &buffer, &length) != 0)
+                  throw py::error_already_set();
+              py::gil_scoped_release release;
+              return jdoc::detect(buffer, static_cast<size_t>(length),
+                                  name_hint);
           },
           py::arg("data"), py::arg("name_hint") = "",
           "Detect the format of a document held in bytes (no file I/O).");

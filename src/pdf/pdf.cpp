@@ -128,11 +128,8 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
         page_indices = opts.pages;
     }
 
-    // Always extract images for markdown references; only save to disk if dir is set
     std::string image_dir;
-    ConvertOptions img_opts = opts;
-    img_opts.images = true;
-    if (!opts.image_dir.empty()) {
+    if (opts.images && !opts.image_dir.empty()) {
         image_dir = opts.image_dir;
         util::ensure_dir(image_dir);
     }
@@ -169,7 +166,7 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
                 has_fonts = fd.is_dict() && !fd.dict.empty();
             }
         }
-        if (!has_fonts && !img_opts.images) continue;
+        if (!has_fonts && !opts.images) continue;
 
         // Parse content stream
         auto content_data = get_page_content(doc, page_obj);
@@ -178,7 +175,7 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
         // Extract text lines
         bool plaintext = (opts.format == OutputFormat::PLAINTEXT);
         bool need_tables = opts.tables && !plaintext;
-        bool need_graphics = need_tables || img_opts.images;
+        bool need_graphics = need_tables || opts.images;
 
         auto parse_result = parse_content_stream(doc, content_data, resources, page_h,
                                                   &font_cache, !need_graphics);
@@ -201,7 +198,7 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
         }
 
         // Image extraction
-        if (img_opts.images) {
+        if (opts.images) {
             // Check for layered page
             bool has_regular = false, has_mask = false;
             for (auto& ip : parse_result.images) {

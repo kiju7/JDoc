@@ -1123,6 +1123,12 @@ std::string DocParser::text_to_markdown(const std::string& raw_text) {
     for (size_t i = 0; i < lines.size(); ++i) {
         std::string_view ln = lines[i];
 
+        // Word terminates even a one-cell row with a cell mark. It is useful
+        // between cells, but at the end of a line it has no text meaning and
+        // must not leak into the UTF-8 output as the U+001F control character.
+        while (!ln.empty() && ln.back() == '\x1F')
+            ln.remove_suffix(1);
+
         // Limit consecutive empty lines to 1
         if (ln.empty()) {
             consecutive_empty++;
@@ -1481,11 +1487,14 @@ std::string DocParser::to_markdown(const ConvertOptions& opts) {
 
     auto images = extract_images(opts.min_image_size);
 
+    fprintf(stderr, "[DBG-md] opts.images=%d image_dir='%s' images=%zu\n", opts.images, opts.image_dir.c_str(), images.size());
     if (opts.images) {
         for (auto& img : images) {
-            img.saved_path = util::save_image_to_file(
+            std::string sp = util::save_image_to_file(
                 opts.image_dir, img.name, img.format,
                 img.data.data(), img.data.size());
+            fprintf(stderr, "[DBG-md]   save name=%s size=%zu -> '%s'\n", img.name.c_str(), img.data.size(), sp.c_str());
+            img.saved_path = sp;
             if (!img.saved_path.empty()) {
                 img.data.clear();
                 img.data.shrink_to_fit();
@@ -1515,8 +1524,23 @@ std::vector<PageChunk> DocParser::to_chunks(const ConvertOptions& opts) {
     for (const auto& img : images)
         if (!img.embedded_text.empty())
             chunk.text += "\n\n" + img.embedded_text;
-    if (opts.images)
+    if (opts.images) {
+        // When an image_dir is set, write each image to disk and drop the bytes
+        // (matching to_markdown() and the OOXML parsers). Without it the encoded
+        // bytes stay on the chunk for in-memory consumers.
+        if (!opts.image_dir.empty()) {
+            for (auto& img : images) {
+                img.saved_path = util::save_image_to_file(
+                    opts.image_dir, img.name, img.format,
+                    img.data.data(), img.data.size());
+                if (!img.saved_path.empty()) {
+                    img.data.clear();
+                    img.data.shrink_to_fit();
+                }
+            }
+        }
         chunk.images = std::move(images);
+    }
 
     chunk.page_width = 612.0;
     chunk.page_height = 792.0;

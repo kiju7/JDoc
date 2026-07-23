@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <limits>
 #include <map>
 #include <memory>
 #include <numeric>
@@ -516,8 +517,8 @@ std::vector<ExtractedImage> extract_page_images(PdfDoc& doc, const PdfObj& page_
         ImageData img;
         img.page_number = page_num;
         img.name = "page" + std::to_string(page_num + 1) + "_img" + std::to_string(img_idx);
-        img.width = w;
-        img.height = h;
+        img.width = static_cast<unsigned>(w);
+        img.height = static_cast<unsigned>(h);
 
         // Determine filter chain
         auto filter_obj = doc.resolve(xobj.get("Filter"));
@@ -669,19 +670,36 @@ std::vector<ExtractedImage> extract_page_images(PdfDoc& doc, const PdfObj& page_
                 }
             }
 
-            size_t expected = static_cast<size_t>(w) * h * components * bpc / 8;
-            if (decoded.size() < expected && decoded.size() > 0) {
+            const size_t width = static_cast<size_t>(w);
+            const size_t height = static_cast<size_t>(h);
+            if (width > std::numeric_limits<size_t>::max() / height)
+                continue;
+            const size_t pixel_count = width * height;
+            const size_t component_count =
+                components > 0 ? static_cast<size_t>(components) : 0;
+            const bool byte_aligned =
+                bpc == 8 && component_count > 0 &&
+                pixel_count <=
+                    std::numeric_limits<size_t>::max() / component_count;
+            const size_t expected = byte_aligned
+                ? pixel_count * component_count : 0;
+            if (expected > 0 && decoded.size() < expected) {
                 // Try to infer components
-                size_t total = static_cast<size_t>(w) * h;
-                if (total > 0 && decoded.size() % total == 0)
-                    components = static_cast<int>(decoded.size() / total);
+                if (pixel_count > 0 && decoded.size() % pixel_count == 0)
+                    components =
+                        static_cast<int>(decoded.size() / pixel_count);
             }
 
             // Apply Indexed palette expansion
             if (is_indexed && !indexed_lookup.empty() && components == 1) {
-                size_t pixel_count = static_cast<size_t>(w) * h;
-                std::vector<uint8_t> expanded(pixel_count * indexed_base_comps);
+                if (indexed_base_comps != 1 && indexed_base_comps != 3 &&
+                    indexed_base_comps != 4)
+                    continue;
                 size_t lut_stride = static_cast<size_t>(indexed_base_comps);
+                if (pixel_count >
+                    std::numeric_limits<size_t>::max() / lut_stride)
+                    continue;
+                std::vector<uint8_t> expanded(pixel_count * lut_stride);
                 for (size_t px = 0; px < pixel_count && px < decoded.size(); px++) {
                     int idx = decoded[px];
                     if (idx > indexed_hival) idx = indexed_hival;
@@ -703,11 +721,18 @@ std::vector<ExtractedImage> extract_page_images(PdfDoc& doc, const PdfObj& page_
         if (!img.data.empty() || !img.pixels.empty()) {
             // Encode raw pixels to PNG for in-memory delivery
             if (img.format == "raw" && img.data.empty() && !img.pixels.empty()) {
-                auto png = pixels_to_png(img.pixels.data(), img.width, img.height, img.components);
-                img.data.assign(png.begin(), png.end());
-                img.format = "png";
-                img.pixels.clear();
-                img.pixels.shrink_to_fit();
+                auto png = pixels_to_png(img.pixels.data(), img.pixels.size(),
+                                         img.width, img.height, img.components);
+                if (!png.empty()) {
+                    img.data.assign(png.begin(), png.end());
+                    img.format = "png";
+                    img.pixels = {};
+                } else {
+                    // Unsupported component layout or truncated sample data.
+                    // Never expose a "raw" image whose declared dimensions
+                    // exceed its backing buffer.
+                    continue;
+                }
             }
 
             if (!output_dir.empty()) {
@@ -868,7 +893,9 @@ struct Canvas {
     }
 
     std::vector<char> to_png(int level = Z_BEST_SPEED) const {
-        return pixels_to_png(pixels.data(), width, height, 3, level);
+        return pixels_to_png(pixels.data(), pixels.size(),
+                             static_cast<unsigned>(width),
+                             static_cast<unsigned>(height), 3, level);
     }
 };
 
@@ -1324,7 +1351,9 @@ ImageData render_page_composite(PdfDoc& doc, const PdfObj& page_obj,
     img.components = 3;
 
     // Canvas is already RGB — encode to PNG for in-memory delivery
-    auto png = pixels_to_png(canvas.pixels.data(), rw, rh, 3, Z_BEST_SPEED);
+    auto png = pixels_to_png(canvas.pixels.data(), canvas.pixels.size(),
+                             static_cast<unsigned>(rw),
+                             static_cast<unsigned>(rh), 3, Z_BEST_SPEED);
     img.format = "png";
     img.data.assign(png.begin(), png.end());
 

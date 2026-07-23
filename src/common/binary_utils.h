@@ -9,7 +9,8 @@ namespace jdoc { namespace util {
 
 inline uint16_t read_u16_le(const void* p) {
     const uint8_t* b = static_cast<const uint8_t*>(p);
-    return uint16_t(b[0]) | (uint16_t(b[1]) << 8);
+    return static_cast<uint16_t>(
+        uint16_t(b[0]) | (uint16_t(b[1]) << 8));
 }
 
 inline uint32_t read_u32_le(const void* p) {

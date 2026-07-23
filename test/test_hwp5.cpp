@@ -9,6 +9,7 @@
 #include "jdoc/jdoc.h"
 #include "jdoc/hwp.h"
 #include "jdoc/hwp_types.h"
+#include "common/string_utils.h"
 
 #include <cassert>
 #include <cstring>
@@ -497,6 +498,17 @@ static void test_footnote_inside_table_cell() {
     TEST_END
 }
 
+static void test_surrogate_pair_text() {
+    TEST(surrogate_pair_text)
+    Bytes sec;
+    put_paragraph(sec, 0, u"수학 문자: \U0001D400");
+
+    auto md = convert(build_ole(make_file_header(), Bytes(64, 0), sec));
+    ASSERT(jdoc::util::is_valid_utf8(md));
+    ASSERT(md.find("\xF0\x9D\x90\x80") != std::string::npos);
+    TEST_END
+}
+
 int main() {
     std::cerr << "\n=== HWP 5.x drawing object tests ===\n";
 
@@ -510,6 +522,7 @@ int main() {
     test_header_footer_hoisted_to_section_start();
     test_footnote_follows_referencing_paragraph();
     test_footnote_inside_table_cell();
+    test_surrogate_pair_text();
 
     std::cerr << "\n=== Results: " << tests_passed << " passed, "
               << tests_failed << " failed ===\n";

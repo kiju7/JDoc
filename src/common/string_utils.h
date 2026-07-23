@@ -11,6 +11,12 @@ namespace jdoc { namespace util {
 
 // Append a Unicode codepoint as UTF-8 bytes.
 inline void append_utf8(std::string& out, uint32_t cp) {
+    // UTF-8 encodes Unicode scalar values, not UTF-16 surrogate code units.
+    // Keeping this check at the shared boundary guarantees that one malformed
+    // input mapping cannot make an entire converted document invalid UTF-8.
+    if (cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF))
+        cp = 0xFFFD;
+
     if (cp < 0x80) {
         out.push_back(static_cast<char>(cp));
     } else if (cp < 0x800) {

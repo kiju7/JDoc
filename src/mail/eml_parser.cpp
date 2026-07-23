@@ -385,4 +385,14 @@ void eml_to_markdown_chunks_stream(const std::string& file_path,
     sink(std::move(chunk));
 }
 
+void eml_to_markdown_chunks_mem_stream(const uint8_t* data, size_t size,
+                                       const ConvertOptions& opts,
+                                       const PageSink& sink) {
+    EmlParser parser(data, size);
+    PageChunk chunk;
+    chunk.page_number = 0;
+    chunk.text = parser.to_markdown(opts);
+    sink(std::move(chunk));
+}
+
 } // namespace jdoc

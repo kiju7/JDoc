@@ -839,10 +839,7 @@ private:
 
             // Append text
             std::string txt;
-            for (auto ch : cpara.text) {
-                if (!is_hwp_printable(ch)) continue;
-                util::append_utf8(txt, ch);
-            }
+            append_hwp_text(txt, cpara.text, 0, cpara.text.size());
             txt = util::trim(txt);
             if (!txt.empty()) {
                 if (!out.empty() && out.back() != '\x02')
@@ -1088,6 +1085,27 @@ private:
         if (ch >= 0x0100 && ch <= 0x02FF) return false;
         if (ch >= 0x0500 && ch <= 0x0FFF) return false;
         return true;
+    }
+
+    static void append_hwp_text(std::string& out,
+                                const std::u16string& text,
+                                size_t begin, size_t end) {
+        end = std::min(end, text.size());
+        for (size_t i = begin; i < end; ++i) {
+            const uint32_t high = text[i];
+            if (high >= 0xD800 && high <= 0xDBFF && i + 1 < end) {
+                const uint32_t low = text[i + 1];
+                if (low >= 0xDC00 && low <= 0xDFFF) {
+                    const uint32_t codepoint =
+                        0x10000 + ((high - 0xD800) << 10) + (low - 0xDC00);
+                    util::append_utf8(out, codepoint);
+                    ++i;
+                    continue;
+                }
+            }
+            if (is_hwp_printable(static_cast<char16_t>(high)))
+                util::append_utf8(out, high);
+        }
     }
 
     void parse_para_text(const uint8_t* data, uint32_t size, HWPParagraph& para) {
@@ -1468,11 +1486,7 @@ private:
 
         if (para.char_shapes.empty()) {
             FormattedSpan span;
-            for (size_t i = 0; i < para.text.size(); i++) {
-                char16_t ch = para.text[i];
-                if (!is_hwp_printable(ch)) continue;
-                util::append_utf8(span.text, ch);
-            }
+            append_hwp_text(span.text, para.text, 0, para.text.size());
             spans.push_back(std::move(span));
         } else {
             for (size_t si = 0; si < para.char_shapes.size(); si++) {
@@ -1491,11 +1505,7 @@ private:
                     size_counts[cs.height]++;
                 }
 
-                for (uint32_t pos = start; pos < end && pos < para.text.size(); pos++) {
-                    char16_t ch = para.text[pos];
-                    if (!is_hwp_printable(ch)) continue;
-                    util::append_utf8(span.text, ch);
-                }
+                append_hwp_text(span.text, para.text, start, end);
 
                 if (!span.text.empty()) {
                     spans.push_back(std::move(span));
@@ -1637,6 +1647,25 @@ void hwp_to_markdown_chunks_stream(const std::string& hwp_path,
         return;
     }
     HWPParser parser(hwp_path, opts);
+    parser.parse();
+    parser.convert_chunks_stream(plaintext, sink);
+}
+
+void hwp_to_markdown_chunks_mem_stream(const uint8_t* data, size_t size,
+                                       const ConvertOptions& opts_in,
+                                       const PageSink& sink) {
+    ConvertOptions opts = opts_in;
+    opts.page_chunks = true;
+    bool plaintext = (opts.format == OutputFormat::PLAINTEXT);
+    if (is_hwp3_signature(data, size)) {
+        Hwp3Parser parser(data, size);
+        for (auto& chunk : parser.to_chunks(opts)) {
+            if (plaintext) chunk.text = util::strip_markdown(chunk.text);
+            if (!sink(std::move(chunk))) return;
+        }
+        return;
+    }
+    HWPParser parser(data, size, opts);
     parser.parse();
     parser.convert_chunks_stream(plaintext, sink);
 }

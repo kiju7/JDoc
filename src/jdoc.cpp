@@ -498,6 +498,12 @@ void for_each_chunk(const void* data, size_t size, const std::string& name_hint,
         case FileFormat::OFFICE:
             office_to_markdown_chunks_mem_stream(bytes, size, name_hint, opts, sink);
             return;
+        case FileFormat::HWPX:
+            hwpx_to_markdown_chunks_mem_stream(bytes, size, opts, sink);
+            return;
+        case FileFormat::HWP:
+            hwp_to_markdown_chunks_mem_stream(bytes, size, opts, sink);
+            return;
         case FileFormat::TXT: {
             PageChunk chunk;
             chunk.page_number = 0;
@@ -510,10 +516,10 @@ void for_each_chunk(const void* data, size_t size, const std::string& name_hint,
         case FileFormat::WMF:
             sink(metafile_to_chunk(fmt, bytes, size, opts));
             return;
+        case FileFormat::EML:
+            eml_to_markdown_chunks_mem_stream(bytes, size, opts, sink);
+            return;
         default:
-            // HWP/HWPX/EML have no in-memory chunk path today; the archive
-            // walker extracts those members to disk and uses the file-path
-            // streaming variant instead.
             if (is_archive_format(fmt))
                 throw std::runtime_error("Nested archive must be walked, not converted: " + name_hint);
             throw std::runtime_error(

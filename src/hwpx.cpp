@@ -998,4 +998,15 @@ void hwpx_to_markdown_chunks_stream(const std::string& hwpx_path,
     parser.convert_chunks_stream(plaintext, sink);
 }
 
+void hwpx_to_markdown_chunks_mem_stream(const uint8_t* data, size_t size,
+                                        const ConvertOptions& opts_in,
+                                        const PageSink& sink) {
+    ConvertOptions opts = opts_in;
+    opts.page_chunks = true;
+    bool plaintext = (opts.format == OutputFormat::PLAINTEXT);
+    HWPXParser parser(data, size, opts);
+    parser.parse();
+    parser.convert_chunks_stream(plaintext, sink);
+}
+
 } // namespace jdoc

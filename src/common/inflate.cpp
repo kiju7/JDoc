@@ -1,16 +1,22 @@
 // inflate.cpp - libdeflate-backed whole-buffer decompression. License: MIT
 #include "common/inflate.h"
 #include <libdeflate.h>
+#include <limits>
 
 namespace jdoc {
 
 namespace {
 
 // One decompressor per thread, reused across calls (libdeflate decompressors
-// are stateless between calls). Leaks one object per thread at exit — harmless.
+// are stateless between calls) and released when the thread exits.
 libdeflate_decompressor* thread_decompressor() {
-    thread_local libdeflate_decompressor* d = libdeflate_alloc_decompressor();
-    return d;
+    struct Holder {
+        Holder() : ptr(libdeflate_alloc_decompressor()) {}
+        ~Holder() { libdeflate_free_decompressor(ptr); }
+        libdeflate_decompressor* ptr;
+    };
+    thread_local Holder decompressor;
+    return decompressor.ptr;
 }
 
 // Grow-and-retry driver for the unknown-output-size helpers. `fn` is one of
@@ -20,7 +26,13 @@ std::vector<uint8_t> grow_inflate(const uint8_t* in, size_t in_size,
                                   size_t hint, Fn fn) {
     libdeflate_decompressor* d = thread_decompressor();
     if (!d || in_size == 0) return {};
-    std::vector<uint8_t> out(hint ? hint : in_size * 4 + 64);
+    size_t initial_size = hint;
+    if (initial_size == 0) {
+        const size_t max_size = std::numeric_limits<size_t>::max();
+        initial_size = in_size > (max_size - 64) / 4
+            ? in_size : in_size * 4 + 64;
+    }
+    std::vector<uint8_t> out(initial_size);
     for (;;) {
         size_t actual = 0;
         libdeflate_result r = fn(d, in, in_size, out.data(), out.size(), &actual);
@@ -29,7 +41,7 @@ std::vector<uint8_t> grow_inflate(const uint8_t* in, size_t in_size,
             return out;
         }
         if (r == LIBDEFLATE_INSUFFICIENT_SPACE) {
-            if (out.size() > (size_t{1} << 34)) return {};  // 16 GiB guard
+            if (out.size() > out.max_size() / 2) return {};
             out.resize(out.size() * 2);
             continue;
         }

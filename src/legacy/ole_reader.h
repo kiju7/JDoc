@@ -56,12 +56,16 @@ private:
     FILE* fp_ = nullptr;
     const uint8_t* mem_data_ = nullptr;
     size_t mem_size_ = 0;
+    uint64_t source_size_ = 0;
+    uint64_t sector_count_ = 0;
     bool valid_ = false;
     uint16_t major_version_ = 0;
     uint32_t sector_size_ = 512;
     uint32_t mini_sector_size_ = 64;
     uint32_t mini_cutoff_ = 4096;
     uint32_t first_dir_sector_ = 0;
+    uint32_t first_mini_fat_sector_ = 0;
+    uint32_t num_mini_fat_sectors_ = 0;
     std::vector<uint32_t> fat_;
     std::vector<uint32_t> mini_fat_;
     std::vector<DirEntry> dirs_;
@@ -76,12 +80,11 @@ private:
     // Follow a mini-FAT chain through the mini-stream.
     std::vector<char> read_mini_chain(uint32_t start, uint64_t size) const;
 
-    void parse_header();
-    void parse_fat();
+    void parse_header_and_fat();
     void parse_directories();
     void parse_mini_fat();
 
-    // Recursively traverse the red-black tree of directory entries.
+    // Traverse the red-black directory tree without recursion.
     void traverse_dir(int id, std::vector<std::string>& names) const;
 
     // Find directory entry index by name, or -1.

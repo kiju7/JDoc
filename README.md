@@ -217,7 +217,8 @@ Go(`StreamPages(path).Pages()` → `iter.Seq[Page]`)와 Java(`Jdoc.streamPages(p
 
 ## 옵션
 
-모든 API가 **같은 옵션을 같은 이름으로** 공유한다 (C++ `ConvertOptions`, C `JDocOptions`, Python 키워드 인자 — 명칭 동일. CLI는 같은 이름의 플래그).
+C++ `ConvertOptions`와 Python `ConvertOptions`는 같은 필드를 공유한다. C API와
+CLI는 각 환경의 관례에 맞는 대응 필드·플래그를 제공한다.
 
 ### 변환 옵션
 
@@ -242,9 +243,8 @@ Go(`StreamPages(path).Pages()` → `iter.Seq[Page]`)와 Java(`Jdoc.streamPages(p
 | `max_member_bytes` | `512MiB` | 멤버당 해제 후 크기 상한. 멤버가 하나씩만 상주하므로 **실질 메모리 상한** | `--max-member-mb N` |
 | `max_total_bytes` | `64GiB` | 호출당 누적 해제 크기 (CPU 시간 가드) | `--max-total-mb N` |
 | `max_entries` | `200000` | 방문 멤버 수 상한 (중첩 포함) | `--max-entries N` |
-| `max_ratio` | `1000` | 압축비 폭탄 의심 한도 (`0` = 검사 안 함) | `--max-ratio N` |
+| `max_ratio` | `10000` | 압축비 폭탄 의심 한도 (`0` = 검사 안 함) | `--max-ratio N` |
 | `include_unsupported` | `false` | 미지원 멤버도 결과에 오류로 포함 | `--include-unsupported` |
-| `threads` | `1` | 멤버 변환 워커 수 (`1` = 단일 스레드, `-1`/`0` = 전체 코어) | `--threads N` |
 
 - 멤버당·압축비·깊이 초과는 **해당 멤버만 스킵**하고 순회를 계속하며, 누적·멤버 수 초과만 순회를 중단
 - 아카이브 멤버의 이미지는 멤버 간 파일명 충돌을 막기 위해 `image_dir/<멤버 경로>/` 하위에 저장되며(중첩 구조 보존), 마크다운 참조 경로도 함께 조정됨
@@ -263,7 +263,6 @@ Go(`StreamPages(path).Pages()` → `iter.Seq[Page]`)와 Java(`Jdoc.streamPages(p
 | 목록 | | ✓ | ✓ | | | | | | | ✓ | |
 | 링크 | ✓ | ✓ | ✓ | | | | | | | ✓ | |
 | 주석 | ✓ | | | | | | | | | | |
-| 차트/SmartArt | | | | | | ✓ | | | | | |
 | 발표자 노트 | | | | | | ✓ | ✓ | | | | |
 
 ## 의존성

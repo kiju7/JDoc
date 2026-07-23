@@ -4,6 +4,7 @@
 #include "jdoc/detect.h"
 
 #include <cstdint>
+#include <climits>
 #include <cstring>
 #include <cstdlib>
 #include <string>
@@ -11,8 +12,9 @@
 
 static void set_error(char* buf, int buf_size, const char* msg) {
     if (buf && buf_size > 0) {
-        strncpy(buf, msg, buf_size - 1);
-        buf[buf_size - 1] = '\0';
+        const size_t size = static_cast<size_t>(buf_size);
+        strncpy(buf, msg, size - 1);
+        buf[size - 1] = '\0';
     }
 }
 
@@ -66,17 +68,55 @@ static jdoc::ConvertOptions to_cpp_opts(const JDocOptions* opts) {
 
 // Marshal one C++ PageChunk into a caller-owned JDocPage (deep copy). Inner
 // allocations are released by free_page_inner / jdoc_free_pages.
-static void fill_page(JDocPage& dst, const jdoc::PageChunk& src) {
+// Release a JDocPage's inner allocations (not the page struct itself).
+static void free_page_inner(JDocPage& page) {
+    free(page.text);
+    for (int i = 0; i < page.image_count; ++i) {
+        free(page.images[i].name);
+        free(page.images[i].data);
+        free(page.images[i].format);
+        free(page.images[i].saved_path);
+    }
+    free(page.images);
+    page = {};
+}
+
+static void free_pages(JDocPage* pages, size_t count) {
+    if (!pages) return;
+    for (size_t i = 0; i < count; ++i)
+        free_page_inner(pages[i]);
+    free(pages);
+}
+
+static void free_members(JDocMember* members, size_t count) {
+    if (!members) return;
+    for (size_t i = 0; i < count; ++i) {
+        free(members[i].member_path);
+        free(members[i].format);
+        free(members[i].markdown);
+        free(members[i].error);
+    }
+    free(members);
+}
+
+static bool fill_page(JDocPage& dst, const jdoc::PageChunk& src) {
+    dst = {};
     dst.page_number = src.page_number;
     dst.text = strdup_c(src.text);
-    dst.images = nullptr;
-    dst.image_count = 0;
+    if (!dst.text) return false;
 
     size_t n = src.images.size();
-    if (n == 0) return;
+    if (n == 0) return true;
+    if (n > INT_MAX) {
+        free_page_inner(dst);
+        return false;
+    }
 
     dst.images = (JDocImage*)calloc(n, sizeof(JDocImage));
-    if (!dst.images) return;
+    if (!dst.images) {
+        free_page_inner(dst);
+        return false;
+    }
     dst.image_count = (int)n;
 
     for (size_t j = 0; j < n; j++) {
@@ -88,28 +128,22 @@ static void fill_page(JDocPage& dst, const jdoc::PageChunk& src) {
         di.height = si.height;
         di.format = strdup_c(si.format);
         di.saved_path = strdup_c(si.saved_path);
+        if (!di.name || !di.format || !di.saved_path ||
+            si.data.size() > INT_MAX) {
+            free_page_inner(dst);
+            return false;
+        }
         di.data_size = (int)si.data.size();
         if (!si.data.empty()) {
             di.data = (char*)malloc(si.data.size());
-            if (di.data)
-                memcpy(di.data, si.data.data(), si.data.size());
+            if (!di.data) {
+                free_page_inner(dst);
+                return false;
+            }
+            memcpy(di.data, si.data.data(), si.data.size());
         }
     }
-}
-
-// Release a JDocPage's inner allocations (not the page struct itself).
-static void free_page_inner(JDocPage& p) {
-    free(p.text);
-    for (int j = 0; j < p.image_count; j++) {
-        free(p.images[j].name);
-        free(p.images[j].data);
-        free(p.images[j].format);
-        free(p.images[j].saved_path);
-    }
-    free(p.images);
-    p.text = nullptr;
-    p.images = nullptr;
-    p.image_count = 0;
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -134,7 +168,10 @@ char* jdoc_convert(const char* file_path, const JDocOptions* opts,
     }
     try {
         auto cpp_opts = to_cpp_opts(opts);
-        return strdup_c(jdoc::convert(file_path, cpp_opts));
+        char* result = strdup_c(jdoc::convert(file_path, cpp_opts));
+        if (!result)
+            set_error(err_buf, err_buf_size, "memory allocation failed");
+        return result;
     } catch (const std::exception& e) {
         set_error(err_buf, err_buf_size, e.what());
         return nullptr;
@@ -157,6 +194,10 @@ JDocPage* jdoc_convert_pages(const char* file_path, const JDocOptions* opts,
         auto cpp_opts = to_cpp_opts(opts);
         auto chunks = jdoc::convert_chunks(file_path, cpp_opts);
         if (chunks.empty()) return nullptr;
+        if (chunks.size() > INT_MAX) {
+            set_error(err_buf, err_buf_size, "too many pages");
+            return nullptr;
+        }
 
         JDocPage* pages = (JDocPage*)calloc(chunks.size(), sizeof(JDocPage));
         if (!pages) {
@@ -164,8 +205,13 @@ JDocPage* jdoc_convert_pages(const char* file_path, const JDocOptions* opts,
             return nullptr;
         }
 
-        for (size_t i = 0; i < chunks.size(); i++)
-            fill_page(pages[i], chunks[i]);
+        for (size_t i = 0; i < chunks.size(); i++) {
+            if (!fill_page(pages[i], chunks[i])) {
+                free_pages(pages, i + 1);
+                set_error(err_buf, err_buf_size, "memory allocation failed");
+                return nullptr;
+            }
+        }
 
         *out_count = (int)chunks.size();
         return pages;
@@ -188,13 +234,21 @@ int jdoc_convert_pages_stream(const char* file_path, const JDocOptions* opts,
     }
     try {
         auto cpp_opts = to_cpp_opts(opts);
+        bool allocation_failed = false;
         jdoc::for_each_chunk(file_path, cpp_opts, [&](jdoc::PageChunk&& chunk) {
             JDocPage page = {};
-            fill_page(page, chunk);
+            if (!fill_page(page, chunk)) {
+                allocation_failed = true;
+                return false;
+            }
             int keep_going = cb(&page, userdata);
             free_page_inner(page);
             return keep_going != 0;
         });
+        if (allocation_failed) {
+            set_error(err_buf, err_buf_size, "memory allocation failed");
+            return -1;
+        }
         return 0;
     } catch (const std::exception& e) {
         set_error(err_buf, err_buf_size, e.what());
@@ -217,6 +271,10 @@ JDocMember* jdoc_convert_archive(const char* file_path, const JDocOptions* opts,
     try {
         auto results = jdoc::convert_archive(file_path, to_cpp_opts(opts));
         if (results.empty()) return nullptr;
+        if (results.size() > INT_MAX) {
+            set_error(err_buf, err_buf_size, "too many archive members");
+            return nullptr;
+        }
 
         JDocMember* members = (JDocMember*)calloc(results.size(), sizeof(JDocMember));
         if (!members) {
@@ -233,6 +291,12 @@ JDocMember* jdoc_convert_archive(const char* file_path, const JDocOptions* opts,
                 members[i].markdown = strdup_c(src.markdown);
             else
                 members[i].error = strdup_c(src.error);
+            if (!members[i].member_path || !members[i].format ||
+                (src.ok() ? !members[i].markdown : !members[i].error)) {
+                free_members(members, i + 1);
+                set_error(err_buf, err_buf_size, "memory allocation failed");
+                return nullptr;
+            }
         }
         *out_count = (int)results.size();
         return members;
@@ -255,8 +319,11 @@ char* jdoc_convert_mem(const void* data, int size, const char* name_hint,
     }
     try {
         auto cpp_opts = to_cpp_opts(opts);
-        return strdup_c(jdoc::convert(data, (size_t)size,
-                                      name_hint ? name_hint : "", cpp_opts));
+        char* result = strdup_c(jdoc::convert(
+            data, (size_t)size, name_hint ? name_hint : "", cpp_opts));
+        if (!result)
+            set_error(err_buf, err_buf_size, "memory allocation failed");
+        return result;
     } catch (const std::exception& e) {
         set_error(err_buf, err_buf_size, e.what());
         return nullptr;
@@ -267,10 +334,18 @@ char* jdoc_convert_mem(const void* data, int size, const char* name_hint,
 }
 
 static int fill_format_info(const jdoc::FormatInfo& src, JDocFormatInfo* out) {
+    *out = {};
     out->format = strdup_c(src.format);
-    out->category = (int)src.category;
     out->extension = strdup_c(src.extension);
     out->mime = strdup_c(src.mime);
+    if (!out->format || !out->extension || !out->mime) {
+        free(out->format);
+        free(out->extension);
+        free(out->mime);
+        *out = {};
+        return -1;
+    }
+    out->category = (int)src.category;
     out->convertible = src.convertible ? 1 : 0;
     return 0;
 }
@@ -283,7 +358,10 @@ int jdoc_detect(const char* file_path, JDocFormatInfo* out,
         return -1;
     }
     try {
-        return fill_format_info(jdoc::detect(file_path), out);
+        int result = fill_format_info(jdoc::detect(file_path), out);
+        if (result != 0)
+            set_error(err_buf, err_buf_size, "memory allocation failed");
+        return result;
     } catch (const std::exception& e) {
         set_error(err_buf, err_buf_size, e.what());
         return -1;
@@ -301,8 +379,11 @@ int jdoc_detect_mem(const void* data, int size, const char* name_hint,
         return -1;
     }
     try {
-        return fill_format_info(
+        int result = fill_format_info(
             jdoc::detect(data, (size_t)size, name_hint ? name_hint : ""), out);
+        if (result != 0)
+            set_error(err_buf, err_buf_size, "memory allocation failed");
+        return result;
     } catch (const std::exception& e) {
         set_error(err_buf, err_buf_size, e.what());
         return -1;
@@ -325,29 +406,11 @@ void jdoc_free_format_info(JDocFormatInfo* info) {
 }
 
 void jdoc_free_members(JDocMember* members, int count) {
-    if (!members) return;
-    for (int i = 0; i < count; i++) {
-        free(members[i].member_path);
-        free(members[i].format);
-        free(members[i].markdown);
-        free(members[i].error);
-    }
-    free(members);
+    free_members(members, count > 0 ? static_cast<size_t>(count) : 0);
 }
 
 void jdoc_free_pages(JDocPage* pages, int count) {
-    if (!pages) return;
-    for (int i = 0; i < count; i++) {
-        free(pages[i].text);
-        for (int j = 0; j < pages[i].image_count; j++) {
-            free(pages[i].images[j].name);
-            free(pages[i].images[j].data);
-            free(pages[i].images[j].format);
-            free(pages[i].images[j].saved_path);
-        }
-        free(pages[i].images);
-    }
-    free(pages);
+    free_pages(pages, count > 0 ? static_cast<size_t>(count) : 0);
 }
 
 } // extern "C"

@@ -41,3 +41,71 @@ jobs:
 
       - name: Run tests
         run: ctest --test-dir build -C Release --output-on-failure
+
+  sanitizers:
+    name: ASan + UBSan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: >-
+          cmake -S . -B build
+          -DCMAKE_BUILD_TYPE=Debug
+          -DJDOC_BUILD_TESTS=ON
+          -DJDOC_ENABLE_SANITIZERS=ON
+
+      - name: Build
+        run: cmake --build build -j 4
+
+      - name: Run tests
+        run: ctest --test-dir build --output-on-failure
+
+  bindings:
+    name: Language bindings
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ilammy/setup-nasm@v1
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "11"
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.10"
+
+      - name: Install Python build dependency
+        run: python -m pip install pybind11
+
+      - name: Configure
+        run: >-
+          cmake -S . -B build
+          -DCMAKE_BUILD_TYPE=Release
+          -DBUILD_PYTHON=ON
+          -Dpybind11_DIR=$(python -m pybind11 --cmakedir)
+
+      - name: Build
+        run: cmake --build build -j 4
+
+      - name: Test Python binding
+        env:
+          PYTHONPATH: build
+        run: >-
+          python -c "import _jdoc;
+          assert _jdoc.convert_bytes(b'hello', 'x.txt') == 'hello';
+          assert _jdoc.detect_bytes(b'hello', 'x.txt').format == 'TXT'"
+
+      - name: Test Go binding
+        working-directory: bindings/go
+        run: go test ./...
+
+      - name: Test Java binding
+        working-directory: bindings/java
+        run: gradle test

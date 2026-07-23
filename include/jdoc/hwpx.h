@@ -19,5 +19,8 @@ std::string hwpx_to_markdown_mem(const uint8_t* data, size_t size,
 // Streaming variant: emit one section XML part at a time; return false to stop.
 void hwpx_to_markdown_chunks_stream(const std::string& hwpx_path,
                                     const ConvertOptions& opts, const PageSink& sink);
+void hwpx_to_markdown_chunks_mem_stream(const uint8_t* data, size_t size,
+                                        const ConvertOptions& opts,
+                                        const PageSink& sink);
 
 } // namespace jdoc

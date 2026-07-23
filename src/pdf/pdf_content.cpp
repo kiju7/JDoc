@@ -172,8 +172,17 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
 
             uint32_t unicode = gs.font ? gs.font->decode_char(code) : code;
             if (unicode == 0 || unicode == 0xFFFD) continue;
-            // Private Use Area: unmappable glyphs (e.g. HWP equation fonts) — no text value
-            if ((unicode >= 0xE000 && unicode <= 0xF8FF) || unicode >= 0xFFFE) continue;
+            // Private-use glyphs have no portable text value. Skip Unicode
+            // noncharacters too, but retain valid supplementary characters
+            // such as mathematical alphanumerics above U+FFFF.
+            const bool private_use =
+                (unicode >= 0xE000 && unicode <= 0xF8FF) ||
+                (unicode >= 0xF0000 && unicode <= 0xFFFFD) ||
+                (unicode >= 0x100000 && unicode <= 0x10FFFD);
+            const bool noncharacter =
+                (unicode >= 0xFDD0 && unicode <= 0xFDEF) ||
+                ((unicode & 0xFFFF) >= 0xFFFE);
+            if (private_use || noncharacter) continue;
 
             // Rendering matrix from the pre-advance text matrix.
             double trm[6];

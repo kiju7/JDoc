@@ -11,6 +11,18 @@ if(MSVC)
     add_compile_options(/utf-8)
 endif()
 
+option(JDOC_ENABLE_SANITIZERS "Enable AddressSanitizer and UBSan" OFF)
+if(JDOC_ENABLE_SANITIZERS)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+        add_compile_options(-fsanitize=address,undefined
+                            -fno-omit-frame-pointer)
+        add_link_options(-fsanitize=address,undefined)
+    else()
+        message(FATAL_ERROR
+            "JDOC_ENABLE_SANITIZERS requires Clang or GCC")
+    endif()
+endif()
+
 # A bare `cmake -S . -B build` leaves CMAKE_BUILD_TYPE empty on single-config
 # generators, which means no optimization flags at all — a -O0 build that looks
 # normal. Release is the only sensible default for a conversion library.
@@ -252,7 +264,7 @@ if(JDOC_BUILD_TESTS)
     enable_testing()
     foreach(t IN ITEMS test_pdf test_pdf_crypt test_office test_archive
                        test_hwp3 test_hwp5 test_hwpx test_eml test_msg test_odf
-                       test_detect test_stream test_emf test_wmf)
+                       test_detect test_stream test_emf test_wmf test_safety)
         add_executable(${t} test/${t}.cpp)
         target_link_libraries(${t} PRIVATE jdoc_lib)
         target_include_directories(${t} PRIVATE include src)
@@ -275,6 +287,8 @@ endif()
 option(BUILD_PYTHON "Build Python bindings" OFF)
 
 if(BUILD_PYTHON)
+    set(PYBIND11_FINDPYTHON ON)
+    find_package(Python COMPONENTS Interpreter Development.Module REQUIRED)
     find_package(pybind11 REQUIRED)
     pybind11_add_module(_jdoc src/python_bindings.cpp)
     target_link_libraries(_jdoc PRIVATE jdoc_lib)
