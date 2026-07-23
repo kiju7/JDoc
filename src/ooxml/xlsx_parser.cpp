@@ -1023,99 +1023,131 @@ std::string XlsxParser::to_markdown(const ConvertOptions& opts) {
 
 // ── to_chunks ───────────────────────────────────────────
 
-std::vector<PageChunk> XlsxParser::to_chunks(
-    const ConvertOptions& opts) {
+bool XlsxParser::sheet_wanted(int sheet_num, const ConvertOptions& opts) {
+    if (opts.pages.empty()) return true;
+    for (int p : opts.pages) if (p == sheet_num) return true;
+    return false;
+}
 
+// Build one sheet's base chunk (heading + table markdown + structured tables).
+// Images are attached separately (see to_chunks), matching the eager path where
+// images are distributed after all sheet chunks are built.
+PageChunk XlsxParser::build_sheet_chunk(size_t i, const ConvertOptions& opts) {
+    int sheet_num = static_cast<int>(i) + 1;
+    auto sheet = parse_sheet(sheets_[i]);
+
+    PageChunk chunk;
+    chunk.page_number = sheet_num;
+
+    std::string text;
+    std::string display_name = sheet.name.empty()
+        ? ("Sheet " + std::to_string(sheet_num))
+        : sheet.name;
+    text += "## "; text += display_name; text += "\n\n";
+
+    if (!sheet.cells.empty()) {
+        text += format_sheet_as_table(sheet); text += "\n";
+
+        // Build structured table data for the chunk
+        // Convert sparse grid to dense 2D vector
+        if (opts.tables) {
+            int total_rows = sheet.max_row + 1;
+            int total_cols = sheet.max_col + 1;
+            int display_rows = total_rows;  // no row limit
+
+            std::vector<std::vector<std::string>> table;
+            table.reserve(display_rows);
+
+            for (int r = 0; r < display_rows; ++r) {
+                std::vector<std::string> row;
+                row.reserve(total_cols);
+                auto row_it = sheet.cells.find(r);
+                for (int c = 0; c < total_cols; ++c) {
+                    if (row_it != sheet.cells.end()) {
+                        auto col_it = row_it->second.find(c);
+                        if (col_it != row_it->second.end()) {
+                            std::string val = col_it->second.value;
+                            if (!val.empty() && col_it->second.bold)
+                                val = "**" + val + "**";
+                            row.push_back(std::move(val));
+                            continue;
+                        }
+                    }
+                    row.push_back("");
+                }
+                table.push_back(std::move(row));
+            }
+
+            chunk.tables.push_back(std::move(table));
+        }
+    } else {
+        text += "*Empty sheet*\n\n";
+    }
+
+    chunk.text = std::move(text);
+    return chunk;
+}
+
+std::vector<PageChunk> XlsxParser::to_chunks(const ConvertOptions& opts) {
     std::vector<PageChunk> chunks;
-    // Always enumerate images so we can reference them in text
+    to_chunks(opts, [&](PageChunk&& c) {
+        chunks.push_back(std::move(c));
+        return true;
+    });
+    return chunks;
+}
+
+bool XlsxParser::to_chunks(const ConvertOptions& opts, const PageSink& sink) {
+    // Always enumerate images up front so they can be referenced in text. This
+    // means image bytes are resident regardless of streaming (bounded like the
+    // eager path); streaming still shrinks the per-sheet table working set.
     ConvertOptions img_opts = opts;
     img_opts.images = true;
     auto all_images = extract_images(img_opts);
 
+    // The eager path attaches each image to the chunk whose page_number matches,
+    // else to the first chunk. Replicate that: an image targets its own sheet if
+    // that sheet is present, otherwise the first present sheet. Precompute the
+    // first present sheet so orphans land there (matching chunks[0] in eager).
+    int first_present = -1;
+    for (size_t i = 0; i < sheets_.size(); ++i) {
+        if (sheet_wanted(static_cast<int>(i) + 1, opts)) {
+            first_present = static_cast<int>(i) + 1;
+            break;
+        }
+    }
+    if (first_present < 0) return true;  // no sheets → eager returns empty
+
+    auto target_sheet = [&](const ImageData& img) -> int {
+        int n = img.page_number;
+        if (n >= 1 && n <= static_cast<int>(sheets_.size()) && sheet_wanted(n, opts))
+            return n;
+        return first_present;  // orphan → first present chunk
+    };
+
     for (size_t i = 0; i < sheets_.size(); ++i) {
         int sheet_num = static_cast<int>(i) + 1;
+        if (!sheet_wanted(sheet_num, opts)) continue;
 
-        // Filter by requested pages (sheets treated as pages)
-        if (!opts.pages.empty()) {
-            bool found = false;
-            for (int p : opts.pages) {
-                if (p == sheet_num) { found = true; break; }
-            }
-            if (!found) continue;
-        }
+        PageChunk chunk = build_sheet_chunk(i, opts);
 
-        auto sheet = parse_sheet(sheets_[i]);
-
-        PageChunk chunk;
-        chunk.page_number = sheet_num;
-
-        std::string text;
-        std::string display_name = sheet.name.empty()
-            ? ("Sheet " + std::to_string(sheet_num))
-            : sheet.name;
-        text += "## "; text += display_name; text += "\n\n";
-
-        if (!sheet.cells.empty()) {
-            text += format_sheet_as_table(sheet); text += "\n";
-
-            // Build structured table data for the chunk
-            // Convert sparse grid to dense 2D vector
-            if (opts.tables) {
-                int total_rows = sheet.max_row + 1;
-                int total_cols = sheet.max_col + 1;
-                int display_rows = total_rows;  // no row limit
-
-                std::vector<std::vector<std::string>> table;
-                table.reserve(display_rows);
-
-                for (int r = 0; r < display_rows; ++r) {
-                    std::vector<std::string> row;
-                    row.reserve(total_cols);
-                    auto row_it = sheet.cells.find(r);
-                    for (int c = 0; c < total_cols; ++c) {
-                        if (row_it != sheet.cells.end()) {
-                            auto col_it = row_it->second.find(c);
-                            if (col_it != row_it->second.end()) {
-                                std::string val = col_it->second.value;
-                                if (!val.empty() && col_it->second.bold)
-                                    val = "**" + val + "**";
-                                row.push_back(std::move(val));
-                                continue;
-                            }
-                        }
-                        row.push_back("");
-                    }
-                    table.push_back(std::move(row));
-                }
-
-                chunk.tables.push_back(std::move(table));
-            }
-        } else {
-            text += "*Empty sheet*\n\n";
-        }
-
-        chunk.text = text;
-        chunks.push_back(std::move(chunk));
-    }
-
-    // Distribute images to their corresponding sheet chunks
-    if (!all_images.empty() && !chunks.empty()) {
+        // Attach the images targeting this sheet, in all_images order (the first
+        // present sheet also collects orphans). Each image targets exactly one
+        // sheet, so moving it out here is safe.
         for (auto& img : all_images) {
-            PageChunk* target = &chunks[0];
-            for (auto& c : chunks) {
-                if (c.page_number == img.page_number) { target = &c; break; }
-            }
+            if (target_sheet(img) != sheet_num) continue;
             std::string ref_name = img.name;
             if (!img.saved_path.empty()) {
                 auto sl = img.saved_path.find_last_of('/');
                 ref_name = (sl != std::string::npos) ? img.saved_path.substr(sl + 1) : img.saved_path;
             }
-            target->text += "![" + img.name + "](" + ref_name + ")\n\n";
-            target->images.push_back(std::move(img));
+            chunk.text += "![" + img.name + "](" + ref_name + ")\n\n";
+            chunk.images.push_back(std::move(img));
         }
-    }
 
-    return chunks;
+        if (!sink(std::move(chunk))) return false;
+    }
+    return true;
 }
 
 } // namespace jdoc
