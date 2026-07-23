@@ -17,12 +17,19 @@ jobs:
   native:
     name: native-${{ matrix.os }}
     runs-on: ${{ matrix.os }}
+    # Linux builds inside a manylinux_2_28 container (glibc 2.28, AlmaLinux 8) so
+    # the CLI/SDK run on older distros (Rocky/RHEL/CentOS 8+) — an ubuntu-latest
+    # build links glibc 2.38 and fails everywhere older. Combined with static
+    # libstdc++/libgcc, the binary needs only GLIBC ≤ 2.28 and no GLIBCXX.
+    container: ${{ matrix.container }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
             platform: linux-x64
+            container: quay.io/pypa/manylinux_2_28_x86_64
+            ldflags: "-static-libstdc++ -static-libgcc"
           - os: macos-latest
             platform: macos-arm64
           - os: windows-latest
@@ -30,8 +37,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # NASM assembles libjpeg-turbo's x86 SIMD (WITH_SIMD=ON); arm64 uses NEON.
+      # Toolchain deps. In the manylinux container the compiler + cmake ship with
+      # the image; add zlib/libjpeg-turbo (find_package uses them) and NASM for
+      # libjpeg-turbo's x86 SIMD. Non-container runners fetch NASM via setup-nasm.
+      - name: Install deps (manylinux)
+        if: matrix.container != ''
+        run: yum install -y zlib-devel libjpeg-turbo-devel nasm
       - name: Set up NASM
+        if: matrix.container == ''
         uses: ilammy/setup-nasm@v1
 
       # Build the CLI (jdoc) and the shared library with the C API (jdoc_shared).
@@ -41,7 +54,7 @@ jobs:
       # infrequent enough that the caching is not worth that fragility.
       - name: Build
         run: |
-          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_EXE_LINKER_FLAGS="${{ matrix.ldflags }}" -DCMAKE_SHARED_LINKER_FLAGS="${{ matrix.ldflags }}"
           cmake --build build --config Release -j 4 --target jdoc jdoc_shared
 
       # CLI archive: jdoc(.exe) + docs.
