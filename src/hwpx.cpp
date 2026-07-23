@@ -97,32 +97,20 @@ public:
         return true;
     }
 
+    // Eager collection is a thin wrapper over the streaming primitive, so the
+    // two can never diverge. Plaintext stripping is applied by the caller for
+    // the eager path, so pass false here.
     std::vector<PageChunk> convert_chunks() {
         std::vector<PageChunk> chunks;
-        int section_idx = 0;
-
-        for (auto& section_path : section_paths_) {
-            // Check page filter
-            if (!opts_.pages.empty()) {
-                bool found = false;
-                for (int p : opts_.pages) {
-                    if (p == section_idx) { found = true; break; }
-                }
-                if (!found) { section_idx++; continue; }
-            }
-
-            PageChunk chunk;
-            chunk.page_number = section_idx + 1;
-            parse_section(section_path, chunk);
-            chunks.push_back(std::move(chunk));
-            section_idx++;
-        }
-
+        convert_chunks_stream(false, [&](PageChunk&& c) {
+            chunks.push_back(std::move(c));
+            return true;
+        });
         return chunks;
     }
 
-    // Streaming variant: parse and emit one section XML at a time so peak
-    // memory tracks a single section. Byte-identical to convert_chunks().
+    // Streaming primitive: parse and emit one section XML at a time so peak
+    // memory tracks a single section.
     void convert_chunks_stream(bool plaintext, const PageSink& sink) {
         int section_idx = 0;
 

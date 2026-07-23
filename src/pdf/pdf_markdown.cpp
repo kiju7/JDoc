@@ -622,20 +622,25 @@ static PageChunk build_page_chunk(ExtractResult& r, const ConvertOptions& opts,
                                             opts.image_ref_prefix);
     chunk.text = plaintext ? util::strip_markdown(page_md) : page_md;
 
+    // Rendering above already consumed the tables, so move the rows out rather
+    // than copying them into the chunk.
     for (auto& td : r.all_tables[p])
-        chunk.tables.push_back(td.rows);
+        chunk.tables.push_back(std::move(td.rows));
 
     chunk.images = std::move(r.all_images[p]);
     return chunk;
 }
 
-// Streaming emit: hand each page's chunk to `sink` and release that page's
-// per-page buffers immediately after, so the consumer holds one page at a time.
-// Output is byte-identical to result_to_chunks. `sink` returning false stops
-// early. The document-wide font stats (r.stats) are already computed, so
-// heading detection matches the eager path exactly.
+// Streaming primitive shared by the eager and streaming entry points: build each
+// page's chunk and hand it to `sink`. When release_per_page is true (streaming),
+// each page's remaining buffers are freed right after emit so the residual
+// footprint shrinks as the stream advances. The eager collector passes false —
+// it destroys `r` immediately after, so the per-page clears would be pure
+// overhead (a measurable few-percent on glibc). Output is identical either way;
+// document-wide font stats (r.stats) are already computed, so heading detection
+// matches. `sink` returning false stops early.
 void stream_result_chunks(ExtractResult& r, const ConvertOptions& opts,
-                          const PageSink& sink) {
+                          const PageSink& sink, bool release_per_page) {
     std::vector<int> page_indices;
     if (opts.pages.empty()) {
         for (int i = 0; i < r.total_pages; i++) page_indices.push_back(i);
@@ -649,13 +654,13 @@ void stream_result_chunks(ExtractResult& r, const ConvertOptions& opts,
         if (p < 0 || p >= r.total_pages) continue;
         PageChunk chunk = build_page_chunk(r, opts, plaintext, p);
 
-        // Release this page's remaining buffers before handing off, so the
-        // producer's residual footprint shrinks as the stream advances.
-        r.all_lines[p] = {};
-        r.all_tables[p] = {};
-        if (p < (int)r.all_annots.size()) r.all_annots[p] = {};
-        r.all_image_y[p] = {};
-        r.all_image_x[p] = {};
+        if (release_per_page) {
+            r.all_lines[p] = {};
+            r.all_tables[p] = {};
+            if (p < (int)r.all_annots.size()) r.all_annots[p] = {};
+            r.all_image_y[p] = {};
+            r.all_image_x[p] = {};
+        }
 
         if (!sink(std::move(chunk))) return;
     }
@@ -663,24 +668,13 @@ void stream_result_chunks(ExtractResult& r, const ConvertOptions& opts,
 
 std::vector<PageChunk> result_to_chunks(ExtractResult& r,
                                                const ConvertOptions& opts) {
-    // Eager path: build every chunk and return them. Unlike stream_result_chunks
-    // this does NOT release r's per-page buffers as it goes — the caller destroys
-    // r immediately afterwards, so the extra per-page clears would be pure
-    // overhead (a measurable few-percent on glibc). This keeps the eager path's
-    // cost identical to the pre-streaming implementation.
-    std::vector<int> page_indices;
-    if (opts.pages.empty()) {
-        for (int i = 0; i < r.total_pages; i++) page_indices.push_back(i);
-    } else {
-        page_indices = opts.pages;
-    }
-    bool plaintext = (opts.format == OutputFormat::PLAINTEXT);
-
+    // Eager collection is a thin wrapper over the streaming primitive (single
+    // source of truth), with per-page release disabled — see above.
     std::vector<PageChunk> chunks;
-    for (int p : page_indices) {
-        if (p < 0 || p >= r.total_pages) continue;
-        chunks.push_back(build_page_chunk(r, opts, plaintext, p));
-    }
+    stream_result_chunks(r, opts, [&](PageChunk&& c) {
+        chunks.push_back(std::move(c));
+        return true;
+    }, /*release_per_page=*/false);
     return chunks;
 }
 

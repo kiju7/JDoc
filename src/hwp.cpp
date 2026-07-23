@@ -152,37 +152,21 @@ public:
         return true;
     }
 
+    // Eager collection is a thin wrapper over the streaming primitive, so the
+    // two can never diverge (single source of truth). Plaintext stripping is
+    // applied by the caller for the eager path, so pass false here.
     std::vector<PageChunk> convert_chunks() {
         std::vector<PageChunk> chunks;
-
-        for (int i = 0; i < (int)section_data_.size(); i++) {
-            if (!opts_.pages.empty()) {
-                bool found = false;
-                for (int p : opts_.pages) {
-                    if (p == i) { found = true; break; }
-                }
-                if (!found) continue;
-            }
-
-            PageChunk chunk;
-            chunk.page_number = i + 1;
-            // Default A4 page dimensions
-            chunk.page_width = 595.28;
-            chunk.page_height = 841.88;
-
-            parse_section(i, chunk);
-            section_data_[i].clear();
-            section_data_[i].shrink_to_fit();
-            chunks.push_back(std::move(chunk));
-        }
-
-        release_storage();
+        convert_chunks_stream(false, [&](PageChunk&& c) {
+            chunks.push_back(std::move(c));
+            return true;
+        });
         return chunks;
     }
 
-    // Streaming variant: parse one BodyText section, emit it, free its raw
+    // Streaming primitive: parse one BodyText section, emit it, free its raw
     // bytes, then move to the next — so peak memory tracks a single section
-    // rather than the whole document. Byte-identical to convert_chunks().
+    // rather than the whole document.
     void convert_chunks_stream(bool plaintext, const PageSink& sink) {
         for (int i = 0; i < (int)section_data_.size(); i++) {
             if (!opts_.pages.empty()) {

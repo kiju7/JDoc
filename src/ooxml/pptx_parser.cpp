@@ -887,8 +887,10 @@ PageChunk PptxParser::build_slide_chunk(size_t i, const ConvertOptions& opts) {
             }
             case SlideElement::TABLE:
                 if (opts.tables) {
-                    chunk.tables.push_back(elem.rows);
+                    // Render first (reads the rows), then move them into the
+                    // chunk instead of copying.
                     text += "\n"; text += util::format_markdown_table(elem.rows); text += "\n";
+                    chunk.tables.push_back(std::move(elem.rows));
                 }
                 break;
         }

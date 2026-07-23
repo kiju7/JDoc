@@ -95,6 +95,6 @@ std::vector<AnnotEntry> extract_annotations(PdfDoc& doc, const PdfObj& page_obj,
 std::string result_to_markdown(ExtractResult& r, const ConvertOptions& opts);
 std::vector<PageChunk> result_to_chunks(ExtractResult& r, const ConvertOptions& opts);
 void stream_result_chunks(ExtractResult& r, const ConvertOptions& opts,
-                          const PageSink& sink);
+                          const PageSink& sink, bool release_per_page = true);
 
 }} // namespace jdoc::pdf_detail
