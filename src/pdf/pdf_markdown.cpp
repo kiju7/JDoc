@@ -604,8 +604,43 @@ std::string result_to_markdown(ExtractResult& r, const ConvertOptions& opts) {
     return full_md;
 }
 
-std::vector<PageChunk> result_to_chunks(ExtractResult& r,
-                                               const ConvertOptions& opts) {
+// Build one page's chunk from the extracted result. Moves that page's images
+// out of `r`; the caller is expected to release the page's other per-page data
+// afterwards when streaming.
+static PageChunk build_page_chunk(ExtractResult& r, const ConvertOptions& opts,
+                                  bool plaintext, int p) {
+    PageChunk chunk;
+    chunk.page_number = p + 1;
+    chunk.page_width = r.page_widths[p];
+    chunk.page_height = r.page_heights[p];
+    chunk.body_font_size = r.stats.body_size;
+    std::string page_md = page_to_markdown(r.all_lines[p], r.stats,
+                                            r.all_images[p], r.all_image_y[p], r.all_image_x[p],
+                                            r.all_tables[p],
+                                            p < (int)r.all_annots.size() ? r.all_annots[p] : std::vector<AnnotEntry>{},
+                                            r.col_boundaries[p],
+                                            opts.image_ref_prefix);
+    chunk.text = plaintext ? util::strip_markdown(page_md) : page_md;
+
+    // Rendering above already consumed the tables, so move the rows out rather
+    // than copying them into the chunk.
+    for (auto& td : r.all_tables[p])
+        chunk.tables.push_back(std::move(td.rows));
+
+    chunk.images = std::move(r.all_images[p]);
+    return chunk;
+}
+
+// Streaming primitive shared by the eager and streaming entry points: build each
+// page's chunk and hand it to `sink`. When release_per_page is true (streaming),
+// each page's remaining buffers are freed right after emit so the residual
+// footprint shrinks as the stream advances. The eager collector passes false —
+// it destroys `r` immediately after, so the per-page clears would be pure
+// overhead (a measurable few-percent on glibc). Output is identical either way;
+// document-wide font stats (r.stats) are already computed, so heading detection
+// matches. `sink` returning false stops early.
+void stream_result_chunks(ExtractResult& r, const ConvertOptions& opts,
+                          const PageSink& sink, bool release_per_page) {
     std::vector<int> page_indices;
     if (opts.pages.empty()) {
         for (int i = 0; i < r.total_pages; i++) page_indices.push_back(i);
@@ -615,28 +650,31 @@ std::vector<PageChunk> result_to_chunks(ExtractResult& r,
 
     bool plaintext = (opts.format == OutputFormat::PLAINTEXT);
 
-    std::vector<PageChunk> chunks;
     for (int p : page_indices) {
         if (p < 0 || p >= r.total_pages) continue;
-        PageChunk chunk;
-        chunk.page_number = p + 1;
-        chunk.page_width = r.page_widths[p];
-        chunk.page_height = r.page_heights[p];
-        chunk.body_font_size = r.stats.body_size;
-        std::string page_md = page_to_markdown(r.all_lines[p], r.stats,
-                                                r.all_images[p], r.all_image_y[p], r.all_image_x[p],
-                                                r.all_tables[p],
-                                                p < (int)r.all_annots.size() ? r.all_annots[p] : std::vector<AnnotEntry>{},
-                                                r.col_boundaries[p],
-                                                opts.image_ref_prefix);
-        chunk.text = plaintext ? util::strip_markdown(page_md) : page_md;
+        PageChunk chunk = build_page_chunk(r, opts, plaintext, p);
 
-        for (auto& td : r.all_tables[p])
-            chunk.tables.push_back(td.rows);
+        if (release_per_page) {
+            r.all_lines[p] = {};
+            r.all_tables[p] = {};
+            if (p < (int)r.all_annots.size()) r.all_annots[p] = {};
+            r.all_image_y[p] = {};
+            r.all_image_x[p] = {};
+        }
 
-        chunk.images = std::move(r.all_images[p]);
-        chunks.push_back(std::move(chunk));
+        if (!sink(std::move(chunk))) return;
     }
+}
+
+std::vector<PageChunk> result_to_chunks(ExtractResult& r,
+                                               const ConvertOptions& opts) {
+    // Eager collection is a thin wrapper over the streaming primitive (single
+    // source of truth), with per-page release disabled — see above.
+    std::vector<PageChunk> chunks;
+    stream_result_chunks(r, opts, [&](PageChunk&& c) {
+        chunks.push_back(std::move(c));
+        return true;
+    }, /*release_per_page=*/false);
     return chunks;
 }
 

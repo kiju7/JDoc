@@ -12,6 +12,10 @@
 #include "zip_reader.h"
 #include "legacy/ole_reader.h"
 #include "common/string_utils.h"
+#include "common/image_utils.h"
+#include "common/png_encode.h"
+#include "common/emf_text.h"
+#include "common/wmf_text.h"
 
 #include <cstring>
 #include <fstream>
@@ -66,6 +70,8 @@ static FileFormat format_from_ext(const std::string& name) {
     if (ext == ".hwpx") return FileFormat::HWPX;
     if (ext == ".hwp") return FileFormat::HWP;
     if (ext == ".eml") return FileFormat::EML;
+    if (ext == ".emf") return FileFormat::EMF;
+    if (ext == ".wmf") return FileFormat::WMF;
     if (ext == ".docx" || ext == ".xlsx" || ext == ".pptx" ||
         ext == ".doc" || ext == ".xls" || ext == ".ppt" || ext == ".rtf" ||
         ext == ".html" || ext == ".htm" || ext == ".xlsb" ||
@@ -123,6 +129,15 @@ static FileFormat format_from_magic(const unsigned char* magic, size_t n) {
     // HWP 2.x/3.x legacy binary ("HWP Document File V3.00 \x1A\x01\x02\x03\x04\x05")
     if (n >= 19 && memcmp(magic, "HWP Document File V", 19) == 0)
         return FileFormat::HWP;
+    // EMF: EMR_HEADER record (0x01000000) + " EMF" signature at offset 40.
+    if (n >= 44 && magic[0] == 0x01 && magic[1] == 0x00 && magic[2] == 0x00 &&
+        magic[3] == 0x00 && memcmp(magic + 40, " EMF", 4) == 0)
+        return FileFormat::EMF;
+    // WMF with the Aldus placeable header (D7 CD C6 9A). A bare WMF header has no
+    // reliable magic, so those resolve by extension instead.
+    if (n >= 4 && magic[0] == 0xD7 && magic[1] == 0xCD && magic[2] == 0xC6 &&
+        magic[3] == 0x9A)
+        return FileFormat::WMF;
     return FileFormat::UNKNOWN;
 }
 
@@ -167,6 +182,93 @@ static std::string read_text_file(const std::string& path) {
                    std::istreambuf_iterator<char>());
     }
     return util::plain_text_to_utf8(std::move(buf));
+}
+
+// Read a whole file into a raw byte buffer (no text conversion). Throws if the
+// file cannot be opened. Used for binary formats like EMF/WMF metafiles.
+static std::string read_file_bytes(const std::string& path) {
+    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    if (!f) throw std::runtime_error("Cannot open file: " + path);
+    std::string buf;
+    std::streamoff size = f.tellg();
+    if (size > 0) {
+        buf.resize(static_cast<size_t>(size));
+        f.seekg(0);
+        f.read(buf.data(), static_cast<std::streamsize>(size));
+        buf.resize(static_cast<size_t>(f.gcount()));
+    } else if (size < 0) {
+        buf.assign(std::istreambuf_iterator<char>(f),
+                   std::istreambuf_iterator<char>());
+    }
+    return buf;
+}
+
+// One-pass EMF/WMF extraction (text and/or bitmaps) dispatched by format, so a
+// metafile carrying both is parsed only once.
+static MetafileContent metafile_extract(FileFormat fmt, const uint8_t* data,
+                                        size_t size, bool want_text,
+                                        bool want_images) {
+    return fmt == FileFormat::EMF
+               ? emf_extract(data, size, want_text, want_images)
+               : wmf_extract(data, size, want_text, want_images);
+}
+
+// Markdown for a standalone EMF/WMF: recovered text plus, when opts.images,
+// its embedded bitmaps saved to image_dir and referenced inline. Image naming
+// ("page1_img{N}") and the "![name](ref)\n\n" reference format match every
+// other parser so downstream output stays uniform.
+static std::string metafile_to_markdown(FileFormat fmt, const uint8_t* data,
+                                        size_t size, const ConvertOptions& opts) {
+    MetafileContent c = metafile_extract(fmt, data, size, true, opts.images);
+    std::string md = std::move(c.text);
+    int i = 0;
+    for (auto& bmp : c.images) {
+        std::string name = "page1_img" + std::to_string(i++);
+        std::string filename = name + ".bmp";
+        if (!opts.image_dir.empty())
+            util::save_image_to_file(opts.image_dir, name, "bmp",
+                                     bmp.data(), bmp.size());
+        if (!md.empty() && md.back() != '\n') md += "\n\n";
+        md += "![" + filename + "](" + opts.image_ref_prefix + filename + ")\n\n";
+    }
+    return md;
+}
+
+// Build a single PageChunk for a standalone EMF/WMF, matching the parsers: the
+// recovered text with inline image references, and (when opts.images) the
+// bitmaps as ImageData — the BMP buffer is moved in (no copy), then saved to
+// disk when image_dir is set, else held in memory.
+static PageChunk metafile_to_chunk(FileFormat fmt, const uint8_t* data,
+                                   size_t size, const ConvertOptions& opts) {
+    MetafileContent c = metafile_extract(fmt, data, size, true, opts.images);
+    PageChunk chunk;
+    chunk.page_number = 1;
+    chunk.text = std::move(c.text);
+    int i = 0;
+    for (auto& bmp : c.images) {
+        std::string name = "page1_img" + std::to_string(i++);
+        std::string filename = name + ".bmp";
+        ImageData img;
+        img.page_number = 1;
+        img.name = name;
+        img.format = "bmp";
+        img.data = std::move(bmp);           // BMP buffer moved in, no copy
+        util::populate_image_dimensions(img);
+        if (!opts.image_dir.empty()) {
+            img.saved_path = util::save_image_to_file(
+                opts.image_dir, name, "bmp", img.data.data(), img.data.size());
+            if (!img.saved_path.empty()) {
+                img.data.clear();
+                img.data.shrink_to_fit();
+            }
+        }
+        if (!chunk.text.empty() && chunk.text.back() != '\n')
+            chunk.text += "\n\n";
+        chunk.text += "![" + filename + "](" + opts.image_ref_prefix +
+                      filename + ")\n\n";
+        chunk.images.push_back(std::move(img));
+    }
+    return chunk;
 }
 
 } // anonymous namespace
@@ -256,6 +358,8 @@ const char* file_format_name(FileFormat fmt) {
         case FileFormat::HWPX:     return "HWPX";
         case FileFormat::TXT:      return "TXT";
         case FileFormat::EML:      return "EML";
+        case FileFormat::EMF:      return "EMF";
+        case FileFormat::WMF:      return "WMF";
         case FileFormat::ZIP:      return "ZIP";
         case FileFormat::GZIP:     return "GZIP";
         case FileFormat::BZIP2:    return "BZIP2";
@@ -288,6 +392,8 @@ std::string convert_from_memory_as(FileFormat fmt,
             return util::plain_text_to_utf8(
                 std::string(reinterpret_cast<const char*>(data), size));
         case FileFormat::EML:    return eml_to_markdown_mem(data, size, opts);
+        case FileFormat::EMF:
+        case FileFormat::WMF:    return metafile_to_markdown(fmt, data, size, opts);
         default:
             if (is_archive_format(fmt))
                 throw std::runtime_error("Nested archive must be walked, not converted: " + name_hint);
@@ -304,6 +410,12 @@ std::string convert(const std::string& file_path, ConvertOptions opts) {
         case FileFormat::HWP:    return hwp_to_markdown(file_path, opts);
         case FileFormat::TXT:    return read_text_file(file_path);
         case FileFormat::EML:    return eml_to_markdown(file_path, opts);
+        case FileFormat::EMF:
+        case FileFormat::WMF: {
+            auto b = read_file_bytes(file_path);
+            return metafile_to_markdown(
+                fmt, reinterpret_cast<const uint8_t*>(b.data()), b.size(), opts);
+        }
         default:
             if (is_archive_format(fmt))
                 throw std::runtime_error("File is an archive; use convert_archive(): " + file_path);
@@ -332,10 +444,86 @@ std::vector<PageChunk> convert_chunks(const std::string& file_path,
             return {chunk};
         }
         case FileFormat::EML:    return eml_to_markdown_chunks(file_path, opts);
+        case FileFormat::EMF:
+        case FileFormat::WMF: {
+            auto b = read_file_bytes(file_path);
+            return {metafile_to_chunk(
+                fmt, reinterpret_cast<const uint8_t*>(b.data()), b.size(), opts)};
+        }
         default:
             if (is_archive_format(fmt))
                 throw std::runtime_error("File is an archive; use convert_archive(): " + file_path);
             throw std::runtime_error("Unsupported file format: " + file_path);
+    }
+}
+
+void for_each_chunk(const std::string& file_path, const ConvertOptions& opts,
+                    const PageSink& sink) {
+    auto fmt = detect_format(file_path);
+    switch (fmt) {
+        case FileFormat::PDF:    pdf_to_markdown_chunks_stream(file_path, opts, sink); return;
+        case FileFormat::OFFICE: office_to_markdown_chunks_stream(file_path, opts, sink); return;
+        case FileFormat::HWPX:   hwpx_to_markdown_chunks_stream(file_path, opts, sink); return;
+        case FileFormat::HWP:    hwp_to_markdown_chunks_stream(file_path, opts, sink); return;
+        case FileFormat::TXT: {
+            PageChunk chunk;
+            chunk.page_number = 0;
+            chunk.text = read_text_file(file_path);
+            sink(std::move(chunk));
+            return;
+        }
+        case FileFormat::EML:    eml_to_markdown_chunks_stream(file_path, opts, sink); return;
+        case FileFormat::EMF:
+        case FileFormat::WMF: {
+            auto b = read_file_bytes(file_path);
+            sink(metafile_to_chunk(
+                fmt, reinterpret_cast<const uint8_t*>(b.data()), b.size(), opts));
+            return;
+        }
+        default:
+            if (is_archive_format(fmt))
+                throw std::runtime_error("File is an archive; use convert_archive(): " + file_path);
+            throw std::runtime_error("Unsupported file format: " + file_path);
+    }
+}
+
+void for_each_chunk(const void* data, size_t size, const std::string& name_hint,
+                    const ConvertOptions& opts, const PageSink& sink) {
+    const uint8_t* bytes = static_cast<const uint8_t*>(data);
+    auto fmt = detect_format_mem(bytes, size, name_hint);
+    switch (fmt) {
+        case FileFormat::PDF:
+            pdf_to_markdown_chunks_mem_stream(bytes, size, opts, sink);
+            return;
+        case FileFormat::OFFICE:
+            office_to_markdown_chunks_mem_stream(bytes, size, name_hint, opts, sink);
+            return;
+        case FileFormat::HWPX:
+            hwpx_to_markdown_chunks_mem_stream(bytes, size, opts, sink);
+            return;
+        case FileFormat::HWP:
+            hwp_to_markdown_chunks_mem_stream(bytes, size, opts, sink);
+            return;
+        case FileFormat::TXT: {
+            PageChunk chunk;
+            chunk.page_number = 0;
+            chunk.text = util::plain_text_to_utf8(
+                std::string(reinterpret_cast<const char*>(bytes), size));
+            sink(std::move(chunk));
+            return;
+        }
+        case FileFormat::EMF:
+        case FileFormat::WMF:
+            sink(metafile_to_chunk(fmt, bytes, size, opts));
+            return;
+        case FileFormat::EML:
+            eml_to_markdown_chunks_mem_stream(bytes, size, opts, sink);
+            return;
+        default:
+            if (is_archive_format(fmt))
+                throw std::runtime_error("Nested archive must be walked, not converted: " + name_hint);
+            throw std::runtime_error(
+                "In-memory page streaming is not supported for this format: " + name_hint);
     }
 }
 

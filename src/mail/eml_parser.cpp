@@ -109,11 +109,13 @@ std::string decode_encoded_words(const std::string& in) {
 // ── Constructors ────────────────────────────────────────────
 
 EmlParser::EmlParser(const std::string& file_path) {
-    std::ifstream ifs(file_path, std::ios::binary);
+    std::ifstream ifs(file_path, std::ios::binary | std::ios::ate);
     if (!ifs) return;
-    std::ostringstream ss;
-    ss << ifs.rdbuf();
-    raw_ = ss.str();
+    std::streamsize size = ifs.tellg();
+    if (size <= 0) return;
+    ifs.seekg(0, std::ios::beg);
+    raw_.resize(static_cast<size_t>(size));
+    if (!ifs.read(&raw_[0], size)) raw_.clear();
 }
 
 EmlParser::EmlParser(const uint8_t* data, size_t size)
@@ -371,6 +373,26 @@ std::vector<PageChunk> eml_to_markdown_chunks(const std::string& file_path,
                                               ConvertOptions opts) {
     EmlParser parser(file_path);
     return parser.to_chunks(opts);
+}
+
+void eml_to_markdown_chunks_stream(const std::string& file_path,
+                                   const ConvertOptions& opts, const PageSink& sink) {
+    // An EML message is a single page, so this emits exactly one chunk.
+    EmlParser parser(file_path);
+    PageChunk chunk;
+    chunk.page_number = 0;
+    chunk.text = parser.to_markdown(opts);
+    sink(std::move(chunk));
+}
+
+void eml_to_markdown_chunks_mem_stream(const uint8_t* data, size_t size,
+                                       const ConvertOptions& opts,
+                                       const PageSink& sink) {
+    EmlParser parser(data, size);
+    PageChunk chunk;
+    chunk.page_number = 0;
+    chunk.text = parser.to_markdown(opts);
+    sink(std::move(chunk));
 }
 
 } // namespace jdoc

@@ -1,6 +1,7 @@
 // .rtf (Rich Text Format) parser implementation.
 
 #include "rtf_parser.h"
+#include "common/emf_text.h"
 #include "common/file_utils.h"
 #include "common/image_utils.h"
 #include "common/string_utils.h"
@@ -200,27 +201,27 @@ void RtfParser::parse(std::string& out_text, std::vector<PictImage>& out_images)
                         if (doc_codepage == 949 || doc_codepage == 1361) {
                             // CP949/EUC-KR: DBCS lead byte 0x81-0xFE
                             if (dbcs_pending) {
-                                out_text += util::cp949_to_utf8(dbcs_lead, byte);
+                                util::append_cp949(out_text, dbcs_lead, byte);
                                 dbcs_pending = false;
                             } else if (util::is_cp949_lead(byte)) {
                                 dbcs_lead = byte;
                                 dbcs_pending = true;
                             } else {
-                                out_text += util::cp1252_to_utf8(byte);
+                                util::append_cp1252(out_text, byte);
                             }
                         } else if (doc_codepage == 932) {
                             // CP932/Shift-JIS: lead byte 0x81-0x9F, 0xE0-0xFC
                             if (dbcs_pending) {
-                                out_text += util::cp932_to_utf8(dbcs_lead, byte);
+                                util::append_cp932(out_text, dbcs_lead, byte);
                                 dbcs_pending = false;
                             } else if ((byte >= 0x81 && byte <= 0x9F) || (byte >= 0xE0 && byte <= 0xFC)) {
                                 dbcs_lead = byte;
                                 dbcs_pending = true;
                             } else {
-                                out_text += util::cp1252_to_utf8(byte);
+                                util::append_cp1252(out_text, byte);
                             }
                         } else {
-                            out_text += util::cp1252_to_utf8(byte);
+                            util::append_cp1252(out_text, byte);
                         }
                     }
                     pos += 2;
@@ -514,6 +515,14 @@ std::string RtfParser::to_markdown(const ConvertOptions& opts) {
                 text += "![" + filename + "](" + opts.image_ref_prefix + filename + ")\n\n";
             else
                 text += "![" + filename + "](" + filename + ")\n\n";
+            if (pi.format == "emf" || pi.format == "wmf") {
+                std::vector<char> bytes = !pi.bin_data.empty()
+                    ? pi.bin_data : hex_to_binary(pi.hex_data);
+                std::string t = metafile_extract_text(
+                    pi.format.c_str(),
+                    reinterpret_cast<const uint8_t*>(bytes.data()), bytes.size());
+                if (!t.empty()) text += t + "\n\n";
+            }
         }
     }
 
@@ -531,6 +540,18 @@ std::vector<PageChunk> RtfParser::to_chunks(const ConvertOptions& opts) {
     chunk.page_width = 612.0;
     chunk.page_height = 792.0;
     chunk.body_font_size = 12.0;
+
+    // Metafile text is content (not an image), so recover it regardless of
+    // whether image extraction is enabled.
+    for (const auto& pi : pict_images) {
+        if (pi.format != "emf" && pi.format != "wmf") continue;
+        std::vector<char> bytes = !pi.bin_data.empty()
+            ? pi.bin_data : hex_to_binary(pi.hex_data);
+        std::string t = metafile_extract_text(
+            pi.format.c_str(),
+            reinterpret_cast<const uint8_t*>(bytes.data()), bytes.size());
+        if (!t.empty()) chunk.text += "\n\n" + t;
+    }
 
     if (opts.images) {
         for (size_t i = 0; i < pict_images.size(); ++i) {

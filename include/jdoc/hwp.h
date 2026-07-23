@@ -16,4 +16,11 @@ std::vector<PageChunk> hwp_to_markdown_chunks(const std::string& hwp_path,
 std::string hwp_to_markdown_mem(const uint8_t* data, size_t size,
                                 ConvertOptions opts = {});
 
+// Streaming variant: emit one OLE BodyText section at a time; return false to stop.
+void hwp_to_markdown_chunks_stream(const std::string& hwp_path,
+                                   const ConvertOptions& opts, const PageSink& sink);
+void hwp_to_markdown_chunks_mem_stream(const uint8_t* data, size_t size,
+                                       const ConvertOptions& opts,
+                                       const PageSink& sink);
+
 } // namespace jdoc

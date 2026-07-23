@@ -20,6 +20,14 @@ public:
     /// Convert workbook to per-sheet chunks.
     std::vector<PageChunk> to_chunks(const ConvertOptions& opts);
 
+    /// Streaming variant: emit one sheet chunk at a time (parsing each sheet on
+    /// demand), so the working set tracks a single sheet's table rather than the
+    /// whole workbook, and the first sheet is available before the rest are
+    /// parsed. Images are still enumerated up front (needed for text refs), so
+    /// image bytes are resident regardless. Byte-identical to to_chunks().
+    /// Returns false if the sink stopped early.
+    bool to_chunks(const ConvertOptions& opts, const PageSink& sink);
+
 private:
     ZipReader& zip_;
 
@@ -84,6 +92,11 @@ private:
     };
 
     SheetData parse_sheet(const SheetInfo& info);
+
+    // Per-sheet chunk builder (base text + tables, no images) shared by the
+    // eager and streaming to_chunks.
+    PageChunk build_sheet_chunk(size_t sheet_index, const ConvertOptions& opts);
+    static bool sheet_wanted(int sheet_num, const ConvertOptions& opts);
 
     // Parse comments for a sheet, return cell_ref -> comment_text
     // (merges legacy xl/comments*.xml and modern threaded comments).

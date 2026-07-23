@@ -3,6 +3,7 @@
 // License: MIT
 
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -21,8 +22,12 @@ struct ImageData {
     int components = 3;             // 1=gray, 3=RGB, 4=CMYK
     std::vector<char> data;         // encoded bytes (jpeg/png) or raw pixels
     std::vector<uint8_t> pixels;    // raw pixel buffer (width * height * components)
-    std::string format;             // "jpeg", "png", "raw"
+    std::string format;             // "jpeg", "png", "raw", "emf", "wmf"
     std::string saved_path;
+    // Text recovered from a vector metafile (EMF/WMF) via record parsing; empty
+    // for raster images. Emitted alongside the figure so metafile-drawn text is
+    // not lost to a raster-only path.
+    std::string embedded_text;
 };
 
 struct PageChunk {
@@ -34,6 +39,13 @@ struct PageChunk {
     std::vector<std::vector<std::vector<std::string>>> tables;
     std::vector<ImageData> images;
 };
+
+// Streaming sink for per-page conversion. The core produces one PageChunk at a
+// time and hands it to the sink; return false to stop early (mirrors
+// archive.h's MemberCallback). This is an internal/advanced entry point — the
+// language bindings wrap it as their native iterator rather than exposing a
+// raw callback.
+using PageSink = std::function<bool(PageChunk&&)>;
 
 // Limits for archive conversion (convert_archive). Sizes are enforced while
 // streaming decompression runs — header size fields are never trusted, so a

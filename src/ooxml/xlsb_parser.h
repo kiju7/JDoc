@@ -41,7 +41,7 @@ private:
 
     // XLSB variable-length integer reading
     static uint16_t read_record_header(const uint8_t* data, size_t& offset,
-                                        uint32_t& out_size);
+                                        size_t size, uint32_t& out_size);
     static std::string read_xl_widestring(const uint8_t* data, size_t& offset,
                                             size_t end);
 

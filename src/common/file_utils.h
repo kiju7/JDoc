@@ -5,8 +5,10 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdint>
+#include <limits>
 #include <string>
 #include <utility>
+#include <vector>
 
 #ifdef _WIN32
   #include <direct.h>
@@ -23,7 +25,8 @@ inline std::string get_extension(const std::string& path) {
     auto dot = path.rfind('.');
     if (dot == std::string::npos) return "";
     std::string ext = path.substr(dot);
-    for (auto& c : ext) c = std::tolower(static_cast<unsigned char>(c));
+    for (auto& c : ext)
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
     return ext;
 }
 
@@ -84,6 +87,36 @@ inline void ensure_dirs(const std::string& dir) {
         std::string parent = dir.substr(0, pos);
         if (!parent.empty()) jdoc_mkdir(parent.c_str());
     }
+}
+
+// Render rows as a GitHub-flavored markdown table; the first row is the header.
+// Empty input yields "". Column count is the widest row; short rows pad with "".
+// Shared by the docx and pptx parsers (previously duplicated verbatim).
+inline std::string format_markdown_table(
+    const std::vector<std::vector<std::string>>& rows) {
+    if (rows.empty()) return "";
+    size_t cols = 0;
+    for (auto& row : rows) cols = std::max(cols, row.size());
+    if (cols == 0) return "";
+
+    std::string out;
+    out += "|";
+    for (size_t c = 0; c < cols; ++c) {
+        const std::string& cell = (c < rows[0].size()) ? rows[0][c] : "";
+        out += " "; out += cell; out += " |";
+    }
+    out += "\n|";
+    for (size_t c = 0; c < cols; ++c) out += " --- |";
+    out += "\n";
+    for (size_t r = 1; r < rows.size(); ++r) {
+        out += "|";
+        for (size_t c = 0; c < cols; ++c) {
+            const std::string& cell = (c < rows[r].size()) ? rows[r][c] : "";
+            out += " "; out += cell; out += " |";
+        }
+        out += "\n";
+    }
+    return out;
 }
 
 // Strip markdown formatting from text, returning plain text.
@@ -194,12 +227,30 @@ inline std::pair<unsigned, unsigned> image_dimensions_from_data(
     const char* data, size_t size) {
     if (!data || size < 8) return {0, 0};
     auto u8 = reinterpret_cast<const uint8_t*>(data);
+    auto be16 = [u8](size_t offset) {
+        return static_cast<uint16_t>(
+            (uint16_t{u8[offset]} << 8) | u8[offset + 1]);
+    };
+    auto be32 = [u8](size_t offset) {
+        return (uint32_t{u8[offset]} << 24) |
+               (uint32_t{u8[offset + 1]} << 16) |
+               (uint32_t{u8[offset + 2]} << 8) |
+               uint32_t{u8[offset + 3]};
+    };
+    auto le16 = [u8](size_t offset) {
+        return static_cast<uint16_t>(
+            uint16_t{u8[offset]} | (uint16_t{u8[offset + 1]} << 8));
+    };
+    auto le32 = [u8](size_t offset) {
+        return uint32_t{u8[offset]} |
+               (uint32_t{u8[offset + 1]} << 8) |
+               (uint32_t{u8[offset + 2]} << 16) |
+               (uint32_t{u8[offset + 3]} << 24);
+    };
 
     // PNG: signature(8) + IHDR length(4) + "IHDR"(4) + width(4) + height(4)
     if (size >= 24 && u8[0] == 0x89 && u8[1] == 'P' && u8[2] == 'N' && u8[3] == 'G') {
-        unsigned w = (u8[16] << 24) | (u8[17] << 16) | (u8[18] << 8) | u8[19];
-        unsigned h = (u8[20] << 24) | (u8[21] << 16) | (u8[22] << 8) | u8[23];
-        return {w, h};
+        return {be32(16), be32(20)};
     }
 
     // JPEG: find SOF0 (0xFFC0) or SOF2 (0xFFC2) marker
@@ -210,15 +261,13 @@ inline std::pair<unsigned, unsigned> image_dimensions_from_data(
             uint8_t marker = u8[pos + 1];
             if (marker == 0xC0 || marker == 0xC2) {
                 if (pos + 9 < size) {
-                    unsigned h = (u8[pos + 5] << 8) | u8[pos + 6];
-                    unsigned w = (u8[pos + 7] << 8) | u8[pos + 8];
-                    return {w, h};
+                    return {be16(pos + 7), be16(pos + 5)};
                 }
                 break;
             }
             if (marker == 0xD9 || marker == 0xDA) break; // EOI or SOS
             if (pos + 3 < size) {
-                uint16_t seg_len = (u8[pos + 2] << 8) | u8[pos + 3];
+                uint16_t seg_len = be16(pos + 2);
                 pos += 2 + seg_len;
             } else break;
         }
@@ -227,17 +276,18 @@ inline std::pair<unsigned, unsigned> image_dimensions_from_data(
 
     // GIF: "GIF8" + version(2) + width(2 LE) + height(2 LE)
     if (size >= 10 && u8[0] == 'G' && u8[1] == 'I' && u8[2] == 'F') {
-        unsigned w = u8[6] | (u8[7] << 8);
-        unsigned h = u8[8] | (u8[9] << 8);
-        return {w, h};
+        return {le16(6), le16(8)};
     }
 
     // BMP: "BM" + ... + width(4 LE at 18) + height(4 LE at 22)
     if (size >= 26 && u8[0] == 'B' && u8[1] == 'M') {
-        unsigned w = u8[18] | (u8[19] << 8) | (u8[20] << 16) | (u8[21] << 24);
-        int h_signed = static_cast<int>(u8[22] | (u8[23] << 8) | (u8[24] << 16) | (u8[25] << 24));
-        unsigned h = static_cast<unsigned>(h_signed < 0 ? -h_signed : h_signed);
-        return {w, h};
+        uint32_t width = le32(18);
+        int32_t signed_height = static_cast<int32_t>(le32(22));
+        if (signed_height == std::numeric_limits<int32_t>::min())
+            return {width, 0};
+        uint32_t height = static_cast<uint32_t>(
+            signed_height < 0 ? -signed_height : signed_height);
+        return {width, height};
     }
 
     return {0, 0};

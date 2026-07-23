@@ -97,8 +97,21 @@ public:
         return true;
     }
 
+    // Eager collection is a thin wrapper over the streaming primitive, so the
+    // two can never diverge. Plaintext stripping is applied by the caller for
+    // the eager path, so pass false here.
     std::vector<PageChunk> convert_chunks() {
         std::vector<PageChunk> chunks;
+        convert_chunks_stream(false, [&](PageChunk&& c) {
+            chunks.push_back(std::move(c));
+            return true;
+        });
+        return chunks;
+    }
+
+    // Streaming primitive: parse and emit one section XML at a time so peak
+    // memory tracks a single section.
+    void convert_chunks_stream(bool plaintext, const PageSink& sink) {
         int section_idx = 0;
 
         for (auto& section_path : section_paths_) {
@@ -114,11 +127,10 @@ public:
             PageChunk chunk;
             chunk.page_number = section_idx + 1;
             parse_section(section_path, chunk);
-            chunks.push_back(std::move(chunk));
+            if (plaintext) chunk.text = util::strip_markdown(chunk.text);
+            if (!sink(std::move(chunk))) return;
             section_idx++;
         }
-
-        return chunks;
     }
 
 private:
@@ -974,6 +986,27 @@ std::vector<PageChunk> hwpx_to_markdown_chunks(const std::string& hwpx_path,
             chunk.text = util::strip_markdown(chunk.text);
     }
     return chunks;
+}
+
+void hwpx_to_markdown_chunks_stream(const std::string& hwpx_path,
+                                    const ConvertOptions& opts_in, const PageSink& sink) {
+    ConvertOptions opts = opts_in;
+    opts.page_chunks = true;
+    bool plaintext = (opts.format == OutputFormat::PLAINTEXT);
+    HWPXParser parser(hwpx_path, opts);
+    parser.parse();
+    parser.convert_chunks_stream(plaintext, sink);
+}
+
+void hwpx_to_markdown_chunks_mem_stream(const uint8_t* data, size_t size,
+                                        const ConvertOptions& opts_in,
+                                        const PageSink& sink) {
+    ConvertOptions opts = opts_in;
+    opts.page_chunks = true;
+    bool plaintext = (opts.format == OutputFormat::PLAINTEXT);
+    HWPXParser parser(data, size, opts);
+    parser.parse();
+    parser.convert_chunks_stream(plaintext, sink);
 }
 
 } // namespace jdoc

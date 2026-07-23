@@ -60,7 +60,7 @@ void XlsxParser::parse_shared_strings() {
 
     auto data = zip_.read_entry("xl/sharedStrings.xml");
     pugi::xml_document doc;
-    if (!doc.load_buffer(data.data(), data.size(), pugi::parse_default | pugi::parse_ws_pcdata)) return;
+    if (!doc.load_buffer_inplace(data.data(), data.size(), pugi::parse_default | pugi::parse_ws_pcdata)) return;
 
     // Each <si> element contains one shared string
     // Text can be in <t> directly or in <r><t> runs
@@ -95,7 +95,7 @@ void XlsxParser::parse_workbook() {
 
     auto data = zip_.read_entry("xl/workbook.xml");
     pugi::xml_document doc;
-    if (!doc.load_buffer(data.data(), data.size(), pugi::parse_default | pugi::parse_ws_pcdata)) return;
+    if (!doc.load_buffer_inplace(data.data(), data.size(), pugi::parse_default | pugi::parse_ws_pcdata)) return;
 
     // Find <sheets><sheet> elements
     std::vector<pugi::xml_node> sheet_nodes;
@@ -133,7 +133,7 @@ void XlsxParser::parse_workbook_rels() {
 
     auto data = zip_.read_entry(rels_path);
     pugi::xml_document doc;
-    if (!doc.load_buffer(data.data(), data.size(), pugi::parse_default | pugi::parse_ws_pcdata)) return;
+    if (!doc.load_buffer_inplace(data.data(), data.size(), pugi::parse_default | pugi::parse_ws_pcdata)) return;
 
     // Build rId -> target map
     std::map<std::string, std::string> id_to_target;
@@ -166,7 +166,7 @@ void XlsxParser::parse_styles() {
 
     auto data = zip_.read_entry("xl/styles.xml");
     pugi::xml_document doc;
-    if (!doc.load_buffer(data.data(), data.size(), pugi::parse_default | pugi::parse_ws_pcdata)) return;
+    if (!doc.load_buffer_inplace(data.data(), data.size(), pugi::parse_default | pugi::parse_ws_pcdata)) return;
 
     // Parse fonts: <fonts><font><b/> means bold
     std::vector<pugi::xml_node> fonts_nodes;
@@ -513,7 +513,7 @@ std::map<std::string, std::string> XlsxParser::parse_comments(
     if (!zip_.has_entry(rels_path)) return comments;
     auto rels_data = zip_.read_entry(rels_path);
     pugi::xml_document rels_doc;
-    if (!rels_doc.load_buffer(rels_data.data(), rels_data.size())) return comments;
+    if (!rels_doc.load_buffer_inplace(rels_data.data(), rels_data.size())) return comments;
 
     // Locate the legacy (xl/comments*.xml) and modern threaded-comment parts.
     // Both Target forms — relative and absolute ("/xl/...") — are normalized.
@@ -547,7 +547,7 @@ void XlsxParser::parse_legacy_comments(
 
     auto data = zip_.read_entry(path);
     pugi::xml_document doc;
-    if (!doc.load_buffer(data.data(), data.size(), pugi::parse_default | pugi::parse_ws_pcdata)) return;
+    if (!doc.load_buffer_inplace(data.data(), data.size(), pugi::parse_default | pugi::parse_ws_pcdata)) return;
 
     // Parse <commentList><comment ref="A1"><text><t>...</t></text></comment>
     std::vector<pugi::xml_node> comment_nodes;
@@ -579,7 +579,7 @@ void XlsxParser::parse_threaded_comments(
 
     auto data = zip_.read_entry(path);
     pugi::xml_document doc;
-    if (!doc.load_buffer(data.data(), data.size(), pugi::parse_default | pugi::parse_ws_pcdata)) return;
+    if (!doc.load_buffer_inplace(data.data(), data.size(), pugi::parse_default | pugi::parse_ws_pcdata)) return;
 
     // <threadedComment ref="A1" personId="{..}"><text>..</text></threadedComment>
     // Replies to a cell share its ref; join them in document order.
@@ -616,7 +616,7 @@ void XlsxParser::parse_persons() {
     for (const auto* e : zip_.entries_with_prefix("xl/persons/")) {
         auto data = zip_.read_entry(e->name);
         pugi::xml_document doc;
-        if (!doc.load_buffer(data.data(), data.size())) continue;
+        if (!doc.load_buffer_inplace(data.data(), data.size())) continue;
         std::vector<pugi::xml_node> person_nodes;
         xml_find_all(doc, "person", person_nodes);
         for (auto& p : person_nodes) {
@@ -639,7 +639,7 @@ XlsxParser::SheetData XlsxParser::parse_sheet(const SheetInfo& info) {
 
     auto data = zip_.read_entry(info.file_path);
     pugi::xml_document doc;
-    if (!doc.load_buffer(data.data(), data.size(), pugi::parse_default | pugi::parse_ws_pcdata)) return sheet;
+    if (!doc.load_buffer_inplace(data.data(), data.size(), pugi::parse_default | pugi::parse_ws_pcdata)) return sheet;
 
     // Parse comments for this sheet
     auto comments = parse_comments(info);
@@ -785,7 +785,10 @@ std::string XlsxParser::format_sheet_as_table(const SheetData& sheet,
     bool truncated = max_rows > 0 && total_rows > max_rows;
     int display_rows = truncated ? max_rows : total_rows;
 
-    std::ostringstream out;
+    std::string out;
+    // A wide sheet builds a large table; reserve up front to avoid the repeated
+    // reallocations an ostringstream/growing string would otherwise incur.
+    out.reserve(static_cast<size_t>(display_rows) * total_cols * 8 + 64);
 
     // Helper: look up cell value with bold markers applied.
     auto get_cell = [&](int r, int c) -> std::string {
@@ -800,34 +803,34 @@ std::string XlsxParser::format_sheet_as_table(const SheetData& sheet,
     };
 
     // Header row (row 0)
-    out << "|";
+    out += "|";
     for (int c = 0; c < total_cols; ++c) {
-        out << " " << get_cell(0, c) << " |";
+        out += " "; out += get_cell(0, c); out += " |";
     }
-    out << "\n";
+    out += "\n";
 
     // Separator
-    out << "|";
+    out += "|";
     for (int c = 0; c < total_cols; ++c) {
-        out << " --- |";
+        out += " --- |";
     }
-    out << "\n";
+    out += "\n";
 
     // Data rows
     for (int r = 1; r < display_rows; ++r) {
-        out << "|";
+        out += "|";
         for (int c = 0; c < total_cols; ++c) {
-            out << " " << get_cell(r, c) << " |";
+            out += " "; out += get_cell(r, c); out += " |";
         }
-        out << "\n";
+        out += "\n";
     }
 
     if (truncated) {
-        out << "\n*... truncated at " << max_rows
-            << " rows (total: " << total_rows << " rows)*\n";
+        out += "\n*... truncated at "; out += std::to_string(max_rows);
+        out += " rows (total: "; out += std::to_string(total_rows); out += " rows)*\n";
     }
 
-    return out.str();
+    return out;
 }
 
 // ── Image extraction ────────────────────────────────────
@@ -857,7 +860,7 @@ std::vector<ImageData> XlsxParser::extract_images(
         if (!zip_.has_entry(sheet_rels)) continue;
         auto rels_data = zip_.read_entry(sheet_rels);
         pugi::xml_document rels_doc;
-        if (!rels_doc.load_buffer(rels_data.data(), rels_data.size())) continue;
+        if (!rels_doc.load_buffer_inplace(rels_data.data(), rels_data.size())) continue;
 
         // Find drawing targets (type ends with /drawing)
         std::vector<pugi::xml_node> rel_nodes;
@@ -886,7 +889,7 @@ std::vector<ImageData> XlsxParser::extract_images(
             if (!zip_.has_entry(draw_rels)) continue;
             auto draw_rels_data = zip_.read_entry(draw_rels);
             pugi::xml_document draw_rels_doc;
-            if (!draw_rels_doc.load_buffer(draw_rels_data.data(), draw_rels_data.size())) continue;
+            if (!draw_rels_doc.load_buffer_inplace(draw_rels_data.data(), draw_rels_data.size())) continue;
 
             std::map<std::string, std::string> draw_rel_map;
             std::vector<pugi::xml_node> draw_rel_nodes;
@@ -902,7 +905,7 @@ std::vector<ImageData> XlsxParser::extract_images(
             // Parse drawing XML to find blip references
             auto draw_data = zip_.read_entry(drawing_path);
             pugi::xml_document draw_doc;
-            if (!draw_doc.load_buffer(draw_data.data(), draw_data.size())) continue;
+            if (!draw_doc.load_buffer_inplace(draw_data.data(), draw_data.size())) continue;
 
             std::vector<pugi::xml_node> blips;
             xml_find_all(draw_doc, "blip", blips);
@@ -1020,99 +1023,131 @@ std::string XlsxParser::to_markdown(const ConvertOptions& opts) {
 
 // ── to_chunks ───────────────────────────────────────────
 
-std::vector<PageChunk> XlsxParser::to_chunks(
-    const ConvertOptions& opts) {
+bool XlsxParser::sheet_wanted(int sheet_num, const ConvertOptions& opts) {
+    if (opts.pages.empty()) return true;
+    for (int p : opts.pages) if (p == sheet_num) return true;
+    return false;
+}
 
+// Build one sheet's base chunk (heading + table markdown + structured tables).
+// Images are attached separately (see to_chunks), matching the eager path where
+// images are distributed after all sheet chunks are built.
+PageChunk XlsxParser::build_sheet_chunk(size_t i, const ConvertOptions& opts) {
+    int sheet_num = static_cast<int>(i) + 1;
+    auto sheet = parse_sheet(sheets_[i]);
+
+    PageChunk chunk;
+    chunk.page_number = sheet_num;
+
+    std::string text;
+    std::string display_name = sheet.name.empty()
+        ? ("Sheet " + std::to_string(sheet_num))
+        : sheet.name;
+    text += "## "; text += display_name; text += "\n\n";
+
+    if (!sheet.cells.empty()) {
+        text += format_sheet_as_table(sheet); text += "\n";
+
+        // Build structured table data for the chunk
+        // Convert sparse grid to dense 2D vector
+        if (opts.tables) {
+            int total_rows = sheet.max_row + 1;
+            int total_cols = sheet.max_col + 1;
+            int display_rows = total_rows;  // no row limit
+
+            std::vector<std::vector<std::string>> table;
+            table.reserve(display_rows);
+
+            for (int r = 0; r < display_rows; ++r) {
+                std::vector<std::string> row;
+                row.reserve(total_cols);
+                auto row_it = sheet.cells.find(r);
+                for (int c = 0; c < total_cols; ++c) {
+                    if (row_it != sheet.cells.end()) {
+                        auto col_it = row_it->second.find(c);
+                        if (col_it != row_it->second.end()) {
+                            std::string val = col_it->second.value;
+                            if (!val.empty() && col_it->second.bold)
+                                val = "**" + val + "**";
+                            row.push_back(std::move(val));
+                            continue;
+                        }
+                    }
+                    row.push_back("");
+                }
+                table.push_back(std::move(row));
+            }
+
+            chunk.tables.push_back(std::move(table));
+        }
+    } else {
+        text += "*Empty sheet*\n\n";
+    }
+
+    chunk.text = std::move(text);
+    return chunk;
+}
+
+std::vector<PageChunk> XlsxParser::to_chunks(const ConvertOptions& opts) {
     std::vector<PageChunk> chunks;
-    // Always enumerate images so we can reference them in text
+    to_chunks(opts, [&](PageChunk&& c) {
+        chunks.push_back(std::move(c));
+        return true;
+    });
+    return chunks;
+}
+
+bool XlsxParser::to_chunks(const ConvertOptions& opts, const PageSink& sink) {
+    // Always enumerate images up front so they can be referenced in text. This
+    // means image bytes are resident regardless of streaming (bounded like the
+    // eager path); streaming still shrinks the per-sheet table working set.
     ConvertOptions img_opts = opts;
     img_opts.images = true;
     auto all_images = extract_images(img_opts);
 
+    // The eager path attaches each image to the chunk whose page_number matches,
+    // else to the first chunk. Replicate that: an image targets its own sheet if
+    // that sheet is present, otherwise the first present sheet. Precompute the
+    // first present sheet so orphans land there (matching chunks[0] in eager).
+    int first_present = -1;
+    for (size_t i = 0; i < sheets_.size(); ++i) {
+        if (sheet_wanted(static_cast<int>(i) + 1, opts)) {
+            first_present = static_cast<int>(i) + 1;
+            break;
+        }
+    }
+    if (first_present < 0) return true;  // no sheets → eager returns empty
+
+    auto target_sheet = [&](const ImageData& img) -> int {
+        int n = img.page_number;
+        if (n >= 1 && n <= static_cast<int>(sheets_.size()) && sheet_wanted(n, opts))
+            return n;
+        return first_present;  // orphan → first present chunk
+    };
+
     for (size_t i = 0; i < sheets_.size(); ++i) {
         int sheet_num = static_cast<int>(i) + 1;
+        if (!sheet_wanted(sheet_num, opts)) continue;
 
-        // Filter by requested pages (sheets treated as pages)
-        if (!opts.pages.empty()) {
-            bool found = false;
-            for (int p : opts.pages) {
-                if (p == sheet_num) { found = true; break; }
-            }
-            if (!found) continue;
-        }
+        PageChunk chunk = build_sheet_chunk(i, opts);
 
-        auto sheet = parse_sheet(sheets_[i]);
-
-        PageChunk chunk;
-        chunk.page_number = sheet_num;
-
-        std::ostringstream text;
-        std::string display_name = sheet.name.empty()
-            ? ("Sheet " + std::to_string(sheet_num))
-            : sheet.name;
-        text << "## " << display_name << "\n\n";
-
-        if (!sheet.cells.empty()) {
-            text << format_sheet_as_table(sheet) << "\n";
-
-            // Build structured table data for the chunk
-            // Convert sparse grid to dense 2D vector
-            if (opts.tables) {
-                int total_rows = sheet.max_row + 1;
-                int total_cols = sheet.max_col + 1;
-                int display_rows = total_rows;  // no row limit
-
-                std::vector<std::vector<std::string>> table;
-                table.reserve(display_rows);
-
-                for (int r = 0; r < display_rows; ++r) {
-                    std::vector<std::string> row;
-                    row.reserve(total_cols);
-                    auto row_it = sheet.cells.find(r);
-                    for (int c = 0; c < total_cols; ++c) {
-                        if (row_it != sheet.cells.end()) {
-                            auto col_it = row_it->second.find(c);
-                            if (col_it != row_it->second.end()) {
-                                std::string val = col_it->second.value;
-                                if (!val.empty() && col_it->second.bold)
-                                    val = "**" + val + "**";
-                                row.push_back(std::move(val));
-                                continue;
-                            }
-                        }
-                        row.push_back("");
-                    }
-                    table.push_back(std::move(row));
-                }
-
-                chunk.tables.push_back(std::move(table));
-            }
-        } else {
-            text << "*Empty sheet*\n\n";
-        }
-
-        chunk.text = text.str();
-        chunks.push_back(std::move(chunk));
-    }
-
-    // Distribute images to their corresponding sheet chunks
-    if (!all_images.empty() && !chunks.empty()) {
+        // Attach the images targeting this sheet, in all_images order (the first
+        // present sheet also collects orphans). Each image targets exactly one
+        // sheet, so moving it out here is safe.
         for (auto& img : all_images) {
-            PageChunk* target = &chunks[0];
-            for (auto& c : chunks) {
-                if (c.page_number == img.page_number) { target = &c; break; }
-            }
+            if (target_sheet(img) != sheet_num) continue;
             std::string ref_name = img.name;
             if (!img.saved_path.empty()) {
                 auto sl = img.saved_path.find_last_of('/');
                 ref_name = (sl != std::string::npos) ? img.saved_path.substr(sl + 1) : img.saved_path;
             }
-            target->text += "![" + img.name + "](" + ref_name + ")\n\n";
-            target->images.push_back(std::move(img));
+            chunk.text += "![" + img.name + "](" + ref_name + ")\n\n";
+            chunk.images.push_back(std::move(img));
         }
-    }
 
-    return chunks;
+        if (!sink(std::move(chunk))) return false;
+    }
+    return true;
 }
 
 } // namespace jdoc

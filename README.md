@@ -21,7 +21,8 @@ C++17 기반 문서 → 마크다운 변환기. 무거운 의존성 없이 zlib,
 - **아카이브 코덱** — 7Z: LZMA/LZMA2/PPMd·branch 필터(디코더 전용 LZMA SDK 벤더링, solid block 사전 크기 검사). ALZ/EGG: store/deflate/bzip2/LZMA, solid EGG 스트리밍 분배 지원, CRC 검증, CP949 파일명 변환. RAR: 4.x/5.x 헤더 워크·store 멤버(독점 압축 코덱 멤버는 멤버별 오류, [근거](docs/rar-feasibility.md)). 암호화·독점 코덱(AZO) 멤버는 명확한 오류로 보고
 - **압축폭탄 방어** — 헤더 크기 필드를 신뢰하지 않고 해제 도중 출력 바이트를 계수해 강제. 멤버당·누적·멤버 수·압축비·재귀 깊이 한도 (기본값과 해제 방법은 [옵션](#옵션) 참조)
 - **단일 스레드** — 변환 호출당 스레드 1개, 전역 상태 없음. 호출자가 문서/아카이브 단위로 자유롭게 병렬화 가능
-- **다양한 API** — CLI, Python (pybind11), C, C++
+- **다양한 API** — CLI, Python (pybind11), C, C++, Go (cgo), Java (JNA)
+- **포맷 판별** — 추출 없이 파일 포맷만 판별하는 `detect` API. 이름·카테고리·확장자·MIME·변환가능 여부를 담은 구조체 반환, 이미지 등 비변환 포맷도 검출. 5개 언어 공통
 
 ## 설치
 
@@ -183,9 +184,41 @@ for (int i = 0; i < page_count; i++) {
 jdoc_free_pages(pages, page_count);
 ```
 
+### 스트리밍 (지연 페이지 이터레이터)
+
+`convert_pages`/`convert_chunks`는 전 페이지를 한 번에 만들어 반환한다(eager). 스트리밍 API는 **페이지를 하나씩 생성→소비→해제**해, 소비자가 한 페이지분 메모리만 들고 큰 문서를 처리할 수 있다. 출력은 eager와 **바이트 동일**하며, 콜백이 `false`(C는 `0`)를 반환하면 조기 중단한다.
+
+pptx(슬라이드)·xlsx(시트)·hwp/hwpx(섹션)처럼 단위별로 지연 파싱되는 포맷은 **첫 페이지 지연과 피크 메모리가 크게 준다** (예: 25슬라이드 pptx에서 첫 페이지 ≈−98%, 피크 ≈−44%). PDF·docx 등 문서 전체를 한 번에 파싱하는 포맷도 API는 동일하게 동작하며 소비자측 페이지 단위 소유 이득을 준다.
+
+```python
+# Python — 제너레이터
+for page in jdoc.convert_pages_stream("big.pptx", images=True):
+    process(page)          # 한 페이지씩 지연 생성; break로 조기 중단
+```
+
+```cpp
+// C++ — sink 콜백 (jdoc/jdoc.h)
+jdoc::for_each_chunk("big.pptx", opts, [](jdoc::PageChunk&& page) {
+    // page.text, page.images ...
+    return true;           // false 반환 시 조기 중단
+});
+```
+
+```c
+/* C API — 콜백형 (jdoc/jdoc_c_api.h). page는 콜백 동안만 유효 */
+int on_page(const JDocPage* page, void* userdata) {
+    printf("Page %d: %s\n", page->page_number, page->text);
+    return 1;              /* 0 반환 시 조기 중단 */
+}
+jdoc_convert_pages_stream("big.pptx", &opts, on_page, NULL, err, sizeof(err));
+```
+
+Go(`StreamPages(path).Pages()` → `iter.Seq[Page]`)와 Java(`Jdoc.streamPages(path)` → `Stream<Page>`) 바인딩도 각 언어의 지연 이터레이터로 같은 API를 제공한다 (`bindings/go`, `bindings/java`).
+
 ## 옵션
 
-모든 API가 **같은 옵션을 같은 이름으로** 공유한다 (C++ `ConvertOptions`, C `JDocOptions`, Python 키워드 인자 — 명칭 동일. CLI는 같은 이름의 플래그).
+C++ `ConvertOptions`와 Python `ConvertOptions`는 같은 필드를 공유한다. C API와
+CLI는 각 환경의 관례에 맞는 대응 필드·플래그를 제공한다.
 
 ### 변환 옵션
 
@@ -210,9 +243,8 @@ jdoc_free_pages(pages, page_count);
 | `max_member_bytes` | `512MiB` | 멤버당 해제 후 크기 상한. 멤버가 하나씩만 상주하므로 **실질 메모리 상한** | `--max-member-mb N` |
 | `max_total_bytes` | `64GiB` | 호출당 누적 해제 크기 (CPU 시간 가드) | `--max-total-mb N` |
 | `max_entries` | `200000` | 방문 멤버 수 상한 (중첩 포함) | `--max-entries N` |
-| `max_ratio` | `1000` | 압축비 폭탄 의심 한도 (`0` = 검사 안 함) | `--max-ratio N` |
+| `max_ratio` | `10000` | 압축비 폭탄 의심 한도 (`0` = 검사 안 함) | `--max-ratio N` |
 | `include_unsupported` | `false` | 미지원 멤버도 결과에 오류로 포함 | `--include-unsupported` |
-| `threads` | `1` | 멤버 변환 워커 수 (`1` = 단일 스레드, `-1`/`0` = 전체 코어) | `--threads N` |
 
 - 멤버당·압축비·깊이 초과는 **해당 멤버만 스킵**하고 순회를 계속하며, 누적·멤버 수 초과만 순회를 중단
 - 아카이브 멤버의 이미지는 멤버 간 파일명 충돌을 막기 위해 `image_dir/<멤버 경로>/` 하위에 저장되며(중첩 구조 보존), 마크다운 참조 경로도 함께 조정됨
@@ -231,7 +263,6 @@ jdoc_free_pages(pages, page_count);
 | 목록 | | ✓ | ✓ | | | | | | | ✓ | |
 | 링크 | ✓ | ✓ | ✓ | | | | | | | ✓ | |
 | 주석 | ✓ | | | | | | | | | | |
-| 차트/SmartArt | | | | | | ✓ | | | | | |
 | 발표자 노트 | | | | | | ✓ | ✓ | | | | |
 
 ## 의존성

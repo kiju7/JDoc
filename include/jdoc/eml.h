@@ -14,4 +14,11 @@ std::string eml_to_markdown_mem(const uint8_t* data, size_t size,
 std::vector<PageChunk> eml_to_markdown_chunks(const std::string& file_path,
                                               ConvertOptions opts = {});
 
+// Streaming variant: an EML is a single page, so this emits exactly one chunk.
+void eml_to_markdown_chunks_stream(const std::string& file_path,
+                                   const ConvertOptions& opts, const PageSink& sink);
+void eml_to_markdown_chunks_mem_stream(const uint8_t* data, size_t size,
+                                       const ConvertOptions& opts,
+                                       const PageSink& sink);
+
 } // namespace jdoc

@@ -52,25 +52,7 @@ private:
     std::string extract_footnotes();
     std::string extract_endnotes();
 
-    struct ParagraphInfo {
-        std::string text;
-        int heading_level = 0;
-        bool is_list = false;
-        bool is_ordered = false;
-        int list_level = 0;
-        bool is_page_break = false;
-    };
-
-    struct RunInfo {
-        std::string text;
-        bool bold = false;
-        bool italic = false;
-    };
-
     std::vector<ImageData> extract_images(const ConvertOptions& opts);
-
-    std::string format_table(
-        const std::vector<std::vector<std::string>>& rows);
 };
 
 } // namespace jdoc

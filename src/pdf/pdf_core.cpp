@@ -1,6 +1,7 @@
 #include "pdf_core.h"
 #include "common/string_utils.h"
 #include "common/file_utils.h"
+#include "common/inflate.h"
 #include <fstream>
 #include <zlib.h>
 #include <algorithm>
@@ -150,6 +151,14 @@ PdfObj PdfLexer::parse_object(int depth) {
 std::vector<uint8_t> decode_flate(const uint8_t* src, size_t src_len) {
     std::vector<uint8_t> out;
     if (src_len == 0) return out;
+
+    // Fast path: libdeflate decodes a well-formed FlateDecode stream whole.
+    auto whole = inflate_zlib(src, src_len, src_len * 3);
+    if (!whole.empty()) return whole;
+
+    // Fallback: many real PDFs have truncated/malformed streams (missing the
+    // adler32 trailer, wrong /Length). zlib's streaming inflate recovers the
+    // PARTIAL output that precedes the damage, where libdeflate returns nothing.
     out.reserve(src_len * 3);
 
     z_stream zs = {};
@@ -975,6 +984,22 @@ void parse_tounicode_cmap(PdfDoc& doc, const PdfObj& tu_obj, PdfFont& font) {
         return val;
     };
 
+    auto parse_unicode = [&](const std::string& hex) -> uint32_t {
+        if (hex.size() < 4)
+            return parse_hex(hex);
+
+        const uint32_t high = parse_hex(hex.substr(0, 4));
+        if (high < 0xD800 || high > 0xDFFF)
+            return high;
+        if (high > 0xDBFF || hex.size() < 8)
+            return 0xFFFD;
+
+        const uint32_t low = parse_hex(hex.substr(4, 4));
+        if (low < 0xDC00 || low > 0xDFFF)
+            return 0xFFFD;
+        return 0x10000 + ((high - 0xD800) << 10) + (low - 0xDC00);
+    };
+
     auto extract_hex = [](const std::string& s, size_t start, size_t end) -> std::string {
         std::string h;
         for (size_t i = start; i < end; i++) {
@@ -1008,13 +1033,7 @@ void parse_tounicode_cmap(PdfDoc& doc, const PdfObj& tu_obj, PdfFont& font) {
             std::string dst_hex = extract_hex(cmap, s2 + 1, e2);
 
             uint32_t src = parse_hex(src_hex);
-            if (dst_hex.size() <= 4) {
-                font.to_unicode[src] = parse_hex(dst_hex);
-            } else {
-                // Multi-byte: decode as UTF-16BE sequence, store first char
-                uint32_t u = parse_hex(dst_hex.substr(0, 4));
-                font.to_unicode[src] = u;
-            }
+            font.to_unicode[src] = parse_unicode(dst_hex);
             cp = e2 + 1;
         }
         p = ebc + 9;
@@ -1060,7 +1079,7 @@ void parse_tounicode_cmap(PdfDoc& doc, const PdfObj& tu_obj, PdfFont& font) {
                     auto ae = cmap.find('>', as);
                     if (ae >= arr_end) break;
                     std::string dh = extract_hex(cmap, as + 1, ae);
-                    font.to_unicode[code] = parse_hex(dh);
+                    font.to_unicode[code] = parse_unicode(dh);
                     code++;
                     ap = ae + 1;
                 }
@@ -1071,7 +1090,7 @@ void parse_tounicode_cmap(PdfDoc& doc, const PdfObj& tu_obj, PdfFont& font) {
                 auto e3 = cmap.find('>', s3);
                 if (e3 >= ebr) break;
                 std::string dst_hex = extract_hex(cmap, s3 + 1, e3);
-                uint32_t dst = parse_hex(dst_hex);
+                uint32_t dst = parse_unicode(dst_hex);
                 for (uint32_t code = lo; code <= hi; code++)
                     font.to_unicode[code] = dst + (code - lo);
                 cp = e3 + 1;

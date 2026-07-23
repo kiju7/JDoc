@@ -7,12 +7,13 @@
 #include "jdoc/hwp_types.h"
 #include "legacy/hwp3_parser.h"
 #include "legacy/ole_reader.h"
+#include "common/emf_text.h"
 #include "common/file_utils.h"
 #include "common/image_utils.h"
+#include "common/inflate.h"
 #include "common/media_cache.h"
 #include "common/png_encode.h"
 #include "common/string_utils.h"
-#include <zlib.h>
 #include <algorithm>
 #include <map>
 #include <sstream>
@@ -23,37 +24,12 @@
 
 namespace jdoc {
 
-// ── Zlib decompression ──────────────────────────────────────
+// ── Decompression ──────────────────────────────────────────
 
+// HWP sections are raw DEFLATE (no zlib/gzip wrapper). libdeflate decodes the
+// whole section in one call; the 4x hint sizes the first output guess.
 static std::vector<uint8_t> decompress(const uint8_t* data, size_t len) {
-    // HWP uses raw deflate (no header)
-    std::vector<uint8_t> output;
-    output.resize(len * 4);  // initial guess
-
-    z_stream strm = {};
-    if (inflateInit2(&strm, -MAX_WBITS) != Z_OK) return {};
-
-    strm.next_in = const_cast<uint8_t*>(data);
-    strm.avail_in = len;
-
-    int ret;
-    do {
-        if (strm.total_out >= output.size()) {
-            output.resize(output.size() * 2);
-        }
-        strm.next_out = output.data() + strm.total_out;
-        strm.avail_out = output.size() - strm.total_out;
-        ret = inflate(&strm, Z_NO_FLUSH);
-        if (ret == Z_MEM_ERROR || ret == Z_DATA_ERROR) {
-            inflateEnd(&strm);
-            return {};
-        }
-    } while (ret != Z_STREAM_END);
-
-    output.resize(strm.total_out);
-    output.shrink_to_fit();
-    inflateEnd(&strm);
-    return output;
+    return inflate_raw(data, len, len * 4);
 }
 
 // ── OLE stream reading helper ──────────────────────────────
@@ -176,9 +152,22 @@ public:
         return true;
     }
 
+    // Eager collection is a thin wrapper over the streaming primitive, so the
+    // two can never diverge (single source of truth). Plaintext stripping is
+    // applied by the caller for the eager path, so pass false here.
     std::vector<PageChunk> convert_chunks() {
         std::vector<PageChunk> chunks;
+        convert_chunks_stream(false, [&](PageChunk&& c) {
+            chunks.push_back(std::move(c));
+            return true;
+        });
+        return chunks;
+    }
 
+    // Streaming primitive: parse one BodyText section, emit it, free its raw
+    // bytes, then move to the next — so peak memory tracks a single section
+    // rather than the whole document.
+    void convert_chunks_stream(bool plaintext, const PageSink& sink) {
         for (int i = 0; i < (int)section_data_.size(); i++) {
             if (!opts_.pages.empty()) {
                 bool found = false;
@@ -197,11 +186,11 @@ public:
             parse_section(i, chunk);
             section_data_[i].clear();
             section_data_[i].shrink_to_fit();
-            chunks.push_back(std::move(chunk));
+            if (plaintext) chunk.text = util::strip_markdown(chunk.text);
+            if (!sink(std::move(chunk))) { release_storage(); return; }
         }
 
         release_storage();
-        return chunks;
     }
 
     void release_storage() {
@@ -850,10 +839,7 @@ private:
 
             // Append text
             std::string txt;
-            for (auto ch : cpara.text) {
-                if (!is_hwp_printable(ch)) continue;
-                util::append_utf8(txt, ch);
-            }
+            append_hwp_text(txt, cpara.text, 0, cpara.text.size());
             txt = util::trim(txt);
             if (!txt.empty()) {
                 if (!out.empty() && out.back() != '\x02')
@@ -1099,6 +1085,27 @@ private:
         if (ch >= 0x0100 && ch <= 0x02FF) return false;
         if (ch >= 0x0500 && ch <= 0x0FFF) return false;
         return true;
+    }
+
+    static void append_hwp_text(std::string& out,
+                                const std::u16string& text,
+                                size_t begin, size_t end) {
+        end = std::min(end, text.size());
+        for (size_t i = begin; i < end; ++i) {
+            const uint32_t high = text[i];
+            if (high >= 0xD800 && high <= 0xDBFF && i + 1 < end) {
+                const uint32_t low = text[i + 1];
+                if (low >= 0xDC00 && low <= 0xDFFF) {
+                    const uint32_t codepoint =
+                        0x10000 + ((high - 0xD800) << 10) + (low - 0xDC00);
+                    util::append_utf8(out, codepoint);
+                    ++i;
+                    continue;
+                }
+            }
+            if (is_hwp_printable(static_cast<char16_t>(high)))
+                util::append_utf8(out, high);
+        }
     }
 
     void parse_para_text(const uint8_t* data, uint32_t size, HWPParagraph& para) {
@@ -1354,7 +1361,8 @@ private:
                 std::string name_ext = entry->name.substr(dot + 1);
                 for (auto& c : name_ext) c = std::tolower(c);
                 if (name_ext == "png" || name_ext == "jpg" || name_ext == "jpeg" ||
-                    name_ext == "gif" || name_ext == "bmp" || name_ext == "emf")
+                    name_ext == "gif" || name_ext == "bmp" || name_ext == "emf" ||
+                    name_ext == "wmf")
                     ext = name_ext;
             }
         }
@@ -1387,6 +1395,13 @@ private:
             image_data.data(), image_data.size());
         if (!actual_fmt.empty()) ext = actual_fmt;
 
+        // EMF/WMF are vector metafiles: recover any text drawn inside so it is
+        // not lost to the raster-only image path.
+        std::string meta_text;
+        if (ext == "emf" || ext == "wmf")
+            meta_text = metafile_extract_text(ext.c_str(), image_data.data(),
+                                              image_data.size());
+
         filename = unified + "." + (ext == "jpeg" ? "jpg" : ext);
         std::string saved_path;
         if (!opts_.image_dir.empty()) {
@@ -1403,6 +1418,7 @@ private:
         idata.name = unified;
         idata.format = ext;
         idata.saved_path = saved_path;
+        idata.embedded_text = meta_text;
         if (opts_.image_dir.empty()) {
             idata.data.assign(reinterpret_cast<const char*>(image_data.data()),
                               reinterpret_cast<const char*>(image_data.data()) + image_data.size());
@@ -1412,7 +1428,10 @@ private:
 
         image_idx++;
 
-        return "![" + unified + "](" + opts_.image_ref_prefix + filename + ")\n\n";
+        std::string out = "![" + unified + "](" + opts_.image_ref_prefix +
+                          filename + ")\n\n";
+        if (!meta_text.empty()) out += meta_text + "\n\n";
+        return out;
     }
 
     // ── Paragraph to Markdown ───────────────────────────────
@@ -1467,11 +1486,7 @@ private:
 
         if (para.char_shapes.empty()) {
             FormattedSpan span;
-            for (size_t i = 0; i < para.text.size(); i++) {
-                char16_t ch = para.text[i];
-                if (!is_hwp_printable(ch)) continue;
-                util::append_utf8(span.text, ch);
-            }
+            append_hwp_text(span.text, para.text, 0, para.text.size());
             spans.push_back(std::move(span));
         } else {
             for (size_t si = 0; si < para.char_shapes.size(); si++) {
@@ -1490,11 +1505,7 @@ private:
                     size_counts[cs.height]++;
                 }
 
-                for (uint32_t pos = start; pos < end && pos < para.text.size(); pos++) {
-                    char16_t ch = para.text[pos];
-                    if (!is_hwp_printable(ch)) continue;
-                    util::append_utf8(span.text, ch);
-                }
+                append_hwp_text(span.text, para.text, start, end);
 
                 if (!span.text.empty()) {
                     spans.push_back(std::move(span));
@@ -1619,6 +1630,44 @@ std::vector<PageChunk> hwp_to_markdown_chunks(const std::string& hwp_path,
             chunk.text = util::strip_markdown(chunk.text);
     }
     return chunks;
+}
+
+void hwp_to_markdown_chunks_stream(const std::string& hwp_path,
+                                   const ConvertOptions& opts_in, const PageSink& sink) {
+    ConvertOptions opts = opts_in;
+    opts.page_chunks = true;
+    bool plaintext = (opts.format == OutputFormat::PLAINTEXT);
+    if (file_is_hwp3(hwp_path)) {
+        // Legacy HWP3 is a single chunk — collect and emit once.
+        Hwp3Parser parser(hwp_path);
+        for (auto& chunk : parser.to_chunks(opts)) {
+            if (plaintext) chunk.text = util::strip_markdown(chunk.text);
+            if (!sink(std::move(chunk))) return;
+        }
+        return;
+    }
+    HWPParser parser(hwp_path, opts);
+    parser.parse();
+    parser.convert_chunks_stream(plaintext, sink);
+}
+
+void hwp_to_markdown_chunks_mem_stream(const uint8_t* data, size_t size,
+                                       const ConvertOptions& opts_in,
+                                       const PageSink& sink) {
+    ConvertOptions opts = opts_in;
+    opts.page_chunks = true;
+    bool plaintext = (opts.format == OutputFormat::PLAINTEXT);
+    if (is_hwp3_signature(data, size)) {
+        Hwp3Parser parser(data, size);
+        for (auto& chunk : parser.to_chunks(opts)) {
+            if (plaintext) chunk.text = util::strip_markdown(chunk.text);
+            if (!sink(std::move(chunk))) return;
+        }
+        return;
+    }
+    HWPParser parser(data, size, opts);
+    parser.parse();
+    parser.convert_chunks_stream(plaintext, sink);
 }
 
 } // namespace jdoc

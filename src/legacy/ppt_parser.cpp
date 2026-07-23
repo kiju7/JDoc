@@ -3,6 +3,7 @@
 // record type (0x3EE=slide, 0x3F8=master, 0x3F0=notes) → extract text per slide.
 
 #include "ppt_parser.h"
+#include "common/emf_text.h"
 #include "common/string_utils.h"
 #include "common/binary_utils.h"
 #include "common/file_utils.h"
@@ -88,7 +89,7 @@ static std::string decode_text_bytes(const char* data, size_t len) {
             if (ch == 0x0D && i + 1 < len &&
                 static_cast<uint8_t>(data[i + 1]) == 0x0A) ++i;  // CRLF
         } else if (ch >= 0x20 || ch == '\t' || ch == '\n') {
-            text += util::cp1252_to_utf8(ch);
+            util::append_cp1252(text, ch);
         }
     }
     return text;
@@ -666,6 +667,12 @@ std::vector<ImageData> PptParser::extract_images(unsigned min_image_size) {
                 img.name = "page1_img" + std::to_string(img_idx++);
                 img.format = fmt;
                 img.data = std::move(img_data);
+                // Metafile text: img.data is the decompressed EMF/WMF stream.
+                if (is_metafile && (fmt == "emf" || fmt == "wmf"))
+                    img.embedded_text = metafile_extract_text(
+                        fmt.c_str(),
+                        reinterpret_cast<const uint8_t*>(img.data.data()),
+                        img.data.size());
                 util::populate_image_dimensions(img);
                 if (util::is_image_too_small(img, min_image_size)) {
                     --img_idx;
@@ -720,6 +727,8 @@ std::string PptParser::to_markdown(const ConvertOptions& opts) {
                     md += "![" + filename + "](" + opts.image_ref_prefix + filename + ")\n\n";
                 else
                     md += "![" + filename + "](" + filename + ")\n\n";
+                if (!img.embedded_text.empty())
+                    md += img.embedded_text + "\n\n";
             }
         }
     }
@@ -765,6 +774,8 @@ std::vector<PageChunk> PptParser::to_chunks(const ConvertOptions& opts) {
                     slide_md += "![" + filename + "](" + opts.image_ref_prefix + filename + ")\n\n";
                 else
                     slide_md += "![" + filename + "](" + filename + ")\n\n";
+                if (!img.embedded_text.empty())
+                    slide_md += img.embedded_text + "\n\n";
                 chunk.images.push_back(img);
             }
         }

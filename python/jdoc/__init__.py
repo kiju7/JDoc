@@ -26,16 +26,21 @@ from _jdoc import (
     # Enums
     OutputFormat,
     DocFormat,
+    FormatCategory,
     # Data classes
     ImageData,
     PageChunk,
     ConvertOptions,
+    FormatInfo,
     # High-level API
     convert,
     convert_pages,
+    convert_pages_stream,
     convert_archive,
     convert_bytes,
     is_archive,
+    detect,
+    detect_bytes,
     MemberResult,
     # Per-format functions
     pdf_to_markdown,
@@ -50,18 +55,23 @@ from _jdoc import (
     format_name,
 )
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 __all__ = [
     "OutputFormat",
     "DocFormat",
+    "FormatCategory",
     "ImageData",
     "PageChunk",
     "ConvertOptions",
+    "FormatInfo",
     "convert",
     "convert_pages",
+    "convert_pages_stream",
     "convert_archive",
     "convert_bytes",
     "is_archive",
+    "detect",
+    "detect_bytes",
     "MemberResult",
     "pdf_to_markdown",
     "pdf_to_markdown_chunks",

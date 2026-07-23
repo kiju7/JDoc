@@ -2,6 +2,7 @@
 #include "pdf_extract.h"
 #include "common/string_utils.h"
 #include "common/file_utils.h"
+#include "common/mapped_file.h"
 #include <fstream>
 #include <algorithm>
 #include <cassert>
@@ -127,11 +128,8 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
         page_indices = opts.pages;
     }
 
-    // Always extract images for markdown references; only save to disk if dir is set
     std::string image_dir;
-    ConvertOptions img_opts = opts;
-    img_opts.images = true;
-    if (!opts.image_dir.empty()) {
+    if (opts.images && !opts.image_dir.empty()) {
         image_dir = opts.image_dir;
         util::ensure_dir(image_dir);
     }
@@ -168,7 +166,7 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
                 has_fonts = fd.is_dict() && !fd.dict.empty();
             }
         }
-        if (!has_fonts && !img_opts.images) continue;
+        if (!has_fonts && !opts.images) continue;
 
         // Parse content stream
         auto content_data = get_page_content(doc, page_obj);
@@ -177,7 +175,7 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
         // Extract text lines
         bool plaintext = (opts.format == OutputFormat::PLAINTEXT);
         bool need_tables = opts.tables && !plaintext;
-        bool need_graphics = need_tables || img_opts.images;
+        bool need_graphics = need_tables || opts.images;
 
         auto parse_result = parse_content_stream(doc, content_data, resources, page_h,
                                                   &font_cache, !need_graphics);
@@ -200,7 +198,7 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
         }
 
         // Image extraction
-        if (img_opts.images) {
+        if (opts.images) {
             // Check for layered page
             bool has_regular = false, has_mask = false;
             for (auto& ip : parse_result.images) {
@@ -285,19 +283,15 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
 }
 
 static ExtractResult extract_pdf(const std::string& pdf_path, const ConvertOptions& opts) {
-    std::ifstream file(pdf_path, std::ios::binary | std::ios::ate);
-    if (!file) throw std::runtime_error("Cannot open PDF: " + pdf_path);
+    // Map the file read-only: the parser treats its input as const (the
+    // convert_bytes path already feeds it read-only buffers), so mapping avoids
+    // a whole-file heap allocation and the read() copy. Falls back to a heap
+    // read when mapping is unavailable.
+    MappedFile mf(pdf_path);
+    if (!mf.valid()) throw std::runtime_error("Cannot open PDF: " + pdf_path);
+    if (mf.size() == 0) throw std::runtime_error("Empty PDF file: " + pdf_path);
 
-    std::streamsize fsize = file.tellg();
-    if (fsize <= 0) throw std::runtime_error("Empty PDF file: " + pdf_path);
-    file.seekg(0, std::ios::beg);
-
-    std::vector<uint8_t> file_data(static_cast<size_t>(fsize));
-    if (!file.read(reinterpret_cast<char*>(file_data.data()), fsize))
-        throw std::runtime_error("Cannot read PDF: " + pdf_path);
-    file.close();
-
-    return extract_pdf_buffer(file_data.data(), file_data.size(), pdf_path, opts);
+    return extract_pdf_buffer(mf.data(), mf.size(), pdf_path, opts);
 }
 
 
@@ -327,5 +321,32 @@ std::vector<PageChunk> pdf_to_markdown_chunks_mem(const uint8_t* data, size_t si
                                                   ConvertOptions opts) {
     auto r = extract_pdf_buffer(data, size, "<memory>", opts);
     return result_to_chunks(r, opts);
+}
+
+void pdf_to_markdown_chunks_stream(const std::string& pdf_path,
+                                   const ConvertOptions& opts, const PageSink& sink) {
+    // Shared document setup (xref, fonts, page tree) is parsed once inside
+    // extract_pdf; the per-page emit loop then streams, releasing each page's
+    // buffers as the consumer advances (stream_result_chunks).
+    //
+    // NOTE — PDF is a deliberate exception to producer-side peak-memory
+    // reduction. Markdown heading detection needs the document-wide modal body
+    // font size, which is only known after every page's text lines are parsed
+    // (FontStats::compute over all_lines). Deferring image decode to a second
+    // pass to shrink producer peak would force either a content re-parse
+    // (throughput regression on text-heavy PDFs) or retaining every page's
+    // parse result (memory regression on vector-heavy PDFs) — both violate the
+    // "no regression" requirement. So the streaming win here is consumer-side:
+    // the sink owns and frees one page at a time. Producer peak is bounded by
+    // image_dir (its existing per-page disk flush) when set. Output is
+    // byte-identical to pdf_to_markdown_chunks.
+    auto r = extract_pdf(pdf_path, opts);
+    stream_result_chunks(r, opts, sink);
+}
+
+void pdf_to_markdown_chunks_mem_stream(const uint8_t* data, size_t size,
+                                       const ConvertOptions& opts, const PageSink& sink) {
+    auto r = extract_pdf_buffer(data, size, "<memory>", opts);
+    stream_result_chunks(r, opts, sink);
 }
 } // namespace jdoc

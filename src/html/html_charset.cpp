@@ -138,7 +138,7 @@ std::string to_utf8(const char* data, size_t size, Charset cs) {
                 if (c < 0x80)
                     out.push_back(static_cast<char>(c));
                 else
-                    out += util::cp1252_to_utf8(c);
+                    util::append_cp1252(out, c);
             }
             return out;
         }

@@ -1,0 +1,37 @@
+plugins {
+    id 'java-library'
+}
+
+group = 'com.jiran'
+version = '1.0.0'
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    api 'net.java.dev.jna:jna:5.14.0'
+
+    testImplementation 'org.junit.jupiter:junit-jupiter:5.10.2'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+}
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(11)
+    }
+}
+
+test {
+    useJUnitPlatform()
+
+    // Locate libjdoc: default to the CMake build dir at the repo root, override
+    // with -Djna.library.path=<dir> or the JDOC_LIB_DIR env var.
+    def libDir = System.getProperty('jna.library.path') ?:
+                 System.getenv('JDOC_LIB_DIR') ?:
+                 "${rootDir}/../../build"
+    systemProperty 'jna.library.path', libDir
+    // macOS: the loader also needs the dylib's directory.
+    environment 'DYLD_LIBRARY_PATH', libDir
+    environment 'LD_LIBRARY_PATH', libDir
+}

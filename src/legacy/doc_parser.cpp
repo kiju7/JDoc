@@ -4,8 +4,10 @@
 #include "doc_parser.h"
 #include "common/string_utils.h"
 #include "common/binary_utils.h"
+#include "common/emf_text.h"
 #include "common/file_utils.h"
 #include "common/image_utils.h"
+#include "common/inflate.h"
 #include "common/png_encode.h"
 
 #include <algorithm>
@@ -176,6 +178,8 @@ static std::string replace_image_markers(const std::string& md,
                 const auto& img = images[img_idx];
                 std::string fn = img.name + "." + img.format;
                 result += "\n![" + fn + "](" + prefix + fn + ")\n";
+                if (!img.embedded_text.empty())
+                    result += img.embedded_text + "\n";
             }
             img_idx++;
             i += 2;
@@ -187,6 +191,8 @@ static std::string replace_image_markers(const std::string& md,
         const auto& img = images[img_idx];
         std::string fn = img.name + "." + img.format;
         result += "\n![" + fn + "](" + fn + ")\n";
+        if (!img.embedded_text.empty())
+            result += img.embedded_text + "\n";
     }
     return result;
 }
@@ -736,13 +742,13 @@ std::string DocParser::extract_text_word6(const std::vector<char>& word_doc,
         // DBCS: check for lead byte.
         if (is_korean && util::is_cp949_lead(ch) && pos + 1 < end) {
             uint8_t trail = static_cast<uint8_t>(word_doc[pos + 1]);
-            result += util::cp949_to_utf8(ch, trail);
+            util::append_cp949(result, ch, trail);
             pos += 2;
             continue;
         }
         if (is_japanese && util::is_cp932_lead(ch) && pos + 1 < end) {
             uint8_t trail = static_cast<uint8_t>(word_doc[pos + 1]);
-            result += util::cp932_to_utf8(ch, trail);
+            util::append_cp932(result, ch, trail);
             pos += 2;
             continue;
         }
@@ -922,7 +928,7 @@ std::string DocParser::extract_text_word8(const std::vector<char>& word_doc,
                 if (is_korean && util::is_cp949_lead(ch) && pos + 1 < end) {
                     update_bold(fc_base + local_off);
                     uint8_t trail = static_cast<uint8_t>(word_doc[pos + 1]);
-                    result += util::cp949_to_utf8(ch, trail);
+                    util::append_cp949(result, ch, trail);
                     pos += 2;
                     local_off += 2;
                     continue;
@@ -930,7 +936,7 @@ std::string DocParser::extract_text_word8(const std::vector<char>& word_doc,
                 if (is_japanese && util::is_cp932_lead(ch) && pos + 1 < end) {
                     update_bold(fc_base + local_off);
                     uint8_t trail = static_cast<uint8_t>(word_doc[pos + 1]);
-                    result += util::cp932_to_utf8(ch, trail);
+                    util::append_cp932(result, ch, trail);
                     pos += 2;
                     local_off += 2;
                     continue;
@@ -1116,6 +1122,12 @@ std::string DocParser::text_to_markdown(const std::string& raw_text) {
 
     for (size_t i = 0; i < lines.size(); ++i) {
         std::string_view ln = lines[i];
+
+        // Word terminates even a one-cell row with a cell mark. It is useful
+        // between cells, but at the end of a line it has no text meaning and
+        // must not leak into the UTF-8 output as the U+001F control character.
+        while (!ln.empty() && ln.back() == '\x1F')
+            ln.remove_suffix(1);
 
         // Limit consecutive empty lines to 1
         if (ln.empty()) {
@@ -1321,6 +1333,23 @@ std::vector<ImageData> DocParser::extract_images(unsigned min_image_size) {
     if (stream.empty()) return images;
 
     int img_idx = 0;
+
+    // EMF/WMF metafiles carry text; recover it. The Data-stream BLIP path holds
+    // zlib-compressed bytes, the WordDocument scan holds raw bytes — try raw
+    // first, then inflate. emf_extract_text validates the header, so a wrong
+    // guess yields no text rather than garbage.
+    auto fill_metafile_text = [](ImageData& img) {
+        if (img.format != "emf" && img.format != "wmf") return;
+        const uint8_t* p = reinterpret_cast<const uint8_t*>(img.data.data());
+        std::string t = metafile_extract_text(img.format.c_str(), p, img.data.size());
+        if (t.empty()) {
+            auto dec = inflate_zlib(p, img.data.size(), img.data.size() * 10);
+            if (!dec.empty())
+                t = metafile_extract_text(img.format.c_str(), dec.data(), dec.size());
+        }
+        img.embedded_text = std::move(t);
+    };
+
     size_t pos = 0;
     while (pos + 8 < stream.size()) {
         std::string fmt = detect_image_format(stream.data() + pos, stream.size() - pos);
@@ -1348,6 +1377,7 @@ std::vector<ImageData> DocParser::extract_images(unsigned min_image_size) {
             img.name = "page1_img" + std::to_string(img_idx++);
             img.format = fmt;
             img.data.assign(stream.begin() + img_start, stream.begin() + img_end);
+            fill_metafile_text(img);
             util::populate_image_dimensions(img);
             if (util::is_image_too_small(img, min_image_size)) {
                 --img_idx;
@@ -1405,6 +1435,7 @@ std::vector<ImageData> DocParser::extract_images(unsigned min_image_size) {
             img.name = "page1_img" + std::to_string(img_idx++);
             img.format = fmt;
             img.data.assign(data.begin() + img_start, data.begin() + img_start + img_size);
+            fill_metafile_text(img);
             util::populate_image_dimensions(img);
             if (util::is_image_too_small(img, min_image_size)) {
                 --img_idx;
@@ -1484,8 +1515,28 @@ std::vector<PageChunk> DocParser::to_chunks(const ConvertOptions& opts) {
     std::string raw = extract_text();
     chunk.text = strip_image_markers(text_to_markdown(raw));
 
+    // Recover metafile (EMF/WMF) text regardless of image extraction, since it
+    // is document content; only attach the images themselves when requested.
+    auto images = extract_images(opts.min_image_size);
+    for (const auto& img : images)
+        if (!img.embedded_text.empty())
+            chunk.text += "\n\n" + img.embedded_text;
     if (opts.images) {
-        chunk.images = extract_images(opts.min_image_size);
+        // When an image_dir is set, write each image to disk and drop the bytes
+        // (matching to_markdown() and the OOXML parsers). Without it the encoded
+        // bytes stay on the chunk for in-memory consumers.
+        if (!opts.image_dir.empty()) {
+            for (auto& img : images) {
+                img.saved_path = util::save_image_to_file(
+                    opts.image_dir, img.name, img.format,
+                    img.data.data(), img.data.size());
+                if (!img.saved_path.empty()) {
+                    img.data.clear();
+                    img.data.shrink_to_fit();
+                }
+            }
+        }
+        chunk.images = std::move(images);
     }
 
     chunk.page_width = 612.0;

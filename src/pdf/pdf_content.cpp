@@ -145,6 +145,96 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
         return false;
     };
 
+    // Show one text string: decode codes, map to Unicode, advance the text
+    // matrix and emit a TextChar per rendered glyph. Shared by Tj/'/" and by
+    // each string element of TJ (TJ handles its numeric adjustments itself), so
+    // the two show paths cannot drift apart. Rotated glyphs advance but are not
+    // emitted; unmappable/PUA glyphs are skipped without advancing (matching the
+    // original per-operator loops).
+    auto show_text_string = [&](GfxState& gs, const std::string& s) {
+        double fs = gs.font_size;
+        double h_scale = gs.h_scaling / 100.0;
+        double gw_scale = (gs.font && gs.font->is_type3) ? gs.font->glyph_space_scale : 0.001;
+        bool use_2byte = gs.font && (gs.font->is_identity || gs.font->is_type0);
+        if (gs.font && gs.font->cmap_code_bytes == 1) use_2byte = false;
+        if (gs.font && gs.font->cmap_code_bytes == 2) use_2byte = true;
+
+        size_t i = 0;
+        while (i < s.size()) {
+            uint32_t code;
+            if (use_2byte && i + 1 < s.size()) {
+                code = (static_cast<uint8_t>(s[i]) << 8) | static_cast<uint8_t>(s[i + 1]);
+                i += 2;
+            } else {
+                code = static_cast<uint8_t>(s[i]);
+                i++;
+            }
+
+            uint32_t unicode = gs.font ? gs.font->decode_char(code) : code;
+            if (unicode == 0 || unicode == 0xFFFD) continue;
+            // Private-use glyphs have no portable text value. Skip Unicode
+            // noncharacters too, but retain valid supplementary characters
+            // such as mathematical alphanumerics above U+FFFF.
+            const bool private_use =
+                (unicode >= 0xE000 && unicode <= 0xF8FF) ||
+                (unicode >= 0xF0000 && unicode <= 0xFFFFD) ||
+                (unicode >= 0x100000 && unicode <= 0x10FFFD);
+            const bool noncharacter =
+                (unicode >= 0xFDD0 && unicode <= 0xFDEF) ||
+                ((unicode & 0xFFFF) >= 0xFFFE);
+            if (private_use || noncharacter) continue;
+
+            // Rendering matrix from the pre-advance text matrix.
+            double trm[6];
+            double scale_mat[6] = {fs * h_scale, 0, 0, fs, 0, gs.text_rise};
+            mat_multiply(trm, scale_mat, gs.text_mat);
+            double final_mat[6];
+            mat_multiply(final_mat, trm, gs.ctm);
+
+            double glyph_w = gs.font ? gs.font->get_width(code) : 0;
+            if (glyph_w <= 0) glyph_w = (gs.font && (gs.font->is_identity || gs.font->is_type0)) ? 1000 : 600;
+            double char_w_ts = glyph_w * gw_scale * fs * h_scale;
+            double advance = char_w_ts + gs.char_spacing;
+            if (unicode == ' ') advance += gs.word_spacing;
+
+            // Skip rotated text (vertical direction dominates) but still advance.
+            if (std::abs(final_mat[1]) > std::abs(final_mat[0]) * 2) {
+                gs.text_mat[4] += advance * gs.text_mat[0];
+                gs.text_mat[5] += advance * gs.text_mat[1];
+                continue;
+            }
+
+            double gx, gy;
+            transform_point(final_mat, 0, 0, gx, gy);
+            double char_h = std::abs(final_mat[3]);
+            if (char_h < 1) char_h = std::abs(final_mat[0]);
+
+            // Advance first; the right edge is the next glyph's origin.
+            gs.text_mat[4] += advance * gs.text_mat[0];
+            gs.text_mat[5] += advance * gs.text_mat[1];
+            double next_gx, next_gy;
+            {
+                double next_mat[6];
+                mat_multiply(next_mat, gs.text_mat, gs.ctm);
+                transform_point(next_mat, 0, 0, next_gx, next_gy);
+            }
+
+            TextChar tc;
+            tc.x = gx;
+            tc.y = gy;
+            tc.left = gx;
+            tc.right = next_gx;
+            tc.top = gy + char_h * 0.8;
+            tc.bot = gy - char_h * 0.2;
+            tc.font_size = char_h;
+            tc.unicode = unicode;
+            tc.is_bold = (gs.font && gs.font->is_bold) ||
+                         gs.render_mode == 2 || gs.render_mode == 6;
+            tc.is_italic = gs.font ? gs.font->is_italic : false;
+            result.chars.push_back(tc);
+        }
+    };
+
     while (lex.pos < lex.len) {
         lex.skip_ws();
         if (lex.pos >= lex.len) break;
@@ -346,174 +436,19 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
                 }
 
                 if (!operands.empty() && operands.back().is_str()) {
-                    auto& s = operands.back().str_val;
-                    double fs = gs.font_size;
-                    double h_scale = gs.h_scaling / 100.0;
-                    double gw_scale = (gs.font && gs.font->is_type3) ? gs.font->glyph_space_scale : 0.001;
-
-                    bool use_2byte = gs.font && (gs.font->is_identity || gs.font->is_type0);
-                    if (gs.font && gs.font->cmap_code_bytes == 1) use_2byte = false;
-                    if (gs.font && gs.font->cmap_code_bytes == 2) use_2byte = true;
-                    size_t i = 0;
-                    while (i < s.size()) {
-                        uint32_t code;
-                        if (use_2byte && i + 1 < s.size()) {
-                            code = (static_cast<uint8_t>(s[i]) << 8) | static_cast<uint8_t>(s[i + 1]);
-                            i += 2;
-                        } else {
-                            code = static_cast<uint8_t>(s[i]);
-                            i++;
-                        }
-
-                        uint32_t unicode = gs.font ? gs.font->decode_char(code) : code;
-                        if (unicode == 0 || unicode == 0xFFFD) continue;
-                        // Private Use Area: unmappable glyphs (e.g. HWP equation fonts) — no text value
-                        if ((unicode >= 0xE000 && unicode <= 0xF8FF) || unicode >= 0xFFFE) continue;
-
-                        // Recompute rendering matrix for each char (text_mat changes with advances)
-                        double trm[6];
-                        double scale_mat[6] = {fs * h_scale, 0, 0, fs, 0, gs.text_rise};
-                        mat_multiply(trm, scale_mat, gs.text_mat);
-                        double final_mat[6];
-                        mat_multiply(final_mat, trm, gs.ctm);
-
-                        // Skip rotated text (vertical > horizontal direction)
-                        if (std::abs(final_mat[1]) > std::abs(final_mat[0]) * 2) {
-                            double glyph_w_skip = gs.font ? gs.font->get_width(code) : 0;
-                            if (glyph_w_skip <= 0) glyph_w_skip = 600;
-                            double adv = glyph_w_skip * gw_scale * fs * h_scale + gs.char_spacing;
-                            if (unicode == ' ') adv += gs.word_spacing;
-                            gs.text_mat[4] += adv * gs.text_mat[0];
-                            gs.text_mat[5] += adv * gs.text_mat[1];
-                            continue;
-                        }
-
-                        double gx, gy;
-                        transform_point(final_mat, 0, 0, gx, gy);
-
-                        double glyph_w = gs.font ? gs.font->get_width(code) : 0;
-                        if (glyph_w <= 0) glyph_w = (gs.font && (gs.font->is_identity || gs.font->is_type0)) ? 1000 : 600;
-                        // char_w in text space (used for text matrix advance)
-                        double char_w_ts = glyph_w * gw_scale * fs * h_scale;
-                        // char_w in page space (for bounding box)
-                        double gx2, gy2;
-                        transform_point(final_mat, glyph_w * gw_scale, 0, gx2, gy2);
-                        double char_w = std::abs(gx2 - gx);
-                        if (char_w < 0.1) char_w = std::abs(final_mat[0]) * glyph_w * gw_scale;
-                        double char_h = std::abs(final_mat[3]);
-                        if (char_h < 1) char_h = std::abs(final_mat[0]);
-
-                        // Advance text position first, then compute right edge
-                        double advance = char_w_ts + gs.char_spacing;
-                        if (unicode == ' ') advance += gs.word_spacing;
-                        gs.text_mat[4] += advance * gs.text_mat[0];
-                        gs.text_mat[5] += advance * gs.text_mat[1];
-
-                        // Right edge = next char position (from advanced text matrix)
-                        double next_gx, next_gy;
-                        {
-                            double next_mat[6];
-                            mat_multiply(next_mat, gs.text_mat, gs.ctm);
-                            transform_point(next_mat, 0, 0, next_gx, next_gy);
-                        }
-
-                        TextChar tc;
-                        tc.x = gx;
-                        tc.y = gy;
-                        tc.left = gx;
-                        tc.right = next_gx;
-                        tc.top = gy + char_h * 0.8;
-                        tc.bot = gy - char_h * 0.2;
-                        tc.font_size = char_h;
-                        tc.unicode = unicode;
-                        tc.is_bold = (gs.font && gs.font->is_bold) ||
-                                     gs.render_mode == 2 || gs.render_mode == 6;
-                        tc.is_italic = gs.font ? gs.font->is_italic : false;
-                        result.chars.push_back(tc);
-                    }
+                    show_text_string(gs, operands.back().str_val);
                 }
             } else if (tok_eq("TJ")) {
                 if (!operands.empty() && operands.back().is_arr()) {
-                    auto& arr = operands.back().arr;
                     double fs = gs.font_size;
                     double h_scale = gs.h_scaling / 100.0;
-                    double gw_scale = (gs.font && gs.font->is_type3) ? gs.font->glyph_space_scale : 0.001;
-                    bool use_2byte = gs.font && (gs.font->is_identity || gs.font->is_type0);
-                    if (gs.font && gs.font->cmap_code_bytes == 1) use_2byte = false;
-                    if (gs.font && gs.font->cmap_code_bytes == 2) use_2byte = true;
-
-                    for (auto& elem : arr) {
+                    for (auto& elem : operands.back().arr) {
                         if (elem.is_num()) {
-                            double adjust = elem.as_num();
-                            double shift = -adjust / 1000.0 * fs * h_scale;
+                            double shift = -elem.as_num() / 1000.0 * fs * h_scale;
                             gs.text_mat[4] += shift * gs.text_mat[0];
                             gs.text_mat[5] += shift * gs.text_mat[1];
                         } else if (elem.is_str()) {
-                            auto& s = elem.str_val;
-                            size_t i = 0;
-                            while (i < s.size()) {
-                                uint32_t code;
-                                if (use_2byte && i + 1 < s.size()) {
-                                    code = (static_cast<uint8_t>(s[i]) << 8) | static_cast<uint8_t>(s[i + 1]);
-                                    i += 2;
-                                } else {
-                                    code = static_cast<uint8_t>(s[i]);
-                                    i++;
-                                }
-
-                                uint32_t unicode = gs.font ? gs.font->decode_char(code) : code;
-                                if (unicode == 0 || unicode == 0xFFFD) continue;
-                                // Private Use Area: unmappable glyphs (e.g. HWP equation fonts) — no text value
-                                if ((unicode >= 0xE000 && unicode <= 0xF8FF) || unicode >= 0xFFFE) continue;
-
-                                double trm[6];
-                                double scale_mat[6] = {fs * h_scale, 0, 0, fs, 0, gs.text_rise};
-                                mat_multiply(trm, scale_mat, gs.text_mat);
-                                double final_mat[6];
-                                mat_multiply(final_mat, trm, gs.ctm);
-
-                                double glyph_w = gs.font ? gs.font->get_width(code) : 0;
-                                if (glyph_w <= 0) glyph_w = (gs.font && (gs.font->is_identity || gs.font->is_type0)) ? 1000 : 600;
-                                double char_w_ts = glyph_w * gw_scale * fs * h_scale;
-
-                                double advance = char_w_ts + gs.char_spacing;
-                                if (unicode == ' ') advance += gs.word_spacing;
-                                gs.text_mat[4] += advance * gs.text_mat[0];
-                                gs.text_mat[5] += advance * gs.text_mat[1];
-
-                                // Skip rotated text (vertical > horizontal direction)
-                                if (std::abs(final_mat[1]) > std::abs(final_mat[0]) * 2)
-                                    continue;
-
-                                double gx, gy;
-                                transform_point(final_mat, 0, 0, gx, gy);
-
-                                double gx2, gy2;
-                                transform_point(final_mat, glyph_w * gw_scale, 0, gx2, gy2);
-                                double char_w = std::abs(gx2 - gx);
-                                if (char_w < 0.1) char_w = std::abs(final_mat[0]) * glyph_w * gw_scale;
-                                double char_h = std::abs(final_mat[3]);
-                                if (char_h < 1) char_h = std::abs(final_mat[0]);
-
-                                double next_gx, next_gy;
-                                {
-                                    double nm[6];
-                                    mat_multiply(nm, gs.text_mat, gs.ctm);
-                                    transform_point(nm, 0, 0, next_gx, next_gy);
-                                }
-
-                                TextChar tc;
-                                tc.x = gx; tc.y = gy;
-                                tc.left = gx; tc.right = next_gx;
-                                tc.top = gy + char_h * 0.8;
-                                tc.bot = gy - char_h * 0.2;
-                                tc.font_size = char_h;
-                                tc.unicode = unicode;
-                                tc.is_bold = (gs.font && gs.font->is_bold) ||
-                                             gs.render_mode == 2 || gs.render_mode == 6;
-                                tc.is_italic = gs.font ? gs.font->is_italic : false;
-                                result.chars.push_back(tc);
-                            }
+                            show_text_string(gs, elem.str_val);
                         }
                     }
                 }

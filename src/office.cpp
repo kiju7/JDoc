@@ -22,6 +22,8 @@
 #include <algorithm>
 #include <memory>
 #include <stdexcept>
+#include <type_traits>
+#include <utility>
 
 namespace jdoc {
 
@@ -489,6 +491,53 @@ std::vector<PageChunk> office_to_markdown_chunks_mem(const uint8_t* data, size_t
     in.data = data;
     in.size = size;
     return to_chunks_impl(detect_office_format_mem(data, size, name_hint), in, opts);
+}
+
+// Detects whether a parser exposes a streaming `to_chunks(opts, sink)`. Parsers
+// whose per-unit loop is genuinely lazy (pptx: parse+resolve per slide) provide
+// it and stream one page at a time; the rest fall back to collect-then-stream
+// (byte-identical, but their setup is already eager so peak is unchanged).
+template <class P, class = void>
+struct has_stream_to_chunks : std::false_type {};
+template <class P>
+struct has_stream_to_chunks<P, std::void_t<decltype(std::declval<P&>().to_chunks(
+        std::declval<const ConvertOptions&>(), std::declval<const PageSink&>()))>>
+    : std::true_type {};
+
+static void to_chunks_stream_impl(DocFormat format, const DocInput& in,
+                                  const ConvertOptions& opts, const PageSink& sink) {
+    bool plaintext = (opts.format == OutputFormat::PLAINTEXT);
+    // Mirror to_chunks_impl's post-hoc plaintext strip, applied per chunk.
+    PageSink emit = [&](PageChunk&& c) {
+        if (plaintext) c.text = util::strip_markdown(c.text);
+        return sink(std::move(c));
+    };
+    with_office_parser(format, in, [&](auto& parser) -> bool {
+        using P = std::decay_t<decltype(parser)>;
+        if constexpr (has_stream_to_chunks<P>::value) {
+            return parser.to_chunks(opts, emit);
+        } else {
+            for (auto& c : parser.to_chunks(opts))
+                if (!emit(std::move(c))) return false;
+            return true;
+        }
+    });
+}
+
+void office_to_markdown_chunks_stream(const std::string& file_path,
+                                      const ConvertOptions& opts, const PageSink& sink) {
+    DocInput in;
+    in.path = &file_path;
+    to_chunks_stream_impl(detect_office_format(file_path), in, opts, sink);
+}
+
+void office_to_markdown_chunks_mem_stream(const uint8_t* data, size_t size,
+                                          const std::string& name_hint,
+                                          const ConvertOptions& opts, const PageSink& sink) {
+    DocInput in;
+    in.data = data;
+    in.size = size;
+    to_chunks_stream_impl(detect_office_format_mem(data, size, name_hint), in, opts, sink);
 }
 
 } // namespace jdoc

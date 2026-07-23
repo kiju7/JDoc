@@ -10,6 +10,8 @@
 #include <sstream>
 #include <algorithm>
 #include <filesystem>
+#include <limits>
+#include <stdexcept>
 
 void print_usage(const char* prog) {
     std::cerr << "Usage: " << prog << " <input_file> [output.md] [options]\n"
@@ -38,9 +40,14 @@ std::vector<int> parse_pages(const std::string& s) {
     std::stringstream ss(s);
     std::string token;
     while (std::getline(ss, token, ',')) {
-        try { pages.push_back(std::stoi(token)); }
-        catch (...) {}
+        size_t parsed = 0;
+        int page = std::stoi(token, &parsed);
+        if (parsed != token.size() || page < 0)
+            throw std::invalid_argument("Invalid page number: " + token);
+        pages.push_back(page);
     }
+    if (pages.empty())
+        throw std::invalid_argument("--pages requires at least one page");
     return pages;
 }
 
@@ -55,67 +62,85 @@ int main(int argc, char* argv[]) {
     jdoc::ConvertOptions opts;
     bool chunk_mode = false;
 
-    for (int i = 1; i < argc; i++) {
-        std::string arg = argv[i];
-        if (arg == "--help" || arg == "-h") {
-            print_usage(argv[0]);
-            return 0;
-        }
-        else if (arg == "--pages" && i + 1 < argc) {
-            opts.pages = parse_pages(argv[++i]);
-        }
-        else if (arg == "--no-tables") {
-            opts.tables = false;
-        }
-        else if (arg == "--chunks") {
-            chunk_mode = true;
-        }
-        else if (arg == "--images" && i + 1 < argc) {
-            opts.images = true;
-            opts.image_dir = argv[++i];
-        }
-        else if (arg == "--min-image-size" && i + 1 < argc) {
-            opts.min_image_size = static_cast<unsigned>(std::stoi(argv[++i]));
-        }
-        else if (arg == "--format" && i + 1 < argc) {
-            std::string f = argv[++i];
-            if (f == "text" || f == "plaintext")
+    try {
+        for (int i = 1; i < argc; i++) {
+            std::string arg = argv[i];
+            auto value = [&]() -> std::string {
+                if (i + 1 >= argc)
+                    throw std::invalid_argument("Missing value for " + arg);
+                return argv[++i];
+            };
+
+            if (arg == "--help" || arg == "-h") {
+                print_usage(argv[0]);
+                return 0;
+            } else if (arg == "--pages") {
+                opts.pages = parse_pages(value());
+            } else if (arg == "--no-tables") {
+                opts.tables = false;
+            } else if (arg == "--chunks") {
+                chunk_mode = true;
+            } else if (arg == "--images") {
+                opts.images = true;
+                opts.image_dir = value();
+            } else if (arg == "--min-image-size") {
+                long long size = std::stoll(value());
+                if (size < 0 ||
+                    static_cast<unsigned long long>(size) >
+                        std::numeric_limits<unsigned>::max())
+                    throw std::invalid_argument("Invalid --min-image-size");
+                opts.min_image_size = static_cast<unsigned>(size);
+            } else if (arg == "--format") {
+                std::string format = value();
+                if (format == "text" || format == "plaintext")
+                    opts.format = jdoc::OutputFormat::PLAINTEXT;
+                else if (format != "markdown")
+                    throw std::invalid_argument("Invalid --format: " + format);
+            } else if (arg == "--plaintext" || arg == "--text") {
                 opts.format = jdoc::OutputFormat::PLAINTEXT;
+            } else if (arg == "--max-depth") {
+                opts.archive.max_depth = std::stoi(value());
+            } else if (arg == "--max-member-mb" ||
+                       arg == "--max-total-mb") {
+                long long mb = std::stoll(value());
+                if (mb > 0 &&
+                    static_cast<unsigned long long>(mb) >
+                        (std::numeric_limits<uint64_t>::max() >> 20))
+                    throw std::invalid_argument("Size is too large for " + arg);
+                uint64_t bytes = mb < 0
+                    ? UINT64_MAX : static_cast<uint64_t>(mb) << 20;
+                if (arg == "--max-member-mb")
+                    opts.archive.max_member_bytes = bytes;
+                else
+                    opts.archive.max_total_bytes = bytes;
+            } else if (arg == "--max-entries") {
+                long long count = std::stoll(value());
+                if (count > UINT32_MAX)
+                    throw std::invalid_argument("Invalid --max-entries");
+                opts.archive.max_entries =
+                    count < 0 ? UINT32_MAX : static_cast<uint32_t>(count);
+            } else if (arg == "--max-ratio") {
+                long long ratio = std::stoll(value());
+                if (ratio > UINT32_MAX)
+                    throw std::invalid_argument("Invalid --max-ratio");
+                opts.archive.max_ratio =
+                    ratio <= 0 ? 0 : static_cast<uint32_t>(ratio);
+            } else if (arg == "--include-unsupported") {
+                opts.archive.include_unsupported = true;
+            } else if (!arg.empty() && arg[0] == '-') {
+                throw std::invalid_argument("Unknown option: " + arg);
+            } else if (input_path.empty()) {
+                input_path = arg;
+            } else if (output_path.empty()) {
+                output_path = arg;
+            } else {
+                throw std::invalid_argument(
+                    "Unexpected positional argument: " + arg);
+            }
         }
-        else if (arg == "--plaintext" || arg == "--text") {  // alias of --format text
-            opts.format = jdoc::OutputFormat::PLAINTEXT;
-        }
-        else if (arg == "--max-depth" && i + 1 < argc) {
-            opts.archive.max_depth = std::stoi(argv[++i]);  // negative = unlimited
-        }
-        else if (arg == "--max-member-mb" && i + 1 < argc) {
-            long long mb = std::stoll(argv[++i]);
-            opts.archive.max_member_bytes =
-                mb < 0 ? UINT64_MAX : static_cast<uint64_t>(mb) << 20;
-        }
-        else if (arg == "--max-total-mb" && i + 1 < argc) {
-            long long mb = std::stoll(argv[++i]);
-            opts.archive.max_total_bytes =
-                mb < 0 ? UINT64_MAX : static_cast<uint64_t>(mb) << 20;
-        }
-        else if (arg == "--max-entries" && i + 1 < argc) {
-            long long n = std::stoll(argv[++i]);
-            opts.archive.max_entries =
-                n < 0 ? UINT32_MAX : static_cast<uint32_t>(n);
-        }
-        else if (arg == "--max-ratio" && i + 1 < argc) {
-            long long n = std::stoll(argv[++i]);
-            opts.archive.max_ratio = n <= 0 ? 0 : static_cast<uint32_t>(n);
-        }
-        else if (arg == "--include-unsupported") {
-            opts.archive.include_unsupported = true;
-        }
-        else if (input_path.empty()) {
-            input_path = arg;
-        }
-        else if (output_path.empty()) {
-            output_path = arg;
-        }
+    } catch (const std::exception& e) {
+        std::cerr << "Error: " << e.what() << "\n";
+        return 1;
     }
 
     if (input_path.empty()) {
@@ -166,12 +191,22 @@ int main(int argc, char* argv[]) {
 
         if (chunk_mode) {
             auto chunks = jdoc::convert_chunks(input_path, opts);
+            std::ofstream ofs;
+            std::ostream* out = &std::cout;
+            if (!output_path.empty()) {
+                ofs.open(output_path);
+                if (!ofs) {
+                    std::cerr << "Error: Cannot write to " << output_path << "\n";
+                    return 1;
+                }
+                out = &ofs;
+            }
 
             for (auto& chunk : chunks) {
-                std::cout << "=== Page " << chunk.page_number
-                          << " (" << chunk.page_width << "x" << chunk.page_height
-                          << ", body=" << chunk.body_font_size << "pt) ===\n";
-                std::cout << chunk.text << "\n\n";
+                *out << "=== Page " << chunk.page_number
+                     << " (" << chunk.page_width << "x" << chunk.page_height
+                     << ", body=" << chunk.body_font_size << "pt) ===\n"
+                     << chunk.text << "\n\n";
                 for (auto& img : chunk.images) {
                     if (!img.saved_path.empty())
                         std::cerr << img.name << " -> " << img.saved_path << "\n";

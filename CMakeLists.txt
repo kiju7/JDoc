@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(jdoc VERSION 1.1.0 LANGUAGES CXX C)
+project(jdoc VERSION 1.2.0 LANGUAGES CXX C)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -9,6 +9,18 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 # the non-ASCII (Korean) string literals in sources and tests survive.
 if(MSVC)
     add_compile_options(/utf-8)
+endif()
+
+option(JDOC_ENABLE_SANITIZERS "Enable AddressSanitizer and UBSan" OFF)
+if(JDOC_ENABLE_SANITIZERS)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+        add_compile_options(-fsanitize=address,undefined
+                            -fno-omit-frame-pointer)
+        add_link_options(-fsanitize=address,undefined)
+    else()
+        message(FATAL_ERROR
+            "JDOC_ENABLE_SANITIZERS requires Clang or GCC")
+    endif()
 endif()
 
 # A bare `cmake -S . -B build` leaves CMAKE_BUILD_TYPE empty on single-config
@@ -28,6 +40,10 @@ endif()
 # box on Linux, macOS and Windows without a package manager.
 include(FetchContent)
 
+# zlib: still needed for the streaming gzip/tar.gz path (GzInflateStream), which
+# libdeflate cannot serve (it has no streaming API). Prefer the system copy —
+# on macOS that is Apple's specially tuned build, the fastest inflate available
+# on Apple Silicon — and fall back to fetching madler-zlib on a clean box.
 find_package(ZLIB QUIET)
 if(NOT ZLIB_FOUND)
     message(STATUS "System zlib not found — fetching and building it (FetchContent)")
@@ -37,8 +53,6 @@ if(NOT ZLIB_FOUND)
         GIT_SHALLOW TRUE)
     set(ZLIB_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
     FetchContent_MakeAvailable(zlib)
-    # zlib's CMake builds `zlibstatic` but does not provide the imported target
-    # or export its (partly generated) headers; wire both up ourselves.
     if(NOT TARGET ZLIB::ZLIB)
         add_library(ZLIB::ZLIB ALIAS zlibstatic)
     endif()
@@ -46,6 +60,19 @@ if(NOT ZLIB_FOUND)
         $<BUILD_INTERFACE:${zlib_SOURCE_DIR}>
         $<BUILD_INTERFACE:${zlib_BINARY_DIR}>)
 endif()
+
+# libdeflate: whole-buffer DEFLATE/zlib, ~1.3-1.6x faster than zlib/zlib-ng for
+# inflate and 2-3x for deflate. Every "read whole member then (de)compress" path
+# (zip members, PDF FlateDecode, HWP sections, office metafiles, PNG encode) uses
+# it; only the streaming gz path stays on zlib. Portable C, no NASM, MSVC-clean.
+FetchContent_Declare(libdeflate
+    GIT_REPOSITORY https://github.com/ebiggers/libdeflate.git
+    GIT_TAG v1.20
+    GIT_SHALLOW TRUE)
+set(LIBDEFLATE_BUILD_SHARED_LIB OFF CACHE BOOL "" FORCE)
+set(LIBDEFLATE_BUILD_GZIP OFF CACHE BOOL "" FORCE)
+set(LIBDEFLATE_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+FetchContent_MakeAvailable(libdeflate)
 
 find_package(JPEG QUIET)
 if(NOT JPEG_FOUND)
@@ -74,8 +101,11 @@ if(NOT JPEG_FOUND)
             -DENABLE_SHARED=OFF
             -DENABLE_STATIC=ON
             -DWITH_TURBOJPEG=OFF
-            -DWITH_SIMD=OFF            # avoid a NASM build dependency
+            -DWITH_SIMD=ON             # SIMD decode; x86 needs NASM (CI installs it), arm64 uses NEON
             -DWITH_CRT_DLL=ON         # use /MD to match this project (no LIBCMT clash)
+            # Relay any compiler-cache launcher (sccache in CI); empty = no-op.
+            -DCMAKE_C_COMPILER_LAUNCHER=${CMAKE_C_COMPILER_LAUNCHER}
+            -DCMAKE_CXX_COMPILER_LAUNCHER=${CMAKE_CXX_COMPILER_LAUNCHER}
         BUILD_BYPRODUCTS ${_jpeg_lib})
     # The include dir must exist at configure time for the imported target check.
     file(MAKE_DIRECTORY ${_jpeg_prefix}/include)
@@ -127,6 +157,9 @@ option(JDOC_WITH_BZIP2 "Decode bzip2 (.bz2, alz/egg members) via system libbz2" 
 add_library(jdoc_lib STATIC
     # common + zip
     src/common/string_utils.cpp
+    src/common/inflate.cpp
+    src/common/emf_text.cpp
+    src/common/wmf_text.cpp
     src/zip_reader.cpp
     # archive containers + walker
     src/archive/input_stream.cpp
@@ -170,6 +203,8 @@ add_library(jdoc_lib STATIC
     src/legacy/ole_reader.cpp
     # unified auto-detect API
     src/jdoc.cpp
+    # public format detection API
+    src/detect.cpp
     # vendored code, folded in as objects
     $<TARGET_OBJECTS:pugixml>
     $<TARGET_OBJECTS:lzma_sdk>
@@ -183,7 +218,8 @@ endif()
 target_include_directories(jdoc_lib
     PUBLIC include
     PRIVATE src vendor vendor/pugixml vendor/lzma)
-target_link_libraries(jdoc_lib PUBLIC ZLIB::ZLIB JPEG::JPEG Threads::Threads)
+target_link_libraries(jdoc_lib PUBLIC ZLIB::ZLIB JPEG::JPEG Threads::Threads
+                                       libdeflate::libdeflate_static)
 if(JDOC_WITH_BZIP2)
     find_package(BZip2 REQUIRED)
     target_compile_definitions(jdoc_lib PRIVATE JDOC_WITH_BZIP2)
@@ -227,7 +263,8 @@ option(JDOC_BUILD_TESTS "Build unit tests" OFF)
 if(JDOC_BUILD_TESTS)
     enable_testing()
     foreach(t IN ITEMS test_pdf test_pdf_crypt test_office test_archive
-                       test_hwp3 test_hwp5 test_hwpx test_eml test_msg test_odf)
+                       test_hwp3 test_hwp5 test_hwpx test_eml test_msg test_odf
+                       test_detect test_stream test_emf test_wmf test_safety)
         add_executable(${t} test/${t}.cpp)
         target_link_libraries(${t} PRIVATE jdoc_lib)
         target_include_directories(${t} PRIVATE include src)
@@ -235,6 +272,14 @@ if(JDOC_BUILD_TESTS)
         add_test(NAME ${t} COMMAND ${t}
                  WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
     endforeach()
+
+    # Concurrency test: exercises the C API from many threads, so it links the
+    # shared library (where the C API lives) rather than jdoc_lib.
+    add_executable(test_thread_safety test/test_thread_safety.cpp)
+    target_link_libraries(test_thread_safety PRIVATE jdoc_shared Threads::Threads)
+    target_include_directories(test_thread_safety PRIVATE include src)
+    add_test(NAME test_thread_safety COMMAND test_thread_safety
+             WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 endif()
 
 # ── Python bindings (pybind11) ────────────────────────────────
@@ -242,6 +287,8 @@ endif()
 option(BUILD_PYTHON "Build Python bindings" OFF)
 
 if(BUILD_PYTHON)
+    set(PYBIND11_FINDPYTHON ON)
+    find_package(Python COMPONENTS Interpreter Development.Module REQUIRED)
     find_package(pybind11 REQUIRED)
     pybind11_add_module(_jdoc src/python_bindings.cpp)
     target_link_libraries(_jdoc PRIVATE jdoc_lib)

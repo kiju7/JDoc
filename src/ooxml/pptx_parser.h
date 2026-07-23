@@ -22,6 +22,13 @@ public:
     /// Convert presentation to per-slide chunks.
     std::vector<PageChunk> to_chunks(const ConvertOptions& opts);
 
+    /// Streaming variant: emit one slide chunk at a time (parsing and resolving
+    /// each slide's images on demand), so peak memory tracks a single slide and
+    /// the first slide is available before the rest are parsed. The trailing
+    /// master/layout chunk is emitted last. Byte-identical to to_chunks().
+    /// Returns false if the sink stopped early.
+    bool to_chunks(const ConvertOptions& opts, const PageSink& sink);
+
 private:
     ZipReader& zip_;
 
@@ -42,6 +49,11 @@ private:
         std::string notes;
         std::vector<SlideElement> elements;
     };
+
+    // Per-slide chunk builder shared by the eager and streaming to_chunks.
+    PageChunk build_slide_chunk(size_t slide_index, const ConvertOptions& opts);
+    bool emit_master_layout(const std::string& body, const PageSink& sink);
+    static bool page_wanted(int slide_num, const ConvertOptions& opts);
 
     SlideContent parse_slide(const std::string& slide_path);
     void extract_shape(const pugi::xml_node& sp,
@@ -89,9 +101,6 @@ private:
     std::map<int, int> slide_image_idx_;
 
     std::map<std::string, std::string> parse_slide_rels(const std::string& slide_path);
-
-    std::string format_table(
-        const std::vector<std::vector<std::string>>& rows);
 };
 
 } // namespace jdoc

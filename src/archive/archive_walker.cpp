@@ -53,13 +53,13 @@ bool is_metadata_member(const std::string& name) {
     return base.compare(0, 2, "._") == 0 || base == ".DS_Store";
 }
 
-// Strip leading '/' and any "../" components so member paths are safe,
-// display-friendly relative paths.
+// Convert both archive separator styles and discard traversal components so
+// the result is always a display-friendly relative path on every platform.
 std::string normalize_member_name(const std::string& name) {
     std::string out;
     size_t pos = 0;
     while (pos < name.size()) {
-        size_t slash = name.find('/', pos);
+        size_t slash = name.find_first_of("/\\", pos);
         size_t len = (slash == std::string::npos ? name.size() : slash) - pos;
         std::string comp = name.substr(pos, len);
         if (!comp.empty() && comp != "." && comp != "..") {
@@ -799,23 +799,23 @@ bool walk_egg_solid(EggReader& egg, const std::string& prefix, int depth,
                 if (member_left == 0 && !next_member()) return false;
                 size_t take = static_cast<size_t>(
                     std::min<uint64_t>(n, member_left));
+                budget.total_out += take;
+                if (budget.total_out > opts.archive.max_total_bytes) {
+                    MemberResult r;
+                    r.member_path = prefix + normalize_member_name(
+                        members[idx - 1].name);
+                    r.error_code = MemberErrorCode::TOTAL_LIMIT;
+                    r.error = total_limit_msg(opts.archive);
+                    cb(std::move(r));
+                    stopped = true;
+                    return false;
+                }
                 if (!draining) {
                     if (data.size() + take > opts.archive.max_member_bytes) {
                         draining = true;  // cap hit: drain the rest
                         cap_hit = true;
                         data = std::vector<char>();
                     } else {
-                        budget.total_out += take;
-                        if (budget.total_out > opts.archive.max_total_bytes) {
-                            MemberResult r;
-                            r.member_path = prefix + normalize_member_name(
-                                members[idx - 1].name);
-                            r.error_code = MemberErrorCode::TOTAL_LIMIT;
-                            r.error = total_limit_msg(opts.archive);
-                            cb(std::move(r));
-                            stopped = true;
-                            return false;
-                        }
                         data.insert(data.end(), p, p + take);
                     }
                 }

@@ -508,6 +508,15 @@ static void test_basic_zip() {
         ASSERT(rs.size() == 1 && rs[0].member_path == "real.txt");
     TEST_END
 
+    TEST(backslash_path_traversal_is_normalized)
+        auto zip = make_zip({{"..\\..\\outside.txt", "safe"}});
+        auto path = write_tmp("backslash-path.zip", zip);
+        auto rs = jdoc::convert_archive(path);
+        ASSERT(rs.size() == 1);
+        ASSERT(rs[0].member_path == "outside.txt");
+        ASSERT(rs[0].markdown == "safe");
+    TEST_END
+
     TEST(unsupported_member_skipped_by_default)
         std::string binary(64, '\0');
         auto zip = make_zip({{"blob.bin", binary}, {"ok.txt", "fine"}});
