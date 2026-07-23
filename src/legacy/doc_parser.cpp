@@ -1487,14 +1487,11 @@ std::string DocParser::to_markdown(const ConvertOptions& opts) {
 
     auto images = extract_images(opts.min_image_size);
 
-    fprintf(stderr, "[DBG-md] opts.images=%d image_dir='%s' images=%zu\n", opts.images, opts.image_dir.c_str(), images.size());
     if (opts.images) {
         for (auto& img : images) {
-            std::string sp = util::save_image_to_file(
+            img.saved_path = util::save_image_to_file(
                 opts.image_dir, img.name, img.format,
                 img.data.data(), img.data.size());
-            fprintf(stderr, "[DBG-md]   save name=%s size=%zu -> '%s'\n", img.name.c_str(), img.data.size(), sp.c_str());
-            img.saved_path = sp;
             if (!img.saved_path.empty()) {
                 img.data.clear();
                 img.data.shrink_to_fit();
