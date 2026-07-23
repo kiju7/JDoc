@@ -146,6 +146,8 @@ add_library(jdoc_lib STATIC
     # common + zip
     src/common/string_utils.cpp
     src/common/inflate.cpp
+    src/common/emf_text.cpp
+    src/common/wmf_text.cpp
     src/zip_reader.cpp
     # archive containers + walker
     src/archive/input_stream.cpp
@@ -250,7 +252,7 @@ if(JDOC_BUILD_TESTS)
     enable_testing()
     foreach(t IN ITEMS test_pdf test_pdf_crypt test_office test_archive
                        test_hwp3 test_hwp5 test_hwpx test_eml test_msg test_odf
-                       test_detect)
+                       test_detect test_stream test_emf test_wmf)
         add_executable(${t} test/${t}.cpp)
         target_link_libraries(${t} PRIVATE jdoc_lib)
         target_include_directories(${t} PRIVATE include src)

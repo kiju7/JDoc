@@ -16,9 +16,104 @@
 #include "jdoc/hwpx.h"
 #include "common/file_utils.h"
 
+#include <condition_variable>
 #include <cstring>
+#include <deque>
+#include <mutex>
+#include <string>
+#include <thread>
 
 namespace py = pybind11;
+
+// Lazy page iterator backing convert_pages_stream(). A background thread runs
+// the C++ core's for_each_chunk with the GIL released, pushing each page into a
+// bounded queue; __next__ pops from it (releasing the GIL while it waits). The
+// bound caps producer/consumer skew so peak memory tracks a few pages, not the
+// whole document. The sink stays in pure C++ (no Python), so no GIL juggling is
+// needed on the producer side.
+class PageStream {
+public:
+    PageStream(std::string path, jdoc::ConvertOptions opts, size_t capacity)
+        : path_(std::move(path)), opts_(std::move(opts)), capacity_(capacity) {
+        worker_ = std::thread([this] { run(); });
+    }
+
+    ~PageStream() {
+        {
+            std::lock_guard<std::mutex> lk(mutex_);
+            stop_ = true;
+        }
+        not_full_.notify_all();
+        not_empty_.notify_all();
+        if (worker_.joinable()) {
+            py::gil_scoped_release release;  // producer needs no GIL; avoid any stall
+            worker_.join();
+        }
+    }
+
+    // Returns the next page, or raises StopIteration when exhausted.
+    jdoc::PageChunk next() {
+        jdoc::PageChunk item;
+        bool have_item = false;
+        std::string error;
+        {
+            py::gil_scoped_release release;
+            std::unique_lock<std::mutex> lk(mutex_);
+            not_empty_.wait(lk, [this] { return !queue_.empty() || done_; });
+            if (!queue_.empty()) {
+                item = std::move(queue_.front());
+                queue_.pop_front();
+                have_item = true;
+                lk.unlock();
+                not_full_.notify_one();
+            } else {
+                error = error_;  // done_ and queue drained
+            }
+        }
+        if (have_item) return item;
+        if (!error.empty()) throw std::runtime_error(error);
+        throw py::stop_iteration();
+    }
+
+private:
+    void run() {
+        try {
+            jdoc::for_each_chunk(path_, opts_, [this](jdoc::PageChunk&& chunk) {
+                std::unique_lock<std::mutex> lk(mutex_);
+                not_full_.wait(lk, [this] { return queue_.size() < capacity_ || stop_; });
+                if (stop_) return false;
+                queue_.push_back(std::move(chunk));
+                lk.unlock();
+                not_empty_.notify_one();
+                return true;
+            });
+        } catch (const std::exception& e) {
+            std::lock_guard<std::mutex> lk(mutex_);
+            error_ = e.what();
+        } catch (...) {
+            std::lock_guard<std::mutex> lk(mutex_);
+            error_ = "unknown error";
+        }
+        {
+            std::lock_guard<std::mutex> lk(mutex_);
+            done_ = true;
+        }
+        not_empty_.notify_all();
+    }
+
+    std::string path_;
+    jdoc::ConvertOptions opts_;
+    size_t capacity_;
+
+    std::mutex mutex_;
+    std::condition_variable not_full_;
+    std::condition_variable not_empty_;
+    std::deque<jdoc::PageChunk> queue_;
+    std::string error_;
+    bool done_ = false;
+    bool stop_ = false;
+    std::thread worker_;
+};
 
 // ── Python module definition ─────────────────────────────
 
@@ -40,6 +135,7 @@ PYBIND11_MODULE(_jdoc, m) {
         .def_readwrite("height", &jdoc::ImageData::height)
         .def_readwrite("format", &jdoc::ImageData::format)
         .def_readwrite("saved_path", &jdoc::ImageData::saved_path)
+        .def_readwrite("embedded_text", &jdoc::ImageData::embedded_text)
         .def_property("data",
             // getter: return image data as Python bytes
             [](const jdoc::ImageData& img) -> py::bytes {
@@ -214,6 +310,61 @@ Args:
 
 Returns:
     List of PageChunk objects, one per page/slide/sheet
+)doc");
+
+    // Lazy streaming iterator over pages. Yields one PageChunk at a time as the
+    // document is converted, so peak memory tracks a few pages rather than the
+    // whole document and the first page arrives before the rest are parsed.
+    py::class_<PageStream>(m, "_PageStream")
+        .def("__iter__", [](PageStream& self) -> PageStream& { return self; })
+        .def("__next__", &PageStream::next);
+
+    m.def("convert_pages_stream", [](const std::string& file_path,
+                                     const std::string& format,
+                                     const std::vector<int>& pages,
+                                     bool tables,
+                                     bool images,
+                                     const std::string& image_dir,
+                                     const std::string& image_ref_prefix,
+                                     unsigned min_image_size,
+                                     unsigned buffer_size) {
+        jdoc::ConvertOptions opts;
+        opts.pages = pages;
+        opts.tables = tables;
+        opts.images = images;
+        opts.image_dir = image_dir;
+        opts.image_ref_prefix = image_ref_prefix;
+        opts.min_image_size = min_image_size;
+        if (format == "text" || format == "plaintext" || format == "plain")
+            opts.format = jdoc::OutputFormat::PLAINTEXT;
+        else
+            opts.format = jdoc::OutputFormat::MARKDOWN;
+        size_t cap = buffer_size > 0 ? buffer_size : 1;
+        return std::unique_ptr<PageStream>(
+            new PageStream(file_path, std::move(opts), cap));
+    },
+    py::arg("file_path"),
+    py::arg("format") = "markdown",
+    py::arg("pages") = std::vector<int>{},
+    py::arg("tables") = true,
+    py::arg("images") = false,
+    py::arg("image_dir") = "",
+    py::arg("image_ref_prefix") = "",
+    py::arg("min_image_size") = 50,
+    py::arg("buffer_size") = 4,
+    R"doc(Convert a document to per-page chunks, lazily.
+
+Returns an iterator that yields one PageChunk at a time as the document is
+converted. Compared to convert_pages(), peak memory tracks only a few pages
+(see buffer_size) instead of the whole document, and the first page is
+available before the rest are parsed. Output is identical to convert_pages().
+
+A background thread does the conversion; abandoning the iterator (or breaking
+out of the loop) stops it. Same arguments as convert_pages(), plus:
+    buffer_size: max pages held in the internal queue (default 4)
+
+Yields:
+    PageChunk objects, one per page/slide/sheet
 )doc");
 
     // ── Archive conversion ────────────────────────────────

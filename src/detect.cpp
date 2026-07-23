@@ -67,6 +67,10 @@ static const Entry* lookup(const std::string& fmt) {
     static const Entry WEBP {FormatCategory::Image, ".webp", "image/webp", false};
     static const Entry ICO  {FormatCategory::Image, ".ico",  "image/x-icon", false};
     static const Entry PSD  {FormatCategory::Image, ".psd",  "image/vnd.adobe.photoshop", false};
+    // Metafiles: vector records carrying text — jdoc extracts that text, so
+    // unlike raster images these are convertible.
+    static const Entry EMF  {FormatCategory::Image, ".emf",  "image/emf", true};
+    static const Entry WMF  {FormatCategory::Image, ".wmf",  "image/wmf", true};
 
     // Documents.
     static const Entry PDF  {FormatCategory::Document, ".pdf",  "application/pdf", true};
@@ -125,6 +129,8 @@ static const Entry* lookup(const std::string& fmt) {
     if (fmt == "WEBP") return &WEBP;
     if (fmt == "ICO")  return &ICO;
     if (fmt == "PSD")  return &PSD;
+    if (fmt == "EMF")  return &EMF;
+    if (fmt == "WMF")  return &WMF;
     if (fmt == "PDF")  return &PDF;
     if (fmt == "HWP")  return &HWP;
     if (fmt == "HWPX") return &HWPX;

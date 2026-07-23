@@ -35,6 +35,7 @@ from _jdoc import (
     # High-level API
     convert,
     convert_pages,
+    convert_pages_stream,
     convert_archive,
     convert_bytes,
     is_archive,
@@ -65,6 +66,7 @@ __all__ = [
     "FormatInfo",
     "convert",
     "convert_pages",
+    "convert_pages_stream",
     "convert_archive",
     "convert_bytes",
     "is_archive",

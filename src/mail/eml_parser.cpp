@@ -375,4 +375,14 @@ std::vector<PageChunk> eml_to_markdown_chunks(const std::string& file_path,
     return parser.to_chunks(opts);
 }
 
+void eml_to_markdown_chunks_stream(const std::string& file_path,
+                                   const ConvertOptions& opts, const PageSink& sink) {
+    // An EML message is a single page, so this emits exactly one chunk.
+    EmlParser parser(file_path);
+    PageChunk chunk;
+    chunk.page_number = 0;
+    chunk.text = parser.to_markdown(opts);
+    sink(std::move(chunk));
+}
+
 } // namespace jdoc

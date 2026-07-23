@@ -604,8 +604,38 @@ std::string result_to_markdown(ExtractResult& r, const ConvertOptions& opts) {
     return full_md;
 }
 
-std::vector<PageChunk> result_to_chunks(ExtractResult& r,
-                                               const ConvertOptions& opts) {
+// Build one page's chunk from the extracted result. Moves that page's images
+// out of `r`; the caller is expected to release the page's other per-page data
+// afterwards when streaming.
+static PageChunk build_page_chunk(ExtractResult& r, const ConvertOptions& opts,
+                                  bool plaintext, int p) {
+    PageChunk chunk;
+    chunk.page_number = p + 1;
+    chunk.page_width = r.page_widths[p];
+    chunk.page_height = r.page_heights[p];
+    chunk.body_font_size = r.stats.body_size;
+    std::string page_md = page_to_markdown(r.all_lines[p], r.stats,
+                                            r.all_images[p], r.all_image_y[p], r.all_image_x[p],
+                                            r.all_tables[p],
+                                            p < (int)r.all_annots.size() ? r.all_annots[p] : std::vector<AnnotEntry>{},
+                                            r.col_boundaries[p],
+                                            opts.image_ref_prefix);
+    chunk.text = plaintext ? util::strip_markdown(page_md) : page_md;
+
+    for (auto& td : r.all_tables[p])
+        chunk.tables.push_back(td.rows);
+
+    chunk.images = std::move(r.all_images[p]);
+    return chunk;
+}
+
+// Streaming emit: hand each page's chunk to `sink` and release that page's
+// per-page buffers immediately after, so the consumer holds one page at a time.
+// Output is byte-identical to result_to_chunks. `sink` returning false stops
+// early. The document-wide font stats (r.stats) are already computed, so
+// heading detection matches the eager path exactly.
+void stream_result_chunks(ExtractResult& r, const ConvertOptions& opts,
+                          const PageSink& sink) {
     std::vector<int> page_indices;
     if (opts.pages.empty()) {
         for (int i = 0; i < r.total_pages; i++) page_indices.push_back(i);
@@ -615,28 +645,29 @@ std::vector<PageChunk> result_to_chunks(ExtractResult& r,
 
     bool plaintext = (opts.format == OutputFormat::PLAINTEXT);
 
-    std::vector<PageChunk> chunks;
     for (int p : page_indices) {
         if (p < 0 || p >= r.total_pages) continue;
-        PageChunk chunk;
-        chunk.page_number = p + 1;
-        chunk.page_width = r.page_widths[p];
-        chunk.page_height = r.page_heights[p];
-        chunk.body_font_size = r.stats.body_size;
-        std::string page_md = page_to_markdown(r.all_lines[p], r.stats,
-                                                r.all_images[p], r.all_image_y[p], r.all_image_x[p],
-                                                r.all_tables[p],
-                                                p < (int)r.all_annots.size() ? r.all_annots[p] : std::vector<AnnotEntry>{},
-                                                r.col_boundaries[p],
-                                                opts.image_ref_prefix);
-        chunk.text = plaintext ? util::strip_markdown(page_md) : page_md;
+        PageChunk chunk = build_page_chunk(r, opts, plaintext, p);
 
-        for (auto& td : r.all_tables[p])
-            chunk.tables.push_back(td.rows);
+        // Release this page's remaining buffers before handing off, so the
+        // producer's residual footprint shrinks as the stream advances.
+        r.all_lines[p] = {};
+        r.all_tables[p] = {};
+        if (p < (int)r.all_annots.size()) r.all_annots[p] = {};
+        r.all_image_y[p] = {};
+        r.all_image_x[p] = {};
 
-        chunk.images = std::move(r.all_images[p]);
-        chunks.push_back(std::move(chunk));
+        if (!sink(std::move(chunk))) return;
     }
+}
+
+std::vector<PageChunk> result_to_chunks(ExtractResult& r,
+                                               const ConvertOptions& opts) {
+    std::vector<PageChunk> chunks;
+    stream_result_chunks(r, opts, [&](PageChunk&& c) {
+        chunks.push_back(std::move(c));
+        return true;
+    });
     return chunks;
 }
 

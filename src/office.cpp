@@ -491,4 +491,32 @@ std::vector<PageChunk> office_to_markdown_chunks_mem(const uint8_t* data, size_t
     return to_chunks_impl(detect_office_format_mem(data, size, name_hint), in, opts);
 }
 
+// Streaming: the office parsers build their document structure eagerly during
+// setup (DOM / workbook / slide index), so we collect the chunks once and then
+// hand them out one at a time, moving each into the sink and freeing it before
+// the next. This keeps output byte-identical to the eager path while giving the
+// consumer per-page ownership (peak consumer memory tracks one page).
+static void stream_office_chunks(std::vector<PageChunk> chunks, const PageSink& sink) {
+    for (auto& chunk : chunks) {
+        if (!sink(std::move(chunk))) return;
+    }
+}
+
+void office_to_markdown_chunks_stream(const std::string& file_path,
+                                      const ConvertOptions& opts, const PageSink& sink) {
+    DocInput in;
+    in.path = &file_path;
+    stream_office_chunks(to_chunks_impl(detect_office_format(file_path), in, opts), sink);
+}
+
+void office_to_markdown_chunks_mem_stream(const uint8_t* data, size_t size,
+                                          const std::string& name_hint,
+                                          const ConvertOptions& opts, const PageSink& sink) {
+    DocInput in;
+    in.data = data;
+    in.size = size;
+    stream_office_chunks(
+        to_chunks_impl(detect_office_format_mem(data, size, name_hint), in, opts), sink);
+}
+
 } // namespace jdoc

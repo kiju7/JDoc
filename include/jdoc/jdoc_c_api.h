@@ -72,6 +72,20 @@ JDocPage* jdoc_convert_pages(const char* file_path, const JDocOptions* opts,
                               int* out_count,
                               char* err_buf, int err_buf_size);
 
+/* Streaming page callback. Invoked once per page as the document is converted.
+ * `page` is borrowed and valid only for the duration of the call — copy out
+ * what you need; do NOT free it. Return nonzero to continue, 0 to stop early.
+ * `userdata` is passed through from jdoc_convert_pages_stream. */
+typedef int (*JDocPageCallback)(const JDocPage* page, void* userdata);
+
+/* Streaming variant of jdoc_convert_pages: pages are delivered one at a time to
+ * `cb` and never accumulated, so peak memory tracks a single page. The bindings
+ * wrap this as their native lazy iterator. opts may be NULL for defaults.
+ * Returns 0 on success, -1 on error (message in err_buf). */
+int jdoc_convert_pages_stream(const char* file_path, const JDocOptions* opts,
+                              JDocPageCallback cb, void* userdata,
+                              char* err_buf, int err_buf_size);
+
 /* ── Archive ──────────────────────────────────────────────── */
 
 /* Machine-readable member failure classification (JDocMember.error_code).

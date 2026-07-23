@@ -16,17 +16,31 @@
 package jdoc
 
 /*
-#cgo CFLAGS: -I${SRCDIR}/../../include
+#cgo CFLAGS: -I${SRCDIR}/../../include -Wno-nullability-completeness
 #cgo LDFLAGS: -L${SRCDIR}/../../build -ljdoc
 #cgo linux LDFLAGS: -Wl,-rpath,${SRCDIR}/../../build
 #cgo darwin LDFLAGS: -Wl,-rpath,${SRCDIR}/../../build
 #include <stdlib.h>
 #include <jdoc/jdoc_c_api.h>
+
+// Bridge: jdoc_convert_pages_stream takes a C function pointer. goJDocPageSink
+// (exported from Go below) is that pointer; this thin wrapper lets Go invoke
+// the stream with it while passing a cgo.Handle through userdata. The prototype
+// must match cgo's generated one (non-const JDocPage*), so we cast to the
+// JDocPageCallback signature (adding const to the pointee is safe) at the call.
+extern int goJDocPageSink(JDocPage* page, void* userdata);
+static int jdoc_stream_pages(const char* path, const JDocOptions* opts,
+                             void* userdata, char* err, int errsz) {
+    return jdoc_convert_pages_stream(path, opts,
+        (JDocPageCallback)goJDocPageSink, userdata, err, errsz);
+}
 */
 import "C"
 
 import (
 	"errors"
+	"iter"
+	"runtime/cgo"
 	"unsafe"
 )
 
@@ -185,3 +199,151 @@ func ConvertArchive(path string) ([]Member, error) {
 	}
 	return members, nil
 }
+
+// ── Pages ─────────────────────────────────────────────────────
+
+// Image is one image extracted from a page.
+type Image struct {
+	PageNumber int
+	Name       string
+	Width      uint
+	Height     uint
+	Data       []byte // raw image bytes (jpeg/png/bmp)
+	Format     string // "jpeg", "png", "bmp", ...
+	SavedPath  string // disk path if image extraction wrote to a directory
+}
+
+// Page is one page/slide/sheet of a converted document.
+type Page struct {
+	PageNumber int
+	Text       string // markdown or plaintext for this page
+	Images     []Image
+}
+
+// goPage copies a borrowed C JDocPage into an owned Go Page.
+func goPage(p *C.JDocPage) Page {
+	page := Page{
+		PageNumber: int(p.page_number),
+		Text:       C.GoString(p.text),
+	}
+	n := int(p.image_count)
+	if n > 0 && p.images != nil {
+		imgs := unsafe.Slice(p.images, n)
+		page.Images = make([]Image, n)
+		for i := 0; i < n; i++ {
+			si := &imgs[i]
+			page.Images[i] = Image{
+				PageNumber: int(si.page_number),
+				Name:       C.GoString(si.name),
+				Width:      uint(si.width),
+				Height:     uint(si.height),
+				Format:     C.GoString(si.format),
+				SavedPath:  C.GoString(si.saved_path),
+			}
+			if si.data != nil && si.data_size > 0 {
+				page.Images[i].Data = C.GoBytes(unsafe.Pointer(si.data), si.data_size)
+			}
+		}
+	}
+	return page
+}
+
+// ConvertPages converts a document to per-page chunks eagerly, using default
+// options. For large documents prefer StreamPages, which yields one page at a
+// time. Returns an error for unsupported formats and archives.
+func ConvertPages(path string) ([]Page, error) {
+	cPath := C.CString(path)
+	defer C.free(unsafe.Pointer(cPath))
+
+	var count C.int
+	errBuf := make([]C.char, errBufSize)
+	arr := C.jdoc_convert_pages(cPath, nil, &count, &errBuf[0], C.int(errBufSize))
+	if arr == nil {
+		if msg := C.GoString(&errBuf[0]); msg != "" {
+			return nil, errors.New(msg)
+		}
+		return nil, nil // no pages
+	}
+	defer C.jdoc_free_pages(arr, count)
+
+	n := int(count)
+	pages := make([]Page, n)
+	slice := unsafe.Slice(arr, n)
+	for i := 0; i < n; i++ {
+		pages[i] = goPage(&slice[i])
+	}
+	return pages, nil
+}
+
+// sinkState carries the caller's yield closure across the C boundary, plus any
+// panic recovered while yielding (re-raised after the C call unwinds).
+type sinkState struct {
+	yield func(Page) bool
+	panic any
+}
+
+//export goJDocPageSink
+func goJDocPageSink(page *C.JDocPage, userdata unsafe.Pointer) C.int {
+	s := cgo.Handle(userdata).Value().(*sinkState)
+	// A panic must not cross the C frame; capture it, stop the stream, and let
+	// StreamPages re-raise it once jdoc_stream_pages has returned.
+	cont := false
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				s.panic = r
+			}
+		}()
+		cont = s.yield(goPage(page))
+	}()
+	if s.panic != nil || !cont {
+		return 0 // stop the walk
+	}
+	return 1
+}
+
+// PageStream drives a lazy, single-pass walk over a document's pages. Iterate
+// with Pages; after the loop, check Err for a conversion failure.
+type PageStream struct {
+	path string
+	err  error
+}
+
+// StreamPages returns a lazy page iterator for the document at path, using
+// default options. Pages are produced one at a time as they are consumed, so
+// peak memory tracks a single page rather than the whole document, and the
+// first page is available before the rest are parsed. Output matches
+// ConvertPages.
+func StreamPages(path string) *PageStream {
+	return &PageStream{path: path}
+}
+
+// Pages returns a single-use iterator over the document's pages. Breaking out
+// of the range loop stops the underlying conversion. Any conversion error is
+// reported by Err after iteration ends.
+func (s *PageStream) Pages() iter.Seq[Page] {
+	return func(yield func(Page) bool) {
+		state := &sinkState{yield: yield}
+		h := cgo.NewHandle(state)
+		defer h.Delete()
+
+		cPath := C.CString(s.path)
+		defer C.free(unsafe.Pointer(cPath))
+
+		errBuf := make([]C.char, errBufSize)
+		rc := C.jdoc_stream_pages(cPath, nil, unsafe.Pointer(h),
+			&errBuf[0], C.int(errBufSize))
+
+		if state.panic != nil {
+			panic(state.panic) // re-raise a yield panic in the caller's goroutine
+		}
+		if rc != 0 {
+			if msg := C.GoString(&errBuf[0]); msg != "" {
+				s.err = errors.New(msg)
+			}
+		}
+	}
+}
+
+// Err returns the error from the most recent Pages iteration, if any.
+func (s *PageStream) Err() error { return s.err }

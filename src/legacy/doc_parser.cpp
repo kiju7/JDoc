@@ -4,8 +4,10 @@
 #include "doc_parser.h"
 #include "common/string_utils.h"
 #include "common/binary_utils.h"
+#include "common/emf_text.h"
 #include "common/file_utils.h"
 #include "common/image_utils.h"
+#include "common/inflate.h"
 #include "common/png_encode.h"
 
 #include <algorithm>
@@ -176,6 +178,8 @@ static std::string replace_image_markers(const std::string& md,
                 const auto& img = images[img_idx];
                 std::string fn = img.name + "." + img.format;
                 result += "\n![" + fn + "](" + prefix + fn + ")\n";
+                if (!img.embedded_text.empty())
+                    result += img.embedded_text + "\n";
             }
             img_idx++;
             i += 2;
@@ -187,6 +191,8 @@ static std::string replace_image_markers(const std::string& md,
         const auto& img = images[img_idx];
         std::string fn = img.name + "." + img.format;
         result += "\n![" + fn + "](" + fn + ")\n";
+        if (!img.embedded_text.empty())
+            result += img.embedded_text + "\n";
     }
     return result;
 }
@@ -1321,6 +1327,23 @@ std::vector<ImageData> DocParser::extract_images(unsigned min_image_size) {
     if (stream.empty()) return images;
 
     int img_idx = 0;
+
+    // EMF/WMF metafiles carry text; recover it. The Data-stream BLIP path holds
+    // zlib-compressed bytes, the WordDocument scan holds raw bytes — try raw
+    // first, then inflate. emf_extract_text validates the header, so a wrong
+    // guess yields no text rather than garbage.
+    auto fill_metafile_text = [](ImageData& img) {
+        if (img.format != "emf" && img.format != "wmf") return;
+        const uint8_t* p = reinterpret_cast<const uint8_t*>(img.data.data());
+        std::string t = metafile_extract_text(img.format.c_str(), p, img.data.size());
+        if (t.empty()) {
+            auto dec = inflate_zlib(p, img.data.size(), img.data.size() * 10);
+            if (!dec.empty())
+                t = metafile_extract_text(img.format.c_str(), dec.data(), dec.size());
+        }
+        img.embedded_text = std::move(t);
+    };
+
     size_t pos = 0;
     while (pos + 8 < stream.size()) {
         std::string fmt = detect_image_format(stream.data() + pos, stream.size() - pos);
@@ -1348,6 +1371,7 @@ std::vector<ImageData> DocParser::extract_images(unsigned min_image_size) {
             img.name = "page1_img" + std::to_string(img_idx++);
             img.format = fmt;
             img.data.assign(stream.begin() + img_start, stream.begin() + img_end);
+            fill_metafile_text(img);
             util::populate_image_dimensions(img);
             if (util::is_image_too_small(img, min_image_size)) {
                 --img_idx;
@@ -1405,6 +1429,7 @@ std::vector<ImageData> DocParser::extract_images(unsigned min_image_size) {
             img.name = "page1_img" + std::to_string(img_idx++);
             img.format = fmt;
             img.data.assign(data.begin() + img_start, data.begin() + img_start + img_size);
+            fill_metafile_text(img);
             util::populate_image_dimensions(img);
             if (util::is_image_too_small(img, min_image_size)) {
                 --img_idx;
@@ -1484,9 +1509,14 @@ std::vector<PageChunk> DocParser::to_chunks(const ConvertOptions& opts) {
     std::string raw = extract_text();
     chunk.text = strip_image_markers(text_to_markdown(raw));
 
-    if (opts.images) {
-        chunk.images = extract_images(opts.min_image_size);
-    }
+    // Recover metafile (EMF/WMF) text regardless of image extraction, since it
+    // is document content; only attach the images themselves when requested.
+    auto images = extract_images(opts.min_image_size);
+    for (const auto& img : images)
+        if (!img.embedded_text.empty())
+            chunk.text += "\n\n" + img.embedded_text;
+    if (opts.images)
+        chunk.images = std::move(images);
 
     chunk.page_width = 612.0;
     chunk.page_height = 792.0;

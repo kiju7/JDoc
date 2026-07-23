@@ -94,5 +94,7 @@ void collect_bookmarks(PdfDoc& doc, const PdfObj& node, int depth,
 std::vector<AnnotEntry> extract_annotations(PdfDoc& doc, const PdfObj& page_obj, double page_h);
 std::string result_to_markdown(ExtractResult& r, const ConvertOptions& opts);
 std::vector<PageChunk> result_to_chunks(ExtractResult& r, const ConvertOptions& opts);
+void stream_result_chunks(ExtractResult& r, const ConvertOptions& opts,
+                          const PageSink& sink);
 
 }} // namespace jdoc::pdf_detail

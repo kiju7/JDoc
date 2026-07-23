@@ -1,8 +1,11 @@
 package com.jiran.jdoc;
 
 import com.sun.jna.Pointer;
+import com.sun.jna.ptr.IntByReference;
 
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.List;
 
 /**
  * High-level Java API for the JDoc document converter.
@@ -75,6 +78,45 @@ public final class Jdoc {
         } finally {
             lib.jdoc_free_string(p);
         }
+    }
+
+    /** Convert a document to per-page chunks eagerly, using default options.
+     *  For large documents prefer {@link #streamPages}, which yields one page
+     *  at a time. Throws for unsupported formats and archives. */
+    public static List<Page> convertPages(String filePath) {
+        JdocLibrary lib = JdocLibrary.INSTANCE;
+        byte[] err = new byte[ERR_BUF_SIZE];
+        IntByReference count = new IntByReference();
+        Pointer arr = lib.jdoc_convert_pages(filePath, null, count, err, ERR_BUF_SIZE);
+        if (arr == null) {
+            String msg = cString(err);
+            if (!msg.isEmpty()) throw new JdocException(msg);
+            return new ArrayList<>();  // no pages
+        }
+        try {
+            int n = count.getValue();
+            List<Page> pages = new ArrayList<>(n);
+            if (n > 0) {
+                JdocLibrary.JDocPage first = new JdocLibrary.JDocPage(arr);
+                first.read();
+                JdocLibrary.JDocPage[] native_pages =
+                        (JdocLibrary.JDocPage[]) first.toArray(n);
+                for (JdocLibrary.JDocPage np : native_pages) {
+                    pages.add(PageStream.fromNative(np));
+                }
+            }
+            return pages;
+        } finally {
+            lib.jdoc_free_pages(arr, count.getValue());
+        }
+    }
+
+    /** Open a lazy page iterator for a document, using default options. Yields
+     *  one page at a time so peak memory tracks a few pages, not the whole
+     *  document. The result must be closed (try-with-resources); see
+     *  {@link PageStream}. Output matches {@link #convertPages}. */
+    public static PageStream streamPages(String filePath) {
+        return new PageStream(filePath, 4);
     }
 
     private static FormatInfo toFormatInfo(JdocLibrary.JDocFormatInfo out) {

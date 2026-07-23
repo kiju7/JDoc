@@ -12,6 +12,7 @@ namespace jdoc {
 
 enum class FileFormat {
     PDF, OFFICE, HWP, HWPX, TXT, EML,
+    EMF, WMF,   // metafiles — vector records carrying text (+ images)
     ZIP, GZIP, BZIP2, TAR, SEVENZIP, ALZ, EGG, RAR,
     UNKNOWN
 };

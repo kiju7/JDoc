@@ -7,6 +7,7 @@
 #include "jdoc/hwp_types.h"
 #include "legacy/hwp3_parser.h"
 #include "legacy/ole_reader.h"
+#include "common/emf_text.h"
 #include "common/file_utils.h"
 #include "common/image_utils.h"
 #include "common/inflate.h"
@@ -177,6 +178,35 @@ public:
 
         release_storage();
         return chunks;
+    }
+
+    // Streaming variant: parse one BodyText section, emit it, free its raw
+    // bytes, then move to the next — so peak memory tracks a single section
+    // rather than the whole document. Byte-identical to convert_chunks().
+    void convert_chunks_stream(bool plaintext, const PageSink& sink) {
+        for (int i = 0; i < (int)section_data_.size(); i++) {
+            if (!opts_.pages.empty()) {
+                bool found = false;
+                for (int p : opts_.pages) {
+                    if (p == i) { found = true; break; }
+                }
+                if (!found) continue;
+            }
+
+            PageChunk chunk;
+            chunk.page_number = i + 1;
+            // Default A4 page dimensions
+            chunk.page_width = 595.28;
+            chunk.page_height = 841.88;
+
+            parse_section(i, chunk);
+            section_data_[i].clear();
+            section_data_[i].shrink_to_fit();
+            if (plaintext) chunk.text = util::strip_markdown(chunk.text);
+            if (!sink(std::move(chunk))) { release_storage(); return; }
+        }
+
+        release_storage();
     }
 
     void release_storage() {
@@ -1329,7 +1359,8 @@ private:
                 std::string name_ext = entry->name.substr(dot + 1);
                 for (auto& c : name_ext) c = std::tolower(c);
                 if (name_ext == "png" || name_ext == "jpg" || name_ext == "jpeg" ||
-                    name_ext == "gif" || name_ext == "bmp" || name_ext == "emf")
+                    name_ext == "gif" || name_ext == "bmp" || name_ext == "emf" ||
+                    name_ext == "wmf")
                     ext = name_ext;
             }
         }
@@ -1362,6 +1393,13 @@ private:
             image_data.data(), image_data.size());
         if (!actual_fmt.empty()) ext = actual_fmt;
 
+        // EMF/WMF are vector metafiles: recover any text drawn inside so it is
+        // not lost to the raster-only image path.
+        std::string meta_text;
+        if (ext == "emf" || ext == "wmf")
+            meta_text = metafile_extract_text(ext.c_str(), image_data.data(),
+                                              image_data.size());
+
         filename = unified + "." + (ext == "jpeg" ? "jpg" : ext);
         std::string saved_path;
         if (!opts_.image_dir.empty()) {
@@ -1378,6 +1416,7 @@ private:
         idata.name = unified;
         idata.format = ext;
         idata.saved_path = saved_path;
+        idata.embedded_text = meta_text;
         if (opts_.image_dir.empty()) {
             idata.data.assign(reinterpret_cast<const char*>(image_data.data()),
                               reinterpret_cast<const char*>(image_data.data()) + image_data.size());
@@ -1387,7 +1426,10 @@ private:
 
         image_idx++;
 
-        return "![" + unified + "](" + opts_.image_ref_prefix + filename + ")\n\n";
+        std::string out = "![" + unified + "](" + opts_.image_ref_prefix +
+                          filename + ")\n\n";
+        if (!meta_text.empty()) out += meta_text + "\n\n";
+        return out;
     }
 
     // ── Paragraph to Markdown ───────────────────────────────
@@ -1594,6 +1636,25 @@ std::vector<PageChunk> hwp_to_markdown_chunks(const std::string& hwp_path,
             chunk.text = util::strip_markdown(chunk.text);
     }
     return chunks;
+}
+
+void hwp_to_markdown_chunks_stream(const std::string& hwp_path,
+                                   const ConvertOptions& opts_in, const PageSink& sink) {
+    ConvertOptions opts = opts_in;
+    opts.page_chunks = true;
+    bool plaintext = (opts.format == OutputFormat::PLAINTEXT);
+    if (file_is_hwp3(hwp_path)) {
+        // Legacy HWP3 is a single chunk — collect and emit once.
+        Hwp3Parser parser(hwp_path);
+        for (auto& chunk : parser.to_chunks(opts)) {
+            if (plaintext) chunk.text = util::strip_markdown(chunk.text);
+            if (!sink(std::move(chunk))) return;
+        }
+        return;
+    }
+    HWPParser parser(hwp_path, opts);
+    parser.parse();
+    parser.convert_chunks_stream(plaintext, sink);
 }
 
 } // namespace jdoc

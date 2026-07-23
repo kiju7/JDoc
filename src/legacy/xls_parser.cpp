@@ -1,8 +1,10 @@
 // .xls (BIFF8) parser implementation.
 
 #include "xls_parser.h"
+#include "common/emf_text.h"
 #include "common/file_utils.h"
 #include "common/image_utils.h"
+#include "common/inflate.h"
 #include "common/string_utils.h"
 #include "common/binary_utils.h"
 
@@ -815,6 +817,24 @@ std::vector<ImageData> XlsParser::extract_images(unsigned min_image_size) {
                     img.format = fmt;
                     img.data.assign(drawing_data.begin() + img_offset,
                                     drawing_data.begin() + img_offset + img_size);
+                    // Metafile text: the BLIPFileData is usually zlib-compressed.
+                    // Try the bytes raw first (uncompressed metafiles), then
+                    // inflate. emf_extract_text validates the header, so a wrong
+                    // guess simply yields no text.
+                    if (fmt == "emf" || fmt == "wmf") {
+                        const uint8_t* p =
+                            reinterpret_cast<const uint8_t*>(img.data.data());
+                        std::string t = metafile_extract_text(fmt.c_str(), p,
+                                                              img.data.size());
+                        if (t.empty()) {
+                            auto dec = inflate_zlib(p, img.data.size(),
+                                                    img.data.size() * 10);
+                            if (!dec.empty())
+                                t = metafile_extract_text(fmt.c_str(),
+                                                          dec.data(), dec.size());
+                        }
+                        img.embedded_text = std::move(t);
+                    }
                     util::populate_image_dimensions(img);
                     if (util::is_image_too_small(img, min_image_size)) {
                         --img_idx;
@@ -849,6 +869,8 @@ std::string XlsParser::to_markdown(const ConvertOptions& opts) {
                 md += "![" + filename + "](" + opts.image_ref_prefix + filename + ")\n\n";
             else
                 md += "![" + filename + "](" + filename + ")\n\n";
+            if (!img.embedded_text.empty())
+                md += img.embedded_text + "\n\n";
         }
     }
 
@@ -903,6 +925,8 @@ std::vector<PageChunk> XlsParser::to_chunks(const ConvertOptions& opts) {
             int start = static_cast<int>(i) * img_per_sheet;
             int end = std::min(start + img_per_sheet, static_cast<int>(images.size()));
             for (int j = start; j < end; ++j) {
+                if (!images[j].embedded_text.empty())
+                    chunk.text += "\n\n" + images[j].embedded_text;
                 chunk.images.push_back(images[j]);
             }
         }

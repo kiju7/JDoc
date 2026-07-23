@@ -41,4 +41,12 @@ std::vector<PageChunk> office_to_markdown_chunks_mem(const uint8_t* data, size_t
                                                      const std::string& name_hint,
                                                      ConvertOptions opts = {});
 
+// Streaming variants: emit one page (docx page-break region / xlsx sheet /
+// pptx slide / single chunk for rtf/html/doc) at a time; return false to stop.
+void office_to_markdown_chunks_stream(const std::string& file_path,
+                                      const ConvertOptions& opts, const PageSink& sink);
+void office_to_markdown_chunks_mem_stream(const uint8_t* data, size_t size,
+                                          const std::string& name_hint,
+                                          const ConvertOptions& opts, const PageSink& sink);
+
 } // namespace jdoc

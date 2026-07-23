@@ -64,6 +64,54 @@ static jdoc::ConvertOptions to_cpp_opts(const JDocOptions* opts) {
     return o;
 }
 
+// Marshal one C++ PageChunk into a caller-owned JDocPage (deep copy). Inner
+// allocations are released by free_page_inner / jdoc_free_pages.
+static void fill_page(JDocPage& dst, const jdoc::PageChunk& src) {
+    dst.page_number = src.page_number;
+    dst.text = strdup_c(src.text);
+    dst.images = nullptr;
+    dst.image_count = 0;
+
+    size_t n = src.images.size();
+    if (n == 0) return;
+
+    dst.images = (JDocImage*)calloc(n, sizeof(JDocImage));
+    if (!dst.images) return;
+    dst.image_count = (int)n;
+
+    for (size_t j = 0; j < n; j++) {
+        auto& si = src.images[j];
+        auto& di = dst.images[j];
+        di.page_number = si.page_number;
+        di.name = strdup_c(si.name);
+        di.width = si.width;
+        di.height = si.height;
+        di.format = strdup_c(si.format);
+        di.saved_path = strdup_c(si.saved_path);
+        di.data_size = (int)si.data.size();
+        if (!si.data.empty()) {
+            di.data = (char*)malloc(si.data.size());
+            if (di.data)
+                memcpy(di.data, si.data.data(), si.data.size());
+        }
+    }
+}
+
+// Release a JDocPage's inner allocations (not the page struct itself).
+static void free_page_inner(JDocPage& p) {
+    free(p.text);
+    for (int j = 0; j < p.image_count; j++) {
+        free(p.images[j].name);
+        free(p.images[j].data);
+        free(p.images[j].format);
+        free(p.images[j].saved_path);
+    }
+    free(p.images);
+    p.text = nullptr;
+    p.images = nullptr;
+    p.image_count = 0;
+}
+
 // ---------------------------------------------------------------------------
 // Public C API
 // ---------------------------------------------------------------------------
@@ -116,35 +164,8 @@ JDocPage* jdoc_convert_pages(const char* file_path, const JDocOptions* opts,
             return nullptr;
         }
 
-        for (size_t i = 0; i < chunks.size(); i++) {
-            auto& src = chunks[i];
-            pages[i].page_number = src.page_number;
-            pages[i].text = strdup_c(src.text);
-
-            size_t n = src.images.size();
-            if (n == 0) continue;
-
-            pages[i].images = (JDocImage*)calloc(n, sizeof(JDocImage));
-            if (!pages[i].images) continue;
-            pages[i].image_count = (int)n;
-
-            for (size_t j = 0; j < n; j++) {
-                auto& si = src.images[j];
-                auto& di = pages[i].images[j];
-                di.page_number = si.page_number;
-                di.name = strdup_c(si.name);
-                di.width = si.width;
-                di.height = si.height;
-                di.format = strdup_c(si.format);
-                di.saved_path = strdup_c(si.saved_path);
-                di.data_size = (int)si.data.size();
-                if (!si.data.empty()) {
-                    di.data = (char*)malloc(si.data.size());
-                    if (di.data)
-                        memcpy(di.data, si.data.data(), si.data.size());
-                }
-            }
-        }
+        for (size_t i = 0; i < chunks.size(); i++)
+            fill_page(pages[i], chunks[i]);
 
         *out_count = (int)chunks.size();
         return pages;
@@ -154,6 +175,33 @@ JDocPage* jdoc_convert_pages(const char* file_path, const JDocOptions* opts,
     } catch (...) {
         set_error(err_buf, err_buf_size, "unknown error");
         return nullptr;
+    }
+}
+
+int jdoc_convert_pages_stream(const char* file_path, const JDocOptions* opts,
+                              JDocPageCallback cb, void* userdata,
+                              char* err_buf, int err_buf_size) {
+    set_error(err_buf, err_buf_size, "");
+    if (!file_path || !cb) {
+        set_error(err_buf, err_buf_size, "file_path or callback is NULL");
+        return -1;
+    }
+    try {
+        auto cpp_opts = to_cpp_opts(opts);
+        jdoc::for_each_chunk(file_path, cpp_opts, [&](jdoc::PageChunk&& chunk) {
+            JDocPage page = {};
+            fill_page(page, chunk);
+            int keep_going = cb(&page, userdata);
+            free_page_inner(page);
+            return keep_going != 0;
+        });
+        return 0;
+    } catch (const std::exception& e) {
+        set_error(err_buf, err_buf_size, e.what());
+        return -1;
+    } catch (...) {
+        set_error(err_buf, err_buf_size, "unknown error");
+        return -1;
     }
 }
 

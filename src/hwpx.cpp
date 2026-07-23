@@ -121,6 +121,30 @@ public:
         return chunks;
     }
 
+    // Streaming variant: parse and emit one section XML at a time so peak
+    // memory tracks a single section. Byte-identical to convert_chunks().
+    void convert_chunks_stream(bool plaintext, const PageSink& sink) {
+        int section_idx = 0;
+
+        for (auto& section_path : section_paths_) {
+            // Check page filter
+            if (!opts_.pages.empty()) {
+                bool found = false;
+                for (int p : opts_.pages) {
+                    if (p == section_idx) { found = true; break; }
+                }
+                if (!found) { section_idx++; continue; }
+            }
+
+            PageChunk chunk;
+            chunk.page_number = section_idx + 1;
+            parse_section(section_path, chunk);
+            if (plaintext) chunk.text = util::strip_markdown(chunk.text);
+            if (!sink(std::move(chunk))) return;
+            section_idx++;
+        }
+    }
+
 private:
     std::unique_ptr<ZipReader> zip_;
     ConvertOptions opts_;
@@ -974,6 +998,16 @@ std::vector<PageChunk> hwpx_to_markdown_chunks(const std::string& hwpx_path,
             chunk.text = util::strip_markdown(chunk.text);
     }
     return chunks;
+}
+
+void hwpx_to_markdown_chunks_stream(const std::string& hwpx_path,
+                                    const ConvertOptions& opts_in, const PageSink& sink) {
+    ConvertOptions opts = opts_in;
+    opts.page_chunks = true;
+    bool plaintext = (opts.format == OutputFormat::PLAINTEXT);
+    HWPXParser parser(hwpx_path, opts);
+    parser.parse();
+    parser.convert_chunks_stream(plaintext, sink);
 }
 
 } // namespace jdoc

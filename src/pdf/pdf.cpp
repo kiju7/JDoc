@@ -325,4 +325,31 @@ std::vector<PageChunk> pdf_to_markdown_chunks_mem(const uint8_t* data, size_t si
     auto r = extract_pdf_buffer(data, size, "<memory>", opts);
     return result_to_chunks(r, opts);
 }
+
+void pdf_to_markdown_chunks_stream(const std::string& pdf_path,
+                                   const ConvertOptions& opts, const PageSink& sink) {
+    // Shared document setup (xref, fonts, page tree) is parsed once inside
+    // extract_pdf; the per-page emit loop then streams, releasing each page's
+    // buffers as the consumer advances (stream_result_chunks).
+    //
+    // NOTE — PDF is a deliberate exception to producer-side peak-memory
+    // reduction. Markdown heading detection needs the document-wide modal body
+    // font size, which is only known after every page's text lines are parsed
+    // (FontStats::compute over all_lines). Deferring image decode to a second
+    // pass to shrink producer peak would force either a content re-parse
+    // (throughput regression on text-heavy PDFs) or retaining every page's
+    // parse result (memory regression on vector-heavy PDFs) — both violate the
+    // "no regression" requirement. So the streaming win here is consumer-side:
+    // the sink owns and frees one page at a time. Producer peak is bounded by
+    // image_dir (its existing per-page disk flush) when set. Output is
+    // byte-identical to pdf_to_markdown_chunks.
+    auto r = extract_pdf(pdf_path, opts);
+    stream_result_chunks(r, opts, sink);
+}
+
+void pdf_to_markdown_chunks_mem_stream(const uint8_t* data, size_t size,
+                                       const ConvertOptions& opts, const PageSink& sink) {
+    auto r = extract_pdf_buffer(data, size, "<memory>", opts);
+    stream_result_chunks(r, opts, sink);
+}
 } // namespace jdoc
