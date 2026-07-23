@@ -10,15 +10,25 @@
 // Spec: https://learn.microsoft.com/openspecs/windows_protocols/ms-wmf/
 // License: MIT
 
+#include "common/emf_text.h"   // MetafileContent
+
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace jdoc {
 
-// Extract the text drawn inside a WMF metafile, ordered top-to-bottom then
-// left-to-right. Strings decode as UTF-8-or-CP949 (Korean legacy fallback).
-// Returns "" for non-WMF input or a WMF with no text. Never throws.
+// Single-pass WMF extraction: walk the record stream once, collecting text
+// (when want_text) and/or embedded bitmaps (when want_images). Text decodes as
+// UTF-8-or-CP949; each image is one BMP file, one per DIB-carrying record
+// (META_DIBBITBLT / META_DIBSTRETCHBLT / META_STRETCHDIB / …). Never throws.
+MetafileContent wmf_extract(const uint8_t* data, size_t size,
+                            bool want_text = true, bool want_images = true);
+
+// Convenience wrappers over wmf_extract() for callers that want only one side.
 std::string wmf_extract_text(const uint8_t* data, size_t size);
+std::vector<std::vector<char>> wmf_extract_bitmaps(const uint8_t* data,
+                                                   size_t size);
 
 } // namespace jdoc

@@ -844,91 +844,103 @@ std::string PptxParser::format_master_layout_block(const std::string& body) {
 
 // ── to_chunks ───────────────────────────────────────────
 
-std::vector<PageChunk> PptxParser::to_chunks(
-    const ConvertOptions& opts) {
-
-    std::vector<PageChunk> chunks;
+// Build one slide's chunk. Shared by the eager and streaming to_chunks.
+PageChunk PptxParser::build_slide_chunk(size_t i, const ConvertOptions& opts) {
+    int slide_num = static_cast<int>(i) + 1;
     ConvertOptions img_opts = opts;
     img_opts.images = true;
 
+    auto content = parse_slide(slide_paths_[i]);
+
+    PageChunk chunk;
+    chunk.page_number = slide_num;
+
+    // Distinct media parts already listed for this page — a shape group
+    // that repeats one picture should list it once per page, not per shape
+    std::set<std::string> page_media;
+
+    std::string text;
+
+    if (!content.title.empty()) {
+        text += "# "; text += content.title; text += "\n\n";
+    }
+
+    for (auto& elem : content.elements) {
+        switch (elem.kind) {
+            case SlideElement::TEXT:
+                text += elem.text; text += "\n\n";
+                break;
+            case SlideElement::IMAGE: {
+                ImageData img;
+                std::string ref_name;
+                if (!resolve_image(elem.text, slide_num, img_opts, img, ref_name))
+                    break;
+                text += "!["; text += img.name; text += "]("; text += opts.image_ref_prefix; text += ref_name; text += ")\n\n";
+
+                // The page lists every distinct image it shows, so the
+                // page-to-image association survives deduplication. A page
+                // that reuses an image extracted earlier gets the shared
+                // name and path with no second copy of the bytes.
+                if (page_media.insert(elem.text).second)
+                    chunk.images.push_back(std::move(img));
+                break;
+            }
+            case SlideElement::TABLE:
+                if (opts.tables) {
+                    chunk.tables.push_back(elem.rows);
+                    text += "\n"; text += util::format_markdown_table(elem.rows); text += "\n";
+                }
+                break;
+        }
+    }
+
+    if (!content.notes.empty()) {
+        text += "\n> **Notes:** "; text += content.notes; text += "\n\n";
+    }
+
+    chunk.text = std::move(text);
+    return chunk;
+}
+
+// Emit the trailing master/layout chunk (built from all slides' concatenated
+// text). Returns false if the sink stopped. `body` is the joined slide text.
+bool PptxParser::emit_master_layout(const std::string& body, const PageSink& sink) {
+    std::string extra = format_master_layout_block(body);
+    if (extra.empty()) return true;
+    PageChunk chunk;
+    chunk.page_number = static_cast<int>(slide_paths_.size()) + 1;
+    chunk.text = std::move(extra);
+    return sink(std::move(chunk));
+}
+
+bool PptxParser::page_wanted(int slide_num, const ConvertOptions& opts) {
+    if (opts.pages.empty()) return true;
+    for (int p : opts.pages) if (p == slide_num) return true;
+    return false;
+}
+
+std::vector<PageChunk> PptxParser::to_chunks(const ConvertOptions& opts) {
+    std::vector<PageChunk> chunks;
+    to_chunks(opts, [&](PageChunk&& c) {
+        chunks.push_back(std::move(c));
+        return true;
+    });
+    return chunks;
+}
+
+bool PptxParser::to_chunks(const ConvertOptions& opts, const PageSink& sink) {
+    // Accumulate slide text for the trailing master/layout chunk (text only —
+    // images are emitted and freed per slide, so peak tracks one slide).
+    std::string body;
     for (size_t i = 0; i < slide_paths_.size(); ++i) {
         int slide_num = static_cast<int>(i) + 1;
+        if (!page_wanted(slide_num, opts)) continue;
 
-        if (!opts.pages.empty()) {
-            bool found = false;
-            for (int p : opts.pages) {
-                if (p == slide_num) { found = true; break; }
-            }
-            if (!found) continue;
-        }
-
-        auto content = parse_slide(slide_paths_[i]);
-
-        PageChunk chunk;
-        chunk.page_number = slide_num;
-
-        // Distinct media parts already listed for this page — a shape group
-        // that repeats one picture should list it once per page, not per shape
-        std::set<std::string> page_media;
-
-        std::string text;
-
-        if (!content.title.empty()) {
-            text += "# "; text += content.title; text += "\n\n";
-        }
-
-        for (auto& elem : content.elements) {
-            switch (elem.kind) {
-                case SlideElement::TEXT:
-                    text += elem.text; text += "\n\n";
-                    break;
-                case SlideElement::IMAGE: {
-                    ImageData img;
-                    std::string ref_name;
-                    if (!resolve_image(elem.text, slide_num, img_opts, img, ref_name))
-                        break;
-                    text += "!["; text += img.name; text += "]("; text += opts.image_ref_prefix; text += ref_name; text += ")\n\n";
-
-                    // The page lists every distinct image it shows, so the
-                    // page-to-image association survives deduplication. A page
-                    // that reuses an image extracted earlier gets the shared
-                    // name and path with no second copy of the bytes.
-                    if (page_media.insert(elem.text).second)
-                        chunk.images.push_back(std::move(img));
-                    break;
-                }
-                case SlideElement::TABLE:
-                    if (opts.tables) {
-                        chunk.tables.push_back(elem.rows);
-                        text += "\n"; text += util::format_markdown_table(elem.rows); text += "\n";
-                    }
-                    break;
-            }
-        }
-
-        if (!content.notes.empty()) {
-            text += "\n> **Notes:** "; text += content.notes; text += "\n\n";
-        }
-
-        chunk.text = text;
-        chunks.push_back(std::move(chunk));
+        PageChunk chunk = build_slide_chunk(i, opts);
+        body += chunk.text;
+        if (!sink(std::move(chunk))) return false;
     }
-
-    // Master/layout text belongs to no slide, so it becomes a trailing chunk
-    std::string body;
-    size_t body_total = 0;
-    for (auto& c : chunks) body_total += c.text.size();
-    body.reserve(body_total);
-    for (auto& c : chunks) body += c.text;
-    std::string extra = format_master_layout_block(body);
-    if (!extra.empty()) {
-        PageChunk chunk;
-        chunk.page_number = static_cast<int>(slide_paths_.size()) + 1;
-        chunk.text = extra;
-        chunks.push_back(std::move(chunk));
-    }
-
-    return chunks;
+    return emit_master_layout(body, sink);
 }
 
 } // namespace jdoc

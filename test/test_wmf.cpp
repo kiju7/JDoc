@@ -6,6 +6,8 @@
 #include "jdoc/jdoc.h"
 
 #include <cstdint>
+#include <fstream>
+#include <iterator>
 #include <cstring>
 #include <iostream>
 #include <string>
@@ -156,6 +158,55 @@ void test_rejects() {
     TEST_END
 }
 
+// META_STRETCHDIB (0x0F43): 22 fixed bytes then a contiguous DIB.
+static std::vector<uint8_t> stretchdib(const std::vector<uint8_t>& dib) {
+    std::vector<uint8_t> parm(22, 0);
+    parm.insert(parm.end(), dib.begin(), dib.end());
+    if (parm.size() & 1) parm.push_back(0);
+    size_t rec_bytes = 6 + parm.size();
+    std::vector<uint8_t> r;
+    put_u32v(r, (uint32_t)(rec_bytes / 2));
+    put_u16(r, 0x0F43);
+    r.insert(r.end(), parm.begin(), parm.end());
+    return r;
+}
+
+void test_bitmap_extraction() {
+    std::cerr << "Embedded bitmap extraction:\n";
+
+    TEST("stretchdib -> valid BMP with correct dimensions")
+        std::vector<uint8_t> dib(40, 0);           // BITMAPINFOHEADER
+        auto set32 = [&](size_t o, uint32_t v) {
+            dib[o]=v&0xFF; dib[o+1]=(v>>8)&0xFF; dib[o+2]=(v>>16)&0xFF; dib[o+3]=(v>>24)&0xFF;
+        };
+        set32(0, 40);       // biSize
+        set32(4, 9);        // biWidth
+        set32(8, 6);        // biHeight
+        dib[12] = 1;        // biPlanes
+        dib[14] = 24;       // biBitCount
+        for (int k = 0; k < 12; ++k) dib.push_back(0xCD);  // pixel bytes
+
+        auto w = wmf_header();
+        append(w, stretchdib(dib));
+        append(w, eof_record());
+
+        auto bmps = jdoc::wmf_extract_bitmaps(w.data(), w.size());
+        ASSERT(bmps.size() == 1);
+        auto& b = bmps[0];
+        ASSERT(b[0] == 'B' && b[1] == 'M');
+        int bw = b[18] | b[19]<<8 | b[20]<<16 | b[21]<<24;
+        int bh = b[22] | b[23]<<8 | b[24]<<16 | b[25]<<24;
+        ASSERT(bw == 9 && bh == 6);
+    TEST_END
+
+    TEST("no dib records -> empty")
+        auto w = wmf_header();
+        append(w, exttextout(0, 0, "text only"));
+        append(w, eof_record());
+        ASSERT(jdoc::wmf_extract_bitmaps(w.data(), w.size()).empty());
+    TEST_END
+}
+
 void test_end_to_end() {
     std::cerr << "End-to-end (detect + convert on placeable WMF):\n";
 
@@ -179,12 +230,39 @@ void test_end_to_end() {
     TEST_END
 }
 
-int main() {
+// Ad-hoc: `test_wmf <file.wmf>` prints text + bitmap extraction for a real WMF.
+static int inspect_file(const char* path) {
+    std::ifstream f(path, std::ios::binary);
+    std::vector<uint8_t> d((std::istreambuf_iterator<char>(f)),
+                           std::istreambuf_iterator<char>());
+    std::cerr << path << ": " << d.size() << " bytes\n";
+    auto text = jdoc::wmf_extract_text(d.data(), d.size());
+    std::cerr << "  text: " << text.size() << " bytes"
+              << (text.empty() ? " (none)" : (": " + text.substr(0, 200))) << "\n";
+    auto bmps = jdoc::wmf_extract_bitmaps(d.data(), d.size());
+    std::cerr << "  bitmaps: " << bmps.size() << "\n";
+    for (size_t i = 0; i < bmps.size(); ++i) {
+        auto& b = bmps[i];
+        int w = 0, h = 0;
+        auto u = [&](size_t k) { return (unsigned char)b[k]; };
+        if (b.size() >= 26) {
+            w = u(18) | u(19)<<8 | u(20)<<16 | u(21)<<24;
+            h = u(22) | u(23)<<8 | u(24)<<16 | u(25)<<24;
+        }
+        std::cerr << "    bmp[" << i << "]: " << b.size() << " bytes, "
+                  << w << "x" << h << "\n";
+    }
+    return 0;
+}
+
+int main(int argc, char** argv) {
+    if (argc > 1) return inspect_file(argv[1]);
     std::cerr << "\n=== jdoc::wmf_extract_text tests ===\n\n";
     test_exttextout();
     test_textout();
     test_order_and_placeable();
     test_rejects();
+    test_bitmap_extraction();
     test_end_to_end();
     std::cerr << "\n" << tests_passed << " passed, " << tests_failed
               << " failed\n";

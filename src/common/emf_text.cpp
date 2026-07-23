@@ -130,20 +130,80 @@ void decode_text_record(const uint8_t* rec, size_t rec_size, uint32_t type,
         out.push_back({x, y, std::move(text)});
 }
 
+// Byte offsets (from the record start, incl. the 8-byte header) of the DIB
+// locator fields inside each bitmap record, plus the minimum record size that
+// makes the record well-formed. Mirrors MS-EMF §2.3.1 record layouts.
+struct BitmapFields {
+    uint32_t type;
+    size_t off_bmi, cb_bmi, off_bits, cb_bits, min_size;
+};
+constexpr BitmapFields BITMAP_TABLE[] = {
+    {0x00000051, 48, 52, 56, 60, 80},   // EMR_STRETCHDIBITS
+    {0x00000050, 48, 52, 56, 60, 76},   // EMR_SETDIBITSTODEVICE
+    {0x0000004C, 84, 88, 92, 96, 100},  // EMR_BITBLT
+    {0x0000004D, 84, 88, 92, 96, 108},  // EMR_STRETCHBLT
+    {0x0000004E, 84, 88, 92, 96, 128},  // EMR_MASKBLT
+    {0x0000004F, 96, 100, 104, 108, 140}, // EMR_PLGBLT
+    {0x00000072, 84, 88, 92, 96, 104},  // EMR_ALPHABLEND
+    {0x00000074, 84, 88, 92, 96, 108},  // EMR_TRANSPARENTBLT
+};
+
+const BitmapFields* bitmap_fields(uint32_t type) {
+    for (const auto& f : BITMAP_TABLE)
+        if (f.type == type) return &f;
+    return nullptr;
+}
+
+// Reassemble a DIB (header + pixels) into a BMP file: a 14-byte
+// BITMAPFILEHEADER, the BITMAPINFOHEADER(+palette), then the pixels. The single
+// memcpy of each half into the output buffer is the only copy of the pixel
+// data — the source EMF buffer is read in place otherwise. char buffer so the
+// result moves straight into ImageData::data.
+std::vector<char> dib_to_bmp(const uint8_t* bmi, size_t cb_bmi,
+                             const uint8_t* bits, size_t cb_bits) {
+    uint32_t off_bits = 14 + uint32_t(cb_bmi);
+    uint32_t file_size = off_bits + uint32_t(cb_bits);
+    std::vector<char> out(file_size);
+    auto* o = reinterpret_cast<uint8_t*>(out.data());
+    o[0] = 'B'; o[1] = 'M';
+    o[2] = file_size & 0xFF; o[3] = (file_size >> 8) & 0xFF;
+    o[4] = (file_size >> 16) & 0xFF; o[5] = (file_size >> 24) & 0xFF;
+    // reserved1/reserved2 stay zero
+    o[10] = off_bits & 0xFF; o[11] = (off_bits >> 8) & 0xFF;
+    o[12] = (off_bits >> 16) & 0xFF; o[13] = (off_bits >> 24) & 0xFF;
+    std::memcpy(out.data() + 14, bmi, cb_bmi);
+    std::memcpy(out.data() + off_bits, bits, cb_bits);
+    return out;
+}
+
+// Pull the DIB out of a bitmap record and append its BMP to `out`.
+void take_bitmap(const uint8_t* rec, uint32_t rsize, const BitmapFields& f,
+                 std::vector<std::vector<char>>& out) {
+    if (rsize < f.min_size) return;
+    uint32_t off_bmi = rd_u32(rec + f.off_bmi);
+    uint32_t cb_bmi = rd_u32(rec + f.cb_bmi);
+    uint32_t off_bits = rd_u32(rec + f.off_bits);
+    uint32_t cb_bits = rd_u32(rec + f.cb_bits);
+    auto ok = [&](uint32_t o, uint32_t n) {   // range o..o+n inside the record
+        return o <= rsize && n <= rsize - o;
+    };
+    if (cb_bmi >= 12 && cb_bits > 0 && ok(off_bmi, cb_bmi) && ok(off_bits, cb_bits))
+        out.push_back(dib_to_bmp(rec + off_bmi, cb_bmi, rec + off_bits, cb_bits));
+}
+
 } // namespace
 
-std::string emf_extract_text(const uint8_t* data, size_t size) {
-    if (!data || size < RECORD_HEADER) return {};
+MetafileContent emf_extract(const uint8_t* data, size_t size,
+                            bool want_text, bool want_images) {
+    MetafileContent content;
+    if (!data || size < RECORD_HEADER) return content;
 
     // First record must be EMR_HEADER with the " EMF" signature at offset 40.
-    uint32_t first_type = rd_u32(data);
-    uint32_t first_size = rd_u32(data + 4);
-    if (first_type != EMR_HEADER || first_size < 44 || first_size > size)
-        return {};
-    if (rd_u32(data + 40) != ENHMETA_SIGNATURE)
-        return {};
+    if (rd_u32(data) != EMR_HEADER || rd_u32(data + 4) < 44 ||
+        rd_u32(data + 40) != ENHMETA_SIGNATURE)
+        return content;
 
-    std::vector<Run> runs;
+    std::vector<Run> runs;   // text runs, sorted into reading order below
     size_t off = 0;
     uint32_t seen = 0;
     while (off + RECORD_HEADER <= size && seen < MAX_RECORDS) {
@@ -155,38 +215,51 @@ std::string emf_extract_text(const uint8_t* data, size_t size) {
             break;
         if (type == EMR_EOF) break;
 
-        switch (type) {
-            case EMR_EXTTEXTOUTW: case EMR_EXTTEXTOUTA:
-            case EMR_POLYTEXTOUTW: case EMR_POLYTEXTOUTA:
-            case EMR_SMALLTEXTOUT:
-                decode_text_record(data + off, rsize, type, runs);
-                break;
-            default: break;
+        if (want_text) {
+            switch (type) {
+                case EMR_EXTTEXTOUTW: case EMR_EXTTEXTOUTA:
+                case EMR_POLYTEXTOUTW: case EMR_POLYTEXTOUTA:
+                case EMR_SMALLTEXTOUT:
+                    decode_text_record(data + off, rsize, type, runs);
+                    break;
+                default: break;
+            }
+        }
+        if (want_images) {
+            if (const BitmapFields* f = bitmap_fields(type))
+                take_bitmap(data + off, rsize, *f, content.images);
         }
         off += rsize;
         ++seen;
     }
 
-    if (runs.empty()) return {};
-
-    // Reading order: top-to-bottom, then left-to-right. stable_sort keeps the
-    // original record order among runs that share a reference point.
-    std::stable_sort(runs.begin(), runs.end(), [](const Run& a, const Run& b) {
-        if (a.y != b.y) return a.y < b.y;
-        return a.x < b.x;
-    });
-
-    std::string out;
-    int32_t prev_y = runs.front().y;
-    bool first = true;
-    for (auto& r : runs) {
-        if (!first && r.y != prev_y) out += '\n';   // new baseline → new line
-        out += r.text;
-        prev_y = r.y;
-        first = false;
-        if (out.size() > MAX_OUTPUT) break;
+    if (want_text && !runs.empty()) {
+        // Reading order: top-to-bottom, then left-to-right. stable_sort keeps
+        // the record order among runs that share a reference point.
+        std::stable_sort(runs.begin(), runs.end(), [](const Run& a, const Run& b) {
+            if (a.y != b.y) return a.y < b.y;
+            return a.x < b.x;
+        });
+        int32_t prev_y = runs.front().y;
+        bool first = true;
+        for (auto& r : runs) {
+            if (!first && r.y != prev_y) content.text += '\n';  // new baseline
+            content.text += r.text;
+            prev_y = r.y;
+            first = false;
+            if (content.text.size() > MAX_OUTPUT) break;
+        }
     }
-    return out;
+    return content;
+}
+
+std::string emf_extract_text(const uint8_t* data, size_t size) {
+    return emf_extract(data, size, /*want_text=*/true, /*want_images=*/false).text;
+}
+
+std::vector<std::vector<char>> emf_extract_bitmaps(const uint8_t* data,
+                                                   size_t size) {
+    return emf_extract(data, size, /*want_text=*/false, /*want_images=*/true).images;
 }
 
 std::string metafile_extract_text(const char* format, const uint8_t* data,

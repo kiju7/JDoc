@@ -663,11 +663,24 @@ void stream_result_chunks(ExtractResult& r, const ConvertOptions& opts,
 
 std::vector<PageChunk> result_to_chunks(ExtractResult& r,
                                                const ConvertOptions& opts) {
+    // Eager path: build every chunk and return them. Unlike stream_result_chunks
+    // this does NOT release r's per-page buffers as it goes — the caller destroys
+    // r immediately afterwards, so the extra per-page clears would be pure
+    // overhead (a measurable few-percent on glibc). This keeps the eager path's
+    // cost identical to the pre-streaming implementation.
+    std::vector<int> page_indices;
+    if (opts.pages.empty()) {
+        for (int i = 0; i < r.total_pages; i++) page_indices.push_back(i);
+    } else {
+        page_indices = opts.pages;
+    }
+    bool plaintext = (opts.format == OutputFormat::PLAINTEXT);
+
     std::vector<PageChunk> chunks;
-    stream_result_chunks(r, opts, [&](PageChunk&& c) {
-        chunks.push_back(std::move(c));
-        return true;
-    });
+    for (int p : page_indices) {
+        if (p < 0 || p >= r.total_pages) continue;
+        chunks.push_back(build_page_chunk(r, opts, plaintext, p));
+    }
     return chunks;
 }
 

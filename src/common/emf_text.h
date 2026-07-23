@@ -14,16 +14,35 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace jdoc {
 
-// Extract the text drawn inside an EMF metafile, ordered top-to-bottom then
-// left-to-right by each run's reference point. W (Unicode) runs decode as
-// UTF-16LE; A (ANSI) runs decode as UTF-8-or-CP949 (Korean legacy fallback).
+// Text and embedded bitmaps recovered from a metafile in one pass. `images`
+// holds each embedded bitmap as a standalone BMP file; the char buffer type
+// matches ImageData::data so callers can std::move it in without a copy.
+struct MetafileContent {
+    std::string text;
+    std::vector<std::vector<char>> images;
+};
+
+// Single-pass EMF extraction: walk the record stream once, collecting text
+// (when want_text) and/or embedded bitmaps (when want_images). This is the
+// primary entry point — the convert path uses it so a metafile that carries
+// both is parsed only once. Never throws; malformed input yields whatever was
+// recovered before the defect.
 //
-// Returns "" when `data` is not a valid EMF or contains no text. Never throws;
-// malformed input yields whatever text was recovered before the defect.
+// Text is ordered top-to-bottom then left-to-right by each run's reference
+// point; W (Unicode) runs decode as UTF-16LE, A (ANSI) runs as UTF-8-or-CP949.
+// Each image is one BMP file, one per bitmap record (EMR_BITBLT /
+// EMR_STRETCHDIBITS / …) — many EMFs just wrap a single scanned bitmap.
+MetafileContent emf_extract(const uint8_t* data, size_t size,
+                            bool want_text = true, bool want_images = true);
+
+// Convenience wrappers over emf_extract() for callers that want only one side.
 std::string emf_extract_text(const uint8_t* data, size_t size);
+std::vector<std::vector<char>> emf_extract_bitmaps(const uint8_t* data,
+                                                   size_t size);
 
 // Convenience for the embedded-image path: extract text from a metafile blob
 // given its format label ("emf" or "wmf"). Returns "" for any other label or
