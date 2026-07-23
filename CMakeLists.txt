@@ -260,6 +260,14 @@ if(JDOC_BUILD_TESTS)
         add_test(NAME ${t} COMMAND ${t}
                  WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
     endforeach()
+
+    # Concurrency test: exercises the C API from many threads, so it links the
+    # shared library (where the C API lives) rather than jdoc_lib.
+    add_executable(test_thread_safety test/test_thread_safety.cpp)
+    target_link_libraries(test_thread_safety PRIVATE jdoc_shared Threads::Threads)
+    target_include_directories(test_thread_safety PRIVATE include src)
+    add_test(NAME test_thread_safety COMMAND test_thread_safety
+             WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 endif()
 
 # ── Python bindings (pybind11) ────────────────────────────────

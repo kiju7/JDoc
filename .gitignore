@@ -18,3 +18,8 @@ docs/
 test/bench/
 test/bench_with_rss.sh
 build-*/
+
+# Java (JNA) binding build artifacts
+bindings/java/.gradle/
+bindings/java/build/
+bindings/go/*.test
