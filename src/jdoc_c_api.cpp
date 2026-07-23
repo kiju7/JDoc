@@ -1,6 +1,7 @@
 #include "jdoc/jdoc_c_api.h"
 #include "jdoc/jdoc.h"
 #include "jdoc/archive.h"
+#include "jdoc/detect.h"
 
 #include <cstdint>
 #include <cstring>
@@ -217,7 +218,63 @@ char* jdoc_convert_mem(const void* data, int size, const char* name_hint,
     }
 }
 
+static int fill_format_info(const jdoc::FormatInfo& src, JDocFormatInfo* out) {
+    out->format = strdup_c(src.format);
+    out->category = (int)src.category;
+    out->extension = strdup_c(src.extension);
+    out->mime = strdup_c(src.mime);
+    out->convertible = src.convertible ? 1 : 0;
+    return 0;
+}
+
+int jdoc_detect(const char* file_path, JDocFormatInfo* out,
+                char* err_buf, int err_buf_size) {
+    set_error(err_buf, err_buf_size, "");
+    if (!file_path || !out) {
+        set_error(err_buf, err_buf_size, "file_path or out is NULL");
+        return -1;
+    }
+    try {
+        return fill_format_info(jdoc::detect(file_path), out);
+    } catch (const std::exception& e) {
+        set_error(err_buf, err_buf_size, e.what());
+        return -1;
+    } catch (...) {
+        set_error(err_buf, err_buf_size, "unknown error");
+        return -1;
+    }
+}
+
+int jdoc_detect_mem(const void* data, int size, const char* name_hint,
+                    JDocFormatInfo* out, char* err_buf, int err_buf_size) {
+    set_error(err_buf, err_buf_size, "");
+    if (!data || size <= 0 || !out) {
+        set_error(err_buf, err_buf_size, "data is NULL/empty or out is NULL");
+        return -1;
+    }
+    try {
+        return fill_format_info(
+            jdoc::detect(data, (size_t)size, name_hint ? name_hint : ""), out);
+    } catch (const std::exception& e) {
+        set_error(err_buf, err_buf_size, e.what());
+        return -1;
+    } catch (...) {
+        set_error(err_buf, err_buf_size, "unknown error");
+        return -1;
+    }
+}
+
 void jdoc_free_string(char* str) { free(str); }
+
+void jdoc_free_format_info(JDocFormatInfo* info) {
+    if (!info) return;
+    free(info->format);
+    free(info->extension);
+    free(info->mime);
+    info->format = nullptr;
+    info->extension = nullptr;
+    info->mime = nullptr;
+}
 
 void jdoc_free_members(JDocMember* members, int count) {
     if (!members) return;

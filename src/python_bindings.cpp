@@ -9,6 +9,7 @@
 
 #include "jdoc/jdoc.h"
 #include "jdoc/archive.h"
+#include "jdoc/detect.h"
 #include "jdoc/pdf.h"
 #include "jdoc/office.h"
 #include "jdoc/hwp.h"
@@ -95,6 +96,36 @@ PYBIND11_MODULE(_jdoc, m) {
         .value("ENCRYPTED_PASSWORD", jdoc::DocFormat::ENCRYPTED_PASSWORD)
         .value("ENCRYPTED_RIGHTS", jdoc::DocFormat::ENCRYPTED_RIGHTS)
         .export_values();
+
+    // FormatCategory enum (detect API)
+    py::enum_<jdoc::FormatCategory>(m, "FormatCategory")
+        .value("DOCUMENT", jdoc::FormatCategory::Document)
+        .value("SPREADSHEET", jdoc::FormatCategory::Spreadsheet)
+        .value("PRESENTATION", jdoc::FormatCategory::Presentation)
+        .value("ARCHIVE", jdoc::FormatCategory::Archive)
+        .value("EMAIL", jdoc::FormatCategory::Email)
+        .value("TEXT", jdoc::FormatCategory::Text)
+        .value("IMAGE", jdoc::FormatCategory::Image)
+        .value("UNKNOWN", jdoc::FormatCategory::Unknown)
+        .export_values();
+
+    // FormatInfo (detect API result)
+    py::class_<jdoc::FormatInfo>(m, "FormatInfo")
+        .def(py::init<>())
+        .def_readwrite("format", &jdoc::FormatInfo::format)
+        .def_readwrite("category", &jdoc::FormatInfo::category)
+        .def_readwrite("extension", &jdoc::FormatInfo::extension)
+        .def_readwrite("mime", &jdoc::FormatInfo::mime)
+        .def_readwrite("convertible", &jdoc::FormatInfo::convertible)
+        .def_property_readonly("category_name", [](const jdoc::FormatInfo& i) {
+            return std::string(jdoc::format_category_name(i.category));
+        })
+        .def("__repr__", [](const jdoc::FormatInfo& i) {
+            return "<FormatInfo format='" + i.format + "' category='" +
+                   jdoc::format_category_name(i.category) + "' ext='" +
+                   i.extension + "' convertible=" +
+                   (i.convertible ? "True" : "False") + ">";
+        });
 
     // ── Top-level convenience functions ──────────────────
 
@@ -300,4 +331,22 @@ Returns:
           py::arg("file_path"));
     m.def("format_name", &jdoc::format_name,
           py::arg("fmt"));
+
+    // ── Format detection (detect-only, no extraction) ────
+    m.def("detect",
+          [](const std::string& file_path) { return jdoc::detect(file_path); },
+          py::arg("file_path"),
+          R"doc(Detect a file's format without running a full extraction.
+
+Returns:
+    FormatInfo(format, category, extension, mime, convertible)
+)doc");
+
+    m.def("detect_bytes",
+          [](py::bytes data, const std::string& name_hint) {
+              std::string buf = data;  // copy out of the Python object
+              return jdoc::detect(buf.data(), buf.size(), name_hint);
+          },
+          py::arg("data"), py::arg("name_hint") = "",
+          "Detect the format of a document held in bytes (no file I/O).");
 }

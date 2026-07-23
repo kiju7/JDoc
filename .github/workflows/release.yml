@@ -1,8 +1,10 @@
 name: release
 
-# Push a version tag (e.g. `git tag v1.1.0 && git push origin v1.1.0`) to build
-# CLI binaries and Python wheels for Linux/macOS/Windows and attach them to the
-# GitHub Release. workflow_dispatch builds the same artifacts without releasing.
+# Push a version tag (e.g. `git tag v1.1.0 && git push origin v1.1.0`) to build,
+# for Linux/macOS/Windows: the CLI binary, a native SDK (shared library + C
+# headers, for the Go/Java bindings and any C/C++ consumer), and Python wheels,
+# then attach them to the GitHub Release. workflow_dispatch builds the same
+# artifacts without releasing.
 on:
   push:
     tags: ['v*']
@@ -12,21 +14,25 @@ permissions:
   contents: write   # create the release and upload assets
 
 jobs:
-  cli:
-    name: cli-${{ matrix.os }}
+  native:
+    name: native-${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
-            asset: jdoc-linux-x64
+            platform: linux-x64
           - os: macos-latest
-            asset: jdoc-macos-arm64
+            platform: macos-arm64
           - os: windows-latest
-            asset: jdoc-windows-x64
+            platform: windows-x64
     steps:
       - uses: actions/checkout@v4
+
+      # NASM assembles libjpeg-turbo's x86 SIMD (WITH_SIMD=ON); arm64 uses NEON.
+      - name: Set up NASM
+        uses: ilammy/setup-nasm@v1
 
       # Compiler cache — reuses object files across runs (incl. the bundled
       # zlib/libjpeg-turbo). Fail-safe: if sccache is unavailable the launcher
@@ -34,23 +40,51 @@ jobs:
       - name: Set up sccache
         uses: mozilla-actions/sccache-action@v0.0.6
 
+      # Build the CLI (jdoc) and the shared library with the C API (jdoc_shared).
+      # jdoc_shared is what the Go (cgo) and Java (JNA) bindings link against.
       - name: Build
         env:
           SCCACHE_GHA_ENABLED: "true"
         run: |
           cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_COMPILER_LAUNCHER=sccache
-          cmake --build build --config Release -j 4 --target jdoc
+          cmake --build build --config Release -j 4 --target jdoc jdoc_shared
 
-      - name: Package
+      # CLI archive: jdoc(.exe) + docs.
+      - name: Package CLI
         shell: bash
         run: |
           mkdir -p dist
           if [ -f build/Release/jdoc.exe ]; then
             cp build/Release/jdoc.exe jdoc.exe
-            7z a "dist/${{ matrix.asset }}.zip" jdoc.exe README.md LICENSE
+            7z a "dist/jdoc-${{ matrix.platform }}.zip" jdoc.exe README.md LICENSE
           else
             cp build/jdoc jdoc
-            tar czf "dist/${{ matrix.asset }}.tar.gz" jdoc README.md LICENSE
+            tar czf "dist/jdoc-${{ matrix.platform }}.tar.gz" jdoc README.md LICENSE
+          fi
+
+      # Native SDK: shared library + C headers, for the Go/Java bindings and any
+      # C/C++ consumer. Windows also ships the import lib (jdoc.lib).
+      - name: Package SDK
+        shell: bash
+        run: |
+          mkdir -p dist
+          sdk="jdoc-sdk-${{ matrix.platform }}"
+          mkdir -p "$sdk/lib" "$sdk/include"
+          cp -r include/jdoc "$sdk/include/"
+          cp README.md LICENSE "$sdk/"
+          if [ -d build/Release ]; then
+            # Windows (multi-config): jdoc.dll + import lib jdoc.lib.
+            cp build/Release/jdoc.dll "$sdk/lib/"
+            cp build/Release/jdoc.lib "$sdk/lib/" 2>/dev/null || true
+            7z a "dist/${sdk}.zip" "$sdk"
+          else
+            # Linux/macOS: copy the versioned shared libs, preserving the
+            # unversioned -> versioned symlinks (cp -a; tar keeps symlinks).
+            # Version placement differs: libjdoc.so.<ver> (Linux, suffix) vs
+            # libjdoc.<ver>.dylib (macOS, infix) — so the globs differ too.
+            cp -a build/libjdoc.so* "$sdk/lib/" 2>/dev/null || true
+            cp -a build/libjdoc*.dylib "$sdk/lib/" 2>/dev/null || true
+            tar czf "dist/${sdk}.tar.gz" "$sdk"
           fi
 
       - name: Upload to release
@@ -68,6 +102,13 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
+
+      # NASM for libjpeg-turbo's x86 SIMD in the Windows wheel build (it builds
+      # libjpeg-turbo from source; runs on the host, so PATH NASM is visible).
+      # Linux wheels use the system libjpeg-turbo and macOS wheels are arm64/NEON,
+      # so neither needs it.
+      - name: Set up NASM
+        uses: ilammy/setup-nasm@v1
 
       # Compiler cache for the native (macOS/Windows) wheel builds, where
       # zlib + libjpeg-turbo are compiled from source once per Python version.

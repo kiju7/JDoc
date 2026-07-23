@@ -21,7 +21,8 @@ C++17 기반 문서 → 마크다운 변환기. 무거운 의존성 없이 zlib,
 - **아카이브 코덱** — 7Z: LZMA/LZMA2/PPMd·branch 필터(디코더 전용 LZMA SDK 벤더링, solid block 사전 크기 검사). ALZ/EGG: store/deflate/bzip2/LZMA, solid EGG 스트리밍 분배 지원, CRC 검증, CP949 파일명 변환. RAR: 4.x/5.x 헤더 워크·store 멤버(독점 압축 코덱 멤버는 멤버별 오류, [근거](docs/rar-feasibility.md)). 암호화·독점 코덱(AZO) 멤버는 명확한 오류로 보고
 - **압축폭탄 방어** — 헤더 크기 필드를 신뢰하지 않고 해제 도중 출력 바이트를 계수해 강제. 멤버당·누적·멤버 수·압축비·재귀 깊이 한도 (기본값과 해제 방법은 [옵션](#옵션) 참조)
 - **단일 스레드** — 변환 호출당 스레드 1개, 전역 상태 없음. 호출자가 문서/아카이브 단위로 자유롭게 병렬화 가능
-- **다양한 API** — CLI, Python (pybind11), C, C++
+- **다양한 API** — CLI, Python (pybind11), C, C++, Go (cgo), Java (JNA)
+- **포맷 판별** — 추출 없이 파일 포맷만 판별하는 `detect` API. 이름·카테고리·확장자·MIME·변환가능 여부를 담은 구조체 반환, 이미지 등 비변환 포맷도 검출. 5개 언어 공통 ([문서](docs/detect.md))
 
 ## 설치
 

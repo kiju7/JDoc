@@ -116,9 +116,44 @@ char* jdoc_convert_mem(const void* data, int size, const char* name_hint,
                        const JDocOptions* opts,
                        char* err_buf, int err_buf_size);
 
+/* ── Detect ───────────────────────────────────────────────── */
+
+/* Coarse format family (JDocFormatInfo.category). Mirrors the C++
+ * jdoc::FormatCategory enum. */
+typedef enum {
+    JDOC_CAT_DOCUMENT = 0,
+    JDOC_CAT_SPREADSHEET = 1,
+    JDOC_CAT_PRESENTATION = 2,
+    JDOC_CAT_ARCHIVE = 3,
+    JDOC_CAT_EMAIL = 4,
+    JDOC_CAT_TEXT = 5,
+    JDOC_CAT_IMAGE = 6,
+    JDOC_CAT_UNKNOWN = 7,
+} JDocFormatCategory;
+
+typedef struct {
+    char* format;      /* canonical name: "PDF", "DOCX", "PNG", "UNKNOWN" */
+    int   category;    /* JDocFormatCategory */
+    char* extension;   /* canonical extension incl. dot, e.g. ".pdf" */
+    char* mime;        /* e.g. "application/pdf"; "" if unknown */
+    int   convertible; /* 1 = jdoc can extract text (convert/convert_archive) */
+} JDocFormatInfo;
+
+/* Detect a file's format without running a full extraction.
+ * Fills *out (caller owns the strings; release with jdoc_free_format_info).
+ * Returns 0 on success, -1 on error (message in err_buf). An unrecognized
+ * file still succeeds with format "UNKNOWN". */
+int jdoc_detect(const char* file_path, JDocFormatInfo* out,
+                char* err_buf, int err_buf_size);
+
+/* In-memory variant. name_hint (may be NULL) resolves extension ambiguity. */
+int jdoc_detect_mem(const void* data, int size, const char* name_hint,
+                    JDocFormatInfo* out, char* err_buf, int err_buf_size);
+
 /* ── Free ─────────────────────────────────────────────────── */
 
 void jdoc_free_string(char* str);
+void jdoc_free_format_info(JDocFormatInfo* info);
 void jdoc_free_pages(JDocPage* pages, int count);
 void jdoc_free_members(JDocMember* members, int count);
 

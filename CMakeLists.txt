@@ -189,6 +189,8 @@ add_library(jdoc_lib STATIC
     src/legacy/ole_reader.cpp
     # unified auto-detect API
     src/jdoc.cpp
+    # public format detection API
+    src/detect.cpp
     # vendored code, folded in as objects
     $<TARGET_OBJECTS:pugixml>
     $<TARGET_OBJECTS:lzma_sdk>
@@ -247,7 +249,8 @@ option(JDOC_BUILD_TESTS "Build unit tests" OFF)
 if(JDOC_BUILD_TESTS)
     enable_testing()
     foreach(t IN ITEMS test_pdf test_pdf_crypt test_office test_archive
-                       test_hwp3 test_hwp5 test_hwpx test_eml test_msg test_odf)
+                       test_hwp3 test_hwp5 test_hwpx test_eml test_msg test_odf
+                       test_detect)
         add_executable(${t} test/${t}.cpp)
         target_link_libraries(${t} PRIVATE jdoc_lib)
         target_include_directories(${t} PRIVATE include src)
