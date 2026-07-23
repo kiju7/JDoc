@@ -184,6 +184,37 @@ for (int i = 0; i < page_count; i++) {
 jdoc_free_pages(pages, page_count);
 ```
 
+### 스트리밍 (지연 페이지 이터레이터)
+
+`convert_pages`/`convert_chunks`는 전 페이지를 한 번에 만들어 반환한다(eager). 스트리밍 API는 **페이지를 하나씩 생성→소비→해제**해, 소비자가 한 페이지분 메모리만 들고 큰 문서를 처리할 수 있다. 출력은 eager와 **바이트 동일**하며, 콜백이 `false`(C는 `0`)를 반환하면 조기 중단한다.
+
+pptx(슬라이드)·xlsx(시트)·hwp/hwpx(섹션)처럼 단위별로 지연 파싱되는 포맷은 **첫 페이지 지연과 피크 메모리가 크게 준다** (예: 25슬라이드 pptx에서 첫 페이지 ≈−98%, 피크 ≈−44%). PDF·docx 등 문서 전체를 한 번에 파싱하는 포맷도 API는 동일하게 동작하며 소비자측 페이지 단위 소유 이득을 준다.
+
+```python
+# Python — 제너레이터
+for page in jdoc.convert_pages_stream("big.pptx", images=True):
+    process(page)          # 한 페이지씩 지연 생성; break로 조기 중단
+```
+
+```cpp
+// C++ — sink 콜백 (jdoc/jdoc.h)
+jdoc::for_each_chunk("big.pptx", opts, [](jdoc::PageChunk&& page) {
+    // page.text, page.images ...
+    return true;           // false 반환 시 조기 중단
+});
+```
+
+```c
+/* C API — 콜백형 (jdoc/jdoc_c_api.h). page는 콜백 동안만 유효 */
+int on_page(const JDocPage* page, void* userdata) {
+    printf("Page %d: %s\n", page->page_number, page->text);
+    return 1;              /* 0 반환 시 조기 중단 */
+}
+jdoc_convert_pages_stream("big.pptx", &opts, on_page, NULL, err, sizeof(err));
+```
+
+Go(`StreamPages(path).Pages()` → `iter.Seq[Page]`)와 Java(`Jdoc.streamPages(path)` → `Stream<Page>`) 바인딩도 각 언어의 지연 이터레이터로 같은 API를 제공한다 (`bindings/go`, `bindings/java`).
+
 ## 옵션
 
 모든 API가 **같은 옵션을 같은 이름으로** 공유한다 (C++ `ConvertOptions`, C `JDocOptions`, Python 키워드 인자 — 명칭 동일. CLI는 같은 이름의 플래그).
