@@ -74,7 +74,7 @@ bool OdfParser::load_content(pugi::xml_document& doc, std::vector<char>& buf) co
     if (!zip_.has_entry("content.xml")) return false;
     buf = zip_.read_entry("content.xml");
     if (buf.empty()) return false;  // encrypted or corrupt package
-    return doc.load_buffer(buf.data(), buf.size(),
+    return doc.load_buffer_inplace(buf.data(), buf.size(),
                            pugi::parse_default | pugi::parse_ws_pcdata);
 }
 

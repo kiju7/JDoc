@@ -1,6 +1,7 @@
 #include "pdf_core.h"
 #include "common/string_utils.h"
 #include "common/file_utils.h"
+#include "common/inflate.h"
 #include <fstream>
 #include <zlib.h>
 #include <algorithm>
@@ -150,6 +151,14 @@ PdfObj PdfLexer::parse_object(int depth) {
 std::vector<uint8_t> decode_flate(const uint8_t* src, size_t src_len) {
     std::vector<uint8_t> out;
     if (src_len == 0) return out;
+
+    // Fast path: libdeflate decodes a well-formed FlateDecode stream whole.
+    auto whole = inflate_zlib(src, src_len, src_len * 3);
+    if (!whole.empty()) return whole;
+
+    // Fallback: many real PDFs have truncated/malformed streams (missing the
+    // adler32 trailer, wrong /Length). zlib's streaming inflate recovers the
+    // PARTIAL output that precedes the damage, where libdeflate returns nothing.
     out.reserve(src_len * 3);
 
     z_stream zs = {};

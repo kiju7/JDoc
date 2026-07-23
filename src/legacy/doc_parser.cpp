@@ -736,13 +736,13 @@ std::string DocParser::extract_text_word6(const std::vector<char>& word_doc,
         // DBCS: check for lead byte.
         if (is_korean && util::is_cp949_lead(ch) && pos + 1 < end) {
             uint8_t trail = static_cast<uint8_t>(word_doc[pos + 1]);
-            result += util::cp949_to_utf8(ch, trail);
+            util::append_cp949(result, ch, trail);
             pos += 2;
             continue;
         }
         if (is_japanese && util::is_cp932_lead(ch) && pos + 1 < end) {
             uint8_t trail = static_cast<uint8_t>(word_doc[pos + 1]);
-            result += util::cp932_to_utf8(ch, trail);
+            util::append_cp932(result, ch, trail);
             pos += 2;
             continue;
         }
@@ -922,7 +922,7 @@ std::string DocParser::extract_text_word8(const std::vector<char>& word_doc,
                 if (is_korean && util::is_cp949_lead(ch) && pos + 1 < end) {
                     update_bold(fc_base + local_off);
                     uint8_t trail = static_cast<uint8_t>(word_doc[pos + 1]);
-                    result += util::cp949_to_utf8(ch, trail);
+                    util::append_cp949(result, ch, trail);
                     pos += 2;
                     local_off += 2;
                     continue;
@@ -930,7 +930,7 @@ std::string DocParser::extract_text_word8(const std::vector<char>& word_doc,
                 if (is_japanese && util::is_cp932_lead(ch) && pos + 1 < end) {
                     update_bold(fc_base + local_off);
                     uint8_t trail = static_cast<uint8_t>(word_doc[pos + 1]);
-                    result += util::cp932_to_utf8(ch, trail);
+                    util::append_cp932(result, ch, trail);
                     pos += 2;
                     local_off += 2;
                     continue;

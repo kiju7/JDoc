@@ -43,24 +43,34 @@ XlsbParser::XlsbParser(ZipReader& zip) : zip_(zip) {
 // ── Binary record reading helpers ───────────────────────
 
 uint16_t XlsbParser::read_record_header(const uint8_t* data, size_t& offset,
-                                          uint32_t& out_size) {
+                                          size_t size, uint32_t& out_size) {
+    // A header is 1-2 bytes of type + 1-4 bytes of size (both 7-bit varints),
+    // up to 6 bytes — but the caller's loop only guarantees a couple remain, so
+    // a truncated final record must not read past the buffer. On overflow,
+    // consume the rest and return a no-match sentinel so every caller's
+    // `offset = rec_end` / loop-condition pair exits cleanly.
+    auto truncated = [&]() -> uint16_t { offset = size; out_size = 0; return 0xFFFF; };
+
     // Record type: 1-2 bytes (7-bit variable-length encoding)
+    if (offset >= size) return truncated();
     uint16_t rec_type = data[offset++];
     if (rec_type & 0x80) {
+        if (offset >= size) return truncated();
         rec_type = (rec_type & 0x7F) | (static_cast<uint16_t>(data[offset++]) << 7);
     }
 
     // Record size: 1-4 bytes (7-bit variable-length encoding)
-    uint32_t size = 0;
+    uint32_t rec_size = 0;
     int shift = 0;
     for (int i = 0; i < 4; i++) {
+        if (offset >= size) return truncated();
         uint8_t b = data[offset++];
-        size |= static_cast<uint32_t>(b & 0x7F) << shift;
+        rec_size |= static_cast<uint32_t>(b & 0x7F) << shift;
         if (!(b & 0x80)) break;
         shift += 7;
     }
 
-    out_size = size;
+    out_size = rec_size;
     return rec_type;
 }
 
@@ -71,7 +81,10 @@ std::string XlsbParser::read_xl_widestring(const uint8_t* data, size_t& offset,
     memcpy(&char_count, data + offset, 4);
     offset += 4;
 
-    if (offset + char_count * 2 > end) return "";
+    // Widen before multiplying: char_count is attacker-controlled and
+    // char_count*2 in uint32 could wrap, letting the bounds check pass and the
+    // loop below read far past `end`.
+    if (offset + static_cast<size_t>(char_count) * 2 > end) return "";
 
     std::string result;
     result.reserve(char_count);  // ≥1 byte/char; avoids realloc growth
@@ -104,7 +117,7 @@ void XlsbParser::parse_workbook() {
     if (zip_.has_entry("xl/_rels/workbook.bin.rels")) {
         auto data = zip_.read_entry("xl/_rels/workbook.bin.rels");
         pugi::xml_document doc;
-        if (doc.load_buffer(data.data(), data.size())) {
+        if (doc.load_buffer_inplace(data.data(), data.size())) {
             std::vector<pugi::xml_node> rels;
             xml_find_all(doc, "Relationship", rels);
             for (auto& rel : rels) {
@@ -133,7 +146,7 @@ void XlsbParser::parse_workbook() {
     while (offset + 2 < size) {
         uint32_t rec_size = 0;
         size_t saved = offset;
-        uint16_t rec_type = read_record_header(data, offset, rec_size);
+        uint16_t rec_type = read_record_header(data, offset, size, rec_size);
         size_t rec_end = offset + rec_size;
         if (rec_end > size) break;
 
@@ -177,7 +190,7 @@ void XlsbParser::parse_shared_strings() {
 
     while (offset + 2 < size) {
         uint32_t rec_size = 0;
-        uint16_t rec_type = read_record_header(data, offset, rec_size);
+        uint16_t rec_type = read_record_header(data, offset, size, rec_size);
         size_t rec_end = offset + rec_size;
         if (rec_end > size) break;
 
@@ -185,7 +198,11 @@ void XlsbParser::parse_shared_strings() {
             // BrtBeginSst: uint32 cstTotal + uint32 cstUnique
             uint32_t unique_count;
             memcpy(&unique_count, data + offset + 4, 4);
-            shared_strings_.reserve(unique_count);
+            // cstUnique is an independent field, not bounded by the file — a
+            // corrupt value (e.g. 0xFFFFFFFF) would reserve ~128 GB. Clamp to a
+            // count the remaining bytes could actually hold (≥4 bytes/item).
+            shared_strings_.reserve(
+                std::min<uint32_t>(unique_count, static_cast<uint32_t>(size / 4 + 16)));
         } else if (rec_type == BRT_SST_ITEM) {
             // BrtSSTItem: flags(1) + XLWideString
             size_t p = offset;
@@ -214,7 +231,7 @@ void XlsbParser::parse_styles() {
 
     while (offset + 2 < size) {
         uint32_t rec_size = 0;
-        uint16_t rec_type = read_record_header(data, offset, rec_size);
+        uint16_t rec_type = read_record_header(data, offset, size, rec_size);
         size_t rec_end = offset + rec_size;
         if (rec_end > size) break;
 
@@ -369,7 +386,7 @@ XlsbParser::SheetData XlsbParser::parse_sheet(const SheetInfo& info) {
 
     while (offset + 2 < size) {
         uint32_t rec_size = 0;
-        uint16_t rec_type = read_record_header(data, offset, rec_size);
+        uint16_t rec_type = read_record_header(data, offset, size, rec_size);
         size_t rec_end = offset + rec_size;
         if (rec_end > size) break;
 
@@ -486,9 +503,10 @@ std::string XlsbParser::format_sheet_as_table(const SheetData& sheet,
     bool truncated = max_rows > 0 && total_rows > max_rows;
     int display_rows = truncated ? max_rows : total_rows;
 
-    std::ostringstream out;
+    std::string out;
+    out.reserve(static_cast<size_t>(display_rows) * total_cols * 8 + 64);
 
-    out << "|";
+    out += "|";
     for (int c = 0; c < total_cols; ++c) {
         auto row_it = sheet.cells.find(0);
         std::string cell;
@@ -496,14 +514,14 @@ std::string XlsbParser::format_sheet_as_table(const SheetData& sheet,
             auto col_it = row_it->second.find(c);
             if (col_it != row_it->second.end()) cell = col_it->second;
         }
-        out << " " << cell << " |";
+        out += " "; out += cell; out += " |";
     }
-    out << "\n|";
-    for (int c = 0; c < total_cols; ++c) out << " --- |";
-    out << "\n";
+    out += "\n|";
+    for (int c = 0; c < total_cols; ++c) out += " --- |";
+    out += "\n";
 
     for (int r = 1; r < display_rows; ++r) {
-        out << "|";
+        out += "|";
         for (int c = 0; c < total_cols; ++c) {
             auto row_it = sheet.cells.find(r);
             std::string cell;
@@ -511,16 +529,16 @@ std::string XlsbParser::format_sheet_as_table(const SheetData& sheet,
                 auto col_it = row_it->second.find(c);
                 if (col_it != row_it->second.end()) cell = col_it->second;
             }
-            out << " " << cell << " |";
+            out += " "; out += cell; out += " |";
         }
-        out << "\n";
+        out += "\n";
     }
 
     if (truncated) {
-        out << "\n*... truncated at " << max_rows
-            << " rows (total: " << total_rows << " rows)*\n";
+        out += "\n*... truncated at "; out += std::to_string(max_rows);
+        out += " rows (total: "; out += std::to_string(total_rows); out += " rows)*\n";
     }
-    return out.str();
+    return out;
 }
 
 // ── Public API ──────────────────────────────────────────
@@ -567,18 +585,18 @@ std::vector<PageChunk> XlsbParser::to_chunks(const ConvertOptions& opts) {
         PageChunk chunk;
         chunk.page_number = sheet_num;
 
-        std::ostringstream text;
+        std::string text;
         std::string name = sheet.name.empty()
             ? ("Sheet " + std::to_string(sheet_num)) : sheet.name;
-        text << "## " << name << "\n\n";
+        text += "## "; text += name; text += "\n\n";
 
         if (!sheet.cells.empty()) {
-            text << format_sheet_as_table(sheet) << "\n";
+            text += format_sheet_as_table(sheet); text += "\n";
         } else {
-            text << "*Empty sheet*\n\n";
+            text += "*Empty sheet*\n\n";
         }
 
-        chunk.text = text.str();
+        chunk.text = text;
         chunks.push_back(std::move(chunk));
     }
     return chunks;

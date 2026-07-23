@@ -200,27 +200,27 @@ void RtfParser::parse(std::string& out_text, std::vector<PictImage>& out_images)
                         if (doc_codepage == 949 || doc_codepage == 1361) {
                             // CP949/EUC-KR: DBCS lead byte 0x81-0xFE
                             if (dbcs_pending) {
-                                out_text += util::cp949_to_utf8(dbcs_lead, byte);
+                                util::append_cp949(out_text, dbcs_lead, byte);
                                 dbcs_pending = false;
                             } else if (util::is_cp949_lead(byte)) {
                                 dbcs_lead = byte;
                                 dbcs_pending = true;
                             } else {
-                                out_text += util::cp1252_to_utf8(byte);
+                                util::append_cp1252(out_text, byte);
                             }
                         } else if (doc_codepage == 932) {
                             // CP932/Shift-JIS: lead byte 0x81-0x9F, 0xE0-0xFC
                             if (dbcs_pending) {
-                                out_text += util::cp932_to_utf8(dbcs_lead, byte);
+                                util::append_cp932(out_text, dbcs_lead, byte);
                                 dbcs_pending = false;
                             } else if ((byte >= 0x81 && byte <= 0x9F) || (byte >= 0xE0 && byte <= 0xFC)) {
                                 dbcs_lead = byte;
                                 dbcs_pending = true;
                             } else {
-                                out_text += util::cp1252_to_utf8(byte);
+                                util::append_cp1252(out_text, byte);
                             }
                         } else {
-                            out_text += util::cp1252_to_utf8(byte);
+                            util::append_cp1252(out_text, byte);
                         }
                     }
                     pos += 2;

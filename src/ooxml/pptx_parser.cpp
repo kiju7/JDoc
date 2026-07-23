@@ -110,43 +110,6 @@ std::vector<std::vector<std::string>> PptxParser::parse_table(
 
 // ── Table formatting ────────────────────────────────────
 
-std::string PptxParser::format_table(
-    const std::vector<std::vector<std::string>>& rows) {
-
-    if (rows.empty()) return "";
-
-    size_t cols = 0;
-    for (auto& row : rows) {
-        cols = std::max(cols, row.size());
-    }
-    if (cols == 0) return "";
-
-    std::ostringstream out;
-
-    out << "|";
-    for (size_t c = 0; c < cols; ++c) {
-        const std::string& cell = (c < rows[0].size()) ? rows[0][c] : "";
-        out << " " << cell << " |";
-    }
-    out << "\n";
-
-    out << "|";
-    for (size_t c = 0; c < cols; ++c) {
-        out << " --- |";
-    }
-    out << "\n";
-
-    for (size_t r = 1; r < rows.size(); ++r) {
-        out << "|";
-        for (size_t c = 0; c < cols; ++c) {
-            const std::string& cell = (c < rows[r].size()) ? rows[r][c] : "";
-            out << " " << cell << " |";
-        }
-        out << "\n";
-    }
-
-    return out.str();
-}
 
 static std::string extract_textbody_text(const pugi::xml_node& txBody);
 
@@ -156,7 +119,7 @@ std::string PptxParser::extract_chart_text(const std::string& chart_path) {
     if (!zip_.has_entry(chart_path)) return "";
     auto data = zip_.read_entry(chart_path);
     pugi::xml_document doc;
-    if (!doc.load_buffer(data.data(), data.size())) return "";
+    if (!doc.load_buffer_inplace(data.data(), data.size())) return "";
 
     std::string result;
 
@@ -199,7 +162,7 @@ std::string PptxParser::extract_diagram_text(
     if (!zip_.has_entry(diagram_data_path)) return "";
     auto data = zip_.read_entry(diagram_data_path);
     pugi::xml_document doc;
-    if (!doc.load_buffer(data.data(), data.size())) return "";
+    if (!doc.load_buffer_inplace(data.data(), data.size())) return "";
 
     std::string result;
     std::vector<pugi::xml_node> pt_nodes;
@@ -241,7 +204,7 @@ std::string PptxParser::extract_notes_text(const std::string& notes_path) {
     if (!zip_.has_entry(notes_path)) return "";
     auto data = zip_.read_entry(notes_path);
     pugi::xml_document doc;
-    if (!doc.load_buffer(data.data(), data.size())) return "";
+    if (!doc.load_buffer_inplace(data.data(), data.size())) return "";
 
     auto cSld = xml_child(doc.first_child(), "cSld");
     if (!cSld) return "";
@@ -368,7 +331,7 @@ std::vector<std::string> PptxParser::collect_master_layout_text() {
         auto data = zip_.read_entry(part);
         if (data.empty()) continue;
         pugi::xml_document doc;
-        if (!doc.load_buffer(data.data(), data.size(),
+        if (!doc.load_buffer_inplace(data.data(), data.size(),
                              pugi::parse_default | pugi::parse_ws_pcdata))
             continue;
 
@@ -658,7 +621,7 @@ PptxParser::SlideContent PptxParser::parse_slide(
     SlideContent content;
     auto data = zip_.read_entry(slide_path);
     pugi::xml_document doc;
-    if (!doc.load_buffer(data.data(), data.size(), pugi::parse_default | pugi::parse_ws_pcdata)) return content;
+    if (!doc.load_buffer_inplace(data.data(), data.size(), pugi::parse_default | pugi::parse_ws_pcdata)) return content;
 
     auto rels = parse_slide_rels(slide_path);
 
@@ -701,7 +664,7 @@ std::map<std::string, std::string> PptxParser::parse_slide_rels(
 
     auto data = zip_.read_entry(rels_path);
     pugi::xml_document doc;
-    if (!doc.load_buffer(data.data(), data.size(), pugi::parse_default | pugi::parse_ws_pcdata)) return rels;
+    if (!doc.load_buffer_inplace(data.data(), data.size(), pugi::parse_default | pugi::parse_ws_pcdata)) return rels;
 
     std::vector<pugi::xml_node> rel_nodes;
     xml_find_all(doc, "Relationship", rel_nodes);
@@ -839,7 +802,7 @@ std::string PptxParser::to_markdown(const ConvertOptions& opts) {
                 }
                 case SlideElement::TABLE:
                     if (opts.tables)
-                        out << "\n" << format_table(elem.rows) << "\n";
+                        out << "\n" << util::format_markdown_table(elem.rows) << "\n";
                     break;
             }
         }
@@ -908,23 +871,23 @@ std::vector<PageChunk> PptxParser::to_chunks(
         // that repeats one picture should list it once per page, not per shape
         std::set<std::string> page_media;
 
-        std::ostringstream text;
+        std::string text;
 
         if (!content.title.empty()) {
-            text << "# " << content.title << "\n\n";
+            text += "# "; text += content.title; text += "\n\n";
         }
 
         for (auto& elem : content.elements) {
             switch (elem.kind) {
                 case SlideElement::TEXT:
-                    text << elem.text << "\n\n";
+                    text += elem.text; text += "\n\n";
                     break;
                 case SlideElement::IMAGE: {
                     ImageData img;
                     std::string ref_name;
                     if (!resolve_image(elem.text, slide_num, img_opts, img, ref_name))
                         break;
-                    text << "![" << img.name << "](" << opts.image_ref_prefix << ref_name << ")\n\n";
+                    text += "!["; text += img.name; text += "]("; text += opts.image_ref_prefix; text += ref_name; text += ")\n\n";
 
                     // The page lists every distinct image it shows, so the
                     // page-to-image association survives deduplication. A page
@@ -937,17 +900,17 @@ std::vector<PageChunk> PptxParser::to_chunks(
                 case SlideElement::TABLE:
                     if (opts.tables) {
                         chunk.tables.push_back(elem.rows);
-                        text << "\n" << format_table(elem.rows) << "\n";
+                        text += "\n"; text += util::format_markdown_table(elem.rows); text += "\n";
                     }
                     break;
             }
         }
 
         if (!content.notes.empty()) {
-            text << "\n> **Notes:** " << content.notes << "\n\n";
+            text += "\n> **Notes:** "; text += content.notes; text += "\n\n";
         }
 
-        chunk.text = text.str();
+        chunk.text = text;
         chunks.push_back(std::move(chunk));
     }
 

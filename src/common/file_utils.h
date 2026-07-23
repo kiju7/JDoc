@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <string>
 #include <utility>
+#include <vector>
 
 #ifdef _WIN32
   #include <direct.h>
@@ -84,6 +85,36 @@ inline void ensure_dirs(const std::string& dir) {
         std::string parent = dir.substr(0, pos);
         if (!parent.empty()) jdoc_mkdir(parent.c_str());
     }
+}
+
+// Render rows as a GitHub-flavored markdown table; the first row is the header.
+// Empty input yields "". Column count is the widest row; short rows pad with "".
+// Shared by the docx and pptx parsers (previously duplicated verbatim).
+inline std::string format_markdown_table(
+    const std::vector<std::vector<std::string>>& rows) {
+    if (rows.empty()) return "";
+    size_t cols = 0;
+    for (auto& row : rows) cols = std::max(cols, row.size());
+    if (cols == 0) return "";
+
+    std::string out;
+    out += "|";
+    for (size_t c = 0; c < cols; ++c) {
+        const std::string& cell = (c < rows[0].size()) ? rows[0][c] : "";
+        out += " "; out += cell; out += " |";
+    }
+    out += "\n|";
+    for (size_t c = 0; c < cols; ++c) out += " --- |";
+    out += "\n";
+    for (size_t r = 1; r < rows.size(); ++r) {
+        out += "|";
+        for (size_t c = 0; c < cols; ++c) {
+            const std::string& cell = (c < rows[r].size()) ? rows[r][c] : "";
+            out += " "; out += cell; out += " |";
+        }
+        out += "\n";
+    }
+    return out;
 }
 
 // Strip markdown formatting from text, returning plain text.

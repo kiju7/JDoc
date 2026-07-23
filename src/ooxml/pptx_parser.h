@@ -89,9 +89,6 @@ private:
     std::map<int, int> slide_image_idx_;
 
     std::map<std::string, std::string> parse_slide_rels(const std::string& slide_path);
-
-    std::string format_table(
-        const std::vector<std::vector<std::string>>& rows);
 };
 
 } // namespace jdoc

@@ -4,7 +4,8 @@
 
 #include "common/binary_utils.h"
 #include "common/file_utils.h"
-#include <zlib.h>
+#include <zlib.h>          // crc32 for PNG chunk checksums
+#include <libdeflate.h>    // faster DEFLATE compression for the IDAT payload
 #include <fstream>
 #include <string>
 #include <vector>
@@ -62,12 +63,19 @@ inline std::vector<char> pixels_to_png(const uint8_t* pixels, int w, int h,
         }
     }
 
-    uLong bound = compressBound(static_cast<uLong>(raw.size()));
+    // libdeflate compresses the IDAT payload 2-3x faster than zlib. The bytes
+    // differ from zlib's (different encoder) but the decoded pixels are
+    // identical — PNG is lossless — and the files are typically smaller.
+    // Map the zlib level (Z_BEST_SPEED default) onto libdeflate's 1-12 scale.
+    int ld_level = (level <= 0) ? 6 : (level > 12 ? 12 : level);
+    libdeflate_compressor* comp = libdeflate_alloc_compressor(ld_level);
+    if (!comp) return {};
+    size_t bound = libdeflate_zlib_compress_bound(comp, raw.size());
     std::vector<uint8_t> deflated(bound);
-    uLong deflated_size = bound;
-    if (compress2(deflated.data(), &deflated_size, raw.data(),
-                  static_cast<uLong>(raw.size()), level) != Z_OK)
-        return {};
+    size_t deflated_size = libdeflate_zlib_compress(
+        comp, raw.data(), raw.size(), deflated.data(), bound);
+    libdeflate_free_compressor(comp);
+    if (deflated_size == 0) return {};
 
     raw.clear(); raw.shrink_to_fit();
 

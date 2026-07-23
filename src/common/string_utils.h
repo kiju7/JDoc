@@ -39,18 +39,31 @@ inline std::string utf16le_to_utf8(const uint8_t* data, size_t byte_len) {
     return utf16le_to_utf8(reinterpret_cast<const char*>(data), byte_len);
 }
 
+// Append converters: decode one legacy-codepage unit straight into `out`,
+// with no per-character temporary std::string. These are the hot-loop form;
+// the string-returning versions below wrap them for one-off callers.
+void append_cp1252(std::string& out, uint8_t ch);
+void append_cp949(std::string& out, uint8_t lead, uint8_t trail);
+void append_cp932(std::string& out, uint8_t lead, uint8_t trail);
+
 // Convert a single CP1252 byte to UTF-8 string.
-std::string cp1252_to_utf8(uint8_t ch);
+inline std::string cp1252_to_utf8(uint8_t ch) {
+    std::string out; append_cp1252(out, ch); return out;
+}
 
 // Convert CP949 (Korean Windows codepage) byte pair to UTF-8.
 // lead: first byte (0x81-0xFE), trail: second byte.
-// Returns empty string if the pair is not a valid CP949 sequence.
-std::string cp949_to_utf8(uint8_t lead, uint8_t trail);
+// Returns U+FFFD if the pair is not a valid CP949 sequence.
+inline std::string cp949_to_utf8(uint8_t lead, uint8_t trail) {
+    std::string out; append_cp949(out, lead, trail); return out;
+}
 
 // Convert CP932 (Japanese Windows codepage / Shift-JIS) byte pair to UTF-8.
 // lead: first byte (0x81-0x9F or 0xE0-0xFC), trail: second byte.
-// Returns empty string if the pair is not a valid CP932 sequence.
-std::string cp932_to_utf8(uint8_t lead, uint8_t trail);
+// Returns U+FFFD if the pair is not a valid CP932 sequence.
+inline std::string cp932_to_utf8(uint8_t lead, uint8_t trail) {
+    std::string out; append_cp932(out, lead, trail); return out;
+}
 
 // Check if a byte is a CP949 lead byte.
 inline bool is_cp949_lead(uint8_t ch) {

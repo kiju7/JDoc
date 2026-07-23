@@ -109,11 +109,13 @@ std::string decode_encoded_words(const std::string& in) {
 // ── Constructors ────────────────────────────────────────────
 
 EmlParser::EmlParser(const std::string& file_path) {
-    std::ifstream ifs(file_path, std::ios::binary);
+    std::ifstream ifs(file_path, std::ios::binary | std::ios::ate);
     if (!ifs) return;
-    std::ostringstream ss;
-    ss << ifs.rdbuf();
-    raw_ = ss.str();
+    std::streamsize size = ifs.tellg();
+    if (size <= 0) return;
+    ifs.seekg(0, std::ios::beg);
+    raw_.resize(static_cast<size_t>(size));
+    if (!ifs.read(&raw_[0], size)) raw_.clear();
 }
 
 EmlParser::EmlParser(const uint8_t* data, size_t size)

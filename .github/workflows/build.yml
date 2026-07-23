@@ -28,6 +28,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # libjpeg-turbo's x86 SIMD (WITH_SIMD=ON) assembles with NASM; arm64 uses
+      # NEON and ignores it. Harmless on the macOS runner.
+      - name: Set up NASM
+        uses: ilammy/setup-nasm@v1
+
       - name: Configure
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DJDOC_BUILD_TESTS=ON
 

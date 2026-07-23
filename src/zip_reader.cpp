@@ -4,6 +4,7 @@
 #include "zip_reader.h"
 #include "archive/data_source.h"
 #include "common/binary_utils.h"
+#include "common/inflate.h"
 #include "common/string_utils.h"
 #include <zlib.h>
 #include <cstring>
@@ -292,6 +293,31 @@ std::vector<char> ZipReader::read_entry(const std::string& name) const {
 }
 
 std::vector<char> ZipReader::read_entry(const Entry& entry) const {
+    // Fast path: a DEFLATE member of known size is decoded in one libdeflate
+    // call into an exactly-sized buffer — no 64 KiB streaming loop, no zlib.
+    // Falls through to the streaming path for STORE, oversized members, an
+    // unavailable compressed view, or any libdeflate failure.
+    if (open_ && entry.method == 8 && entry.uncompressed_size > 0 &&
+        entry.uncompressed_size <= READ_ENTRY_CAP) {
+        uint64_t pos = 0;
+        if (find_data_offset(entry, pos)) {
+            std::vector<uint8_t> tmp;
+            const uint8_t* comp = src_->view_at(pos, entry.compressed_size);
+            if (!comp) {
+                tmp.resize(entry.compressed_size);
+                if (src_->read_at(pos, tmp.data(), tmp.size()) == tmp.size())
+                    comp = tmp.data();
+            }
+            if (comp) {
+                std::vector<char> out(static_cast<size_t>(entry.uncompressed_size));
+                if (inflate_raw_known(comp, static_cast<size_t>(entry.compressed_size),
+                                      reinterpret_cast<uint8_t*>(out.data()),
+                                      out.size()))
+                    return out;
+            }
+        }
+    }
+
     std::vector<char> out;
     out.reserve(std::min<uint64_t>(entry.uncompressed_size, READ_ENTRY_CAP));
     bool ok = read_entry_streamed(entry, [&](const char* data, size_t len) {

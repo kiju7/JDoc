@@ -60,7 +60,7 @@ void XlsxParser::parse_shared_strings() {
 
     auto data = zip_.read_entry("xl/sharedStrings.xml");
     pugi::xml_document doc;
-    if (!doc.load_buffer(data.data(), data.size(), pugi::parse_default | pugi::parse_ws_pcdata)) return;
+    if (!doc.load_buffer_inplace(data.data(), data.size(), pugi::parse_default | pugi::parse_ws_pcdata)) return;
 
     // Each <si> element contains one shared string
     // Text can be in <t> directly or in <r><t> runs
@@ -95,7 +95,7 @@ void XlsxParser::parse_workbook() {
 
     auto data = zip_.read_entry("xl/workbook.xml");
     pugi::xml_document doc;
-    if (!doc.load_buffer(data.data(), data.size(), pugi::parse_default | pugi::parse_ws_pcdata)) return;
+    if (!doc.load_buffer_inplace(data.data(), data.size(), pugi::parse_default | pugi::parse_ws_pcdata)) return;
 
     // Find <sheets><sheet> elements
     std::vector<pugi::xml_node> sheet_nodes;
@@ -133,7 +133,7 @@ void XlsxParser::parse_workbook_rels() {
 
     auto data = zip_.read_entry(rels_path);
     pugi::xml_document doc;
-    if (!doc.load_buffer(data.data(), data.size(), pugi::parse_default | pugi::parse_ws_pcdata)) return;
+    if (!doc.load_buffer_inplace(data.data(), data.size(), pugi::parse_default | pugi::parse_ws_pcdata)) return;
 
     // Build rId -> target map
     std::map<std::string, std::string> id_to_target;
@@ -166,7 +166,7 @@ void XlsxParser::parse_styles() {
 
     auto data = zip_.read_entry("xl/styles.xml");
     pugi::xml_document doc;
-    if (!doc.load_buffer(data.data(), data.size(), pugi::parse_default | pugi::parse_ws_pcdata)) return;
+    if (!doc.load_buffer_inplace(data.data(), data.size(), pugi::parse_default | pugi::parse_ws_pcdata)) return;
 
     // Parse fonts: <fonts><font><b/> means bold
     std::vector<pugi::xml_node> fonts_nodes;
@@ -513,7 +513,7 @@ std::map<std::string, std::string> XlsxParser::parse_comments(
     if (!zip_.has_entry(rels_path)) return comments;
     auto rels_data = zip_.read_entry(rels_path);
     pugi::xml_document rels_doc;
-    if (!rels_doc.load_buffer(rels_data.data(), rels_data.size())) return comments;
+    if (!rels_doc.load_buffer_inplace(rels_data.data(), rels_data.size())) return comments;
 
     // Locate the legacy (xl/comments*.xml) and modern threaded-comment parts.
     // Both Target forms — relative and absolute ("/xl/...") — are normalized.
@@ -547,7 +547,7 @@ void XlsxParser::parse_legacy_comments(
 
     auto data = zip_.read_entry(path);
     pugi::xml_document doc;
-    if (!doc.load_buffer(data.data(), data.size(), pugi::parse_default | pugi::parse_ws_pcdata)) return;
+    if (!doc.load_buffer_inplace(data.data(), data.size(), pugi::parse_default | pugi::parse_ws_pcdata)) return;
 
     // Parse <commentList><comment ref="A1"><text><t>...</t></text></comment>
     std::vector<pugi::xml_node> comment_nodes;
@@ -579,7 +579,7 @@ void XlsxParser::parse_threaded_comments(
 
     auto data = zip_.read_entry(path);
     pugi::xml_document doc;
-    if (!doc.load_buffer(data.data(), data.size(), pugi::parse_default | pugi::parse_ws_pcdata)) return;
+    if (!doc.load_buffer_inplace(data.data(), data.size(), pugi::parse_default | pugi::parse_ws_pcdata)) return;
 
     // <threadedComment ref="A1" personId="{..}"><text>..</text></threadedComment>
     // Replies to a cell share its ref; join them in document order.
@@ -616,7 +616,7 @@ void XlsxParser::parse_persons() {
     for (const auto* e : zip_.entries_with_prefix("xl/persons/")) {
         auto data = zip_.read_entry(e->name);
         pugi::xml_document doc;
-        if (!doc.load_buffer(data.data(), data.size())) continue;
+        if (!doc.load_buffer_inplace(data.data(), data.size())) continue;
         std::vector<pugi::xml_node> person_nodes;
         xml_find_all(doc, "person", person_nodes);
         for (auto& p : person_nodes) {
@@ -639,7 +639,7 @@ XlsxParser::SheetData XlsxParser::parse_sheet(const SheetInfo& info) {
 
     auto data = zip_.read_entry(info.file_path);
     pugi::xml_document doc;
-    if (!doc.load_buffer(data.data(), data.size(), pugi::parse_default | pugi::parse_ws_pcdata)) return sheet;
+    if (!doc.load_buffer_inplace(data.data(), data.size(), pugi::parse_default | pugi::parse_ws_pcdata)) return sheet;
 
     // Parse comments for this sheet
     auto comments = parse_comments(info);
@@ -785,7 +785,10 @@ std::string XlsxParser::format_sheet_as_table(const SheetData& sheet,
     bool truncated = max_rows > 0 && total_rows > max_rows;
     int display_rows = truncated ? max_rows : total_rows;
 
-    std::ostringstream out;
+    std::string out;
+    // A wide sheet builds a large table; reserve up front to avoid the repeated
+    // reallocations an ostringstream/growing string would otherwise incur.
+    out.reserve(static_cast<size_t>(display_rows) * total_cols * 8 + 64);
 
     // Helper: look up cell value with bold markers applied.
     auto get_cell = [&](int r, int c) -> std::string {
@@ -800,34 +803,34 @@ std::string XlsxParser::format_sheet_as_table(const SheetData& sheet,
     };
 
     // Header row (row 0)
-    out << "|";
+    out += "|";
     for (int c = 0; c < total_cols; ++c) {
-        out << " " << get_cell(0, c) << " |";
+        out += " "; out += get_cell(0, c); out += " |";
     }
-    out << "\n";
+    out += "\n";
 
     // Separator
-    out << "|";
+    out += "|";
     for (int c = 0; c < total_cols; ++c) {
-        out << " --- |";
+        out += " --- |";
     }
-    out << "\n";
+    out += "\n";
 
     // Data rows
     for (int r = 1; r < display_rows; ++r) {
-        out << "|";
+        out += "|";
         for (int c = 0; c < total_cols; ++c) {
-            out << " " << get_cell(r, c) << " |";
+            out += " "; out += get_cell(r, c); out += " |";
         }
-        out << "\n";
+        out += "\n";
     }
 
     if (truncated) {
-        out << "\n*... truncated at " << max_rows
-            << " rows (total: " << total_rows << " rows)*\n";
+        out += "\n*... truncated at "; out += std::to_string(max_rows);
+        out += " rows (total: "; out += std::to_string(total_rows); out += " rows)*\n";
     }
 
-    return out.str();
+    return out;
 }
 
 // ── Image extraction ────────────────────────────────────
@@ -857,7 +860,7 @@ std::vector<ImageData> XlsxParser::extract_images(
         if (!zip_.has_entry(sheet_rels)) continue;
         auto rels_data = zip_.read_entry(sheet_rels);
         pugi::xml_document rels_doc;
-        if (!rels_doc.load_buffer(rels_data.data(), rels_data.size())) continue;
+        if (!rels_doc.load_buffer_inplace(rels_data.data(), rels_data.size())) continue;
 
         // Find drawing targets (type ends with /drawing)
         std::vector<pugi::xml_node> rel_nodes;
@@ -886,7 +889,7 @@ std::vector<ImageData> XlsxParser::extract_images(
             if (!zip_.has_entry(draw_rels)) continue;
             auto draw_rels_data = zip_.read_entry(draw_rels);
             pugi::xml_document draw_rels_doc;
-            if (!draw_rels_doc.load_buffer(draw_rels_data.data(), draw_rels_data.size())) continue;
+            if (!draw_rels_doc.load_buffer_inplace(draw_rels_data.data(), draw_rels_data.size())) continue;
 
             std::map<std::string, std::string> draw_rel_map;
             std::vector<pugi::xml_node> draw_rel_nodes;
@@ -902,7 +905,7 @@ std::vector<ImageData> XlsxParser::extract_images(
             // Parse drawing XML to find blip references
             auto draw_data = zip_.read_entry(drawing_path);
             pugi::xml_document draw_doc;
-            if (!draw_doc.load_buffer(draw_data.data(), draw_data.size())) continue;
+            if (!draw_doc.load_buffer_inplace(draw_data.data(), draw_data.size())) continue;
 
             std::vector<pugi::xml_node> blips;
             xml_find_all(draw_doc, "blip", blips);
@@ -1046,14 +1049,14 @@ std::vector<PageChunk> XlsxParser::to_chunks(
         PageChunk chunk;
         chunk.page_number = sheet_num;
 
-        std::ostringstream text;
+        std::string text;
         std::string display_name = sheet.name.empty()
             ? ("Sheet " + std::to_string(sheet_num))
             : sheet.name;
-        text << "## " << display_name << "\n\n";
+        text += "## "; text += display_name; text += "\n\n";
 
         if (!sheet.cells.empty()) {
-            text << format_sheet_as_table(sheet) << "\n";
+            text += format_sheet_as_table(sheet); text += "\n";
 
             // Build structured table data for the chunk
             // Convert sparse grid to dense 2D vector
@@ -1088,10 +1091,10 @@ std::vector<PageChunk> XlsxParser::to_chunks(
                 chunk.tables.push_back(std::move(table));
             }
         } else {
-            text << "*Empty sheet*\n\n";
+            text += "*Empty sheet*\n\n";
         }
 
-        chunk.text = text.str();
+        chunk.text = text;
         chunks.push_back(std::move(chunk));
     }
 

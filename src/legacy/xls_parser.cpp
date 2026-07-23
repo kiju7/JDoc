@@ -285,7 +285,7 @@ std::string XlsParser::parse_xl_string(const char* data, size_t len, size_t& pos
     } else {
         for (size_t i = 0; i < bytes_needed; ++i) {
             uint8_t ch = static_cast<uint8_t>(data[pos + i]);
-            result += util::cp1252_to_utf8(ch);
+            util::append_cp1252(result, ch);
         }
     }
     pos += bytes_needed;
@@ -373,7 +373,7 @@ void XlsParser::parse_workbook() {
                 } else {
                     size_t byte_len = std::min(size_t(name_len), size_t(rec_size - 8));
                     for (size_t i = 0; i < byte_len; ++i) {
-                        sname += util::cp1252_to_utf8(static_cast<uint8_t>(rec_data[8 + i]));
+                        util::append_cp1252(sname, static_cast<uint8_t>(rec_data[8 + i]));
                     }
                 }
                 sheet_names.push_back(sname);
@@ -395,7 +395,7 @@ void XlsParser::parse_workbook() {
                         code = util::utf16le_to_utf8(rec_data + str_start, bytes_needed);
                     } else {
                         for (size_t i = 0; i < bytes_needed; ++i) {
-                            code += util::cp1252_to_utf8(
+                            util::append_cp1252(code,
                                 static_cast<uint8_t>(rec_data[str_start + i]));
                         }
                     }
@@ -488,7 +488,7 @@ void XlsParser::parse_workbook() {
                         val = util::utf16le_to_utf8(rec_data + str_start, bytes_needed);
                     } else {
                         for (size_t i = 0; i < bytes_needed; ++i) {
-                            val += util::cp1252_to_utf8(
+                            util::append_cp1252(val,
                                 static_cast<uint8_t>(rec_data[str_start + i]));
                         }
                     }
@@ -564,7 +564,7 @@ void XlsParser::parse_workbook() {
                         val = util::utf16le_to_utf8(rec_data + str_start, bytes_needed);
                     } else {
                         for (size_t i = 0; i < bytes_needed; ++i) {
-                            val += util::cp1252_to_utf8(
+                            util::append_cp1252(val,
                                 static_cast<uint8_t>(rec_data[str_start + i]));
                         }
                     }

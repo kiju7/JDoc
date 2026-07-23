@@ -88,7 +88,7 @@ static std::string decode_text_bytes(const char* data, size_t len) {
             if (ch == 0x0D && i + 1 < len &&
                 static_cast<uint8_t>(data[i + 1]) == 0x0A) ++i;  // CRLF
         } else if (ch >= 0x20 || ch == '\t' || ch == '\n') {
-            text += util::cp1252_to_utf8(ch);
+            util::append_cp1252(text, ch);
         }
     }
     return text;

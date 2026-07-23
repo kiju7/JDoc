@@ -9,10 +9,10 @@
 #include "legacy/ole_reader.h"
 #include "common/file_utils.h"
 #include "common/image_utils.h"
+#include "common/inflate.h"
 #include "common/media_cache.h"
 #include "common/png_encode.h"
 #include "common/string_utils.h"
-#include <zlib.h>
 #include <algorithm>
 #include <map>
 #include <sstream>
@@ -23,37 +23,12 @@
 
 namespace jdoc {
 
-// ── Zlib decompression ──────────────────────────────────────
+// ── Decompression ──────────────────────────────────────────
 
+// HWP sections are raw DEFLATE (no zlib/gzip wrapper). libdeflate decodes the
+// whole section in one call; the 4x hint sizes the first output guess.
 static std::vector<uint8_t> decompress(const uint8_t* data, size_t len) {
-    // HWP uses raw deflate (no header)
-    std::vector<uint8_t> output;
-    output.resize(len * 4);  // initial guess
-
-    z_stream strm = {};
-    if (inflateInit2(&strm, -MAX_WBITS) != Z_OK) return {};
-
-    strm.next_in = const_cast<uint8_t*>(data);
-    strm.avail_in = len;
-
-    int ret;
-    do {
-        if (strm.total_out >= output.size()) {
-            output.resize(output.size() * 2);
-        }
-        strm.next_out = output.data() + strm.total_out;
-        strm.avail_out = output.size() - strm.total_out;
-        ret = inflate(&strm, Z_NO_FLUSH);
-        if (ret == Z_MEM_ERROR || ret == Z_DATA_ERROR) {
-            inflateEnd(&strm);
-            return {};
-        }
-    } while (ret != Z_STREAM_END);
-
-    output.resize(strm.total_out);
-    output.shrink_to_fit();
-    inflateEnd(&strm);
-    return output;
+    return inflate_raw(data, len, len * 4);
 }
 
 // ── OLE stream reading helper ──────────────────────────────

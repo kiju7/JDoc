@@ -2,6 +2,7 @@
 #include "pdf_extract.h"
 #include "common/string_utils.h"
 #include "common/file_utils.h"
+#include "common/mapped_file.h"
 #include <fstream>
 #include <algorithm>
 #include <cassert>
@@ -285,19 +286,15 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
 }
 
 static ExtractResult extract_pdf(const std::string& pdf_path, const ConvertOptions& opts) {
-    std::ifstream file(pdf_path, std::ios::binary | std::ios::ate);
-    if (!file) throw std::runtime_error("Cannot open PDF: " + pdf_path);
+    // Map the file read-only: the parser treats its input as const (the
+    // convert_bytes path already feeds it read-only buffers), so mapping avoids
+    // a whole-file heap allocation and the read() copy. Falls back to a heap
+    // read when mapping is unavailable.
+    MappedFile mf(pdf_path);
+    if (!mf.valid()) throw std::runtime_error("Cannot open PDF: " + pdf_path);
+    if (mf.size() == 0) throw std::runtime_error("Empty PDF file: " + pdf_path);
 
-    std::streamsize fsize = file.tellg();
-    if (fsize <= 0) throw std::runtime_error("Empty PDF file: " + pdf_path);
-    file.seekg(0, std::ios::beg);
-
-    std::vector<uint8_t> file_data(static_cast<size_t>(fsize));
-    if (!file.read(reinterpret_cast<char*>(file_data.data()), fsize))
-        throw std::runtime_error("Cannot read PDF: " + pdf_path);
-    file.close();
-
-    return extract_pdf_buffer(file_data.data(), file_data.size(), pdf_path, opts);
+    return extract_pdf_buffer(mf.data(), mf.size(), pdf_path, opts);
 }
 
 

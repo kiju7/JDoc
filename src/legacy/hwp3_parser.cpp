@@ -133,7 +133,7 @@ uint32_t johab_to_unicode(uint16_t ch) {
 
 // Append a KS X 1001 (EUC-KR) row/cell pair via the shared CP949 tables.
 void append_euc(std::string& out, int lead, int trail) {
-    out += util::cp949_to_utf8(uint8_t(lead), uint8_t(trail));
+    util::append_cp949(out, uint8_t(lead), uint8_t(trail));
 }
 
 // Convert one 16-bit HWP character code to UTF-8, appended to out.

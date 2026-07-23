@@ -30,7 +30,7 @@ void DocxParser::parse_styles() {
 
     auto data = zip_.read_entry("word/styles.xml");
     pugi::xml_document doc;
-    if (!doc.load_buffer(data.data(), data.size(), pugi::parse_default | pugi::parse_ws_pcdata)) return;
+    if (!doc.load_buffer_inplace(data.data(), data.size(), pugi::parse_default | pugi::parse_ws_pcdata)) return;
 
     // Find all <w:style> elements
     std::vector<pugi::xml_node> styles;
@@ -76,7 +76,7 @@ void DocxParser::parse_numbering() {
 
     auto data = zip_.read_entry("word/numbering.xml");
     pugi::xml_document doc;
-    if (!doc.load_buffer(data.data(), data.size(), pugi::parse_default | pugi::parse_ws_pcdata)) return;
+    if (!doc.load_buffer_inplace(data.data(), data.size(), pugi::parse_default | pugi::parse_ws_pcdata)) return;
 
     // Parse abstractNum definitions
     std::vector<pugi::xml_node> abstract_nums;
@@ -129,7 +129,7 @@ void DocxParser::parse_relationships() {
 
     auto data = zip_.read_entry(rels_path);
     pugi::xml_document doc;
-    if (!doc.load_buffer(data.data(), data.size(), pugi::parse_default | pugi::parse_ws_pcdata)) return;
+    if (!doc.load_buffer_inplace(data.data(), data.size(), pugi::parse_default | pugi::parse_ws_pcdata)) return;
 
     std::vector<pugi::xml_node> rels;
     xml_find_all(doc, "Relationship", rels);
@@ -190,7 +190,7 @@ std::string DocxParser::extract_headers_footers() {
         auto data = zip_.read_entry(part);
         if (data.empty()) continue;
         pugi::xml_document doc;
-        if (!doc.load_buffer(data.data(), data.size(),
+        if (!doc.load_buffer_inplace(data.data(), data.size(),
                              pugi::parse_default | pugi::parse_ws_pcdata))
             continue;
 
@@ -218,7 +218,7 @@ std::string DocxParser::extract_footnotes() {
 
     auto data = zip_.read_entry("word/footnotes.xml");
     pugi::xml_document doc;
-    if (!doc.load_buffer(data.data(), data.size())) return "";
+    if (!doc.load_buffer_inplace(data.data(), data.size())) return "";
 
     std::string result;
     std::vector<pugi::xml_node> footnotes;
@@ -248,7 +248,7 @@ std::string DocxParser::extract_endnotes() {
 
     auto data = zip_.read_entry("word/endnotes.xml");
     pugi::xml_document doc;
-    if (!doc.load_buffer(data.data(), data.size())) return "";
+    if (!doc.load_buffer_inplace(data.data(), data.size())) return "";
 
     std::string result;
     std::vector<pugi::xml_node> endnotes;
@@ -316,48 +316,6 @@ std::vector<ImageData> DocxParser::extract_images(
 }
 
 // ── Table formatting ────────────────────────────────────
-
-std::string DocxParser::format_table(
-    const std::vector<std::vector<std::string>>& rows) {
-
-    if (rows.empty()) return "";
-
-    // Determine column count from widest row
-    size_t cols = 0;
-    for (auto& row : rows) {
-        cols = std::max(cols, row.size());
-    }
-    if (cols == 0) return "";
-
-    std::ostringstream out;
-
-    // Header row
-    out << "|";
-    for (size_t c = 0; c < cols; ++c) {
-        const std::string& cell = (c < rows[0].size()) ? rows[0][c] : "";
-        out << " " << cell << " |";
-    }
-    out << "\n";
-
-    // Separator
-    out << "|";
-    for (size_t c = 0; c < cols; ++c) {
-        out << " --- |";
-    }
-    out << "\n";
-
-    // Data rows
-    for (size_t r = 1; r < rows.size(); ++r) {
-        out << "|";
-        for (size_t c = 0; c < cols; ++c) {
-            const std::string& cell = (c < rows[r].size()) ? rows[r][c] : "";
-            out << " " << cell << " |";
-        }
-        out << "\n";
-    }
-
-    return out.str();
-}
 
 // ── Helpers for detecting image references in a paragraph ─
 
@@ -701,7 +659,7 @@ std::string DocxParser::to_markdown(const ConvertOptions& opts) {
 
     auto data = zip_.read_entry("word/document.xml");
     pugi::xml_document doc;
-    if (!doc.load_buffer(data.data(), data.size(), pugi::parse_default | pugi::parse_ws_pcdata)) return "";
+    if (!doc.load_buffer_inplace(data.data(), data.size(), pugi::parse_default | pugi::parse_ws_pcdata)) return "";
 
     auto body = xml_child(doc, "body");
     if (!body) {
@@ -754,7 +712,7 @@ std::string DocxParser::to_markdown(const ConvertOptions& opts) {
 
         if (elem.type == DocxElement::TABLE) {
             if (opts.tables) {
-                out << "\n" << format_table(elem.table_rows) << "\n";
+                out << "\n" << util::format_markdown_table(elem.table_rows) << "\n";
             }
             // Emit images from table cells after the table
             for (auto& rid : elem.table_image_rids) {
@@ -864,7 +822,7 @@ std::vector<PageChunk> DocxParser::to_chunks(
 
     auto data = zip_.read_entry("word/document.xml");
     pugi::xml_document doc;
-    if (!doc.load_buffer(data.data(), data.size(), pugi::parse_default | pugi::parse_ws_pcdata)) return {};
+    if (!doc.load_buffer_inplace(data.data(), data.size(), pugi::parse_default | pugi::parse_ws_pcdata)) return {};
 
     auto body = xml_child(doc, "body");
     if (!body) {
@@ -887,7 +845,7 @@ std::vector<PageChunk> DocxParser::to_chunks(
     std::vector<PageChunk> chunks;
     PageChunk current;
     current.page_number = 1;
-    std::ostringstream text;
+    std::string text;
     std::map<int64_t, int> ordered_counters; // (num_id << 8 | level) -> counter
 
     auto next_counter_c = [&](int num_id, int level) -> int {
@@ -903,13 +861,12 @@ std::vector<PageChunk> DocxParser::to_chunks(
     };
 
     auto flush_chunk = [&]() {
-        current.text = text.str();
+        current.text = text;
         if (!current.text.empty() || !current.tables.empty() || !current.images.empty()) {
             chunks.push_back(std::move(current));
         }
         current = PageChunk{};
         current.page_number = static_cast<int>(chunks.size()) + 1;
-        text.str("");
         text.clear();
         ordered_counters.clear();
     };
@@ -925,7 +882,7 @@ std::vector<PageChunk> DocxParser::to_chunks(
                 // Add table as structured data
                 current.tables.push_back(elem.table_rows);
                 // Also add to text as markdown table
-                text << "\n" << format_table(elem.table_rows) << "\n";
+                text += "\n"; text += util::format_markdown_table(elem.table_rows); text += "\n";
             }
             for (auto& rid : elem.table_image_rids) {
                 auto it = rel_targets_.find(rid);
@@ -935,7 +892,7 @@ std::vector<PageChunk> DocxParser::to_chunks(
                     std::string ref = (nm != image_name_map_.end()) ? nm->second : orig;
                     auto dot = ref.rfind('.');
                     std::string alt = (dot != std::string::npos) ? ref.substr(0, dot) : ref;
-                    text << "![" << alt << "](" << opts.image_ref_prefix << ref << ")\n\n";
+                    text += "!["; text += alt; text += "]("; text += opts.image_ref_prefix; text += ref; text += ")\n\n";
                 }
             }
             continue;
@@ -951,7 +908,7 @@ std::vector<PageChunk> DocxParser::to_chunks(
                 std::string ref = (nm != image_name_map_.end()) ? nm->second : orig;
                 auto dot = ref.rfind('.');
                 std::string alt = (dot != std::string::npos) ? ref.substr(0, dot) : ref;
-                text << "![" << alt << "](" << opts.image_ref_prefix << ref << ")\n\n";
+                text += "!["; text += alt; text += "]("; text += opts.image_ref_prefix; text += ref; text += ")\n\n";
             }
         }
 
@@ -961,27 +918,27 @@ std::vector<PageChunk> DocxParser::to_chunks(
             std::string prefix(elem.heading_level, '#');
             if (elem.is_list && elem.is_ordered) {
                 int n = next_counter_c(elem.num_id, elem.list_level);
-                text << prefix << " " << n << ". " << elem.text << "\n\n";
+                text += prefix; text += " "; text += std::to_string(n); text += ". "; text += elem.text; text += "\n\n";
             } else {
-                text << prefix << " " << elem.text << "\n\n";
+                text += prefix; text += " "; text += elem.text; text += "\n\n";
             }
         } else if (elem.is_list) {
             std::string indent(elem.list_level * 2, ' ');
             if (elem.is_ordered) {
                 int n = next_counter_c(elem.num_id, elem.list_level);
-                text << indent << n << ". " << elem.text << "\n";
+                text += indent; text += std::to_string(n); text += ". "; text += elem.text; text += "\n";
             } else {
-                text << indent << "- " << elem.text << "\n";
+                text += indent; text += "- "; text += elem.text; text += "\n";
             }
         } else {
-            text << elem.text << "\n\n";
+            text += elem.text; text += "\n\n";
         }
     }
 
     // Append footnotes/endnotes to last chunk
     if (!footnotes.empty() || !endnotes.empty()) {
-        if (!footnotes.empty()) text << "\n" << footnotes;
-        if (!endnotes.empty()) text << "\n" << endnotes;
+        if (!footnotes.empty()) { text += "\n"; text += footnotes; }
+        if (!endnotes.empty()) { text += "\n"; text += endnotes; }
     }
 
     flush_chunk();

@@ -17,3 +17,4 @@ build-release/
 docs/
 test/bench/
 test/bench_with_rss.sh
+build-*/

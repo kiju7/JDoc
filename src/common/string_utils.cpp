@@ -36,14 +36,12 @@ std::string utf16le_to_utf8(const char* data, size_t byte_len) {
     return out;
 }
 
-std::string cp1252_to_utf8(uint8_t ch) {
-    std::string out;
+void append_cp1252(std::string& out, uint8_t ch) {
     if (ch >= 0x80 && ch <= 0x9F) {
         append_utf8(out, kCp1252Table[ch - 0x80]);
     } else {
         append_utf8(out, ch);
     }
-    return out;
 }
 
 // ── CP949 (Korean) → Unicode ──────────────────────────────
@@ -94,11 +92,8 @@ static uint32_t cp949_pair_to_unicode(uint8_t lead, uint8_t trail) {
     return 0xFFFD;
 }
 
-std::string cp949_to_utf8(uint8_t lead, uint8_t trail) {
-    std::string out;
-    uint32_t cp = cp949_pair_to_unicode(lead, trail);
-    append_utf8(out, cp);
-    return out;
+void append_cp949(std::string& out, uint8_t lead, uint8_t trail) {
+    append_utf8(out, cp949_pair_to_unicode(lead, trail));
 }
 
 // ── CP932 (Japanese / Shift-JIS) → Unicode ────────────────
@@ -178,11 +173,8 @@ static uint32_t cp932_pair_to_unicode(uint8_t lead, uint8_t trail) {
     return 0xFFFD;
 }
 
-std::string cp932_to_utf8(uint8_t lead, uint8_t trail) {
-    std::string out;
-    uint32_t cp = cp932_pair_to_unicode(lead, trail);
-    append_utf8(out, cp);
-    return out;
+void append_cp932(std::string& out, uint8_t lead, uint8_t trail) {
+    append_utf8(out, cp932_pair_to_unicode(lead, trail));
 }
 
 // ── UTF-8 Validation ──────────────────────────────────────
@@ -281,7 +273,7 @@ std::string cp949_string_to_utf8(const std::string& s) {
             out.push_back(static_cast<char>(c));
             i++;
         } else if (is_cp949_lead(c) && i + 1 < s.size()) {
-            out += cp949_to_utf8(c, static_cast<uint8_t>(s[i + 1]));
+            append_cp949(out, c, static_cast<uint8_t>(s[i + 1]));
             i += 2;
         } else {
             append_utf8(out, 0xFFFD);
