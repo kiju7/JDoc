@@ -2,7 +2,7 @@
 //
 // Thin layer over the internal detect_format() / detect_office_format():
 //   1. Sniff standalone image signatures first (png/jpeg/gif/… — formats jdoc
-//      recognizes but cannot convert). Magic-byte driven, table-driven.
+//      recognizes but cannot convert). Magic-byte driven (offset/mask table).
 //   2. Otherwise defer to the internal container/magic detector, then refine
 //      the OFFICE bucket into the exact office sub-format.
 //   3. Map the resulting fine-grained format to a rich FormatInfo descriptor.

@@ -131,10 +131,9 @@ gradle test -Djna.library.path=../../build
 
 ---
 
-## reference 대비
+## 설계 노트
 
-`reference-project`는 `reference-detect(path, &code)`로 **정수 포맷 코드**만 반환하고,
-카테고리는 코드의 숫자 범위로 암묵 인코딩한다. jdoc의 `detect`는 같은 "판별/추출
-분리" 사상을 따르되, 정수 코드 대신 이름·카테고리·확장자·MIME·변환가능 여부를 담은
-리치 구조체를 5개 언어에서 동일하게 제공한다. 이미지 매직바이트 검출은 reference의
-휴리스틱 판별을 참고했다.
+판별과 추출은 분리돼 있다. `detect`는 헤더 매직바이트 + 컨테이너 구조만 검사하고,
+정수 코드가 아니라 이름·카테고리·확장자·MIME·변환가능 여부를 담은 리치 구조체를
+5개 언어에서 동일하게 반환한다. 정밀 포맷 구분(DOCX/XLSX/PPTX, HWP/HWPX 등)은
+내부 `detect_format` / `detect_office_format` 로직을 재사용한다.
