@@ -418,6 +418,8 @@ Yields:
 
     m.def("convert_archive", [](const std::string& file_path,
                                  const std::string& format,
+                                 const std::vector<int>& pages,
+                                 bool tables,
                                  bool images,
                                  const std::string& image_dir,
                                  const std::string& image_ref_prefix,
@@ -432,6 +434,8 @@ Yields:
         jdoc::ConvertOptions opts;
         if (format == "text" || format == "plaintext" || format == "plain")
             opts.format = jdoc::OutputFormat::PLAINTEXT;
+        opts.pages = pages;
+        opts.tables = tables;
         opts.images = images;
         opts.image_dir = image_dir;
         opts.image_ref_prefix = image_ref_prefix;
@@ -451,6 +455,8 @@ Yields:
     },
     py::arg("file_path"),
     py::arg("format") = "markdown",
+    py::arg("pages") = std::vector<int>{},
+    py::arg("tables") = true,
     py::arg("images") = false,
     py::arg("image_dir") = "",
     py::arg("image_ref_prefix") = "",
