@@ -67,9 +67,17 @@ public final class Jdoc {
     /** Convert a document to Markdown using default options. Throws for
      *  unsupported formats and archives. */
     public static String convert(String filePath) {
+        return convert(filePath, null);
+    }
+
+    /** Convert a document to Markdown. {@code opts} may be null for defaults;
+     *  set {@link Options#images}/{@link Options#imageDir} to extract images.
+     *  Throws for unsupported formats and archives. */
+    public static String convert(String filePath, Options opts) {
         JdocLibrary lib = JdocLibrary.INSTANCE;
+        JdocLibrary.JDocOptions nativeOpts = Options.toNative(opts);
         byte[] err = new byte[ERR_BUF_SIZE];
-        Pointer p = lib.jdoc_convert(filePath, null, err, ERR_BUF_SIZE);
+        Pointer p = lib.jdoc_convert(filePath, nativeOpts, err, ERR_BUF_SIZE);
         if (p == null) {
             throw new JdocException(cString(err));
         }
@@ -84,10 +92,18 @@ public final class Jdoc {
      *  For large documents prefer {@link #streamPages}, which yields one page
      *  at a time. Throws for unsupported formats and archives. */
     public static List<Page> convertPages(String filePath) {
+        return convertPages(filePath, null);
+    }
+
+    /** Convert a document to per-page chunks eagerly. {@code opts} may be null
+     *  for defaults. For large documents prefer {@link #streamPages}, which
+     *  yields one page at a time. Throws for unsupported formats and archives. */
+    public static List<Page> convertPages(String filePath, Options opts) {
         JdocLibrary lib = JdocLibrary.INSTANCE;
+        JdocLibrary.JDocOptions nativeOpts = Options.toNative(opts);
         byte[] err = new byte[ERR_BUF_SIZE];
         IntByReference count = new IntByReference();
-        Pointer arr = lib.jdoc_convert_pages(filePath, null, count, err, ERR_BUF_SIZE);
+        Pointer arr = lib.jdoc_convert_pages(filePath, nativeOpts, count, err, ERR_BUF_SIZE);
         if (arr == null) {
             String msg = cString(err);
             if (!msg.isEmpty()) throw new JdocException(msg);
@@ -116,7 +132,61 @@ public final class Jdoc {
      *  document. The result must be closed (try-with-resources); see
      *  {@link PageStream}. Output matches {@link #convertPages}. */
     public static PageStream streamPages(String filePath) {
-        return new PageStream(filePath, 4);
+        return streamPages(filePath, null);
+    }
+
+    /** Open a lazy page iterator for a document. {@code opts} may be null for
+     *  defaults. The result must be closed (try-with-resources); see
+     *  {@link PageStream}. Output matches {@link #convertPages}. */
+    public static PageStream streamPages(String filePath, Options opts) {
+        return new PageStream(filePath, opts, 4);
+    }
+
+    /** Convert every supported document inside an archive without extracting to
+     *  disk, using default options and limits. */
+    public static List<MemberResult> convertArchive(String filePath) {
+        return convertArchive(filePath, null);
+    }
+
+    /** Convert every supported document inside an archive (zip/gz/tar/tar.gz/
+     *  7z/alz/egg) without extracting to disk. Per-member failures are reported
+     *  in that member's {@link MemberResult#error}, not thrown; only a file that
+     *  cannot be opened at all raises. {@code opts} may be null for defaults —
+     *  set {@link Options#images}/{@link Options#imageDir} to save images, and
+     *  the {@code max*} fields to adjust the archive-bomb guards. */
+    public static List<MemberResult> convertArchive(String filePath, Options opts) {
+        JdocLibrary lib = JdocLibrary.INSTANCE;
+        JdocLibrary.JDocOptions nativeOpts = Options.toNative(opts);
+        byte[] err = new byte[ERR_BUF_SIZE];
+        IntByReference count = new IntByReference();
+        Pointer arr = lib.jdoc_convert_archive(filePath, nativeOpts, count, err, ERR_BUF_SIZE);
+        if (arr == null) {
+            String msg = cString(err);
+            if (!msg.isEmpty()) throw new JdocException(msg);
+            return new ArrayList<>();  // no reportable members
+        }
+        try {
+            int n = count.getValue();
+            List<MemberResult> members = new ArrayList<>(n);
+            if (n > 0) {
+                JdocLibrary.JDocMember first = new JdocLibrary.JDocMember(arr);
+                first.read();
+                JdocLibrary.JDocMember[] native_members =
+                        (JdocLibrary.JDocMember[]) first.toArray(n);
+                for (JdocLibrary.JDocMember nm : native_members) {
+                    members.add(new MemberResult(
+                            str(nm.member_path),
+                            str(nm.format),
+                            str(nm.markdown),
+                            str(nm.error),
+                            nm.error_code,
+                            nm.uncompressed_size));
+                }
+            }
+            return members;
+        } finally {
+            lib.jdoc_free_members(arr, count.getValue());
+        }
     }
 
     private static FormatInfo toFormatInfo(JdocLibrary.JDocFormatInfo out) {
