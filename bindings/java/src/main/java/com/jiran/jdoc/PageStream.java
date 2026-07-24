@@ -46,11 +46,19 @@ public final class PageStream implements Iterable<Page>, AutoCloseable {
     // Strong reference: JNA callbacks may be garbage-collected while native code
     // still holds them, so we must keep this alive for the stream's lifetime.
     private final JdocLibrary.JDocPageCallback callback;
+    // Strong reference for the same reason: the struct owns the native buffers
+    // its pointer fields refer to, and the conversion runs on another thread.
+    private final JdocLibrary.JDocOptions nativeOpts;
     private volatile boolean stop = false;
     private volatile String error = null;
 
     PageStream(String filePath, int capacity) {
+        this(filePath, null, capacity);
+    }
+
+    PageStream(String filePath, Options opts, int capacity) {
         this.queue = new ArrayBlockingQueue<>(Math.max(1, capacity));
+        this.nativeOpts = Options.toNative(opts);
 
         this.callback = (pagePtr, userdata) -> {
             if (stop) return 0;
@@ -70,7 +78,7 @@ public final class PageStream implements Iterable<Page>, AutoCloseable {
         this.producer = new Thread(() -> {
             byte[] err = new byte[ERR_BUF_SIZE];
             int rc = JdocLibrary.INSTANCE.jdoc_convert_pages_stream(
-                    filePath, null, callback, null, err, ERR_BUF_SIZE);
+                    filePath, nativeOpts, callback, null, err, ERR_BUF_SIZE);
             if (rc != 0) {
                 String msg = cString(err);
                 if (!msg.isEmpty()) error = msg;

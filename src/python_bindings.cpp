@@ -418,6 +418,12 @@ Yields:
 
     m.def("convert_archive", [](const std::string& file_path,
                                  const std::string& format,
+                                 const std::vector<int>& pages,
+                                 bool tables,
+                                 bool images,
+                                 const std::string& image_dir,
+                                 const std::string& image_ref_prefix,
+                                 unsigned min_image_size,
                                  int max_depth,
                                  long long max_member_bytes,
                                  long long max_total_bytes,
@@ -428,6 +434,12 @@ Yields:
         jdoc::ConvertOptions opts;
         if (format == "text" || format == "plaintext" || format == "plain")
             opts.format = jdoc::OutputFormat::PLAINTEXT;
+        opts.pages = pages;
+        opts.tables = tables;
+        opts.images = images;
+        opts.image_dir = image_dir;
+        opts.image_ref_prefix = image_ref_prefix;
+        opts.min_image_size = min_image_size;
         // -1 (any negative) disables the corresponding guard.
         opts.archive.max_depth = max_depth;
         opts.archive.max_member_bytes =
@@ -443,6 +455,12 @@ Yields:
     },
     py::arg("file_path"),
     py::arg("format") = "markdown",
+    py::arg("pages") = std::vector<int>{},
+    py::arg("tables") = true,
+    py::arg("images") = false,
+    py::arg("image_dir") = "",
+    py::arg("image_ref_prefix") = "",
+    py::arg("min_image_size") = 50,
     py::arg("max_depth") = 3,
     py::arg("max_member_bytes") = (long long)(512) << 20,
     py::arg("max_total_bytes") = (long long)(64) << 30,
@@ -453,6 +471,10 @@ Yields:
     R"doc(Convert every supported document inside an archive (zip/gz/tar/tar.gz/
 7z/alz/egg) without extracting to disk. Members are decompressed into memory
 one at a time; nested archives are walked recursively up to max_depth.
+
+With images=True and image_dir set, images embedded in member documents — and
+standalone image files (jpeg/png/gif/bmp/webp/tiff) inside the archive — are
+saved under image_dir, mirroring the archive's layout.
 
 Limits: pass -1 to disable a limit (unlimited). Only do this for trusted
 inputs — archive-bomb protection is disabled with it.
