@@ -13,6 +13,8 @@ namespace jdoc {
 enum class FileFormat {
     PDF, OFFICE, HWP, HWPX, TXT, EML,
     EMF, WMF,   // metafiles — vector records carrying text (+ images)
+    IMAGE,      // standalone raster image (jpeg/png/gif/bmp/webp) — no text,
+                // saved as-is when image extraction is on
     ZIP, GZIP, BZIP2, TAR, SEVENZIP, ALZ, EGG, RAR,
     UNKNOWN
 };

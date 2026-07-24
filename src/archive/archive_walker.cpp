@@ -10,6 +10,7 @@
 #include "convert_internal.h"
 #include "zip_reader.h"
 #include "common/file_utils.h"
+#include "common/png_encode.h"
 #include "archive/alz_reader.h"
 #include "archive/egg_reader.h"
 #include "archive/input_stream.h"
@@ -28,13 +29,20 @@ namespace {
 // Media/binary extensions that are never parseable documents: skipped
 // without spending time decompressing them (unless the caller asked for
 // unsupported members to be reported).
-bool has_skippable_ext(const std::string& name) {
+bool has_skippable_ext(const std::string& name, bool extracting_images) {
     auto dot = name.rfind('.');
     if (dot == std::string::npos) return false;
     std::string ext = name.substr(dot + 1);
     for (auto& c : ext) c = std::tolower(static_cast<unsigned char>(c));
+    // Raster images jdoc can save as-is: skipped only when image extraction is
+    // off (nothing to do with them then); processed as IMAGE members when on.
+    static const char* kImages[] = {
+        "png", "jpg", "jpeg", "gif", "bmp", "tif", "tiff", "webp",
+    };
+    for (auto* s : kImages)
+        if (ext == s) return !extracting_images;
     static const char* kSkip[] = {
-        "png", "jpg", "jpeg", "gif", "bmp", "tif", "tiff", "webp", "ico",
+        "ico",
         "mp3", "mp4", "avi", "mov", "mkv", "wav", "flac",
         "exe", "dll", "so", "dylib", "class", "o", "a",
         "ttf", "otf", "woff", "woff2",
@@ -224,6 +232,28 @@ bool handle_member_bytes(const std::string& member_path, const uint8_t* bytes,
         return cb(std::move(r));
     }
 
+    // Standalone image member: extract the file as-is under image_dir, mirroring
+    // the archive's layout with the original filename preserved — no per-member
+    // subdir, no extension rewrite (documents keep the member_convert_opts subdir
+    // scheme below, which single-image members don't need). Image members only
+    // reach here when image extraction is on (has_skippable_ext filters them
+    // out otherwise).
+    if (fmt == FileFormat::IMAGE) {
+        std::string basename = member_path;
+        std::string subdir = opts.image_dir;
+        auto slash = member_path.find_last_of('/');
+        if (slash != std::string::npos) {
+            basename = member_path.substr(slash + 1);
+            if (!subdir.empty()) subdir += "/";
+            subdir += member_path.substr(0, slash);
+        }
+        if (!opts.image_dir.empty())
+            util::save_named_file(subdir, basename, bytes, size);
+        r.markdown = "![" + basename + "](" + opts.image_ref_prefix +
+                     member_path + ")";
+        return cb(std::move(r));
+    }
+
     bool wants_images = opts.images && !opts.image_dir.empty();
 
     try {
@@ -349,7 +379,7 @@ bool walk_zip(const ZipReader& zip, const std::string& prefix, int depth,
 
         if (!count_entry(member_path, budget, opts, cb)) return false;
 
-        if (has_skippable_ext(e.name)) {
+        if (has_skippable_ext(e.name, opts.images)) {
             if (opts.archive.include_unsupported) {
                 MemberResult r;
                 r.member_path = member_path;
@@ -411,7 +441,7 @@ bool walk_7z(const SevenZipReader& sz, const std::string& prefix, int depth,
 
         if (!count_entry(member_path, budget, opts, cb)) return false;
 
-        if (has_skippable_ext(e.name)) {
+        if (has_skippable_ext(e.name, opts.images)) {
             if (opts.archive.include_unsupported) {
                 MemberResult r;
                 r.member_path = member_path;
@@ -477,7 +507,7 @@ bool walk_7z(const SevenZipReader& sz, const std::string& prefix, int depth,
                 const auto& next = entries[j];
                 if (next.folder_index != e.folder_index) break;
                 if (!next.name.empty() && !is_metadata_member(next.name) &&
-                    !has_skippable_ext(next.name)) {
+                    !has_skippable_ext(next.name, opts.images)) {
                     keep_cache = true;
                     break;
                 }
@@ -506,7 +536,7 @@ bool walk_tar(InputStream& src, const std::string& prefix, int depth,
 
         if (!count_entry(member_path, budget, opts, cb)) return false;
 
-        if (has_skippable_ext(m.name)) {
+        if (has_skippable_ext(m.name, opts.images)) {
             if (opts.archive.include_unsupported) {
                 MemberResult r;
                 r.member_path = member_path;
@@ -598,7 +628,7 @@ bool walk_alz(InputStream& src, const std::string& name_hint,
 
         if (!count_entry(member_path, budget, opts, cb)) return false;
 
-        if (has_skippable_ext(m.name)) {
+        if (has_skippable_ext(m.name, opts.images)) {
             if (opts.archive.include_unsupported) {
                 MemberResult r;
                 r.member_path = member_path;
@@ -656,7 +686,7 @@ bool walk_rar(InputStream& src, const std::string& name_hint,
 
         if (!count_entry(member_path, budget, opts, cb)) return false;
 
-        if (has_skippable_ext(m.name)) {
+        if (has_skippable_ext(m.name, opts.images)) {
             if (opts.archive.include_unsupported) {
                 MemberResult r;
                 r.member_path = member_path;
@@ -747,7 +777,7 @@ bool walk_egg_solid(EggReader& egg, const std::string& prefix, int depth,
                     stopped = true;
                     return false;
                 }
-                if (has_skippable_ext(mem.name) || mem.encrypted) {
+                if (has_skippable_ext(mem.name, opts.images) || mem.encrypted) {
                     if (mem.encrypted || opts.archive.include_unsupported) {
                         MemberResult r;
                         r.member_path = path;
@@ -876,7 +906,7 @@ bool walk_egg(InputStream& src, const std::string& name_hint,
 
         if (!count_entry(member_path, budget, opts, cb)) return false;
 
-        if (has_skippable_ext(m.name)) {
+        if (has_skippable_ext(m.name, opts.images)) {
             if (opts.archive.include_unsupported) {
                 MemberResult r;
                 r.member_path = member_path;
