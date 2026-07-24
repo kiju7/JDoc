@@ -137,15 +137,109 @@ func goFormatInfo(info *C.JDocFormatInfo) FormatInfo {
 	}
 }
 
+// Options mirrors the C JDocOptions struct. Start from DefaultOptions and
+// change what you need — the zero value is NOT a valid default (Tables would
+// be off and MinImageSize 0 means "no size filter").
+//
+// The archive limit fields follow the C convention: 0 means "library default"
+// and -1 disables that guard entirely. Only disable a guard for trusted input
+// — archive-bomb protection goes with it.
+type Options struct {
+	Tables         bool   // render tables as markdown tables
+	Images         bool   // extract images
+	ImageDir       string // where to write images; "" keeps them in memory
+	ImageRefPrefix string // prepended to image references in the markdown
+	MinImageSize   uint   // skip images smaller than NxN (0 = no filter)
+	Pages          []int  // page numbers to extract (nil = all)
+	Format         string // "" or "markdown" (default), or "text"
+
+	MaxDepth           int   // nested-archive depth (default 3)
+	MaxMemberBytes     int64 // per-member uncompressed cap (default 512 MiB)
+	MaxTotalBytes      int64 // cumulative cap per call (default 64 GiB)
+	MaxEntries         int   // members visited (default 200000)
+	MaxRatio           int   // bomb-suspect compression ratio (default 10000)
+	IncludeUnsupported bool  // report unsupported members instead of skipping
+}
+
+// DefaultOptions returns the library defaults: tables on, no image extraction,
+// markdown output, all pages, 50px minimum image size, standard archive limits.
+func DefaultOptions() Options {
+	return Options{Tables: true, MinImageSize: 50}
+}
+
+func cbool(b bool) C.int {
+	if b {
+		return 1
+	}
+	return 0
+}
+
+// toC builds a C JDocOptions in C memory (so cgo's pointer rules are satisfied:
+// no Go pointers are stored in memory handed to C) and returns it with a
+// cleanup func that frees it and every string/array it owns.
+func (o Options) toC() (*C.JDocOptions, func()) {
+	c := (*C.JDocOptions)(C.calloc(1, C.size_t(unsafe.Sizeof(C.JDocOptions{}))))
+	var owned []unsafe.Pointer
+	cstr := func(s string) *C.char {
+		if s == "" {
+			return nil
+		}
+		p := C.CString(s)
+		owned = append(owned, unsafe.Pointer(p))
+		return p
+	}
+
+	c.tables = cbool(o.Tables)
+	c.images = cbool(o.Images)
+	c.image_dir = cstr(o.ImageDir)
+	c.image_ref_prefix = cstr(o.ImageRefPrefix)
+	c.min_image_size = C.uint(o.MinImageSize)
+	if n := len(o.Pages); n > 0 {
+		arr := C.malloc(C.size_t(n) * C.size_t(unsafe.Sizeof(C.int(0))))
+		owned = append(owned, arr)
+		dst := unsafe.Slice((*C.int)(arr), n)
+		for i, p := range o.Pages {
+			dst[i] = C.int(p)
+		}
+		c.pages = (*C.int)(arr)
+		c.page_count = C.int(n)
+	}
+	c.format = cstr(o.Format)
+	c.max_depth = C.int(o.MaxDepth)
+	c.max_member_bytes = C.longlong(o.MaxMemberBytes)
+	c.max_total_bytes = C.longlong(o.MaxTotalBytes)
+	c.max_entries = C.int(o.MaxEntries)
+	c.max_ratio = C.int(o.MaxRatio)
+	c.include_unsupported = cbool(o.IncludeUnsupported)
+
+	return c, func() {
+		for _, p := range owned {
+			C.free(p)
+		}
+		C.free(unsafe.Pointer(c))
+	}
+}
+
 // Convert converts a document to Markdown (or plain text) using default
 // options. Returns an error for unsupported formats and archives (use
 // ConvertArchive for the latter).
-func Convert(path string) (string, error) {
+func Convert(path string) (string, error) { return convertWith(path, nil) }
+
+// ConvertWithOptions is Convert with explicit options — notably Images and
+// ImageDir to extract a document's images (and to convert a standalone image
+// file, which is written to ImageDir as-is).
+func ConvertWithOptions(path string, opts Options) (string, error) {
+	c, free := opts.toC()
+	defer free()
+	return convertWith(path, c)
+}
+
+func convertWith(path string, opts *C.JDocOptions) (string, error) {
 	cPath := C.CString(path)
 	defer C.free(unsafe.Pointer(cPath))
 
 	errBuf := make([]C.char, errBufSize)
-	out := C.jdoc_convert(cPath, nil, &errBuf[0], C.int(errBufSize))
+	out := C.jdoc_convert(cPath, opts, &errBuf[0], C.int(errBufSize))
 	if out == nil {
 		return "", errors.New(C.GoString(&errBuf[0]))
 	}
@@ -168,13 +262,25 @@ func (m Member) Ok() bool { return m.Error == "" }
 
 // ConvertArchive converts every supported document inside an archive without
 // extracting to disk, using default limits.
-func ConvertArchive(path string) ([]Member, error) {
+func ConvertArchive(path string) ([]Member, error) { return convertArchiveWith(path, nil) }
+
+// ConvertArchiveWithOptions is ConvertArchive with explicit options — the
+// archive limits, and Images/ImageDir to write out images found inside member
+// documents as well as standalone image files stored in the archive. Extracted
+// files mirror the archive's layout under ImageDir.
+func ConvertArchiveWithOptions(path string, opts Options) ([]Member, error) {
+	c, free := opts.toC()
+	defer free()
+	return convertArchiveWith(path, c)
+}
+
+func convertArchiveWith(path string, opts *C.JDocOptions) ([]Member, error) {
 	cPath := C.CString(path)
 	defer C.free(unsafe.Pointer(cPath))
 
 	var count C.int
 	errBuf := make([]C.char, errBufSize)
-	arr := C.jdoc_convert_archive(cPath, nil, &count, &errBuf[0], C.int(errBufSize))
+	arr := C.jdoc_convert_archive(cPath, opts, &count, &errBuf[0], C.int(errBufSize))
 	if arr == nil {
 		if msg := C.GoString(&errBuf[0]); msg != "" {
 			return nil, errors.New(msg)
@@ -251,13 +357,24 @@ func goPage(p *C.JDocPage) Page {
 // ConvertPages converts a document to per-page chunks eagerly, using default
 // options. For large documents prefer StreamPages, which yields one page at a
 // time. Returns an error for unsupported formats and archives.
-func ConvertPages(path string) ([]Page, error) {
+func ConvertPages(path string) ([]Page, error) { return convertPagesWith(path, nil) }
+
+// ConvertPagesWithOptions is ConvertPages with explicit options — notably
+// Images and ImageDir, which populate each page's Images (and write them to
+// disk when ImageDir is set).
+func ConvertPagesWithOptions(path string, opts Options) ([]Page, error) {
+	c, free := opts.toC()
+	defer free()
+	return convertPagesWith(path, c)
+}
+
+func convertPagesWith(path string, opts *C.JDocOptions) ([]Page, error) {
 	cPath := C.CString(path)
 	defer C.free(unsafe.Pointer(cPath))
 
 	var count C.int
 	errBuf := make([]C.char, errBufSize)
-	arr := C.jdoc_convert_pages(cPath, nil, &count, &errBuf[0], C.int(errBufSize))
+	arr := C.jdoc_convert_pages(cPath, opts, &count, &errBuf[0], C.int(errBufSize))
 	if arr == nil {
 		if msg := C.GoString(&errBuf[0]); msg != "" {
 			return nil, errors.New(msg)
@@ -306,6 +423,7 @@ func goJDocPageSink(page *C.JDocPage, userdata unsafe.Pointer) C.int {
 // with Pages; after the loop, check Err for a conversion failure.
 type PageStream struct {
 	path string
+	opts *Options // nil = C library defaults
 	err  error
 }
 
@@ -316,6 +434,12 @@ type PageStream struct {
 // ConvertPages.
 func StreamPages(path string) *PageStream {
 	return &PageStream{path: path}
+}
+
+// StreamPagesWithOptions is StreamPages with explicit options — notably Images
+// and ImageDir, which populate each yielded page's Images.
+func StreamPagesWithOptions(path string, opts Options) *PageStream {
+	return &PageStream{path: path, opts: &opts}
 }
 
 // Pages returns a single-use iterator over the document's pages. Breaking out
@@ -330,8 +454,15 @@ func (s *PageStream) Pages() iter.Seq[Page] {
 		cPath := C.CString(s.path)
 		defer C.free(unsafe.Pointer(cPath))
 
+		var cOpts *C.JDocOptions
+		if s.opts != nil {
+			c, free := s.opts.toC()
+			defer free()
+			cOpts = c
+		}
+
 		errBuf := make([]C.char, errBufSize)
-		rc := C.jdoc_stream_pages(cPath, nil, unsafe.Pointer(h),
+		rc := C.jdoc_stream_pages(cPath, cOpts, unsafe.Pointer(h),
 			&errBuf[0], C.int(errBufSize))
 
 		if state.panic != nil {
