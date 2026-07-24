@@ -203,4 +203,23 @@ inline std::string save_image_to_file(const std::string& dir,
     return path;
 }
 
+// Save bytes to "<dir>/<filename>" verbatim — the filename (including its
+// original extension) is preserved exactly, unlike save_image_to_file which
+// derives the extension from the format. Creates dir and any missing parents.
+// Returns the saved path, or empty on failure.
+inline std::string save_named_file(const std::string& dir,
+                                   const std::string& filename,
+                                   const void* data, size_t size) {
+    if (dir.empty() || filename.empty() || !data || size == 0) return "";
+    ensure_dirs(dir);
+    std::string path = dir + "/" + filename;
+    std::ofstream ofs(path, std::ios::binary);
+    if (!ofs) return "";
+    if (size > static_cast<size_t>(std::numeric_limits<std::streamsize>::max()))
+        return "";
+    ofs.write(static_cast<const char*>(data),
+              static_cast<std::streamsize>(size));
+    return path;
+}
+
 }} // namespace jdoc::util

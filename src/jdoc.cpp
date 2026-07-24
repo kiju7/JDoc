@@ -72,6 +72,9 @@ static FileFormat format_from_ext(const std::string& name) {
     if (ext == ".eml") return FileFormat::EML;
     if (ext == ".emf") return FileFormat::EMF;
     if (ext == ".wmf") return FileFormat::WMF;
+    if (ext == ".jpg" || ext == ".jpeg" || ext == ".png" || ext == ".gif" ||
+        ext == ".bmp" || ext == ".webp" || ext == ".tif" || ext == ".tiff")
+        return FileFormat::IMAGE;
     if (ext == ".docx" || ext == ".xlsx" || ext == ".pptx" ||
         ext == ".doc" || ext == ".xls" || ext == ".ppt" || ext == ".rtf" ||
         ext == ".html" || ext == ".htm" || ext == ".xlsb" ||
@@ -138,6 +141,16 @@ static FileFormat format_from_magic(const unsigned char* magic, size_t n) {
     if (n >= 4 && magic[0] == 0xD7 && magic[1] == 0xCD && magic[2] == 0xC6 &&
         magic[3] == 0x9A)
         return FileFormat::WMF;
+    // Standalone raster images with strong, multi-byte signatures (jpeg/png/gif/
+    // webp). BMP has only a weak 2-byte "BM" magic that collides with text, so it
+    // resolves by extension instead — kept out here to avoid misreading text.
+    if ((n >= 3 && magic[0] == 0xFF && magic[1] == 0xD8 && magic[2] == 0xFF) ||
+        (n >= 8 && memcmp(magic, "\x89PNG\r\n\x1a\n", 8) == 0) ||
+        (n >= 6 && (memcmp(magic, "GIF87a", 6) == 0 ||
+                    memcmp(magic, "GIF89a", 6) == 0)) ||
+        (n >= 12 && memcmp(magic, "RIFF", 4) == 0 &&
+                    memcmp(magic + 8, "WEBP", 4) == 0))
+        return FileFormat::IMAGE;
     return FileFormat::UNKNOWN;
 }
 
@@ -271,6 +284,73 @@ static PageChunk metafile_to_chunk(FileFormat fmt, const uint8_t* data,
     return chunk;
 }
 
+// Filename for a standalone image: the original basename of the (possibly
+// nested) name hint, preserved verbatim — "a.zip/b/img-1.jpeg" → "img-1.jpeg".
+// The extracted file IS the original, so its name and extension are kept as-is
+// (no jpeg→jpg normalization). A magic-detected extension is appended only when
+// the name carries none.
+static std::string image_basename(const uint8_t* data, size_t size,
+                                  const std::string& name_hint) {
+    std::string base = name_hint;
+    auto slash = base.find_last_of("/\\");
+    if (slash != std::string::npos) base = base.substr(slash + 1);
+    if (base.empty()) base = "image";
+    auto dot = base.rfind('.');
+    if (dot == std::string::npos || dot == 0) {
+        std::string fmt = util::detect_image_format(data, size);
+        base += "." + (fmt.empty() ? std::string("img") : fmt);
+    }
+    return base;
+}
+
+// Stem (name without extension) for ImageData.name.
+static std::string strip_ext(const std::string& filename) {
+    auto dot = filename.rfind('.');
+    return (dot != std::string::npos && dot != 0) ? filename.substr(0, dot)
+                                                  : filename;
+}
+
+// Markdown for a standalone raster image: nothing when image extraction is off
+// (an image carries no text), otherwise the file saved to image_dir under its
+// original name and referenced inline — same "![name](ref)" shape every parser
+// emits. One trailing newline; callers space members as needed.
+static std::string image_to_markdown(const uint8_t* data, size_t size,
+                                     const std::string& name_hint,
+                                     const ConvertOptions& opts) {
+    if (!opts.images) return "";
+    std::string filename = image_basename(data, size, name_hint);
+    if (!opts.image_dir.empty())
+        util::save_named_file(opts.image_dir, filename, data, size);
+    return "![" + filename + "](" + opts.image_ref_prefix + filename + ")\n";
+}
+
+// Single PageChunk for a standalone raster image: the image as ImageData plus
+// its inline reference. When image_dir is set the bytes are written straight
+// from the source buffer under the original name (no userspace copy) and
+// ImageData.data stays empty; only memory mode holds the bytes.
+static PageChunk image_to_chunk(const uint8_t* data, size_t size,
+                                const std::string& name_hint,
+                                const ConvertOptions& opts) {
+    PageChunk chunk;
+    chunk.page_number = 1;
+    if (!opts.images) return chunk;
+
+    std::string filename = image_basename(data, size, name_hint);
+    ImageData img;
+    img.page_number = 1;
+    img.name = strip_ext(filename);
+    img.format = util::detect_image_format(data, size);
+    util::populate_image_dimensions(img, data, size);
+    if (!opts.image_dir.empty())
+        img.saved_path =
+            util::save_named_file(opts.image_dir, filename, data, size);
+    if (img.saved_path.empty())
+        img.data.assign(data, data + size);  // memory mode: caller needs bytes
+    chunk.text = "![" + filename + "](" + opts.image_ref_prefix + filename + ")\n";
+    chunk.images.push_back(std::move(img));
+    return chunk;
+}
+
 } // anonymous namespace
 
 FileFormat detect_format(const std::string& path) {
@@ -360,6 +440,7 @@ const char* file_format_name(FileFormat fmt) {
         case FileFormat::EML:      return "EML";
         case FileFormat::EMF:      return "EMF";
         case FileFormat::WMF:      return "WMF";
+        case FileFormat::IMAGE:    return "IMAGE";
         case FileFormat::ZIP:      return "ZIP";
         case FileFormat::GZIP:     return "GZIP";
         case FileFormat::BZIP2:    return "BZIP2";
@@ -394,6 +475,7 @@ std::string convert_from_memory_as(FileFormat fmt,
         case FileFormat::EML:    return eml_to_markdown_mem(data, size, opts);
         case FileFormat::EMF:
         case FileFormat::WMF:    return metafile_to_markdown(fmt, data, size, opts);
+        case FileFormat::IMAGE:  return image_to_markdown(data, size, name_hint, opts);
         default:
             if (is_archive_format(fmt))
                 throw std::runtime_error("Nested archive must be walked, not converted: " + name_hint);
@@ -415,6 +497,12 @@ std::string convert(const std::string& file_path, ConvertOptions opts) {
             auto b = read_file_bytes(file_path);
             return metafile_to_markdown(
                 fmt, reinterpret_cast<const uint8_t*>(b.data()), b.size(), opts);
+        }
+        case FileFormat::IMAGE: {
+            auto b = read_file_bytes(file_path);
+            return image_to_markdown(
+                reinterpret_cast<const uint8_t*>(b.data()), b.size(),
+                file_path, opts);
         }
         default:
             if (is_archive_format(fmt))
@@ -450,6 +538,12 @@ std::vector<PageChunk> convert_chunks(const std::string& file_path,
             return {metafile_to_chunk(
                 fmt, reinterpret_cast<const uint8_t*>(b.data()), b.size(), opts)};
         }
+        case FileFormat::IMAGE: {
+            auto b = read_file_bytes(file_path);
+            return {image_to_chunk(
+                reinterpret_cast<const uint8_t*>(b.data()), b.size(),
+                file_path, opts)};
+        }
         default:
             if (is_archive_format(fmt))
                 throw std::runtime_error("File is an archive; use convert_archive(): " + file_path);
@@ -478,6 +572,13 @@ void for_each_chunk(const std::string& file_path, const ConvertOptions& opts,
             auto b = read_file_bytes(file_path);
             sink(metafile_to_chunk(
                 fmt, reinterpret_cast<const uint8_t*>(b.data()), b.size(), opts));
+            return;
+        }
+        case FileFormat::IMAGE: {
+            auto b = read_file_bytes(file_path);
+            sink(image_to_chunk(
+                reinterpret_cast<const uint8_t*>(b.data()), b.size(),
+                file_path, opts));
             return;
         }
         default:
@@ -515,6 +616,9 @@ void for_each_chunk(const void* data, size_t size, const std::string& name_hint,
         case FileFormat::EMF:
         case FileFormat::WMF:
             sink(metafile_to_chunk(fmt, bytes, size, opts));
+            return;
+        case FileFormat::IMAGE:
+            sink(image_to_chunk(bytes, size, name_hint, opts));
             return;
         case FileFormat::EML:
             eml_to_markdown_chunks_mem_stream(bytes, size, opts, sink);

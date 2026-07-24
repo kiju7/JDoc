@@ -17,6 +17,7 @@ void print_usage(const char* prog) {
     std::cerr << "Usage: " << prog << " <input_file> [output.md] [options]\n"
               << "\nSupported formats:\n"
               << "  PDF, DOCX, XLSX, PPTX, DOC, XLS, PPT, RTF, HTML, HWP, HWPX\n"
+              << "  Images (extracted as-is with --images): JPEG, PNG, GIF, BMP, WEBP, TIFF\n"
               << "  Archives (parsed in memory, no extraction): ZIP, GZ, BZ2, TAR, TAR.GZ, TAR.BZ2, 7Z, ALZ, EGG, RAR\n"
               << "\nOptions:\n"
               << "  --pages N,N,N   Page numbers (0-based, comma-separated)\n"
