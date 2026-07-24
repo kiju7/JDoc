@@ -16,10 +16,12 @@ dependencies {
     testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
 }
 
-java {
-    toolchain {
-        languageVersion = JavaLanguageVersion.of(11)
-    }
+// Target Java 11 without pinning a toolchain: `--release 11` compiles against
+// the Java 11 API using whatever JDK is installed (11, 17, 21, ...), so one
+// configuration builds everywhere. A toolchain block would instead demand that
+// exact JDK be present (or downloaded) and fails the build when it is not.
+tasks.withType(JavaCompile).configureEach {
+    options.release = 11
 }
 
 test {
