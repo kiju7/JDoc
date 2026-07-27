@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <cstdio>
 #include <fstream>
+#include <unordered_set>
 #include <map>
 #include <set>
 #include <sstream>
@@ -749,7 +750,7 @@ XlsxParser::SheetData XlsxParser::parse_sheet(const SheetInfo& info) {
                     if (ch == '\n') ch = ' ';
                 }
                 bool bold = is_bold_style(style_idx);
-                sheet.cells[row][col] = {value, bold};
+                sheet.cells.push_back({row, col, {value, bold}});
                 sheet.max_row = std::max(sheet.max_row, row);
                 sheet.max_col = std::max(sheet.max_col, col);
             }
@@ -759,19 +760,39 @@ XlsxParser::SheetData XlsxParser::parse_sheet(const SheetInfo& info) {
     // A comment can be anchored to an empty cell, which has no <c> element and
     // is therefore never visited by the loop above. Inject any such unconsumed
     // comment at its own coordinate so the memo is not silently dropped.
-    for (const auto& [ref, text] : comments) {
-        auto [c, r] = parse_cell_ref(ref);
-        auto& row_map = sheet.cells[r];
-        if (row_map.count(c)) continue;  // populated cell already merged its comment
-        std::string v = "[" + text + "]";
-        for (auto& ch : v) {
-            if (ch == '|') ch = '/';
-            if (ch == '\n') ch = ' ';
+    if (!comments.empty()) {
+        // The flat vector has no O(log n) membership test, so build the set of
+        // already-present coordinates once (packing row/col into a 64-bit key).
+        // A comment on a populated cell was already merged above; skip those.
+        auto key_of = [](int r, int c) {
+            return (static_cast<uint64_t>(static_cast<uint32_t>(r)) << 32) |
+                   static_cast<uint32_t>(c);
+        };
+        std::unordered_set<uint64_t> present;
+        present.reserve(sheet.cells.size() * 2 + 1);
+        for (const auto& cell : sheet.cells)
+            present.insert(key_of(cell.row, cell.col));
+        for (const auto& [ref, text] : comments) {
+            auto [c, r] = parse_cell_ref(ref);
+            if (!present.insert(key_of(r, c)).second) continue;  // already present
+            std::string v = "[" + text + "]";
+            for (auto& ch : v) {
+                if (ch == '|') ch = '/';
+                if (ch == '\n') ch = ' ';
+            }
+            sheet.cells.push_back({r, c, {v, false}});
+            sheet.max_row = std::max(sheet.max_row, r);
+            sheet.max_col = std::max(sheet.max_col, c);
         }
-        row_map[c] = {v, false};
-        sheet.max_row = std::max(sheet.max_row, r);
-        sheet.max_col = std::max(sheet.max_col, c);
     }
+
+    // Row-major order so the table renderer can walk the cells with a single
+    // advancing cursor. xlsx usually emits cells in this order already, but
+    // comment-anchored cells were appended out of band, so sort to be safe.
+    std::sort(sheet.cells.begin(), sheet.cells.end(),
+              [](const Cell& a, const Cell& b) {
+                  return a.row != b.row ? a.row < b.row : a.col < b.col;
+              });
 
     return sheet;
 }
@@ -793,24 +814,34 @@ std::string XlsxParser::format_sheet_as_table(const SheetData& sheet,
     // reallocations an ostringstream/growing string would otherwise incur.
     out.reserve(static_cast<size_t>(display_rows) * total_cols * 8 + 64);
 
-    // Helper: look up cell value with bold markers applied.
-    auto get_cell = [&](int r, int c) -> std::string {
-        auto row_it = sheet.cells.find(r);
-        if (row_it == sheet.cells.end()) return "";
-        auto col_it = row_it->second.find(c);
-        if (col_it == row_it->second.end()) return "";
-        std::string val = col_it->second.value;
-        if (!val.empty() && col_it->second.bold)
-            val = "**" + val + "**";
-        return val;
+    // The cells are sorted row-major, so a single cursor advances through them
+    // as the dense grid is emitted — no per-cell lookup at all. `ci` is shared
+    // across rows and only ever moves forward.
+    const auto& cells = sheet.cells;
+    const size_t ncells = cells.size();
+    size_t ci = 0;
+    auto emit_row = [&](int r) {
+        out += "|";
+        for (int c = 0; c < total_cols; ++c) {
+            out += " ";
+            while (ci < ncells && (cells[ci].row < r ||
+                   (cells[ci].row == r && cells[ci].col < c)))
+                ++ci;
+            if (ci < ncells && cells[ci].row == r && cells[ci].col == c) {
+                const std::string& val = cells[ci].info.value;
+                if (!val.empty() && cells[ci].info.bold) {
+                    out += "**"; out += val; out += "**";
+                } else {
+                    out += val;
+                }
+            }
+            out += " |";
+        }
+        out += "\n";
     };
 
     // Header row (row 0)
-    out += "|";
-    for (int c = 0; c < total_cols; ++c) {
-        out += " "; out += get_cell(0, c); out += " |";
-    }
-    out += "\n";
+    emit_row(0);
 
     // Separator
     out += "|";
@@ -821,11 +852,7 @@ std::string XlsxParser::format_sheet_as_table(const SheetData& sheet,
 
     // Data rows
     for (int r = 1; r < display_rows; ++r) {
-        out += "|";
-        for (int c = 0; c < total_cols; ++c) {
-            out += " "; out += get_cell(r, c); out += " |";
-        }
-        out += "\n";
+        emit_row(r);
     }
 
     if (truncated) {
@@ -1051,8 +1078,9 @@ PageChunk XlsxParser::build_sheet_chunk(size_t i, const ConvertOptions& opts) {
     if (!sheet.cells.empty()) {
         text += format_sheet_as_table(sheet); text += "\n";
 
-        // Build structured table data for the chunk
-        // Convert sparse grid to dense 2D vector
+        // Build structured table data for the chunk.
+        // Walk the row-major cell vector with a single advancing cursor (same
+        // as format_sheet_as_table), filling gaps with empty strings.
         if (opts.tables) {
             int total_rows = sheet.max_row + 1;
             int total_cols = sheet.max_col + 1;
@@ -1061,22 +1089,25 @@ PageChunk XlsxParser::build_sheet_chunk(size_t i, const ConvertOptions& opts) {
             std::vector<std::vector<std::string>> table;
             table.reserve(display_rows);
 
+            const auto& cells = sheet.cells;
+            const size_t ncells = cells.size();
+            size_t ci = 0;
             for (int r = 0; r < display_rows; ++r) {
                 std::vector<std::string> row;
                 row.reserve(total_cols);
-                auto row_it = sheet.cells.find(r);
                 for (int c = 0; c < total_cols; ++c) {
-                    if (row_it != sheet.cells.end()) {
-                        auto col_it = row_it->second.find(c);
-                        if (col_it != row_it->second.end()) {
-                            std::string val = col_it->second.value;
-                            if (!val.empty() && col_it->second.bold)
-                                val = "**" + val + "**";
-                            row.push_back(std::move(val));
-                            continue;
-                        }
+                    while (ci < ncells && (cells[ci].row < r ||
+                           (cells[ci].row == r && cells[ci].col < c)))
+                        ++ci;
+                    if (ci < ncells && cells[ci].row == r && cells[ci].col == c) {
+                        const std::string& val = cells[ci].info.value;
+                        if (!val.empty() && cells[ci].info.bold)
+                            row.push_back("**" + val + "**");
+                        else
+                            row.push_back(val);
+                    } else {
+                        row.push_back("");
                     }
-                    row.push_back("");
                 }
                 table.push_back(std::move(row));
             }

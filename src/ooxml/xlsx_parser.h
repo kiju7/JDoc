@@ -83,10 +83,21 @@ private:
         bool bold = false;
     };
 
+    struct Cell {
+        int row;
+        int col;
+        CellInfo info;
+    };
+
     struct SheetData {
         std::string name;
-        // Sparse grid: row -> col -> cell
-        std::map<int, std::map<int, CellInfo>> cells;
+        // Cells in row-major (row, then col) order — see parse_sheet, which
+        // sorts once after building. A flat vector rather than a nested
+        // std::map: building is push_back (no per-cell red-black-tree insert or
+        // teardown), and the table renderer walks it with a single advancing
+        // cursor instead of an O(log n) lookup per cell. Stays sparse (no dense
+        // grid) so a huge but mostly-empty sheet cannot blow up memory.
+        std::vector<Cell> cells;
         int max_row = 0;
         int max_col = 0;
     };
