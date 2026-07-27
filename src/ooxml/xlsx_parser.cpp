@@ -793,24 +793,37 @@ std::string XlsxParser::format_sheet_as_table(const SheetData& sheet,
     // reallocations an ostringstream/growing string would otherwise incur.
     out.reserve(static_cast<size_t>(display_rows) * total_cols * 8 + 64);
 
-    // Helper: look up cell value with bold markers applied.
-    auto get_cell = [&](int r, int c) -> std::string {
-        auto row_it = sheet.cells.find(r);
-        if (row_it == sheet.cells.end()) return "";
-        auto col_it = row_it->second.find(c);
-        if (col_it == row_it->second.end()) return "";
-        std::string val = col_it->second.value;
-        if (!val.empty() && col_it->second.bold)
-            val = "**" + val + "**";
-        return val;
+    // Emit one table row. The row's column map is looked up ONCE by the caller
+    // and passed in, rather than re-finding the row for every column: cells is a
+    // nested std::map, so a per-column row lookup repeats an O(log rows) tree
+    // walk total_cols times per row (the dominant cost on a wide, dense sheet).
+    using RowCells = std::map<int, CellInfo>;
+    auto emit_row = [&](const RowCells* row) {
+        out += "|";
+        for (int c = 0; c < total_cols; ++c) {
+            out += " ";
+            if (row) {
+                auto col_it = row->find(c);
+                if (col_it != row->end()) {
+                    const std::string& val = col_it->second.value;
+                    if (!val.empty() && col_it->second.bold) {
+                        out += "**"; out += val; out += "**";
+                    } else {
+                        out += val;
+                    }
+                }
+            }
+            out += " |";
+        }
+        out += "\n";
+    };
+    auto row_at = [&](int r) -> const RowCells* {
+        auto it = sheet.cells.find(r);
+        return it == sheet.cells.end() ? nullptr : &it->second;
     };
 
     // Header row (row 0)
-    out += "|";
-    for (int c = 0; c < total_cols; ++c) {
-        out += " "; out += get_cell(0, c); out += " |";
-    }
-    out += "\n";
+    emit_row(row_at(0));
 
     // Separator
     out += "|";
@@ -821,11 +834,7 @@ std::string XlsxParser::format_sheet_as_table(const SheetData& sheet,
 
     // Data rows
     for (int r = 1; r < display_rows; ++r) {
-        out += "|";
-        for (int c = 0; c < total_cols; ++c) {
-            out += " "; out += get_cell(r, c); out += " |";
-        }
-        out += "\n";
+        emit_row(row_at(r));
     }
 
     if (truncated) {
