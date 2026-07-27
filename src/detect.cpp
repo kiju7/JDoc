@@ -11,6 +11,7 @@
 #include "jdoc/detect.h"
 #include "jdoc/office.h"
 #include "convert_internal.h"
+#include "common/image_magic.h"
 
 #include <cstring>
 #include <fstream>
@@ -26,27 +27,15 @@ namespace {
 // Returns a canonical name ("PNG", "JPEG", …) or nullptr when no image
 // signature matches. `n` is the number of valid header bytes in `b`.
 static const char* image_from_magic(const unsigned char* b, size_t n) {
-    if (n >= 8 && memcmp(b, "\x89PNG\r\n\x1a\n", 8) == 0) return "PNG";
-    if (n >= 3 && b[0] == 0xFF && b[1] == 0xD8 && b[2] == 0xFF) return "JPEG";
-    if (n >= 6 && (memcmp(b, "GIF87a", 6) == 0 || memcmp(b, "GIF89a", 6) == 0))
-        return "GIF";
-    if (n >= 4 && memcmp(b, "8BPS", 4) == 0) return "PSD";
-    // TIFF little-endian (II*\0) and big-endian (MM\0*).
-    if (n >= 4 && (memcmp(b, "II\x2a\x00", 4) == 0 ||
-                   memcmp(b, "MM\x00\x2a", 4) == 0))
-        return "TIFF";
-    // WebP: "RIFF"????"WEBP".
-    if (n >= 12 && memcmp(b, "RIFF", 4) == 0 && memcmp(b + 8, "WEBP", 4) == 0)
-        return "WEBP";
-    // ICO: reserved=0, type=1 (icon).
-    if (n >= 4 && b[0] == 0x00 && b[1] == 0x00 && b[2] == 0x01 && b[3] == 0x00)
-        return "ICO";
-    // BMP: "BM". Guard against text that happens to start with "BM" by also
-    // requiring the 4 reserved header bytes (offset 6-9) to be zero.
-    if (n >= 10 && b[0] == 'B' && b[1] == 'M' &&
-        b[6] == 0 && b[7] == 0 && b[8] == 0 && b[9] == 0)
-        return "BMP";
-    return nullptr;
+    // Shared magic table (common/image_magic.h). This is the standalone-raster
+    // sniff: metafiles (WMF/EMF) are vector documents, not raster images, and
+    // stay on the container/magic path below, so exclude them here to preserve
+    // detect()'s classification flow.
+    util::ImageFormat f = util::image_magic(b, n);
+    if (f == util::ImageFormat::None ||
+        f == util::ImageFormat::Wmf || f == util::ImageFormat::Emf)
+        return nullptr;
+    return util::image_type(f);
 }
 
 struct Entry {
