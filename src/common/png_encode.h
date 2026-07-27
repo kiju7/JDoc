@@ -4,6 +4,7 @@
 
 #include "common/binary_utils.h"
 #include "common/file_utils.h"
+#include "common/image_magic.h"
 #include <zlib.h>          // crc32 for PNG chunk checksums
 #include <libdeflate.h>    // faster DEFLATE compression for the IDAT payload
 #include <fstream>
@@ -167,14 +168,10 @@ inline std::vector<char> bmp_to_png(const void* data, size_t size) {
 }
 
 // Detect actual image format from magic bytes. Returns format string or empty.
+// Thin wrapper over the shared detector (common/image_magic.h) so the office
+// image saver and the standalone-image path agree on the magic table.
 inline std::string detect_image_format(const void* data, size_t size) {
-    if (size < 4) return "";
-    auto* d = static_cast<const uint8_t*>(data);
-    if (d[0] == 0xFF && d[1] == 0xD8) return "jpeg";
-    if (d[0] == 0x89 && d[1] == 'P' && d[2] == 'N' && d[3] == 'G') return "png";
-    if (d[0] == 'G' && d[1] == 'I' && d[2] == 'F') return "gif";
-    if (d[0] == 'B' && d[1] == 'M') return "bmp";
-    return "";
+    return image_magic_ext(data, size);
 }
 
 // Save image to disk as-is (no format conversion).
@@ -186,13 +183,11 @@ inline std::string save_image_to_file(const std::string& dir,
     if (dir.empty() || !data || size == 0) return "";
     ensure_dir(dir);
 
-    // Detect actual format from magic bytes when extension may be wrong
-    std::string actual = format;
-    std::string detected = detect_image_format(data, size);
-    if (!detected.empty()) actual = detected;
-
-    std::string ext = (actual == "jpeg") ? "jpg" : actual;
-    if (ext.empty()) ext = format.empty() ? "bin" : format;
+    // Keep the extension the container declared (zip entry name, BLIP record
+    // type, OLE stream) rather than second-guessing it with a magic-byte sniff:
+    // the extracted file should carry its real, source-declared extension.
+    std::string ext = (format == "jpeg") ? "jpg" : format;
+    if (ext.empty()) ext = "bin";
     std::string path = dir + "/" + name + "." + ext;
     std::ofstream ofs(path, std::ios::binary);
     if (!ofs) return "";
