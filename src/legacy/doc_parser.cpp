@@ -6,6 +6,7 @@
 #include "common/binary_utils.h"
 #include "common/emf_text.h"
 #include "common/file_utils.h"
+#include "common/image_magic.h"
 #include "common/image_utils.h"
 #include "common/inflate.h"
 #include "common/png_encode.h"
@@ -1277,25 +1278,7 @@ std::string DocParser::text_to_markdown(const std::string& raw_text) {
 }
 
 // ── Image detection helpers ─────────────────────────────────────
-
-std::string DocParser::detect_image_format(const char* data, size_t len) {
-    if (len < 8) return "";
-    const uint8_t* d = reinterpret_cast<const uint8_t*>(data);
-
-    if (d[0] == 0xFF && d[1] == 0xD8 && d[2] == 0xFF) return "jpeg";
-    if (d[0] == 0x89 && d[1] == 0x50 && d[2] == 0x4E && d[3] == 0x47 &&
-        d[4] == 0x0D && d[5] == 0x0A && d[6] == 0x1A && d[7] == 0x0A) return "png";
-    if (d[0] == 0x47 && d[1] == 0x49 && d[2] == 0x46 && d[3] == 0x38) return "gif";
-    if (d[0] == 0x42 && d[1] == 0x4D) return "bmp";
-    if (d[0] == 0x49 && d[1] == 0x49 && d[2] == 0x2A && d[3] == 0x00) return "tiff";
-    if (d[0] == 0x4D && d[1] == 0x4D && d[2] == 0x00 && d[3] == 0x2A) return "tiff";
-    if (len >= 4 && d[0] == 0xD7 && d[1] == 0xCD && d[2] == 0xC6 && d[3] == 0x9A) return "wmf";
-    if (len >= 44 && d[0] == 0x01 && d[1] == 0x00 && d[2] == 0x00 && d[3] == 0x00) {
-        if (d[40] == ' ' && d[41] == 'E' && d[42] == 'M' && d[43] == 'F') return "emf";
-    }
-
-    return "";
-}
+// Magic-byte format detection is shared (util::image_magic, common/image_magic.h).
 
 size_t DocParser::find_jpeg_end(const char* data, size_t len) {
     for (size_t i = 2; i + 1 < len; ++i) {
@@ -1352,8 +1335,18 @@ std::vector<ImageData> DocParser::extract_images(unsigned min_image_size) {
 
     size_t pos = 0;
     while (pos + 8 < stream.size()) {
-        std::string fmt = detect_image_format(stream.data() + pos, stream.size() - pos);
-        if (fmt.empty()) {
+        // Probed at every byte offset of a multi-megabyte stream, so this must
+        // stay allocation-free: util::image_magic returns an enum, and the
+        // format string is materialised only once a real image is found.
+        util::ImageFormat mfmt = util::image_magic(stream.data() + pos,
+                                                    stream.size() - pos);
+        // Word embeds these raster/metafile formats as raw streams; webp/ico/psd
+        // never appear here, so they (like a no-match) just advance the scan.
+        bool recovered = mfmt != util::ImageFormat::None &&
+                         mfmt != util::ImageFormat::Webp &&
+                         mfmt != util::ImageFormat::Ico &&
+                         mfmt != util::ImageFormat::Psd;
+        if (!recovered) {
             ++pos;
             continue;
         }
@@ -1361,9 +1354,9 @@ std::vector<ImageData> DocParser::extract_images(unsigned min_image_size) {
         size_t img_start = pos;
         size_t img_end = stream.size();
 
-        if (fmt == "jpeg") {
+        if (mfmt == util::ImageFormat::Jpeg) {
             img_end = img_start + find_jpeg_end(stream.data() + img_start, stream.size() - img_start);
-        } else if (fmt == "png") {
+        } else if (mfmt == util::ImageFormat::Png) {
             img_end = img_start + find_png_end(stream.data() + img_start, stream.size() - img_start);
         } else {
             size_t max_size = std::min(stream.size() - img_start, size_t(10 * 1024 * 1024));
@@ -1375,7 +1368,7 @@ std::vector<ImageData> DocParser::extract_images(unsigned min_image_size) {
             ImageData img;
             img.page_number = 1;
             img.name = "page1_img" + std::to_string(img_idx++);
-            img.format = fmt;
+            img.format = util::image_ext(mfmt);
             img.data.assign(stream.begin() + img_start, stream.begin() + img_end);
             fill_metafile_text(img);
             util::populate_image_dimensions(img);

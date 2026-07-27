@@ -55,8 +55,8 @@ private:
     // Convert raw extracted text to markdown with heuristic formatting.
     std::string text_to_markdown(const std::string& raw_text);
 
-    // Determine image format from magic bytes; returns format string or empty.
-    static std::string detect_image_format(const char* data, size_t len);
+    // Image magic-byte detection lives in common/image_magic.h (util::image_magic),
+    // shared with detect() and the office image saver.
 
     // Find end of JPEG image starting at data.
     static size_t find_jpeg_end(const char* data, size_t len);

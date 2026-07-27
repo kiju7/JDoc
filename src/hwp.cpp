@@ -1390,10 +1390,9 @@ private:
         }
         raw.clear(); raw.shrink_to_fit();
 
-        // Detect actual format from magic bytes
-        std::string actual_fmt = util::detect_image_format(
-            image_data.data(), image_data.size());
-        if (!actual_fmt.empty()) ext = actual_fmt;
+        // Keep the extension declared by the BinData entry rather than
+        // overriding it from a magic-byte sniff — the saved file keeps its
+        // real, source-declared extension.
 
         // EMF/WMF are vector metafiles: recover any text drawn inside so it is
         // not lost to the raster-only image path.

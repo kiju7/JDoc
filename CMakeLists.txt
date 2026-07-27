@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(jdoc VERSION 1.2.0 LANGUAGES CXX C)
+project(jdoc VERSION 1.2.1 LANGUAGES CXX C)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -32,6 +32,28 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
     set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS
                  Debug Release RelWithDebInfo MinSizeRel)
+endif()
+
+# ── Link-time optimization (opt-in) ─────────────────────────
+# Whole-program LTO was measured on this codebase: it speeds the XML formats
+# (+4-23%, by inlining pugixml's node accessors) but *regresses* the PDF and
+# legacy .doc parsers (-5 to -11%), because global inlining bloats their hot
+# paths. The XML win is captured without that tradeoff by JDOC_PUGIXML_HEADER_ONLY
+# below (which inlines the same accessors but only into code that includes
+# pugixml). So LTO is left off by default and offered as an opt-in for callers
+# whose workload is XML-heavy and who don't care about the PDF path.
+# check_ipo_supported keeps it portable: -flto on GCC/Clang, /GL + /LTCG on MSVC.
+option(JDOC_LTO "Enable whole-program LTO (helps XML, regresses PDF/doc)" OFF)
+if(JDOC_LTO AND NOT CMAKE_BUILD_TYPE STREQUAL "Debug"
+        AND NOT JDOC_ENABLE_SANITIZERS)
+    include(CheckIPOSupported)
+    check_ipo_supported(RESULT JDOC_IPO_OK OUTPUT JDOC_IPO_MSG LANGUAGES CXX C)
+    if(JDOC_IPO_OK)
+        set(CMAKE_INTERPROCEDURAL_OPTIMIZATION ON)
+        message(STATUS "LTO enabled (interprocedural optimization)")
+    else()
+        message(STATUS "LTO requested but unsupported: ${JDOC_IPO_MSG}")
+    endif()
 endif()
 
 # ── Dependencies (zlib, libjpeg) ────────────────────────────
@@ -120,9 +142,25 @@ find_package(Threads REQUIRED)
 
 # ── Vendor libraries (compiled as objects, folded into libjdoc) ──────
 
-# pugixml (XML parser for HWPX/OOXML)
-add_library(pugixml OBJECT vendor/pugixml/pugixml.cpp)
-target_include_directories(pugixml PUBLIC vendor/pugixml)
+# pugixml (XML parser for HWPX/OOXML).
+# The office/hwpx/odf parsers spend a large share of their time in pugixml's
+# node accessors — name()/first_child()/next_sibling()/first_attribute() — called
+# millions of times through the xml_utils helpers (8.8M name() calls parsing one
+# text-heavy .xlsx). Compiled as a separate object those trivial accessors never
+# inline into the walk loops. Header-only mode makes them `inline` so they fold
+# into the parsers, which is where the profile says the XML time goes. It touches
+# only code that includes pugixml (the XML parsers) — the PDF and legacy binary
+# paths are unaffected, so unlike whole-program LTO there is no cross-format
+# regression. Portable (plain inline; MSVC-clean).
+option(JDOC_PUGIXML_HEADER_ONLY
+       "Compile pugixml header-only so its node accessors inline into parsers" ON)
+if(JDOC_PUGIXML_HEADER_ONLY)
+    set(JDOC_PUGIXML_OBJ "")
+else()
+    add_library(pugixml OBJECT vendor/pugixml/pugixml.cpp)
+    target_include_directories(pugixml PUBLIC vendor/pugixml)
+    set(JDOC_PUGIXML_OBJ $<TARGET_OBJECTS:pugixml>)
+endif()
 
 # LZMA SDK (7z container + LZMA/LZMA2 decoders, public domain)
 # Decoder-only subset: encoders and all multithreading code (Threads.c,
@@ -205,10 +243,13 @@ add_library(jdoc_lib STATIC
     src/jdoc.cpp
     # public format detection API
     src/detect.cpp
-    # vendored code, folded in as objects
-    $<TARGET_OBJECTS:pugixml>
+    # vendored code, folded in as objects (pugixml only when not header-only)
+    ${JDOC_PUGIXML_OBJ}
     $<TARGET_OBJECTS:lzma_sdk>
 )
+if(JDOC_PUGIXML_HEADER_ONLY)
+    target_compile_definitions(jdoc_lib PRIVATE PUGIXML_HEADER_ONLY)
+endif()
 set_target_properties(jdoc_lib PROPERTIES OUTPUT_NAME jdoc)
 # On Windows the shared library's import lib is also jdoc.lib, which would
 # collide with the static jdoc.lib (LNK1149); give the static one its own name.
