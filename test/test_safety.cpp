@@ -227,6 +227,7 @@ void test_png_converts_cmyk() {
 void test_pdf_honors_images_option() {
     const std::string pdf = image_pdf();
     jdoc::ConvertOptions opts;
+    opts.images = false;
     opts.min_image_size = 0;
     const auto without_images = jdoc::pdf_to_markdown_chunks_mem(
         reinterpret_cast<const uint8_t*>(pdf.data()), pdf.size(), opts);

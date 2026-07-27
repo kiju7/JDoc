@@ -161,10 +161,10 @@ type Options struct {
 	IncludeUnsupported bool  // report unsupported members instead of skipping
 }
 
-// DefaultOptions returns the library defaults: tables on, no image extraction,
+// DefaultOptions returns the library defaults: tables and image extraction on,
 // markdown output, all pages, 50px minimum image size, standard archive limits.
 func DefaultOptions() Options {
-	return Options{Tables: true, MinImageSize: 50}
+	return Options{Tables: true, Images: true, MinImageSize: 50}
 }
 
 func cbool(b bool) C.int {

@@ -116,10 +116,9 @@ static std::string extract_textbody_text(const pugi::xml_node& txBody);
 // ── Chart text extraction ───────────────────────────────
 
 std::string PptxParser::extract_chart_text(const std::string& chart_path) {
-    if (!zip_.has_entry(chart_path)) return "";
-    auto data = zip_.read_entry(chart_path);
+    std::vector<char> data;
     pugi::xml_document doc;
-    if (!doc.load_buffer_inplace(data.data(), data.size())) return "";
+    if (!xml_load_part(zip_, chart_path, doc, data)) return "";
 
     std::string result;
 
@@ -159,10 +158,9 @@ std::string PptxParser::extract_chart_text(const std::string& chart_path) {
 
 std::string PptxParser::extract_diagram_text(
     const std::string& diagram_data_path) {
-    if (!zip_.has_entry(diagram_data_path)) return "";
-    auto data = zip_.read_entry(diagram_data_path);
+    std::vector<char> data;
     pugi::xml_document doc;
-    if (!doc.load_buffer_inplace(data.data(), data.size())) return "";
+    if (!xml_load_part(zip_, diagram_data_path, doc, data)) return "";
 
     std::string result;
     std::vector<pugi::xml_node> pt_nodes;
@@ -201,10 +199,9 @@ std::string PptxParser::extract_diagram_text(
 // ── Notes text extraction ───────────────────────────────
 
 std::string PptxParser::extract_notes_text(const std::string& notes_path) {
-    if (!zip_.has_entry(notes_path)) return "";
-    auto data = zip_.read_entry(notes_path);
+    std::vector<char> data;
     pugi::xml_document doc;
-    if (!doc.load_buffer_inplace(data.data(), data.size())) return "";
+    if (!xml_load_part(zip_, notes_path, doc, data)) return "";
 
     auto cSld = xml_child(doc.first_child(), "cSld");
     if (!cSld) return "";
@@ -213,9 +210,7 @@ std::string PptxParser::extract_notes_text(const std::string& notes_path) {
 
     std::string result;
     for (auto sp = spTree.first_child(); sp; sp = sp.next_sibling()) {
-        const char* name = sp.name();
-        const char* colon = strchr(name, ':');
-        const char* local = colon ? colon + 1 : name;
+        const char* local = xml_local_name(sp);
         if (strcmp(local, "sp") != 0) continue;
 
         // Take every text-bearing shape on the notes page, not just the body
@@ -280,9 +275,7 @@ void PptxParser::collect_layout_shape_text(const pugi::xml_node& parent,
     if (depth > kXmlMaxDepth) return;
 
     for (auto child = parent.first_child(); child; child = child.next_sibling()) {
-        const char* name = child.name();
-        const char* colon = strchr(name, ':');
-        const char* local = colon ? colon + 1 : name;
+        const char* local = xml_local_name(child);
 
         if (strcmp(local, "sp") == 0 || strcmp(local, "cxnSp") == 0) {
             if (is_prompt_placeholder(child)) continue;
@@ -294,9 +287,7 @@ void PptxParser::collect_layout_shape_text(const pugi::xml_node& parent,
             collect_layout_shape_text(child, out, depth + 1);
         } else if (strcmp(local, "AlternateContent") == 0) {
             for (auto alt = child.first_child(); alt; alt = alt.next_sibling()) {
-                const char* an = alt.name();
-                const char* acolon = strchr(an, ':');
-                const char* alocal = acolon ? acolon + 1 : an;
+                const char* alocal = xml_local_name(alt);
                 if (strcmp(alocal, "Choice") != 0) continue;
                 collect_layout_shape_text(alt, out, depth + 1);
             }
@@ -328,11 +319,10 @@ std::vector<std::string> PptxParser::collect_master_layout_text() {
     }
 
     for (const auto& part : parts) {
-        auto data = zip_.read_entry(part);
-        if (data.empty()) continue;
+        std::vector<char> data;
         pugi::xml_document doc;
-        if (!doc.load_buffer_inplace(data.data(), data.size(),
-                             pugi::parse_default | pugi::parse_ws_pcdata))
+        if (!xml_load_part(zip_, part, doc, data,
+                           pugi::parse_default | pugi::parse_ws_pcdata))
             continue;
 
         auto cSld = xml_child(doc.first_child(), "cSld");
@@ -379,9 +369,7 @@ static std::string extract_paragraph_text(const pugi::xml_node& p, bool markdown
     // Walk direct children in document order (not a recursive xml_find_all) so a
     // <a:br> keeps its position between the runs it separates.
     for (auto node = p.first_child(); node; node = node.next_sibling()) {
-        const char* name = node.name();
-        const char* colon = strchr(name, ':');
-        const char* local = colon ? colon + 1 : name;
+        const char* local = xml_local_name(node);
 
         if (strcmp(local, "br") == 0) {
             tokens.push_back({"", PLAIN, true});
@@ -437,9 +425,7 @@ static std::string extract_textbody_text(const pugi::xml_node& txBody) {
     bool first_para = true;
 
     for (auto child = txBody.first_child(); child; child = child.next_sibling()) {
-        const char* name = child.name();
-        const char* colon = strchr(name, ':');
-        const char* local = colon ? colon + 1 : name;
+        const char* local = xml_local_name(child);
         if (strcmp(local, "p") != 0) continue;
 
         if (!first_para) result += "\n";
@@ -453,9 +439,7 @@ static std::string extract_textbody_text(const pugi::xml_node& txBody) {
 // ── Extract blip rId from a node ────────────────────────
 
 static const char* find_blip_rid(const pugi::xml_node& node) {
-    const char* name = node.name();
-    const char* colon = strchr(name, ':');
-    const char* local = colon ? colon + 1 : name;
+    const char* local = xml_local_name(node);
 
     if (strcmp(local, "blip") == 0) {
         const char* embed = xml_attr(node, "embed");
@@ -587,9 +571,7 @@ void PptxParser::extract_shape_tree(const pugi::xml_node& parent,
     if (depth > kXmlMaxDepth) return;
 
     for (auto child = parent.first_child(); child; child = child.next_sibling()) {
-        const char* name = child.name();
-        const char* colon = strchr(name, ':');
-        const char* local = colon ? colon + 1 : name;
+        const char* local = xml_local_name(child);
 
         if (strcmp(local, "sp") == 0 || strcmp(local, "cxnSp") == 0) {
             // A connector (cxnSp) carries an optional label in its own txBody
@@ -602,9 +584,7 @@ void PptxParser::extract_shape_tree(const pugi::xml_node& parent,
             extract_graphic_frame(child, rels, content);
         } else if (strcmp(local, "AlternateContent") == 0) {
             for (auto alt = child.first_child(); alt; alt = alt.next_sibling()) {
-                const char* an = alt.name();
-                const char* acolon = strchr(an, ':');
-                const char* alocal = acolon ? acolon + 1 : an;
+                const char* alocal = xml_local_name(alt);
                 if (strcmp(alocal, "Choice") != 0) continue;
                 extract_shape_tree(alt, rels, content, depth + 1);
             }
@@ -619,9 +599,11 @@ PptxParser::SlideContent PptxParser::parse_slide(
     const std::string& slide_path) {
 
     SlideContent content;
-    auto data = zip_.read_entry(slide_path);
+    std::vector<char> data;
     pugi::xml_document doc;
-    if (!doc.load_buffer_inplace(data.data(), data.size(), pugi::parse_default | pugi::parse_ws_pcdata)) return content;
+    if (!xml_load_part(zip_, slide_path, doc, data,
+                       pugi::parse_default | pugi::parse_ws_pcdata))
+        return content;
 
     auto rels = parse_slide_rels(slide_path);
 
@@ -660,11 +642,11 @@ std::map<std::string, std::string> PptxParser::parse_slide_rels(
     std::string base = slide_path.substr(slash + 1);
     std::string rels_path = dir + "/_rels/" + base + ".rels";
 
-    if (!zip_.has_entry(rels_path)) return rels;
-
-    auto data = zip_.read_entry(rels_path);
+    std::vector<char> data;
     pugi::xml_document doc;
-    if (!doc.load_buffer_inplace(data.data(), data.size(), pugi::parse_default | pugi::parse_ws_pcdata)) return rels;
+    if (!xml_load_part(zip_, rels_path, doc, data,
+                       pugi::parse_default | pugi::parse_ws_pcdata))
+        return rels;
 
     std::vector<pugi::xml_node> rel_nodes;
     xml_find_all(doc, "Relationship", rel_nodes);
@@ -722,8 +704,8 @@ bool PptxParser::resolve_image(const std::string& media_path, int page_number,
     auto hit = media_cache_.find(media_path);
     if (hit.known) {
         if (hit.skipped) return false;
-        out = util::MediaCache::reference(hit.image, page_number);
-        ref_name = hit.ref_name;
+        out = util::MediaCache::reference(*hit.image, page_number);
+        ref_name = *hit.ref_name;
         return true;
     }
 

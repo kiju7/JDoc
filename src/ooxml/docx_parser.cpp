@@ -26,11 +26,11 @@ DocxParser::DocxParser(ZipReader& zip) : zip_(zip) {
 // ── Style parsing (word/styles.xml) ─────────────────────
 
 void DocxParser::parse_styles() {
-    if (!zip_.has_entry("word/styles.xml")) return;
-
-    auto data = zip_.read_entry("word/styles.xml");
+    std::vector<char> data;
     pugi::xml_document doc;
-    if (!doc.load_buffer_inplace(data.data(), data.size(), pugi::parse_default | pugi::parse_ws_pcdata)) return;
+    if (!xml_load_part(zip_, "word/styles.xml", doc, data,
+                       pugi::parse_default | pugi::parse_ws_pcdata))
+        return;
 
     // Find all <w:style> elements
     std::vector<pugi::xml_node> styles;
@@ -72,11 +72,11 @@ void DocxParser::parse_styles() {
 // ── Numbering parsing (word/numbering.xml) ──────────────
 
 void DocxParser::parse_numbering() {
-    if (!zip_.has_entry("word/numbering.xml")) return;
-
-    auto data = zip_.read_entry("word/numbering.xml");
+    std::vector<char> data;
     pugi::xml_document doc;
-    if (!doc.load_buffer_inplace(data.data(), data.size(), pugi::parse_default | pugi::parse_ws_pcdata)) return;
+    if (!xml_load_part(zip_, "word/numbering.xml", doc, data,
+                       pugi::parse_default | pugi::parse_ws_pcdata))
+        return;
 
     // Parse abstractNum definitions
     std::vector<pugi::xml_node> abstract_nums;
@@ -125,11 +125,11 @@ void DocxParser::parse_numbering() {
 
 void DocxParser::parse_relationships() {
     const std::string rels_path = "word/_rels/document.xml.rels";
-    if (!zip_.has_entry(rels_path)) return;
-
-    auto data = zip_.read_entry(rels_path);
+    std::vector<char> data;
     pugi::xml_document doc;
-    if (!doc.load_buffer_inplace(data.data(), data.size(), pugi::parse_default | pugi::parse_ws_pcdata)) return;
+    if (!xml_load_part(zip_, rels_path, doc, data,
+                       pugi::parse_default | pugi::parse_ws_pcdata))
+        return;
 
     std::vector<pugi::xml_node> rels;
     xml_find_all(doc, "Relationship", rels);
@@ -187,11 +187,10 @@ std::string DocxParser::extract_headers_footers() {
     std::string result;
     std::set<std::string> seen;
     for (const auto& part : parts) {
-        auto data = zip_.read_entry(part);
-        if (data.empty()) continue;
+        std::vector<char> data;
         pugi::xml_document doc;
-        if (!doc.load_buffer_inplace(data.data(), data.size(),
-                             pugi::parse_default | pugi::parse_ws_pcdata))
+        if (!xml_load_part(zip_, part, doc, data,
+                           pugi::parse_default | pugi::parse_ws_pcdata))
             continue;
 
         // One line per paragraph, so a multi-line footer stays readable
@@ -214,11 +213,9 @@ std::string DocxParser::extract_headers_footers() {
 // ── Footnote/Endnote extraction ─────────────────────────
 
 std::string DocxParser::extract_footnotes() {
-    if (!zip_.has_entry("word/footnotes.xml")) return "";
-
-    auto data = zip_.read_entry("word/footnotes.xml");
+    std::vector<char> data;
     pugi::xml_document doc;
-    if (!doc.load_buffer_inplace(data.data(), data.size())) return "";
+    if (!xml_load_part(zip_, "word/footnotes.xml", doc, data)) return "";
 
     std::string result;
     std::vector<pugi::xml_node> footnotes;
@@ -244,11 +241,9 @@ std::string DocxParser::extract_footnotes() {
 }
 
 std::string DocxParser::extract_endnotes() {
-    if (!zip_.has_entry("word/endnotes.xml")) return "";
-
-    auto data = zip_.read_entry("word/endnotes.xml");
+    std::vector<char> data;
     pugi::xml_document doc;
-    if (!doc.load_buffer_inplace(data.data(), data.size())) return "";
+    if (!xml_load_part(zip_, "word/endnotes.xml", doc, data)) return "";
 
     std::string result;
     std::vector<pugi::xml_node> endnotes;
@@ -445,9 +440,7 @@ static std::vector<DocxElement> parse_body(
     std::vector<DocxElement> elements;
 
     for (auto child = body.first_child(); child; child = child.next_sibling()) {
-        const char* name = child.name();
-        const char* colon = strchr(name, ':');
-        const char* local = colon ? colon + 1 : name;
+        const char* local = xml_local_name(child);
 
         if (strcmp(local, "p") == 0) {
             // Check for page break before processing paragraph content
@@ -571,9 +564,7 @@ static std::vector<DocxElement> parse_body(
             auto collect_runs = [&](const pugi::xml_node& parent) -> std::vector<StyledRun> {
                 std::vector<StyledRun> result;
                 for (auto r = parent.first_child(); r; r = r.next_sibling()) {
-                    const char* n = r.name();
-                    const char* c = strchr(n, ':');
-                    if (strcmp(c ? c + 1 : n, "r") == 0) {
+                    if (strcmp(xml_local_name(r), "r") == 0) {
                         auto sr = extract_run(r);
                         if (!sr.text.empty())
                             result.push_back(std::move(sr));
@@ -586,9 +577,7 @@ static std::vector<DocxElement> parse_body(
             std::vector<StyledRun> runs;
 
             for (auto pchild = child.first_child(); pchild; pchild = pchild.next_sibling()) {
-                const char* pname = pchild.name();
-                const char* pcolon = strchr(pname, ':');
-                const char* plocal = pcolon ? pcolon + 1 : pname;
+                const char* plocal = xml_local_name(pchild);
 
                 if (strcmp(plocal, "r") == 0) {
                     auto sr = extract_run(pchild);
@@ -655,11 +644,11 @@ static std::vector<DocxElement> parse_body(
 // ── to_markdown ─────────────────────────────────────────
 
 std::string DocxParser::to_markdown(const ConvertOptions& opts) {
-    if (!zip_.has_entry("word/document.xml")) return "";
-
-    auto data = zip_.read_entry("word/document.xml");
+    std::vector<char> data;
     pugi::xml_document doc;
-    if (!doc.load_buffer_inplace(data.data(), data.size(), pugi::parse_default | pugi::parse_ws_pcdata)) return "";
+    if (!xml_load_part(zip_, "word/document.xml", doc, data,
+                       pugi::parse_default | pugi::parse_ws_pcdata))
+        return "";
 
     auto body = xml_child(doc, "body");
     if (!body) {
@@ -818,11 +807,11 @@ std::string DocxParser::format_header_footer_block(const std::string& body) {
 std::vector<PageChunk> DocxParser::to_chunks(
     const ConvertOptions& opts) {
 
-    if (!zip_.has_entry("word/document.xml")) return {};
-
-    auto data = zip_.read_entry("word/document.xml");
+    std::vector<char> data;
     pugi::xml_document doc;
-    if (!doc.load_buffer_inplace(data.data(), data.size(), pugi::parse_default | pugi::parse_ws_pcdata)) return {};
+    if (!xml_load_part(zip_, "word/document.xml", doc, data,
+                       pugi::parse_default | pugi::parse_ws_pcdata))
+        return {};
 
     auto body = xml_child(doc, "body");
     if (!body) {

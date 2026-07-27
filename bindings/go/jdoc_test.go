@@ -29,6 +29,12 @@ func TestDetectPDF(t *testing.T) {
 	}
 }
 
+func TestDefaultOptionsExtractImages(t *testing.T) {
+	if !DefaultOptions().Images {
+		t.Error("image extraction must be enabled by default")
+	}
+}
+
 func TestDetectArchive(t *testing.T) {
 	info, err := Detect(filepath.Join(repoRoot(), "test/fixtures/7z/store.7z"))
 	if err != nil {

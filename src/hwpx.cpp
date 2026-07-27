@@ -9,6 +9,7 @@
 #include "common/media_cache.h"
 #include "common/png_encode.h"
 #include "common/string_utils.h"
+#include "xml_utils.h"
 #include "zip_reader.h"
 #include <pugixml.hpp>
 #include <algorithm>
@@ -153,12 +154,9 @@ private:
 
     // ── content.hpf parsing ─────────────────────────────────
     void parse_content_hpf() {
-        auto data = zip_->read_entry("Contents/content.hpf");
-        if (data.empty()) return;
-
+        std::vector<char> data;
         pugi::xml_document doc;
-        // data outlives doc and is not reused, so parse in place (no copy).
-        doc.load_buffer_inplace(data.data(), data.size());
+        if (!xml_load_part(*zip_, "Contents/content.hpf", doc, data)) return;
 
         // Find manifest items: <opf:item id="..." href="..." media-type="..."/>
         for (auto item : doc.select_nodes("//item")) {
@@ -198,12 +196,9 @@ private:
 
     // ── header.xml parsing ──────────────────────────────────
     void parse_header_xml() {
-        auto data = zip_->read_entry("Contents/header.xml");
-        if (data.empty()) return;
-
+        std::vector<char> data;
         pugi::xml_document doc;
-        // data outlives doc and is not reused, so parse in place (no copy).
-        doc.load_buffer_inplace(data.data(), data.size());
+        if (!xml_load_part(*zip_, "Contents/header.xml", doc, data)) return;
 
         // Parse font faces
         parse_font_faces(doc);
@@ -315,12 +310,9 @@ private:
 
     // ── Section XML parsing ─────────────────────────────────
     void parse_section(const std::string& section_path, PageChunk& chunk) {
-        auto data = zip_->read_entry(section_path);
-        if (data.empty()) return;
-
+        std::vector<char> data;
         pugi::xml_document doc;
-        // data outlives doc and is not reused, so parse in place (no copy).
-        doc.load_buffer_inplace(data.data(), data.size());
+        if (!xml_load_part(*zip_, section_path, doc, data)) return;
 
         // Find <hs:sec> root
         auto sec = doc.first_child();
@@ -907,7 +899,7 @@ private:
         auto hit = media_cache_.find(file_path);
         if (hit.known) {
             if (hit.skipped) return {};
-            return util::MediaCache::reference(hit.image, page_number);
+            return util::MediaCache::reference(*hit.image, page_number);
         }
 
         // Read image data from ZIP

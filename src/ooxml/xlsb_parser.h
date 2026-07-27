@@ -51,9 +51,17 @@ private:
     static std::string serial_to_time(double serial);
     static bool is_date_format(int fmt_id, const std::string& fmt_code);
 
+    struct Cell {
+        int row;
+        int col;
+        std::string value;
+    };
+
     struct SheetData {
         std::string name;
-        std::map<int, std::map<int, std::string>> cells;
+        // XLSB records are normally row-major, so append is O(1) and rendering
+        // can walk the sparse cells with one forward cursor.
+        std::vector<Cell> cells;
         int max_row = 0;
         int max_col = 0;
     };

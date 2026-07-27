@@ -15,12 +15,6 @@ namespace jdoc {
 
 namespace {
 
-const char* loc(const pugi::xml_node& n) {
-    const char* nm = n.name();
-    const char* c = strchr(nm, ':');
-    return c ? c + 1 : nm;
-}
-
 std::string rstrip(std::string s) {
     while (!s.empty() && (s.back() == '\n' || s.back() == ' ' || s.back() == '\t' ||
                           s.back() == '\r'))
@@ -34,7 +28,7 @@ void collect_slide_frames(const pugi::xml_node& n,
                           std::vector<pugi::xml_node>& out, int depth = 0) {
     if (depth > 32) return;
     for (auto c = n.first_child(); c; c = c.next_sibling()) {
-        const char* l = loc(c);
+        const char* l = xml_local_name(c);
         if (strcmp(l, "notes") == 0) continue;   // speaker notes: separate path
         if (strcmp(l, "frame") == 0) { out.push_back(c); continue; }
         collect_slide_frames(c, out, depth + 1);
@@ -50,7 +44,7 @@ void collect_para(const pugi::xml_node& node, std::string& out, int depth = 0) {
             out += c.value();
             continue;
         }
-        const char* name = loc(c);
+        const char* name = xml_local_name(c);
         if (strcmp(name, "line-break") == 0) {
             out += "\n";
         } else if (strcmp(name, "tab") == 0) {
@@ -71,11 +65,8 @@ void collect_para(const pugi::xml_node& node, std::string& out, int depth = 0) {
 OdfParser::OdfParser(ZipReader& zip, DocFormat kind) : zip_(zip), kind_(kind) {}
 
 bool OdfParser::load_content(pugi::xml_document& doc, std::vector<char>& buf) const {
-    if (!zip_.has_entry("content.xml")) return false;
-    buf = zip_.read_entry("content.xml");
-    if (buf.empty()) return false;  // encrypted or corrupt package
-    return doc.load_buffer_inplace(buf.data(), buf.size(),
-                           pugi::parse_default | pugi::parse_ws_pcdata);
+    return xml_load_part(zip_, "content.xml", doc, buf,
+                         pugi::parse_default | pugi::parse_ws_pcdata);
 }
 
 std::string OdfParser::paragraph_text(const pugi::xml_node& p) const {
@@ -110,7 +101,7 @@ std::string OdfParser::format_table(const pugi::xml_node& table) const {
         std::vector<std::string> row;
         int pending_empty = 0;  // deferred empty columns; trailing ones vanish
         for (auto cell = tr.first_child(); cell; cell = cell.next_sibling()) {
-            const char* nm = loc(cell);
+            const char* nm = xml_local_name(cell);
             bool covered = strcmp(nm, "covered-table-cell") == 0;
             if (strcmp(nm, "table-cell") != 0 && !covered) continue;
 
@@ -232,7 +223,7 @@ std::vector<PageChunk> OdfParser::parse_text(const pugi::xml_node& body,
                                              const ConvertOptions& opts) {
     std::string md;
     for (auto ch = body.first_child(); ch; ch = ch.next_sibling()) {
-        const char* nm = loc(ch);
+        const char* nm = xml_local_name(ch);
         if (strcmp(nm, "h") == 0) {
             std::string t = rstrip(paragraph_text(ch));
             if (t.empty()) continue;
@@ -281,7 +272,7 @@ std::vector<PageChunk> OdfParser::parse_spreadsheet(const pugi::xml_node& body,
     std::vector<PageChunk> chunks;
     int sheet_num = 0;
     for (auto ch = body.first_child(); ch; ch = ch.next_sibling()) {
-        if (strcmp(loc(ch), "table") != 0) continue;
+        if (strcmp(xml_local_name(ch), "table") != 0) continue;
         sheet_num++;
         const char* name = xml_attr(ch, "name");
         std::string display = name[0] ? std::string(name)
@@ -305,7 +296,7 @@ std::vector<PageChunk> OdfParser::parse_presentation(const pugi::xml_node& body,
     std::vector<PageChunk> chunks;
     int page_num = 0;
     for (auto page = body.first_child(); page; page = page.next_sibling()) {
-        if (strcmp(loc(page), "page") != 0) continue;
+        if (strcmp(xml_local_name(page), "page") != 0) continue;
         page_num++;
 
         std::string title;

@@ -99,6 +99,7 @@ jobs:
           PYTHONPATH: build
         run: >-
           python -c "import _jdoc;
+          assert _jdoc.ConvertOptions().images is True;
           assert _jdoc.convert_bytes(b'hello', 'x.txt') == 'hello';
           assert _jdoc.detect_bytes(b'hello', 'x.txt').format == 'TXT'"
 

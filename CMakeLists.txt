@@ -87,9 +87,10 @@ endif()
 # inflate and 2-3x for deflate. Every "read whole member then (de)compress" path
 # (zip members, PDF FlateDecode, HWP sections, office metafiles, PNG encode) uses
 # it; only the streaming gz path stays on zlib. Portable C, no NASM, MSVC-clean.
+# v1.21 also fixes the GCC 11 + binutils 2.35 combination shipped by Rocky 9.
 FetchContent_Declare(libdeflate
     GIT_REPOSITORY https://github.com/ebiggers/libdeflate.git
-    GIT_TAG v1.20
+    GIT_TAG v1.21
     GIT_SHALLOW TRUE)
 set(LIBDEFLATE_BUILD_SHARED_LIB OFF CACHE BOOL "" FORCE)
 set(LIBDEFLATE_BUILD_GZIP OFF CACHE BOOL "" FORCE)
@@ -291,8 +292,10 @@ target_link_libraries(jdoc PRIVATE jdoc_lib)
 target_include_directories(jdoc PRIVATE include src)
 
 # GCC 8 requires explicit linking for std::filesystem
+set(JDOC_FILESYSTEM_LIB "")
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS 9)
-    target_link_libraries(jdoc PRIVATE stdc++fs)
+    set(JDOC_FILESYSTEM_LIB stdc++fs)
+    target_link_libraries(jdoc PRIVATE ${JDOC_FILESYSTEM_LIB})
 endif()
 
 
@@ -307,7 +310,7 @@ if(JDOC_BUILD_TESTS)
                        test_hwp3 test_hwp5 test_hwpx test_eml test_msg test_odf
                        test_detect test_stream test_emf test_wmf test_safety)
         add_executable(${t} test/${t}.cpp)
-        target_link_libraries(${t} PRIVATE jdoc_lib)
+        target_link_libraries(${t} PRIVATE jdoc_lib ${JDOC_FILESYSTEM_LIB})
         target_include_directories(${t} PRIVATE include src)
         # Tests resolve fixtures relative to the repo root (test/fixtures/…).
         add_test(NAME ${t} COMMAND ${t}

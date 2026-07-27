@@ -71,7 +71,7 @@ public final class Jdoc {
     }
 
     /** Convert a document to Markdown. {@code opts} may be null for defaults;
-     *  set {@link Options#images}/{@link Options#imageDir} to extract images.
+     *  image extraction is on by default and {@link Options#imageDir} saves files.
      *  Throws for unsupported formats and archives. */
     public static String convert(String filePath, Options opts) {
         JdocLibrary lib = JdocLibrary.INSTANCE;
@@ -152,7 +152,7 @@ public final class Jdoc {
      *  7z/alz/egg) without extracting to disk. Per-member failures are reported
      *  in that member's {@link MemberResult#error}, not thrown; only a file that
      *  cannot be opened at all raises. {@code opts} may be null for defaults —
-     *  set {@link Options#images}/{@link Options#imageDir} to save images, and
+     *  set {@link Options#imageDir} to save extracted images, and
      *  the {@code max*} fields to adjust the archive-bomb guards. */
     public static List<MemberResult> convertArchive(String filePath, Options opts) {
         JdocLibrary lib = JdocLibrary.INSTANCE;
