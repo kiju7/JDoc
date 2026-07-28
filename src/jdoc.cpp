@@ -238,9 +238,11 @@ static std::string metafile_to_markdown(FileFormat fmt, const uint8_t* data,
     for (auto& bmp : c.images) {
         std::string name = "page1_img" + std::to_string(i++);
         std::string filename = name + ".bmp";
-        if (!opts.image_dir.empty())
+        // Don't reference a bitmap that could not be written to image_dir.
+        if (!opts.image_dir.empty() &&
             util::save_image_to_file(opts.image_dir, name, "bmp",
-                                     bmp.data(), bmp.size());
+                                     bmp.data(), bmp.size()).empty())
+            continue;
         if (!md.empty() && md.back() != '\n') md += "\n\n";
         md += "![" + filename + "](" + opts.image_ref_prefix + filename + ")\n\n";
     }
@@ -319,8 +321,12 @@ static std::string image_to_markdown(const uint8_t* data, size_t size,
                                      const ConvertOptions& opts) {
     if (!opts.images) return "";
     std::string filename = image_basename(data, size, name_hint);
-    if (!opts.image_dir.empty())
-        util::save_named_file(opts.image_dir, filename, data, size);
+    // A write to image_dir that fails must not leave a markdown reference to a
+    // file that was never created. With no image_dir (memory/reference mode) no
+    // file is written and the reference is the intended output.
+    if (!opts.image_dir.empty() &&
+        util::save_named_file(opts.image_dir, filename, data, size).empty())
+        return "";
     return "![" + filename + "](" + opts.image_ref_prefix + filename + ")\n";
 }
 

@@ -3,8 +3,8 @@ package com.jiran.jdoc;
 /**
  * Conversion options, mirroring the C {@code JDocOptions} struct.
  *
- * <p>The defaults here match {@code jdoc_default_options()}: tables on, no
- * images, markdown output, all pages, {@code minImageSize=50}. Archive limits
+ * <p>The defaults here match {@code jdoc_default_options()}: tables and images
+ * on, markdown output, all pages, {@code minImageSize=50}. Archive limits
  * default to {@code 0}, which the library reads as "use the built-in default"
  * ({@code maxDepth=3}, {@code maxMemberBytes=512 MiB}, {@code maxTotalBytes=64
  * GiB}, {@code maxEntries=200000}, {@code maxRatio=10000}); {@code -1} disables
@@ -23,7 +23,7 @@ public final class Options {
     /** Render tables as markdown tables. */
     public boolean tables = true;
     /** Extract images embedded in the document. */
-    public boolean images = false;
+    public boolean images = true;
     /** Image output directory; null keeps images in memory. */
     public String imageDir = null;
     /** Prepended to image references in the markdown; null = none. */

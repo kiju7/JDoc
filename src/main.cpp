@@ -23,7 +23,8 @@ void print_usage(const char* prog) {
               << "  --pages N,N,N   Page numbers (0-based, comma-separated)\n"
               << "  --no-tables     Disable table detection\n"
               << "  --chunks        Output per-page/slide/sheet chunks\n"
-              << "  --images DIR    Extract images to directory\n"
+              << "  --images DIR    Save extracted images to directory\n"
+              << "  --no-images     Disable image extraction (enabled by default)\n"
               << "  --min-image-size N  Skip images smaller than NxN pixels (default: 50, 0=no filter)\n"
               << "  --format F      Output format: markdown (default) or text\n"
               << "\nArchive options:\n"
@@ -84,6 +85,9 @@ int main(int argc, char* argv[]) {
             } else if (arg == "--images") {
                 opts.images = true;
                 opts.image_dir = value();
+            } else if (arg == "--no-images") {
+                opts.images = false;
+                opts.image_dir.clear();
             } else if (arg == "--min-image-size") {
                 long long size = std::stoll(value());
                 if (size < 0 ||

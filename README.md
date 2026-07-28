@@ -57,7 +57,8 @@ jdoc input.pdf output.md                    # 파일로 저장
 jdoc input.docx --format text               # 일반 텍스트 출력
 jdoc input.pdf --pages 0,1,2                # 페이지 선택 (0부터 시작)
 jdoc input.pdf --chunks                     # 페이지별 출력
-jdoc input.pdf --images ./imgs              # 이미지 추출
+jdoc input.pdf --images ./imgs              # 기본 추출 이미지를 디스크에도 저장
+jdoc input.pdf --no-images                   # 이미지 추출 비활성화
 jdoc input.pdf --images ./imgs --min-image-size 100   # 100px 미만 이미지 제외
 jdoc input.pdf --images ./imgs --min-image-size 0     # 모든 이미지 추출
 
@@ -77,8 +78,8 @@ import jdoc
 text = jdoc.convert("document.pdf")
 text = jdoc.convert("report.docx", format="text", pages=[0, 1])
 
-# 이미지 포함 페이지별 청크
-pages = jdoc.convert_pages("document.pdf", images=True)
+# 이미지 포함 페이지별 청크 (이미지 추출은 기본값)
+pages = jdoc.convert_pages("document.pdf")
 for page in pages:
     print(page.text)
     for img in page.images:
@@ -117,10 +118,9 @@ md = jdoc.convert_bytes(open("doc.hwp", "rb").read(), name_hint="doc.hwp")
 std::string md = jdoc::convert("input.pdf");
 std::string md = jdoc::convert("report.docx");
 
-// 이미지를 디렉터리로 추출
+// 이미지 추출은 기본값. 디렉터리를 지정하면 파일로도 저장
 jdoc::ConvertOptions opts;
 opts.pages = {0, 1, 2};
-opts.images = true;
 opts.image_dir = "./images";  // 파일로 저장
 opts.min_image_size = 50;
 std::string md = jdoc::convert("input.pdf", opts);
@@ -167,7 +167,6 @@ jdoc_free_string(text);
 
 // 이미지 포함 페이지별 청크
 JDocOptions opts = jdoc_default_options();
-opts.images = 1;
 opts.image_dir = "./images";  // NULL = 메모리에만 유지
 
 int page_count;
@@ -227,7 +226,7 @@ CLI는 각 환경의 관례에 맞는 대응 필드·플래그를 제공한다.
 | `pages` | 전체 | 추출할 페이지 번호 목록 (0부터 시작) | `--pages 0,1,2` |
 | `tables` | `true` | 표를 마크다운 표로 추출 | `--no-tables` (비활성화) |
 | `page_chunks` | `false` | 페이지/슬라이드/시트별 청크로 출력 | `--chunks` |
-| `images` | `false` | 이미지 추출 | `--images DIR` |
+| `images` | `true` | 이미지 추출 | `--no-images` (비활성화) |
 | `image_dir` | `""` (메모리 유지) | 이미지 저장 디렉토리. 빈 값이면 바이트로만 반환 | `--images DIR` |
 | `image_ref_prefix` | `""` | 마크다운 이미지 참조 경로 앞에 붙일 접두사 | — |
 | `min_image_size` | `50` | N×N px 미만 이미지 제외 (`0` = 필터 없음) | `--min-image-size N` |

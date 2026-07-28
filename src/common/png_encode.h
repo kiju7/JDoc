@@ -4,6 +4,7 @@
 
 #include "common/binary_utils.h"
 #include "common/file_utils.h"
+#include "common/image_magic.h"
 #include <zlib.h>          // crc32 for PNG chunk checksums
 #include <libdeflate.h>    // faster DEFLATE compression for the IDAT payload
 #include <fstream>
@@ -53,10 +54,28 @@ inline std::vector<char> pixels_to_png(const uint8_t* pixels, size_t pixel_size,
     if (height > std::numeric_limits<size_t>::max() / source_row_bytes ||
         pixel_size < height * source_row_bytes)
         return {};
-    if (width > (std::numeric_limits<size_t>::max() - 1) / 3)
+
+    // Preserve grayscale input as grayscale instead of expanding every sample
+    // to three identical RGB bytes. Page-rendered line art also commonly
+    // arrives as RGB with R == G == B throughout, so detect that case before
+    // allocating and compressing three times as much scanline data.
+    bool grayscale = components == 1;
+    if (components == 3) {
+        grayscale = true;
+        for (size_t i = 0; i < height * source_row_bytes; i += 3) {
+            if (pixels[i] != pixels[i + 1] || pixels[i] != pixels[i + 2]) {
+                grayscale = false;
+                break;
+            }
+        }
+    }
+
+    const size_t output_components = grayscale ? 1 : 3;
+    if (width > (std::numeric_limits<size_t>::max() - 1) /
+                    output_components)
         return {};
 
-    size_t row_bytes = 1 + width * 3;
+    size_t row_bytes = 1 + width * output_components;
     if (height > std::numeric_limits<size_t>::max() / row_bytes)
         return {};
     std::vector<uint8_t> raw(row_bytes * height);
@@ -64,6 +83,15 @@ inline std::vector<char> pixels_to_png(const uint8_t* pixels, size_t pixel_size,
         const uint8_t* sr = pixels + static_cast<size_t>(y) * source_row_bytes;
         uint8_t* dr = raw.data() + static_cast<size_t>(y) * row_bytes;
         dr[0] = 0; // filter: none
+        if (grayscale) {
+            if (components == 1) {
+                std::memcpy(dr + 1, sr, width);
+            } else {
+                for (unsigned x = 0; x < w; x++)
+                    dr[1 + x] = sr[x * 3];
+            }
+            continue;
+        }
         for (unsigned x = 0; x < w; x++) {
             if (components == 4) {
                 // CMYK to RGB
@@ -114,7 +142,8 @@ inline std::vector<char> pixels_to_png(const uint8_t* pixels, size_t pixel_size,
     ihdr[5] = static_cast<uint8_t>(png_height >> 16);
     ihdr[6] = static_cast<uint8_t>(png_height >> 8);
     ihdr[7] = static_cast<uint8_t>(png_height);
-    ihdr[8] = 8; ihdr[9] = 2; // 8-bit RGB
+    ihdr[8] = 8;
+    ihdr[9] = grayscale ? 0 : 2; // 8-bit grayscale or RGB
     png_write_chunk(png, "IHDR", ihdr, 13);
     png_write_chunk(png, "IDAT", deflated.data(), static_cast<uint32_t>(deflated_size));
     png_write_chunk(png, "IEND", nullptr, 0);
@@ -167,14 +196,10 @@ inline std::vector<char> bmp_to_png(const void* data, size_t size) {
 }
 
 // Detect actual image format from magic bytes. Returns format string or empty.
+// Thin wrapper over the shared detector (common/image_magic.h) so the office
+// image saver and the standalone-image path agree on the magic table.
 inline std::string detect_image_format(const void* data, size_t size) {
-    if (size < 4) return "";
-    auto* d = static_cast<const uint8_t*>(data);
-    if (d[0] == 0xFF && d[1] == 0xD8) return "jpeg";
-    if (d[0] == 0x89 && d[1] == 'P' && d[2] == 'N' && d[3] == 'G') return "png";
-    if (d[0] == 'G' && d[1] == 'I' && d[2] == 'F') return "gif";
-    if (d[0] == 'B' && d[1] == 'M') return "bmp";
-    return "";
+    return image_magic_ext(data, size);
 }
 
 // Save image to disk as-is (no format conversion).
@@ -186,13 +211,11 @@ inline std::string save_image_to_file(const std::string& dir,
     if (dir.empty() || !data || size == 0) return "";
     ensure_dir(dir);
 
-    // Detect actual format from magic bytes when extension may be wrong
-    std::string actual = format;
-    std::string detected = detect_image_format(data, size);
-    if (!detected.empty()) actual = detected;
-
-    std::string ext = (actual == "jpeg") ? "jpg" : actual;
-    if (ext.empty()) ext = format.empty() ? "bin" : format;
+    // Keep the extension the container declared (zip entry name, BLIP record
+    // type, OLE stream) rather than second-guessing it with a magic-byte sniff:
+    // the extracted file should carry its real, source-declared extension.
+    std::string ext = (format == "jpeg") ? "jpg" : format;
+    if (ext.empty()) ext = "bin";
     std::string path = dir + "/" + name + "." + ext;
     std::ofstream ofs(path, std::ios::binary);
     if (!ofs) return "";

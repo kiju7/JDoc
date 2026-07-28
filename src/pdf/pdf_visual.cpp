@@ -724,7 +724,7 @@ std::vector<ExtractedImage> extract_page_images(PdfDoc& doc, const PdfObj& page_
                 auto png = pixels_to_png(img.pixels.data(), img.pixels.size(),
                                          img.width, img.height, img.components);
                 if (!png.empty()) {
-                    img.data.assign(png.begin(), png.end());
+                    img.data = std::move(png);
                     img.format = "png";
                     img.pixels = {};
                 } else {
@@ -1355,7 +1355,7 @@ ImageData render_page_composite(PdfDoc& doc, const PdfObj& page_obj,
                              static_cast<unsigned>(rw),
                              static_cast<unsigned>(rh), 3, Z_BEST_SPEED);
     img.format = "png";
-    img.data.assign(png.begin(), png.end());
+    img.data = std::move(png);
 
     if (!output_dir.empty()) {
         std::string path = output_dir + "/" + img.name + ".png";

@@ -79,7 +79,7 @@ struct ConvertOptions {
     std::vector<int> pages;
     bool tables = true;
     bool page_chunks = false;
-    bool images = false;
+    bool images = true;
     std::string image_dir;
     std::string image_ref_prefix;   // prepended to image filenames in markdown refs
     unsigned min_image_size = 50;   // skip images smaller than NxN pixels (0 = no filter)

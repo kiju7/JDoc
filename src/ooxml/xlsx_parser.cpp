@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <cstdio>
 #include <fstream>
+#include <unordered_set>
 #include <map>
 #include <set>
 #include <sstream>
@@ -56,11 +57,11 @@ XlsxParser::XlsxParser(ZipReader& zip) : zip_(zip) {
 // ── Shared strings (xl/sharedStrings.xml) ───────────────
 
 void XlsxParser::parse_shared_strings() {
-    if (!zip_.has_entry("xl/sharedStrings.xml")) return;
-
-    auto data = zip_.read_entry("xl/sharedStrings.xml");
+    std::vector<char> data;
     pugi::xml_document doc;
-    if (!doc.load_buffer_inplace(data.data(), data.size(), pugi::parse_default | pugi::parse_ws_pcdata)) return;
+    if (!xml_load_part(zip_, "xl/sharedStrings.xml", doc, data,
+                       pugi::parse_default | pugi::parse_ws_pcdata))
+        return;
 
     // Each <si> element contains one shared string
     // Text can be in <t> directly or in <r><t> runs
@@ -91,11 +92,11 @@ void XlsxParser::parse_shared_strings() {
 // ── Workbook (xl/workbook.xml) ──────────────────────────
 
 void XlsxParser::parse_workbook() {
-    if (!zip_.has_entry("xl/workbook.xml")) return;
-
-    auto data = zip_.read_entry("xl/workbook.xml");
+    std::vector<char> data;
     pugi::xml_document doc;
-    if (!doc.load_buffer_inplace(data.data(), data.size(), pugi::parse_default | pugi::parse_ws_pcdata)) return;
+    if (!xml_load_part(zip_, "xl/workbook.xml", doc, data,
+                       pugi::parse_default | pugi::parse_ws_pcdata))
+        return;
 
     // Find <sheets><sheet> elements
     std::vector<pugi::xml_node> sheet_nodes;
@@ -129,11 +130,11 @@ void XlsxParser::parse_workbook() {
 
 void XlsxParser::parse_workbook_rels() {
     const std::string rels_path = "xl/_rels/workbook.xml.rels";
-    if (!zip_.has_entry(rels_path)) return;
-
-    auto data = zip_.read_entry(rels_path);
+    std::vector<char> data;
     pugi::xml_document doc;
-    if (!doc.load_buffer_inplace(data.data(), data.size(), pugi::parse_default | pugi::parse_ws_pcdata)) return;
+    if (!xml_load_part(zip_, rels_path, doc, data,
+                       pugi::parse_default | pugi::parse_ws_pcdata))
+        return;
 
     // Build rId -> target map
     std::map<std::string, std::string> id_to_target;
@@ -162,20 +163,18 @@ void XlsxParser::parse_workbook_rels() {
 // ── Styles (xl/styles.xml) — number format parsing ──────
 
 void XlsxParser::parse_styles() {
-    if (!zip_.has_entry("xl/styles.xml")) return;
-
-    auto data = zip_.read_entry("xl/styles.xml");
+    std::vector<char> data;
     pugi::xml_document doc;
-    if (!doc.load_buffer_inplace(data.data(), data.size(), pugi::parse_default | pugi::parse_ws_pcdata)) return;
+    if (!xml_load_part(zip_, "xl/styles.xml", doc, data,
+                       pugi::parse_default | pugi::parse_ws_pcdata))
+        return;
 
     // Parse fonts: <fonts><font><b/> means bold
     std::vector<pugi::xml_node> fonts_nodes;
     xml_find_all(doc, "fonts", fonts_nodes);
     if (!fonts_nodes.empty()) {
         for (auto font = fonts_nodes[0].first_child(); font; font = font.next_sibling()) {
-            const char* fname = font.name();
-            const char* fcolon = strchr(fname, ':');
-            const char* flocal = fcolon ? fcolon + 1 : fname;
+            const char* flocal = xml_local_name(font);
             if (strcmp(flocal, "font") != 0) continue;
             bool bold = xml_child(font, "b") ? true : false;
             font_bold_.push_back(bold);
@@ -205,9 +204,7 @@ void XlsxParser::parse_styles() {
     if (!cell_xfs_nodes.empty()) {
         auto cellXfs = cell_xfs_nodes[0];
         for (auto xf = cellXfs.first_child(); xf; xf = xf.next_sibling()) {
-            const char* name = xf.name();
-            const char* colon = strchr(name, ':');
-            const char* local = colon ? colon + 1 : name;
+            const char* local = xml_local_name(xf);
             if (strcmp(local, "xf") != 0) continue;
 
             const char* fmt_id = xml_attr(xf, "numFmtId");
@@ -510,10 +507,10 @@ std::map<std::string, std::string> XlsxParser::parse_comments(
     std::string base = info.file_path.substr(slash + 1);
     std::string rels_path = dir + "/_rels/" + base + ".rels";
 
-    if (!zip_.has_entry(rels_path)) return comments;
-    auto rels_data = zip_.read_entry(rels_path);
+    std::vector<char> rels_data;
     pugi::xml_document rels_doc;
-    if (!rels_doc.load_buffer_inplace(rels_data.data(), rels_data.size())) return comments;
+    if (!xml_load_part(zip_, rels_path, rels_doc, rels_data))
+        return comments;
 
     // Locate the legacy (xl/comments*.xml) and modern threaded-comment parts.
     // Both Target forms — relative and absolute ("/xl/...") — are normalized.
@@ -545,9 +542,11 @@ std::map<std::string, std::string> XlsxParser::parse_comments(
 void XlsxParser::parse_legacy_comments(
     const std::string& path, std::map<std::string, std::string>& out) {
 
-    auto data = zip_.read_entry(path);
+    std::vector<char> data;
     pugi::xml_document doc;
-    if (!doc.load_buffer_inplace(data.data(), data.size(), pugi::parse_default | pugi::parse_ws_pcdata)) return;
+    if (!xml_load_part(zip_, path, doc, data,
+                       pugi::parse_default | pugi::parse_ws_pcdata))
+        return;
 
     // Parse <commentList><comment ref="A1"><text><t>...</t></text></comment>
     std::vector<pugi::xml_node> comment_nodes;
@@ -577,9 +576,11 @@ void XlsxParser::parse_legacy_comments(
 void XlsxParser::parse_threaded_comments(
     const std::string& path, std::map<std::string, std::string>& out) {
 
-    auto data = zip_.read_entry(path);
+    std::vector<char> data;
     pugi::xml_document doc;
-    if (!doc.load_buffer_inplace(data.data(), data.size(), pugi::parse_default | pugi::parse_ws_pcdata)) return;
+    if (!xml_load_part(zip_, path, doc, data,
+                       pugi::parse_default | pugi::parse_ws_pcdata))
+        return;
 
     // <threadedComment ref="A1" personId="{..}"><text>..</text></threadedComment>
     // Replies to a cell share its ref; join them in document order.
@@ -614,9 +615,9 @@ void XlsxParser::parse_threaded_comments(
 // Threaded-comment authors live in xl/persons/person*.xml, referenced by GUID.
 void XlsxParser::parse_persons() {
     for (const auto* e : zip_.entries_with_prefix("xl/persons/")) {
-        auto data = zip_.read_entry(e->name);
+        std::vector<char> data;
         pugi::xml_document doc;
-        if (!doc.load_buffer_inplace(data.data(), data.size())) continue;
+        if (!xml_load_part(zip_, e->name, doc, data)) continue;
         std::vector<pugi::xml_node> person_nodes;
         xml_find_all(doc, "person", person_nodes);
         for (auto& p : person_nodes) {
@@ -637,9 +638,11 @@ XlsxParser::SheetData XlsxParser::parse_sheet(const SheetInfo& info) {
         return sheet;
     }
 
-    auto data = zip_.read_entry(info.file_path);
+    std::vector<char> data;
     pugi::xml_document doc;
-    if (!doc.load_buffer_inplace(data.data(), data.size(), pugi::parse_default | pugi::parse_ws_pcdata)) return sheet;
+    if (!xml_load_part(zip_, info.file_path, doc, data,
+                       pugi::parse_default | pugi::parse_ws_pcdata))
+        return sheet;
 
     // Parse comments for this sheet
     auto comments = parse_comments(info);
@@ -655,18 +658,14 @@ XlsxParser::SheetData XlsxParser::parse_sheet(const SheetInfo& info) {
     for (auto row_node = sheetData.first_child(); row_node;
          row_node = row_node.next_sibling()) {
 
-        const char* rname = row_node.name();
-        const char* rcolon = strchr(rname, ':');
-        const char* rlocal = rcolon ? rcolon + 1 : rname;
+        const char* rlocal = xml_local_name(row_node);
         if (strcmp(rlocal, "row") != 0) continue;
 
         // Walk <c> (cell) elements within this row
         for (auto cell = row_node.first_child(); cell;
              cell = cell.next_sibling()) {
 
-            const char* cname = cell.name();
-            const char* ccolon = strchr(cname, ':');
-            const char* clocal = ccolon ? ccolon + 1 : cname;
+            const char* clocal = xml_local_name(cell);
             if (strcmp(clocal, "c") != 0) continue;
 
             // Get cell reference (e.g. "A1")
@@ -681,7 +680,10 @@ XlsxParser::SheetData XlsxParser::parse_sheet(const SheetInfo& info) {
             int style_idx = style_str[0] ? std::atoi(style_str) : -1;
             std::string value;
 
-            if (std::string(cell_type) == "s") {
+            // cell_type is a const char* attribute value; compare directly
+            // (strcmp, matching the element-name checks above) rather than
+            // constructing a throwaway std::string for every cell.
+            if (strcmp(cell_type, "s") == 0) {
                 // Shared string reference
                 auto v_node = xml_child(cell, "v");
                 if (v_node) {
@@ -694,7 +696,7 @@ XlsxParser::SheetData XlsxParser::parse_sheet(const SheetInfo& info) {
                         }
                     }
                 }
-            } else if (std::string(cell_type) == "inlineStr") {
+            } else if (strcmp(cell_type, "inlineStr") == 0) {
                 // Inline string: <is><t>text</t></is>
                 auto is_node = xml_child(cell, "is");
                 if (is_node) {
@@ -710,14 +712,14 @@ XlsxParser::SheetData XlsxParser::parse_sheet(const SheetInfo& info) {
                         }
                     }
                 }
-            } else if (std::string(cell_type) == "b") {
+            } else if (strcmp(cell_type, "b") == 0) {
                 // Boolean
                 auto v_node = xml_child(cell, "v");
                 if (v_node) {
                     std::string v = xml_text_content(v_node);
                     value = (v == "1") ? "TRUE" : "FALSE";
                 }
-            } else if (std::string(cell_type) == "e") {
+            } else if (strcmp(cell_type, "e") == 0) {
                 // Error
                 auto v_node = xml_child(cell, "v");
                 if (v_node) {
@@ -746,7 +748,7 @@ XlsxParser::SheetData XlsxParser::parse_sheet(const SheetInfo& info) {
                     if (ch == '\n') ch = ' ';
                 }
                 bool bold = is_bold_style(style_idx);
-                sheet.cells[row][col] = {value, bold};
+                sheet.cells.push_back({row, col, {value, bold}});
                 sheet.max_row = std::max(sheet.max_row, row);
                 sheet.max_col = std::max(sheet.max_col, col);
             }
@@ -756,19 +758,39 @@ XlsxParser::SheetData XlsxParser::parse_sheet(const SheetInfo& info) {
     // A comment can be anchored to an empty cell, which has no <c> element and
     // is therefore never visited by the loop above. Inject any such unconsumed
     // comment at its own coordinate so the memo is not silently dropped.
-    for (const auto& [ref, text] : comments) {
-        auto [c, r] = parse_cell_ref(ref);
-        auto& row_map = sheet.cells[r];
-        if (row_map.count(c)) continue;  // populated cell already merged its comment
-        std::string v = "[" + text + "]";
-        for (auto& ch : v) {
-            if (ch == '|') ch = '/';
-            if (ch == '\n') ch = ' ';
+    if (!comments.empty()) {
+        // The flat vector has no O(log n) membership test, so build the set of
+        // already-present coordinates once (packing row/col into a 64-bit key).
+        // A comment on a populated cell was already merged above; skip those.
+        auto key_of = [](int r, int c) {
+            return (static_cast<uint64_t>(static_cast<uint32_t>(r)) << 32) |
+                   static_cast<uint32_t>(c);
+        };
+        std::unordered_set<uint64_t> present;
+        present.reserve(sheet.cells.size() * 2 + 1);
+        for (const auto& cell : sheet.cells)
+            present.insert(key_of(cell.row, cell.col));
+        for (const auto& [ref, text] : comments) {
+            auto [c, r] = parse_cell_ref(ref);
+            if (!present.insert(key_of(r, c)).second) continue;  // already present
+            std::string v = "[" + text + "]";
+            for (auto& ch : v) {
+                if (ch == '|') ch = '/';
+                if (ch == '\n') ch = ' ';
+            }
+            sheet.cells.push_back({r, c, {v, false}});
+            sheet.max_row = std::max(sheet.max_row, r);
+            sheet.max_col = std::max(sheet.max_col, c);
         }
-        row_map[c] = {v, false};
-        sheet.max_row = std::max(sheet.max_row, r);
-        sheet.max_col = std::max(sheet.max_col, c);
     }
+
+    // Row-major order so the table renderer can walk the cells with a single
+    // advancing cursor. xlsx usually emits cells in this order already, but
+    // comment-anchored cells were appended out of band, so sort to be safe.
+    std::sort(sheet.cells.begin(), sheet.cells.end(),
+              [](const Cell& a, const Cell& b) {
+                  return a.row != b.row ? a.row < b.row : a.col < b.col;
+              });
 
     return sheet;
 }
@@ -790,24 +812,34 @@ std::string XlsxParser::format_sheet_as_table(const SheetData& sheet,
     // reallocations an ostringstream/growing string would otherwise incur.
     out.reserve(static_cast<size_t>(display_rows) * total_cols * 8 + 64);
 
-    // Helper: look up cell value with bold markers applied.
-    auto get_cell = [&](int r, int c) -> std::string {
-        auto row_it = sheet.cells.find(r);
-        if (row_it == sheet.cells.end()) return "";
-        auto col_it = row_it->second.find(c);
-        if (col_it == row_it->second.end()) return "";
-        std::string val = col_it->second.value;
-        if (!val.empty() && col_it->second.bold)
-            val = "**" + val + "**";
-        return val;
+    // The cells are sorted row-major, so a single cursor advances through them
+    // as the dense grid is emitted — no per-cell lookup at all. `ci` is shared
+    // across rows and only ever moves forward.
+    const auto& cells = sheet.cells;
+    const size_t ncells = cells.size();
+    size_t ci = 0;
+    auto emit_row = [&](int r) {
+        out += "|";
+        for (int c = 0; c < total_cols; ++c) {
+            out += " ";
+            while (ci < ncells && (cells[ci].row < r ||
+                   (cells[ci].row == r && cells[ci].col < c)))
+                ++ci;
+            if (ci < ncells && cells[ci].row == r && cells[ci].col == c) {
+                const std::string& val = cells[ci].info.value;
+                if (!val.empty() && cells[ci].info.bold) {
+                    out += "**"; out += val; out += "**";
+                } else {
+                    out += val;
+                }
+            }
+            out += " |";
+        }
+        out += "\n";
     };
 
     // Header row (row 0)
-    out += "|";
-    for (int c = 0; c < total_cols; ++c) {
-        out += " "; out += get_cell(0, c); out += " |";
-    }
-    out += "\n";
+    emit_row(0);
 
     // Separator
     out += "|";
@@ -818,11 +850,7 @@ std::string XlsxParser::format_sheet_as_table(const SheetData& sheet,
 
     // Data rows
     for (int r = 1; r < display_rows; ++r) {
-        out += "|";
-        for (int c = 0; c < total_cols; ++c) {
-            out += " "; out += get_cell(r, c); out += " |";
-        }
-        out += "\n";
+        emit_row(r);
     }
 
     if (truncated) {
@@ -857,10 +885,9 @@ std::vector<ImageData> XlsxParser::extract_images(
         std::string base = info.file_path.substr(slash + 1);
         std::string sheet_rels = dir + "/_rels/" + base + ".rels";
 
-        if (!zip_.has_entry(sheet_rels)) continue;
-        auto rels_data = zip_.read_entry(sheet_rels);
+        std::vector<char> rels_data;
         pugi::xml_document rels_doc;
-        if (!rels_doc.load_buffer_inplace(rels_data.data(), rels_data.size())) continue;
+        if (!xml_load_part(zip_, sheet_rels, rels_doc, rels_data)) continue;
 
         // Find drawing targets (type ends with /drawing)
         std::vector<pugi::xml_node> rel_nodes;
@@ -886,10 +913,11 @@ std::vector<ImageData> XlsxParser::extract_images(
             std::string draw_base = drawing_path.substr(draw_slash + 1);
             std::string draw_rels = draw_dir + "/_rels/" + draw_base + ".rels";
 
-            if (!zip_.has_entry(draw_rels)) continue;
-            auto draw_rels_data = zip_.read_entry(draw_rels);
+            std::vector<char> draw_rels_data;
             pugi::xml_document draw_rels_doc;
-            if (!draw_rels_doc.load_buffer_inplace(draw_rels_data.data(), draw_rels_data.size())) continue;
+            if (!xml_load_part(zip_, draw_rels, draw_rels_doc,
+                               draw_rels_data))
+                continue;
 
             std::map<std::string, std::string> draw_rel_map;
             std::vector<pugi::xml_node> draw_rel_nodes;
@@ -903,9 +931,10 @@ std::vector<ImageData> XlsxParser::extract_images(
             }
 
             // Parse drawing XML to find blip references
-            auto draw_data = zip_.read_entry(drawing_path);
+            std::vector<char> draw_data;
             pugi::xml_document draw_doc;
-            if (!draw_doc.load_buffer_inplace(draw_data.data(), draw_data.size())) continue;
+            if (!xml_load_part(zip_, drawing_path, draw_doc, draw_data))
+                continue;
 
             std::vector<pugi::xml_node> blips;
             xml_find_all(draw_doc, "blip", blips);
@@ -1048,8 +1077,9 @@ PageChunk XlsxParser::build_sheet_chunk(size_t i, const ConvertOptions& opts) {
     if (!sheet.cells.empty()) {
         text += format_sheet_as_table(sheet); text += "\n";
 
-        // Build structured table data for the chunk
-        // Convert sparse grid to dense 2D vector
+        // Build structured table data for the chunk.
+        // Walk the row-major cell vector with a single advancing cursor (same
+        // as format_sheet_as_table), filling gaps with empty strings.
         if (opts.tables) {
             int total_rows = sheet.max_row + 1;
             int total_cols = sheet.max_col + 1;
@@ -1058,22 +1088,25 @@ PageChunk XlsxParser::build_sheet_chunk(size_t i, const ConvertOptions& opts) {
             std::vector<std::vector<std::string>> table;
             table.reserve(display_rows);
 
+            const auto& cells = sheet.cells;
+            const size_t ncells = cells.size();
+            size_t ci = 0;
             for (int r = 0; r < display_rows; ++r) {
                 std::vector<std::string> row;
                 row.reserve(total_cols);
-                auto row_it = sheet.cells.find(r);
                 for (int c = 0; c < total_cols; ++c) {
-                    if (row_it != sheet.cells.end()) {
-                        auto col_it = row_it->second.find(c);
-                        if (col_it != row_it->second.end()) {
-                            std::string val = col_it->second.value;
-                            if (!val.empty() && col_it->second.bold)
-                                val = "**" + val + "**";
-                            row.push_back(std::move(val));
-                            continue;
-                        }
+                    while (ci < ncells && (cells[ci].row < r ||
+                           (cells[ci].row == r && cells[ci].col < c)))
+                        ++ci;
+                    if (ci < ncells && cells[ci].row == r && cells[ci].col == c) {
+                        const std::string& val = cells[ci].info.value;
+                        if (!val.empty() && cells[ci].info.bold)
+                            row.push_back("**" + val + "**");
+                        else
+                            row.push_back(val);
+                    } else {
+                        row.push_back("");
                     }
-                    row.push_back("");
                 }
                 table.push_back(std::move(row));
             }
