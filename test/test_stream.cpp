@@ -92,7 +92,7 @@ bool run_file(const std::string& path) {
     std::cout << "[*] " << path << "\n";
     bool ok = true;
 
-    jdoc::ConvertOptions md;  // defaults: markdown, tables on, images off
+    jdoc::ConvertOptions md;  // defaults: markdown, tables and images on
     ok &= check_equivalence(path, md, "markdown");
 
     jdoc::ConvertOptions plain;

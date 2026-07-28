@@ -31,8 +31,8 @@ public:
     struct Lookup {
         bool known = false;      // part has been resolved before
         bool skipped = false;    // resolved, and deliberately not emitted
-        ImageData image;         // canonical record (metadata only)
-        std::string ref_name;    // filename used in markdown references
+        const ImageData* image = nullptr;       // cache-owned metadata
+        const std::string* ref_name = nullptr;  // cache-owned filename
     };
 
     Lookup find(const std::string& part) const {
@@ -42,8 +42,8 @@ public:
         r.known = true;
         r.skipped = it->second.skipped;
         if (!r.skipped) {
-            r.image = it->second.image;
-            r.ref_name = it->second.ref_name;
+            r.image = &it->second.image;
+            r.ref_name = &it->second.ref_name;
         }
         return r;
     }

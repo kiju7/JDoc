@@ -81,7 +81,7 @@ public interface JdocLibrary extends Library {
         public static class ByValue extends JDocOptions implements Structure.ByValue {}
     }
 
-    /** Returns the library defaults (no images, markdown, all pages,
+    /** Returns the library defaults (images on, markdown, all pages,
      *  min_image_size 50). {@link Options} mirrors these in pure Java. */
     JDocOptions.ByValue jdoc_default_options();
 

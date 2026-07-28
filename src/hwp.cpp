@@ -1346,12 +1346,12 @@ private:
             if (hit.skipped) return "";
             bool listed = false;
             for (auto& seen : chunk.images)
-                if (seen.name == hit.image.name) { listed = true; break; }
+                if (seen.name == hit.image->name) { listed = true; break; }
             if (!listed)
                 chunk.images.push_back(
-                    util::MediaCache::reference(hit.image, chunk.page_number));
-            return "![" + hit.image.name + "](" + opts_.image_ref_prefix +
-                   hit.ref_name + ")\n\n";
+                    util::MediaCache::reference(*hit.image, chunk.page_number));
+            return "![" + hit.image->name + "](" + opts_.image_ref_prefix +
+                   *hit.ref_name + ")\n\n";
         }
 
         // Detect format from file extension in OLE name

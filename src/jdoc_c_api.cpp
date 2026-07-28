@@ -155,6 +155,7 @@ extern "C" {
 JDocOptions jdoc_default_options(void) {
     JDocOptions o = {};
     o.tables = 1;
+    o.images = 1;
     o.min_image_size = 50;
     return o;
 }

@@ -4,6 +4,7 @@
 #include "jdoc/office.h"
 #include "zip_reader.h"
 #include "legacy/ole_reader.h"
+#include "ooxml/xlsb_parser.h"
 #include <iostream>
 #include <cassert>
 #include <fstream>
@@ -469,7 +470,7 @@ void test_pptx_shared_media() {
     TEST(repeated_media_part_extracted_once)
         auto deck = make_shared_media_pptx();
         jdoc::ConvertOptions opts;
-        opts.images = true;
+        ASSERT(opts.images);
         opts.min_image_size = 0;
         auto chunks = jdoc::office_to_markdown_chunks_mem(
             reinterpret_cast<const uint8_t*>(deck.data()), deck.size(),
@@ -774,6 +775,71 @@ void test_xlsx_fixes() {
     TEST_END
 }
 
+// ── XLSB sparse-cell storage ────────────────────────────────
+
+static void put_xlsb_varint(std::string& out, uint32_t value) {
+    do {
+        uint8_t byte = static_cast<uint8_t>(value & 0x7F);
+        value >>= 7;
+        out.push_back(static_cast<char>(byte | (value ? 0x80 : 0)));
+    } while (value);
+}
+
+static void put_xlsb_widestring(std::string& out, const std::string& text) {
+    put_u32(out, static_cast<uint32_t>(text.size()));
+    for (unsigned char ch : text) put_u16(out, ch);
+}
+
+static void put_xlsb_record(std::string& out, uint16_t type,
+                            const std::string& payload) {
+    put_xlsb_varint(out, type);
+    put_xlsb_varint(out, static_cast<uint32_t>(payload.size()));
+    out += payload;
+}
+
+void test_xlsb_sparse_cells() {
+    std::cerr << "\nXLSB sparse cells:\n";
+
+    std::string bundle(8, '\0');
+    put_xlsb_widestring(bundle, "rId1");
+    put_xlsb_widestring(bundle, "Sheet1");
+    std::string workbook;
+    put_xlsb_record(workbook, 0x9C, bundle);  // BrtBundleSh
+
+    std::string sheet;
+    std::string row(4, '\0');
+    put_xlsb_record(sheet, 0x00, row);  // BrtRowHdr, row 0
+    auto add_string = [&](uint32_t col, const std::string& value) {
+        std::string cell;
+        put_u32(cell, col);
+        put_u32(cell, 0);  // style
+        put_xlsb_widestring(cell, value);
+        put_xlsb_record(sheet, 0x08, cell);  // BrtFmlaString
+    };
+    add_string(1, "old");
+    add_string(0, "first");  // deliberately out of order
+    add_string(1, "last");   // duplicate: last record wins
+
+    std::string rels =
+        "<?xml version=\"1.0\"?><Relationships xmlns=\"http://schemas.openxmlformats.org/"
+        "package/2006/relationships\"><Relationship Id=\"rId1\" Target=\""
+        "worksheets/sheet1.bin\"/></Relationships>";
+    auto package = make_zip({
+        {"xl/workbook.bin", workbook},
+        {"xl/_rels/workbook.bin.rels", rels},
+        {"xl/worksheets/sheet1.bin", sheet},
+    });
+
+    TEST(flat_cells_keep_row_order_and_last_duplicate)
+        jdoc::ZipReader zip(reinterpret_cast<const uint8_t*>(package.data()),
+                            package.size());
+        jdoc::XlsbParser parser(zip);
+        auto md = parser.to_markdown({});
+        ASSERT(md.find("| first | last |") != std::string::npos);
+        ASSERT(md.find("old") == std::string::npos);
+    TEST_END
+}
+
 // ── HTML charset detection ───────────────────────────────────
 
 static std::string convert_html(const std::string& html) {
@@ -900,6 +966,7 @@ int main() {
     test_pptx_shared_media();
     test_docx_header_footer();
     test_xlsx_fixes();
+    test_xlsb_sparse_cells();
     test_html_charset();
     test_pptx_linebreak();
 

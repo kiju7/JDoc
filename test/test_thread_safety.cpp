@@ -159,6 +159,11 @@ static bool extract_all_paged(const std::string& path) {
 // ---------------------------------------------------------------------------
 
 int main() {
+    if (jdoc_default_options().images != 1) {
+        std::cerr << "default image extraction must be enabled\n";
+        return 1;
+    }
+
     const int SMALL_OPS = 200;
     const int BENCH_OPS = 1000;
     const int THREADS[] = {1, 2, 4, 8};

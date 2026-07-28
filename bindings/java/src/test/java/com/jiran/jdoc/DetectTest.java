@@ -16,6 +16,11 @@ class DetectTest {
     }
 
     @Test
+    void defaultOptionsExtractImages() {
+        assertTrue(new Options().images);
+    }
+
+    @Test
     void detectsPdfFile() {
         FormatInfo info = Jdoc.detect(
                 root().resolve("test/fixtures/pdf/sample.pdf").toString());

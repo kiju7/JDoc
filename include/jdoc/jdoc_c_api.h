@@ -13,7 +13,7 @@ extern "C" {
 typedef struct {
     /* conversion */
     int tables;              /* 1 = tables as markdown tables (default 1) */
-    int images;              /* 0 = skip images, 1 = extract */
+    int images;              /* 0 = skip images, 1 = extract (default 1) */
     const char* image_dir;           /* image output directory; NULL = keep in memory */
     const char* image_ref_prefix;    /* prepended to image refs in markdown; NULL = none */
     unsigned int min_image_size;     /* skip images smaller than NxN (0 = no filter) */
@@ -31,7 +31,7 @@ typedef struct {
     int include_unsupported;         /* 1 = report unsupported members */
 } JDocOptions;
 
-/* Returns default options: no images, markdown, all pages, min_size=50. */
+/* Returns default options: images on, markdown, all pages, min_size=50. */
 JDocOptions jdoc_default_options(void);
 
 /* ── Image ────────────────────────────────────────────────── */

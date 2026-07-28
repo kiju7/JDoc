@@ -114,23 +114,22 @@ void XlsbParser::parse_workbook() {
     // XLSB workbook uses binary records, but relationships are XML
     // Parse relationships first to find sheet paths
     std::map<std::string, std::string> id_to_target;
-    if (zip_.has_entry("xl/_rels/workbook.bin.rels")) {
-        auto data = zip_.read_entry("xl/_rels/workbook.bin.rels");
-        pugi::xml_document doc;
-        if (doc.load_buffer_inplace(data.data(), data.size())) {
-            std::vector<pugi::xml_node> rels;
-            xml_find_all(doc, "Relationship", rels);
-            for (auto& rel : rels) {
-                const char* id = xml_attr(rel, "Id");
-                const char* target = xml_attr(rel, "Target");
-                if (id[0] && target[0]) {
-                    std::string t = target;
-                    if (t.find("xl/") != 0 && t.find('/') == std::string::npos)
-                        t = "xl/" + t;
-                    else if (t.find("xl/") != 0 && t.find("worksheets/") == 0)
-                        t = "xl/" + t;
-                    id_to_target[id] = t;
-                }
+    std::vector<char> rels_data;
+    pugi::xml_document rels_doc;
+    if (xml_load_part(zip_, "xl/_rels/workbook.bin.rels",
+                      rels_doc, rels_data)) {
+        std::vector<pugi::xml_node> rels;
+        xml_find_all(rels_doc, "Relationship", rels);
+        for (auto& rel : rels) {
+            const char* id = xml_attr(rel, "Id");
+            const char* target = xml_attr(rel, "Target");
+            if (id[0] && target[0]) {
+                std::string t = target;
+                if (t.find("xl/") != 0 && t.find('/') == std::string::npos)
+                    t = "xl/" + t;
+                else if (t.find("xl/") != 0 && t.find("worksheets/") == 0)
+                    t = "xl/" + t;
+                id_to_target[id] = t;
             }
         }
     }
@@ -383,6 +382,29 @@ XlsbParser::SheetData XlsbParser::parse_sheet(const SheetInfo& info) {
     size_t size = raw.size();
     size_t offset = 0;
     int current_row = 0;
+    bool cells_sorted = true;
+
+    auto store_cell = [&](int col, std::string value) {
+        for (auto& ch : value) {
+            if (ch == '|') ch = '/';
+            if (ch == '\n') ch = ' ';
+        }
+
+        if (!sheet.cells.empty()) {
+            Cell& last = sheet.cells.back();
+            if (last.row == current_row && last.col == col) {
+                last.value = std::move(value);  // same semantics as map overwrite
+                return;
+            }
+            if (current_row < last.row ||
+                (current_row == last.row && col < last.col))
+                cells_sorted = false;
+        }
+
+        sheet.cells.push_back({current_row, col, std::move(value)});
+        sheet.max_row = std::max(sheet.max_row, current_row);
+        sheet.max_col = std::max(sheet.max_col, col);
+    };
 
     while (offset + 2 < size) {
         uint32_t rec_size = 0;
@@ -407,11 +429,8 @@ XlsbParser::SheetData XlsbParser::parse_sheet(const SheetInfo& info) {
                 memcpy(&style, data + offset + 4, 4);
                 memcpy(&sst_idx, data + offset + 8, 4);
                 if (sst_idx < shared_strings_.size()) {
-                    std::string val = shared_strings_[sst_idx];
-                    for (auto& ch : val) { if (ch == '|') ch = '/'; if (ch == '\n') ch = ' '; }
-                    sheet.cells[current_row][static_cast<int>(col)] = val;
-                    sheet.max_row = std::max(sheet.max_row, current_row);
-                    sheet.max_col = std::max(sheet.max_col, static_cast<int>(col));
+                    store_cell(static_cast<int>(col),
+                               shared_strings_[sst_idx]);
                 }
             }
             break;
@@ -427,11 +446,8 @@ XlsbParser::SheetData XlsbParser::parse_sheet(const SheetInfo& info) {
                 memcpy(&val, data + offset + 8, 8);
                 char buf[64];
                 snprintf(buf, sizeof(buf), "%.15g", val);
-                std::string formatted = format_number(buf, static_cast<int>(style));
-                for (auto& ch : formatted) { if (ch == '|') ch = '/'; if (ch == '\n') ch = ' '; }
-                sheet.cells[current_row][static_cast<int>(col)] = formatted;
-                sheet.max_row = std::max(sheet.max_row, current_row);
-                sheet.max_col = std::max(sheet.max_col, static_cast<int>(col));
+                store_cell(static_cast<int>(col),
+                           format_number(buf, static_cast<int>(style)));
             }
             break;
         }
@@ -445,11 +461,8 @@ XlsbParser::SheetData XlsbParser::parse_sheet(const SheetInfo& info) {
                 double val = decode_rk(rk);
                 char buf[64];
                 snprintf(buf, sizeof(buf), "%.15g", val);
-                std::string formatted = format_number(buf, static_cast<int>(style));
-                for (auto& ch : formatted) { if (ch == '|') ch = '/'; if (ch == '\n') ch = ' '; }
-                sheet.cells[current_row][static_cast<int>(col)] = formatted;
-                sheet.max_row = std::max(sheet.max_row, current_row);
-                sheet.max_col = std::max(sheet.max_col, static_cast<int>(col));
+                store_cell(static_cast<int>(col),
+                           format_number(buf, static_cast<int>(style)));
             }
             break;
         }
@@ -459,9 +472,8 @@ XlsbParser::SheetData XlsbParser::parse_sheet(const SheetInfo& info) {
                 uint32_t col;
                 memcpy(&col, data + offset, 4);
                 bool bval = data[offset + 8] != 0;
-                sheet.cells[current_row][static_cast<int>(col)] = bval ? "TRUE" : "FALSE";
-                sheet.max_row = std::max(sheet.max_row, current_row);
-                sheet.max_col = std::max(sheet.max_col, static_cast<int>(col));
+                store_cell(static_cast<int>(col),
+                           bval ? "TRUE" : "FALSE");
             }
             break;
         }
@@ -472,12 +484,8 @@ XlsbParser::SheetData XlsbParser::parse_sheet(const SheetInfo& info) {
                 memcpy(&col, data + offset, 4);
                 size_t p = offset + 8;
                 std::string val = read_xl_widestring(data, p, rec_end);
-                for (auto& ch : val) { if (ch == '|') ch = '/'; if (ch == '\n') ch = ' '; }
-                if (!val.empty()) {
-                    sheet.cells[current_row][static_cast<int>(col)] = val;
-                    sheet.max_row = std::max(sheet.max_row, current_row);
-                    sheet.max_col = std::max(sheet.max_col, static_cast<int>(col));
-                }
+                if (!val.empty())
+                    store_cell(static_cast<int>(col), std::move(val));
             }
             break;
         }
@@ -486,6 +494,27 @@ XlsbParser::SheetData XlsbParser::parse_sheet(const SheetInfo& info) {
         }
 
         offset = rec_end;
+    }
+
+    // Well-formed XLSB is already row-major. Sort only malformed/unusual input;
+    // stable order lets the compaction below retain the last duplicate record,
+    // matching the old map-assignment behavior.
+    if (!cells_sorted) {
+        std::stable_sort(sheet.cells.begin(), sheet.cells.end(),
+            [](const Cell& a, const Cell& b) {
+                return a.row != b.row ? a.row < b.row : a.col < b.col;
+            });
+        size_t out = 0;
+        for (size_t i = 0; i < sheet.cells.size(); ++i) {
+            if (out && sheet.cells[out - 1].row == sheet.cells[i].row &&
+                sheet.cells[out - 1].col == sheet.cells[i].col) {
+                sheet.cells[out - 1] = std::move(sheet.cells[i]);
+            } else {
+                if (out != i) sheet.cells[out] = std::move(sheet.cells[i]);
+                ++out;
+            }
+        }
+        sheet.cells.resize(out);
     }
 
     return sheet;
@@ -506,33 +535,31 @@ std::string XlsbParser::format_sheet_as_table(const SheetData& sheet,
     std::string out;
     out.reserve(static_cast<size_t>(display_rows) * total_cols * 8 + 64);
 
-    out += "|";
-    for (int c = 0; c < total_cols; ++c) {
-        auto row_it = sheet.cells.find(0);
-        std::string cell;
-        if (row_it != sheet.cells.end()) {
-            auto col_it = row_it->second.find(c);
-            if (col_it != row_it->second.end()) cell = col_it->second;
+    size_t ci = 0;
+    auto emit_row = [&](int row) {
+        out += "|";
+        for (int col = 0; col < total_cols; ++col) {
+            out += " ";
+            while (ci < sheet.cells.size() &&
+                   (sheet.cells[ci].row < row ||
+                    (sheet.cells[ci].row == row &&
+                     sheet.cells[ci].col < col)))
+                ++ci;
+            if (ci < sheet.cells.size() &&
+                sheet.cells[ci].row == row &&
+                sheet.cells[ci].col == col)
+                out += sheet.cells[ci].value;
+            out += " |";
         }
-        out += " "; out += cell; out += " |";
-    }
-    out += "\n|";
+        out += "\n";
+    };
+
+    emit_row(0);
+    out += "|";
     for (int c = 0; c < total_cols; ++c) out += " --- |";
     out += "\n";
 
-    for (int r = 1; r < display_rows; ++r) {
-        out += "|";
-        for (int c = 0; c < total_cols; ++c) {
-            auto row_it = sheet.cells.find(r);
-            std::string cell;
-            if (row_it != sheet.cells.end()) {
-                auto col_it = row_it->second.find(c);
-                if (col_it != row_it->second.end()) cell = col_it->second;
-            }
-            out += " "; out += cell; out += " |";
-        }
-        out += "\n";
-    }
+    for (int r = 1; r < display_rows; ++r) emit_row(r);
 
     if (truncated) {
         out += "\n*... truncated at "; out += std::to_string(max_rows);
