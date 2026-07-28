@@ -54,10 +54,28 @@ inline std::vector<char> pixels_to_png(const uint8_t* pixels, size_t pixel_size,
     if (height > std::numeric_limits<size_t>::max() / source_row_bytes ||
         pixel_size < height * source_row_bytes)
         return {};
-    if (width > (std::numeric_limits<size_t>::max() - 1) / 3)
+
+    // Preserve grayscale input as grayscale instead of expanding every sample
+    // to three identical RGB bytes. Page-rendered line art also commonly
+    // arrives as RGB with R == G == B throughout, so detect that case before
+    // allocating and compressing three times as much scanline data.
+    bool grayscale = components == 1;
+    if (components == 3) {
+        grayscale = true;
+        for (size_t i = 0; i < height * source_row_bytes; i += 3) {
+            if (pixels[i] != pixels[i + 1] || pixels[i] != pixels[i + 2]) {
+                grayscale = false;
+                break;
+            }
+        }
+    }
+
+    const size_t output_components = grayscale ? 1 : 3;
+    if (width > (std::numeric_limits<size_t>::max() - 1) /
+                    output_components)
         return {};
 
-    size_t row_bytes = 1 + width * 3;
+    size_t row_bytes = 1 + width * output_components;
     if (height > std::numeric_limits<size_t>::max() / row_bytes)
         return {};
     std::vector<uint8_t> raw(row_bytes * height);
@@ -65,6 +83,15 @@ inline std::vector<char> pixels_to_png(const uint8_t* pixels, size_t pixel_size,
         const uint8_t* sr = pixels + static_cast<size_t>(y) * source_row_bytes;
         uint8_t* dr = raw.data() + static_cast<size_t>(y) * row_bytes;
         dr[0] = 0; // filter: none
+        if (grayscale) {
+            if (components == 1) {
+                std::memcpy(dr + 1, sr, width);
+            } else {
+                for (unsigned x = 0; x < w; x++)
+                    dr[1 + x] = sr[x * 3];
+            }
+            continue;
+        }
         for (unsigned x = 0; x < w; x++) {
             if (components == 4) {
                 // CMYK to RGB
@@ -115,7 +142,8 @@ inline std::vector<char> pixels_to_png(const uint8_t* pixels, size_t pixel_size,
     ihdr[5] = static_cast<uint8_t>(png_height >> 16);
     ihdr[6] = static_cast<uint8_t>(png_height >> 8);
     ihdr[7] = static_cast<uint8_t>(png_height);
-    ihdr[8] = 8; ihdr[9] = 2; // 8-bit RGB
+    ihdr[8] = 8;
+    ihdr[9] = grayscale ? 0 : 2; // 8-bit grayscale or RGB
     png_write_chunk(png, "IHDR", ihdr, 13);
     png_write_chunk(png, "IDAT", deflated.data(), static_cast<uint32_t>(deflated_size));
     png_write_chunk(png, "IEND", nullptr, 0);
