@@ -17,6 +17,45 @@
 
 namespace jdoc { namespace pdf_detail {
 
+// Content-stream operators are one to three bytes. Packing them once turns the
+// long dispatch chain into comparisons of one integer; the compiler can then
+// lower the chain to a jump table instead of repeating length checks and byte
+// comparisons for every candidate operator.
+class ContentOperator {
+public:
+    ContentOperator(const char* token, size_t length) {
+        if (length == 0 || length > 3) return;
+        code_ = static_cast<uint32_t>(length) << 24;
+        code_ |= static_cast<uint32_t>(
+            static_cast<unsigned char>(token[0])) << 16;
+        if (length > 1)
+            code_ |= static_cast<uint32_t>(
+                static_cast<unsigned char>(token[1])) << 8;
+        if (length > 2)
+            code_ |= static_cast<uint32_t>(
+                static_cast<unsigned char>(token[2]));
+    }
+
+    template <size_t N>
+    bool is(const char (&literal)[N]) const {
+        static_assert(N >= 2 && N <= 4,
+                      "PDF operators are one to three bytes");
+        uint32_t expected = static_cast<uint32_t>(N - 1) << 24;
+        expected |= static_cast<uint32_t>(
+            static_cast<unsigned char>(literal[0])) << 16;
+        if constexpr (N > 2)
+            expected |= static_cast<uint32_t>(
+                static_cast<unsigned char>(literal[1])) << 8;
+        if constexpr (N > 3)
+            expected |= static_cast<uint32_t>(
+                static_cast<unsigned char>(literal[2]));
+        return code_ == expected;
+    }
+
+private:
+    uint32_t code_ = 0;
+};
+
 ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>& stream,
                                          const PdfObj& resources, double page_height,
                                          std::unordered_map<int, PdfFont>* font_cache,
@@ -54,12 +93,49 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
     std::vector<PathPoint> current_path;
 
     PdfLexer lex(stream.data(), stream.size());
-    std::vector<PdfObj> operands;
+    // Content streams are overwhelmingly numeric: coordinates, matrices and
+    // colors account for tens of millions of operands in vector-heavy PDFs.
+    // Keeping every number in a full PdfObj constructs and destroys its string,
+    // array and dictionary members even though operators only need a double.
+    // Preserve the exact mixed operand order in a compact reference, while
+    // retaining PdfObj only for names, strings and arrays.
+    struct ContentOperand {
+        double number = 0;
+        uint32_t object_index = 0;
+        bool is_number = true;
+    };
+    std::vector<ContentOperand> operands;
+    std::vector<PdfObj> object_operands;
+    operands.reserve(8);
+    object_operands.reserve(2);
+
+    auto push_object = [&](PdfObj&& obj) {
+        const uint32_t index =
+            static_cast<uint32_t>(object_operands.size());
+        object_operands.push_back(std::move(obj));
+        operands.push_back({0, index, false});
+    };
+
+    auto operand_object = [&](size_t index) -> const PdfObj* {
+        if (index >= operands.size() || operands[index].is_number)
+            return nullptr;
+        const uint32_t object_index = operands[index].object_index;
+        return object_index < object_operands.size()
+            ? &object_operands[object_index] : nullptr;
+    };
+
+    auto operand_num = [&](size_t index) -> double {
+        if (index >= operands.size()) return 0;
+        const auto& operand = operands[index];
+        if (operand.is_number) return operand.number;
+        const PdfObj* obj = operand_object(index);
+        return obj ? obj->as_num() : 0;
+    };
 
     auto pop_num = [&](int idx_from_end = 0) -> double {
         int i = static_cast<int>(operands.size()) - 1 - idx_from_end;
         if (i < 0) return 0;
-        return operands[i].as_num();
+        return operand_num(static_cast<size_t>(i));
     };
 
     auto flush_path_segments = [&]() {
@@ -262,10 +338,11 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
                 if (ndata[0] == '-') { neg = true; i = 1; }
                 else if (ndata[0] == '+') { i = 1; }
                 for (; i < nlen; i++) val = val * 10 + (ndata[i] - '0');
-                operands.push_back(PdfObj::make_int(neg ? -val : val));
+                operands.push_back(
+                    {static_cast<double>(neg ? -val : val), 0, true});
             } else {
-                operands.push_back(PdfObj::make_real(parse_pdf_real(
-                    reinterpret_cast<const char*>(ndata), nlen)));
+                operands.push_back({parse_pdf_real(
+                    reinterpret_cast<const char*>(ndata), nlen), 0, true});
             }
             continue;
         }
@@ -273,14 +350,14 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
         // /name → operand
         if (first_byte == '/') {
             PdfObj obj = lex.parse_object();
-            operands.push_back(std::move(obj));
+            push_object(std::move(obj));
             continue;
         }
 
         // String or array or dict → parse as object
         if (first_byte == '(' || first_byte == '<' || first_byte == '[') {
             PdfObj obj = lex.parse_object();
-            if (!obj.is_none()) operands.push_back(std::move(obj));
+            if (!obj.is_none()) push_object(std::move(obj));
             continue;
         }
 
@@ -292,101 +369,108 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
         if (tok_len == 0) { lex.pos++; continue; }
         const char* tok_ptr = reinterpret_cast<const char*>(lex.data + saved);
 
-        auto tok_eq = [&](const char* s) {
-            size_t sl = std::strlen(s);
-            return tok_len == sl && std::memcmp(tok_ptr, s, sl) == 0;
-        };
-
-        if (tok_eq("true")) { operands.push_back(PdfObj::make_bool(true)); continue; }
-        if (tok_eq("false")) { operands.push_back(PdfObj::make_bool(false)); continue; }
-        if (tok_eq("null")) continue;
+        if (tok_len == 4 && std::memcmp(tok_ptr, "true", 4) == 0) {
+            push_object(PdfObj::make_bool(true));
+            continue;
+        }
+        if (tok_len == 5 && std::memcmp(tok_ptr, "false", 5) == 0) {
+            push_object(PdfObj::make_bool(false));
+            continue;
+        }
+        if (tok_len == 4 && std::memcmp(tok_ptr, "null", 4) == 0) continue;
 
         {
+            const ContentOperator op(tok_ptr, tok_len);
 
             // ── Graphics State ──
-            if (tok_eq("q")) {
+            if (op.is("q")) {
                 state_stack.push_back(gs);
-            } else if (tok_eq("Q")) {
+            } else if (op.is("Q")) {
                 if (!state_stack.empty()) { gs = state_stack.back(); state_stack.pop_back(); }
-            } else if (tok_eq("cm")) {
+            } else if (op.is("cm")) {
                 if (operands.size() >= 6) {
                     double m[6] = {pop_num(5), pop_num(4), pop_num(3), pop_num(2), pop_num(1), pop_num(0)};
                     double r[6];
                     mat_multiply(r, m, gs.ctm);
                     std::memcpy(gs.ctm, r, sizeof(r));
                 }
-            } else if (tok_eq("w")) {
+            } else if (op.is("w")) {
                 gs.line_width = pop_num(0);
-            } else if (tok_eq("J")) {
+            } else if (op.is("J")) {
                 gs.line_cap = static_cast<int>(pop_num(0));
-            } else if (tok_eq("j")) {
+            } else if (op.is("j")) {
                 gs.line_join = static_cast<int>(pop_num(0));
-            } else if (tok_eq("M")) {
+            } else if (op.is("M")) {
                 gs.miter_limit = pop_num(0);
             }
 
             // ── Color (skip when graphics not needed) ──
-            else if (skip_graphics && (tok_eq("RG") || tok_eq("rg") || tok_eq("G") ||
-                     tok_eq("g") || tok_eq("K") || tok_eq("k") || tok_eq("SC") ||
-                     tok_eq("SCN") || tok_eq("sc") || tok_eq("scn") || tok_eq("CS") ||
-                     tok_eq("cs"))) {
+            else if (skip_graphics && (op.is("RG") || op.is("rg") || op.is("G") ||
+                     op.is("g") || op.is("K") || op.is("k") || op.is("SC") ||
+                     op.is("SCN") || op.is("sc") || op.is("scn") || op.is("CS") ||
+                     op.is("cs"))) {
                 // skip color ops
             }
-            else if (tok_eq("RG")) {
+            else if (op.is("RG")) {
                 if (operands.size() >= 3) { gs.stroke_r = pop_num(2); gs.stroke_g = pop_num(1); gs.stroke_b = pop_num(0); }
-            } else if (tok_eq("rg")) {
+            } else if (op.is("rg")) {
                 if (operands.size() >= 3) { gs.fill_r = pop_num(2); gs.fill_g = pop_num(1); gs.fill_b = pop_num(0); }
-            } else if (tok_eq("G")) {
+            } else if (op.is("G")) {
                 double g = pop_num(0); gs.stroke_r = gs.stroke_g = gs.stroke_b = g;
-            } else if (tok_eq("g")) {
+            } else if (op.is("g")) {
                 double g = pop_num(0); gs.fill_r = gs.fill_g = gs.fill_b = g;
-            } else if (tok_eq("K")) {
+            } else if (op.is("K")) {
                 if (operands.size() >= 4) {
                     double c = pop_num(3), m = pop_num(2), y = pop_num(1), k = pop_num(0);
                     gs.stroke_r = 1 - std::min(1.0, c + k);
                     gs.stroke_g = 1 - std::min(1.0, m + k);
                     gs.stroke_b = 1 - std::min(1.0, y + k);
                 }
-            } else if (tok_eq("k")) {
+            } else if (op.is("k")) {
                 if (operands.size() >= 4) {
                     double c = pop_num(3), m = pop_num(2), y = pop_num(1), k = pop_num(0);
                     gs.fill_r = 1 - std::min(1.0, c + k);
                     gs.fill_g = 1 - std::min(1.0, m + k);
                     gs.fill_b = 1 - std::min(1.0, y + k);
                 }
-            } else if (tok_eq("SC") || tok_eq("SCN")) {
+            } else if (op.is("SC") || op.is("SCN")) {
                 if (operands.size() >= 3) { gs.stroke_r = pop_num(2); gs.stroke_g = pop_num(1); gs.stroke_b = pop_num(0); }
                 else if (operands.size() >= 1) { double g = pop_num(0); gs.stroke_r = gs.stroke_g = gs.stroke_b = g; }
-            } else if (tok_eq("sc") || tok_eq("scn")) {
+            } else if (op.is("sc") || op.is("scn")) {
                 if (operands.size() >= 3) { gs.fill_r = pop_num(2); gs.fill_g = pop_num(1); gs.fill_b = pop_num(0); }
                 else if (operands.size() >= 1) { double g = pop_num(0); gs.fill_r = gs.fill_g = gs.fill_b = g; }
-            } else if (tok_eq("CS") || tok_eq("cs")) {
+            } else if (op.is("CS") || op.is("cs")) {
                 // Colorspace name — just consume
             }
 
             // ── Text ──
-            else if (tok_eq("BT")) {
+            else if (op.is("BT")) {
                 double id[6] = {1,0,0,1,0,0};
                 std::memcpy(gs.text_mat, id, sizeof(id));
                 std::memcpy(gs.line_mat, id, sizeof(id));
                 gs.in_text = true;
-            } else if (tok_eq("ET")) {
+            } else if (op.is("ET")) {
                 gs.in_text = false;
-            } else if (tok_eq("Tf")) {
+            } else if (op.is("Tf")) {
                 if (operands.size() >= 2) {
                     gs.font_size = pop_num(0);
-                    std::string fname = operands[operands.size() - 2].str_val;
-                    auto it = fonts.find(fname);
-                    gs.font = (it != fonts.end()) ? &it->second : nullptr;
+                    const PdfObj* font_name =
+                        operand_object(operands.size() - 2);
+                    if (font_name) {
+                        auto it = fonts.find(font_name->str_val);
+                        gs.font = (it != fonts.end()) ? &it->second : nullptr;
+                    } else {
+                        gs.font = nullptr;
+                    }
                 }
-            } else if (tok_eq("Td")) {
+            } else if (op.is("Td")) {
                 if (operands.size() >= 2) {
                     double tx = pop_num(1), ty = pop_num(0);
                     gs.line_mat[4] += tx * gs.line_mat[0] + ty * gs.line_mat[2];
                     gs.line_mat[5] += tx * gs.line_mat[1] + ty * gs.line_mat[3];
                     std::memcpy(gs.text_mat, gs.line_mat, sizeof(gs.text_mat));
                 }
-            } else if (tok_eq("TD")) {
+            } else if (op.is("TD")) {
                 if (operands.size() >= 2) {
                     double tx = pop_num(1), ty = pop_num(0);
                     gs.text_leading = -ty;
@@ -394,55 +478,61 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
                     gs.line_mat[5] += tx * gs.line_mat[1] + ty * gs.line_mat[3];
                     std::memcpy(gs.text_mat, gs.line_mat, sizeof(gs.text_mat));
                 }
-            } else if (tok_eq("Tm")) {
+            } else if (op.is("Tm")) {
                 if (operands.size() >= 6) {
                     gs.text_mat[0] = pop_num(5); gs.text_mat[1] = pop_num(4);
                     gs.text_mat[2] = pop_num(3); gs.text_mat[3] = pop_num(2);
                     gs.text_mat[4] = pop_num(1); gs.text_mat[5] = pop_num(0);
                     std::memcpy(gs.line_mat, gs.text_mat, sizeof(gs.line_mat));
                 }
-            } else if (tok_eq("T*")) {
+            } else if (op.is("T*")) {
                 gs.line_mat[4] += -gs.text_leading * gs.line_mat[2];
                 gs.line_mat[5] += -gs.text_leading * gs.line_mat[3];
                 std::memcpy(gs.text_mat, gs.line_mat, sizeof(gs.text_mat));
-            } else if (tok_eq("TL")) {
+            } else if (op.is("TL")) {
                 gs.text_leading = pop_num(0);
-            } else if (tok_eq("Tc")) {
+            } else if (op.is("Tc")) {
                 gs.char_spacing = pop_num(0);
-            } else if (tok_eq("Tw")) {
+            } else if (op.is("Tw")) {
                 gs.word_spacing = pop_num(0);
-            } else if (tok_eq("Tz")) {
+            } else if (op.is("Tz")) {
                 gs.h_scaling = pop_num(0);
-            } else if (tok_eq("Ts")) {
+            } else if (op.is("Ts")) {
                 gs.text_rise = pop_num(0);
-            } else if (tok_eq("Tr")) {
+            } else if (op.is("Tr")) {
                 gs.render_mode = static_cast<int>(pop_num(0));
             }
 
             // ── Text Show ──
-            else if (tok_eq("Tj") || tok_eq("'") || tok_eq("\"")) {
-                if (tok_eq("'")) {
+            else if (op.is("Tj") || op.is("'") || op.is("\"")) {
+                if (op.is("'")) {
                     gs.line_mat[4] += -gs.text_leading * gs.line_mat[2];
                     gs.line_mat[5] += -gs.text_leading * gs.line_mat[3];
                     std::memcpy(gs.text_mat, gs.line_mat, sizeof(gs.text_mat));
-                } else if (tok_eq("\"")) {
+                } else if (op.is("\"")) {
                     if (operands.size() >= 3) {
-                        gs.word_spacing = operands[0].as_num();
-                        gs.char_spacing = operands[1].as_num();
+                        gs.word_spacing = operand_num(0);
+                        gs.char_spacing = operand_num(1);
                     }
                     gs.line_mat[4] += -gs.text_leading * gs.line_mat[2];
                     gs.line_mat[5] += -gs.text_leading * gs.line_mat[3];
                     std::memcpy(gs.text_mat, gs.line_mat, sizeof(gs.text_mat));
                 }
 
-                if (!operands.empty() && operands.back().is_str()) {
-                    show_text_string(gs, operands.back().str_val);
+                const PdfObj* text =
+                    operands.empty() ? nullptr
+                                     : operand_object(operands.size() - 1);
+                if (text && text->is_str()) {
+                    show_text_string(gs, text->str_val);
                 }
-            } else if (tok_eq("TJ")) {
-                if (!operands.empty() && operands.back().is_arr()) {
+            } else if (op.is("TJ")) {
+                const PdfObj* array =
+                    operands.empty() ? nullptr
+                                     : operand_object(operands.size() - 1);
+                if (array && array->is_arr()) {
                     double fs = gs.font_size;
                     double h_scale = gs.h_scaling / 100.0;
-                    for (auto& elem : operands.back().arr) {
+                    for (auto& elem : array->arr) {
                         if (elem.is_num()) {
                             double shift = -elem.as_num() / 1000.0 * fs * h_scale;
                             gs.text_mat[4] += shift * gs.text_mat[0];
@@ -455,28 +545,28 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
             }
 
             // ── Path Construction (skip when graphics not needed) ──
-            else if (skip_graphics && (tok_eq("m") || tok_eq("l") || tok_eq("c") ||
-                     tok_eq("v") || tok_eq("y") || tok_eq("h") || tok_eq("re") ||
-                     tok_eq("S") || tok_eq("s") || tok_eq("f") || tok_eq("F") ||
-                     tok_eq("f*") || tok_eq("B") || tok_eq("B*") || tok_eq("b") ||
-                     tok_eq("b*") || tok_eq("n") || tok_eq("W") || tok_eq("W*"))) {
+            else if (skip_graphics && (op.is("m") || op.is("l") || op.is("c") ||
+                     op.is("v") || op.is("y") || op.is("h") || op.is("re") ||
+                     op.is("S") || op.is("s") || op.is("f") || op.is("F") ||
+                     op.is("f*") || op.is("B") || op.is("B*") || op.is("b") ||
+                     op.is("b*") || op.is("n") || op.is("W") || op.is("W*"))) {
                 // skip path ops entirely
             }
-            else if (tok_eq("m")) {
+            else if (op.is("m")) {
                 if (operands.size() >= 2) {
                     double x = pop_num(1), y = pop_num(0);
                     double tx, ty;
                     transform_point(gs.ctm, x, y, tx, ty);
                     current_path.push_back({tx, ty, PathPoint::MOVE});
                 }
-            } else if (tok_eq("l")) {
+            } else if (op.is("l")) {
                 if (operands.size() >= 2) {
                     double x = pop_num(1), y = pop_num(0);
                     double tx, ty;
                     transform_point(gs.ctm, x, y, tx, ty);
                     current_path.push_back({tx, ty, PathPoint::LINE});
                 }
-            } else if (tok_eq("c")) {
+            } else if (op.is("c")) {
                 if (operands.size() >= 6) {
                     double x1 = pop_num(5), y1 = pop_num(4);
                     double x2 = pop_num(3), y2 = pop_num(2);
@@ -487,7 +577,7 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
                     transform_point(gs.ctm, x3, y3, pp.x, pp.y);
                     current_path.push_back(pp);
                 }
-            } else if (tok_eq("v")) {
+            } else if (op.is("v")) {
                 if (operands.size() >= 4) {
                     double x2 = pop_num(3), y2 = pop_num(2);
                     double x3 = pop_num(1), y3 = pop_num(0);
@@ -502,7 +592,7 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
                     transform_point(gs.ctm, x3, y3, pp.x, pp.y);
                     current_path.push_back(pp);
                 }
-            } else if (tok_eq("y")) {
+            } else if (op.is("y")) {
                 if (operands.size() >= 4) {
                     double x1 = pop_num(3), y1 = pop_num(2);
                     double x3 = pop_num(1), y3 = pop_num(0);
@@ -513,9 +603,9 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
                     pp.cx2 = pp.x; pp.cy2 = pp.y;
                     current_path.push_back(pp);
                 }
-            } else if (tok_eq("h")) {
+            } else if (op.is("h")) {
                 current_path.push_back({0, 0, PathPoint::CLOSE});
-            } else if (tok_eq("re")) {
+            } else if (op.is("re")) {
                 if (operands.size() >= 4) {
                     double x = pop_num(3), y = pop_num(2), w = pop_num(1), h = pop_num(0);
                     double tx, ty;
@@ -532,7 +622,7 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
             }
 
             // ── Path Painting ──
-            else if (tok_eq("S")) {
+            else if (op.is("S")) {
                 if (!filter_white_stroke() && !filter_small_rect())
                     flush_path_segments();
                 { RenderPath rp; rp.points = std::move(current_path);
@@ -541,7 +631,7 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
                   rp.line_width = gs.line_width; rp.do_fill = false; rp.do_stroke = true;
                   result.paths.push_back(std::move(rp)); }
                 current_path.clear();
-            } else if (tok_eq("s")) {
+            } else if (op.is("s")) {
                 current_path.push_back({0, 0, PathPoint::CLOSE});
                 if (!filter_white_stroke() && !filter_small_rect())
                     flush_path_segments();
@@ -551,7 +641,7 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
                   rp.line_width = gs.line_width; rp.do_fill = false; rp.do_stroke = true;
                   result.paths.push_back(std::move(rp)); }
                 current_path.clear();
-            } else if (tok_eq("f") || tok_eq("F") || tok_eq("f*")) {
+            } else if (op.is("f") || op.is("F") || op.is("f*")) {
                 if (!filter_small_rect()) flush_path_segments();
                 { RenderPath rp; rp.points = std::move(current_path);
                   rp.fill_r = gs.fill_r; rp.fill_g = gs.fill_g; rp.fill_b = gs.fill_b;
@@ -559,8 +649,8 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
                   rp.line_width = gs.line_width; rp.do_fill = true; rp.do_stroke = false;
                   result.paths.push_back(std::move(rp)); }
                 current_path.clear();
-            } else if (tok_eq("B") || tok_eq("B*") || tok_eq("b") || tok_eq("b*")) {
-                if (tok_eq("b") || tok_eq("b*"))
+            } else if (op.is("B") || op.is("B*") || op.is("b") || op.is("b*")) {
+                if (op.is("b") || op.is("b*"))
                     current_path.push_back({0, 0, PathPoint::CLOSE});
                 if (!filter_white_stroke() && !filter_small_rect())
                     flush_path_segments();
@@ -570,14 +660,17 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
                   rp.line_width = gs.line_width; rp.do_fill = true; rp.do_stroke = true;
                   result.paths.push_back(std::move(rp)); }
                 current_path.clear();
-            } else if (tok_eq("n")) {
+            } else if (op.is("n")) {
                 current_path.clear();
             }
 
             // ── XObject (images) ──
-            else if (tok_eq("Do")) {
-                if (!operands.empty() && operands.back().is_name()) {
-                    std::string xname = operands.back().str_val;
+            else if (op.is("Do")) {
+                const PdfObj* name =
+                    operands.empty() ? nullptr
+                                     : operand_object(operands.size() - 1);
+                if (name && name->is_name()) {
+                    std::string xname = name->str_val;
                     auto& xobjects = res.get("XObject");
                     auto xd = doc.resolve(xobjects);
                     if (xd.is_dict()) {
@@ -633,6 +726,7 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
             }
 
             operands.clear();
+            object_operands.clear();
         }
     }
 
