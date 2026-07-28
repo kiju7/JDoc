@@ -73,6 +73,8 @@ private:
 
     // Read one full sector into buf (must be sector_size_ bytes).
     void read_sector(uint32_t sector, void* buf) const;
+    // Read an arbitrary contiguous source range.
+    void read_at(uint64_t offset, void* buf, size_t size) const;
 
     // Follow a FAT chain and return concatenated data (truncated to size).
     std::vector<char> read_chain(uint32_t start, uint64_t size) const;
