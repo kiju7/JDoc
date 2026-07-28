@@ -54,11 +54,17 @@ public:
                 const std::string& ref_name) {
         Entry e;
         e.skipped = false;
-        e.image = img;
-        e.image.data.clear();
-        e.image.data.shrink_to_fit();
-        e.image.pixels.clear();
-        e.image.pixels.shrink_to_fit();
+        // Copy only the metadata the cache serves to later references. Copying
+        // ImageData wholesale and then clearing data/pixels briefly duplicated
+        // every encoded image (often tens of MiB) for no observable benefit.
+        e.image.page_number = img.page_number;
+        e.image.name = img.name;
+        e.image.width = img.width;
+        e.image.height = img.height;
+        e.image.components = img.components;
+        e.image.format = img.format;
+        e.image.saved_path = img.saved_path;
+        e.image.embedded_text = img.embedded_text;
         e.ref_name = ref_name;
         entries_[part] = std::move(e);
     }
