@@ -166,21 +166,26 @@ void OleReader::read_sector(uint32_t sector, void* buf) const {
     if (!buf || sector >= sector_count_)
         throw std::runtime_error("OLE sector is outside the source");
     uint64_t offset = (static_cast<uint64_t>(sector) + 1) * sector_size_;
+    read_at(offset, buf, sector_size_);
+}
 
+void OleReader::read_at(uint64_t offset, void* buf, size_t size) const {
+    if (!buf || offset > source_size_ || size > source_size_ - offset)
+        throw std::runtime_error("OLE read is outside the source");
     if (mem_data_) {
-        std::memcpy(buf, mem_data_ + offset, sector_size_);
+        std::memcpy(buf, mem_data_ + offset, size);
         return;
     }
 
 #ifdef _WIN32
     if (_fseeki64(fp_, static_cast<__int64>(offset), SEEK_SET) != 0)
-        throw std::runtime_error("Failed to seek OLE sector");
+        throw std::runtime_error("Failed to seek OLE data");
 #else
     if (fseeko(fp_, static_cast<off_t>(offset), SEEK_SET) != 0)
-        throw std::runtime_error("Failed to seek OLE sector");
+        throw std::runtime_error("Failed to seek OLE data");
 #endif
-    if (std::fread(buf, 1, sector_size_, fp_) != sector_size_)
-        throw std::runtime_error("Failed to read OLE sector");
+    if (std::fread(buf, 1, size, fp_) != size)
+        throw std::runtime_error("Failed to read OLE data");
 }
 
 // ---------- parse_directories ------------------------------------------------
@@ -275,34 +280,37 @@ std::vector<char> OleReader::read_chain(uint32_t start, uint64_t size) const {
     auto advance = [this](uint32_t sector) {
         return sector < fat_.size() ? fat_[sector] : ENDOFCHAIN;
     };
-    auto check_cycle = [&] {
+    auto advance_and_check_cycle = [&] {
         sec = advance(sec);
         fast = advance(advance(fast));
         if (sec < fat_.size() && sec == fast)
             throw std::runtime_error("Circular OLE stream chain");
     };
 
-    if (mem_data_) {
-        // Memory-based: direct copy from mapped buffer, no intermediate buffer
-        while (sec != ENDOFCHAIN && sec != FREESECT && sec < fat_.size() && written < size) {
-            uint64_t offset = (static_cast<uint64_t>(sec) + 1) * sector_size_;
-            uint64_t to_copy = std::min(static_cast<uint64_t>(sector_size_), size - written);
-            if (offset > source_size_ || to_copy > source_size_ - offset)
-                throw std::runtime_error("Truncated OLE stream chain");
-            std::memcpy(result.data() + written, mem_data_ + offset, static_cast<size_t>(to_copy));
-            written += to_copy;
-            check_cycle();
+    // OLE writers normally allocate a stream in long consecutive sector runs.
+    // Coalesce each run into one source read instead of seeking and reading one
+    // 512/4096-byte sector at a time. The FAT is still followed and cycle-
+    // checked sector by sector, so fragmented and malformed files keep the
+    // same behavior.
+    while (sec != ENDOFCHAIN && sec != FREESECT &&
+           sec < fat_.size() && written < size) {
+        const uint32_t run_start = sec;
+        uint64_t run_bytes = 0;
+        while (sec != ENDOFCHAIN && sec != FREESECT &&
+               sec < fat_.size() && written + run_bytes < size) {
+            const uint32_t current = sec;
+            const uint64_t remaining = size - written - run_bytes;
+            const uint64_t to_copy =
+                std::min(static_cast<uint64_t>(sector_size_), remaining);
+            run_bytes += to_copy;
+            advance_and_check_cycle();
+            if (to_copy < sector_size_ || sec != current + 1) break;
         }
-    } else {
-        // File-based: sector-at-a-time
-        std::vector<char> sbuf(sector_size_);
-        while (sec != ENDOFCHAIN && sec != FREESECT && sec < fat_.size() && written < size) {
-            read_sector(sec, sbuf.data());
-            uint64_t to_copy = std::min(static_cast<uint64_t>(sector_size_), size - written);
-            std::memcpy(result.data() + written, sbuf.data(), static_cast<size_t>(to_copy));
-            written += to_copy;
-            check_cycle();
-        }
+        const uint64_t offset =
+            (static_cast<uint64_t>(run_start) + 1) * sector_size_;
+        read_at(offset, result.data() + written,
+                static_cast<size_t>(run_bytes));
+        written += run_bytes;
     }
 
     if (written != size)
