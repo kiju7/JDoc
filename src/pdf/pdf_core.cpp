@@ -1166,12 +1166,14 @@ PdfFont load_font(PdfDoc& doc, const PdfObj& font_ref) {
             if (enc.str_val == "Identity-H" || enc.str_val == "Identity-V")
                 font.is_identity = true;
         }
-        // CIDFont descendant — parse /W (widths) and /DW (default width)
-        auto& descendants = fobj.get("DescendantFonts");
+        // CIDFont descendant — parse /W (widths) and /DW (default width).
+        // The array itself may be an indirect reference (Word writes
+        // /DescendantFonts N 0 R), so resolve before the is_arr check.
+        auto descendants = doc.resolve(fobj.get("DescendantFonts"));
         if (descendants.is_arr() && !descendants.arr.empty()) {
             auto cid_font = doc.resolve(descendants.arr[0]);
             if (cid_font.is_dict()) {
-                double dw = cid_font.get("DW").as_num();
+                double dw = doc.resolve(cid_font.get("DW")).as_num();
                 if (dw > 0) font.default_width = dw;
 
                 // /W array: [cid [w1 w2 ...] cid_start cid_end w ...]
