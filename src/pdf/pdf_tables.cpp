@@ -1680,6 +1680,15 @@ static TableData build_table_from_band(
     double snap_tol   = std::max(median_fs * 2.0, 15.0);
     double min_split_gap = std::max(median_fs * 0.5, 4.0);
 
+    // A real column boundary falls into whitespace on every row; a phantom
+    // one (coincidentally aligned gaps in prose) is forced to cut between
+    // glyphs that have no gap at all on some rows. Count, per boundary, the
+    // rows where glyphs sit close on both sides ("near") and among those the
+    // rows where the flanking glyphs almost touch ("torn").
+    std::vector<int> near_cnt(n_cols + 1, 0), torn_cnt(n_cols + 1, 0);
+    double torn_gap = std::max(median_fs * 0.2, 1.2);
+    double near_win = median_fs * 3.0;
+
     for (size_t k = band.first_row; k <= band.last_row; k++) {
         const auto& tr = rows[k];
         // gather chars sorted by x (use char_indices into the per-page chars[])
@@ -1723,6 +1732,22 @@ static TableData build_table_from_band(
                 row_bounds[c] = row_bounds[c-1] + 0.1;
         }
 
+        for (int c = 1; c < (int)row_bounds.size() - 1; c++) {
+            double b = row_bounds[c];
+            const CharInfo* prev = nullptr;
+            const CharInfo* next = nullptr;
+            for (size_t idx : ci) {
+                const auto& ch = chars[idx];
+                if ((ch.left + ch.right) / 2.0 < b) prev = &ch;
+                else { next = &ch; break; }
+            }
+            if (!prev || !next) continue;
+            if (b - prev->right > near_win || next->left - b > near_win)
+                continue;
+            near_cnt[c]++;
+            if (next->left - prev->right < torn_gap) torn_cnt[c]++;
+        }
+
         std::vector<std::string> cells(n_cols);
         std::vector<double> last_right(n_cols, -1e9);
 
@@ -1756,6 +1781,15 @@ static TableData build_table_from_band(
 
         for (auto& c : cells) c = util::trim(c);
         table.rows.push_back(std::move(cells));
+    }
+
+    // A boundary that cuts through touching glyphs on 30%+ of its populated
+    // rows is a phantom column — the whole band is prose, not a table.
+    for (int c = 1; c < n_cols; c++) {
+        if (torn_cnt[c] >= 2 && torn_cnt[c] * 10 >= near_cnt[c] * 3) {
+            table.rows.clear();
+            return table;
+        }
     }
     return table;
 }
@@ -1865,8 +1899,16 @@ static bool accept_table(TableData& table) {
         }
         if (filled == 1 && filled_col >= 0 && r > 0 &&
             !table.rows[r-1][filled_col].empty()) {
-            table.rows[r-1][filled_col] += " ";
-            table.rows[r-1][filled_col] += table.rows[r][filled_col];
+            std::string& prev = table.rows[r-1][filled_col];
+            const std::string& next = table.rows[r][filled_col];
+            // Wrapped numbers ("991225-" / "1234567") continue without a
+            // space, matching get_text_in_rect.
+            bool digit_wrap = prev.size() >= 2 && prev.back() == '-' &&
+                              prev[prev.size() - 2] >= '0' &&
+                              prev[prev.size() - 2] <= '9' &&
+                              !next.empty() && next[0] >= '0' && next[0] <= '9';
+            if (!digit_wrap) prev += " ";
+            prev += next;
             table.rows.erase(table.rows.begin() + r);
             r--;
         }

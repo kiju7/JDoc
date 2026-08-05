@@ -173,7 +173,16 @@ struct PageCharCache {
                 if (y_tol < 2.0) y_tol = 2.0;
                 bool new_row = std::abs(ch.y - prev_y) > y_tol;
                 if (new_row) {
-                    if (!text.empty() && text.back() != ' ') text += ' ';
+                    // A number wrapped across cell lines ("991225-" /
+                    // "1234567") continues without a space; only the
+                    // digit-hyphen-digit shape is joined, so hyphenated
+                    // words keep their space.
+                    bool digit_wrap = text.size() >= 2 && text.back() == '-' &&
+                                      text[text.size() - 2] >= '0' &&
+                                      text[text.size() - 2] <= '9' &&
+                                      ch.unicode >= '0' && ch.unicode <= '9';
+                    if (!digit_wrap && !text.empty() && text.back() != ' ')
+                        text += ' ';
                 } else {
                     // Insert a space when the positional gap exceeds the
                     // word-spacing threshold used by chars_to_lines.
