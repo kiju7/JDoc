@@ -1964,6 +1964,29 @@ static bool accept_table(TableData& table) {
         if (torn >= 2) return false;
     }
 
+    // Two-column page layouts: the tail characters of one text column can
+    // fall into a phantom 1-char column beside the other column's prose. A
+    // column dominated by single CJK characters that leaves fewer than two
+    // other columns is such an artifact, not a table. (Vertical label
+    // columns in real tables survive: their tables keep 2+ other columns.)
+    {
+        int n_cols_t = (int)table.rows[0].size();
+        int single_cjk_cols = 0;
+        for (int c = 0; c < n_cols_t; c++) {
+            int filled = 0, single_cjk = 0;
+            for (auto& row : table.rows) {
+                if (c >= (int)row.size() || row[c].empty()) continue;
+                filled++;
+                if (row[c].size() <= 3 && (unsigned char)row[c][0] >= 0x80)
+                    single_cjk++;
+            }
+            if (filled >= 3 && single_cjk * 10 >= filled * 6)
+                single_cjk_cols++;
+        }
+        if (single_cjk_cols > 0 && n_cols_t - single_cjk_cols < 2)
+            return false;
+    }
+
     // Exam-sheet choice rows: two or more cells in one row starting with an
     // enclosed number (①-⑳, UTF-8 E2 91/92 xx) mean answer options torn
     // into phantom columns, not tabular data.
