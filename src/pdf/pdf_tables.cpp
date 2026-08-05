@@ -440,25 +440,29 @@ TableData build_table(const std::vector<double>& row_ys,
         }
 
         double tb = row_ys.front(), tt = row_ys.back();
-        int rows_in_grid = 0;
+        // Only centers inside the grid count: a page heading sharing the
+        // table's x-band would otherwise inject a phantom row boundary and
+        // break the monotonic row order.
+        std::vector<double> grid_centers;
         for (double tc : table_row_centers)
             if (tc >= tb - row_h * 0.5 && tc <= tt + row_h * 0.5)
-                rows_in_grid++;
+                grid_centers.push_back(tc);
+        int rows_in_grid = (int)grid_centers.size();
 
         int n_rows_expected = (int)row_ys.size() - 1;
         bool use_text_rows = (rows_in_grid < n_rows_expected * 0.9) &&
-                             ((int)table_row_centers.size() >= n_rows_expected * 0.8);
+                             (rows_in_grid >= n_rows_expected * 0.8);
 
-        if (use_text_rows && !table_row_centers.empty()) {
-            std::sort(table_row_centers.begin(), table_row_centers.end());
+        if (use_text_rows && !grid_centers.empty()) {
+            std::sort(grid_centers.begin(), grid_centers.end());
             double half = row_h / 2.0;
             // Clamp to h-line grid boundaries — don't extend beyond the table
             double grid_top = row_ys.back() + half;
             double grid_bot = row_ys.front() - half;
-            actual_ys.push_back(std::max(table_row_centers.front() - half, grid_bot));
-            for (size_t i = 0; i < table_row_centers.size() - 1; i++)
-                actual_ys.push_back((table_row_centers[i] + table_row_centers[i + 1]) / 2.0);
-            actual_ys.push_back(std::min(table_row_centers.back() + half, grid_top));
+            actual_ys.push_back(std::max(grid_centers.front() - half, grid_bot));
+            for (size_t i = 0; i < grid_centers.size() - 1; i++)
+                actual_ys.push_back((grid_centers[i] + grid_centers[i + 1]) / 2.0);
+            actual_ys.push_back(std::min(grid_centers.back() + half, grid_top));
         } else {
             actual_ys = row_ys;
         }
@@ -574,6 +578,47 @@ TableData build_table(const std::vector<double>& row_ys,
         if (filled_cols >= 2) meaningful_rows++;
     }
     if (meaningful_rows < 3) table.rows.clear();
+
+    // Text running THROUGH a drawn v-line marks a drawing, not a table: a
+    // table author never lays text across a rule, while diagram boxes (ERD
+    // entities, flowchart nodes) cut through the labels around them. Count,
+    // where a v-line exists at a row, cases whose flanking glyphs almost
+    // touch across the boundary; widespread crossing rejects the grid.
+    if (!table.rows.empty()) {
+        int crossed = 0, near_n = 0;
+        for (int r = 0; r < n_rows; r++) {
+            double row_bot = std::min(actual_ys[r], actual_ys[r + 1]);
+            double row_top = std::max(actual_ys[r], actual_ys[r + 1]);
+            for (int b = 1; b < n_cols; b++) {
+                if (!has_vline[r][b]) continue;
+                double cx = col_xs[b];
+                const PageCharCache::CharInfo* prev = nullptr;
+                const PageCharCache::CharInfo* next = nullptr;
+                for (auto& ch : cache.chars) {
+                    if (ch.unicode == ' ' || ch.unicode == 0xA0 ||
+                        ch.unicode == '\t') continue;
+                    if (ch.y < row_bot + 1 || ch.y > row_top - 1) continue;
+                    if ((ch.left + ch.right) / 2.0 < cx) {
+                        if (!prev || ch.right > prev->right) prev = &ch;
+                    } else {
+                        if (!next || ch.left < next->left) next = &ch;
+                    }
+                }
+                if (!prev || !next) continue;
+                double fs = std::max(prev->font_size, next->font_size);
+                if (fs < 4) fs = 10;
+                if (cx - prev->right > fs * 3.0 || next->left - cx > fs * 3.0)
+                    continue;
+                near_n++;
+                if (next->left - prev->right < std::max(fs * 0.2, 1.2))
+                    crossed++;
+            }
+        }
+        if (crossed >= 2 && crossed * 10 >= near_n * 3) {
+            table.rows.clear();
+            return table;
+        }
+    }
 
     if (!table.rows.empty()) {
         int n_cols_t = (int)table.rows[0].size();
@@ -1784,12 +1829,22 @@ static TableData build_table_from_band(
     }
 
     // A boundary that cuts through touching glyphs on 30%+ of its populated
-    // rows is a phantom column — the whole band is prose, not a table.
+    // rows is a phantom column — the whole band is prose, not a table. Small
+    // bands (diagram labels) rarely repeat a tear on one boundary, so tears
+    // are also summed across boundaries: real cells have padding, and any
+    // substantial overall tear rate marks a non-table.
+    int total_torn = 0, total_near = 0;
     for (int c = 1; c < n_cols; c++) {
+        total_torn += torn_cnt[c];
+        total_near += near_cnt[c];
         if (torn_cnt[c] >= 2 && torn_cnt[c] * 10 >= near_cnt[c] * 3) {
             table.rows.clear();
             return table;
         }
+    }
+    if (total_torn >= 1 && total_torn * 20 >= total_near * 7) {
+        table.rows.clear();
+        return table;
     }
     return table;
 }
