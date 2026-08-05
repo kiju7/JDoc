@@ -2,6 +2,7 @@
 // Parses ZIP-based .xlsx files using pugixml for XML processing
 
 #include "ooxml/xlsx_parser.h"
+#include "ooxml/xml_stream_scanner.h"
 #include "xml_utils.h"
 #include "common/file_utils.h"
 #include "common/image_utils.h"
@@ -13,6 +14,7 @@
 #include <cstdlib>
 #include <cstdio>
 #include <fstream>
+#include <stdexcept>
 #include <unordered_set>
 #include <map>
 #include <set>
@@ -42,6 +44,25 @@ static std::string resolve_package_path(std::string target,
     return base.empty() ? target : base + "/" + target;
 }
 
+// Streaming-path limits. Parts larger than the stream threshold never touch
+// pugixml; the hard cap bounds decompression of a part whose header lies
+// (nothing legitimate approaches it — Excel itself cannot save a part that
+// large).
+constexpr uint64_t kDefaultStreamThreshold = 256ull << 20;  // 256 MiB
+constexpr uint64_t kMaxStreamPartBytes = 16ull << 30;       // 16 GiB
+// Excel grid limits, used to clamp attacker-controlled row/col references so
+// a lying r="..." attribute cannot force a multi-gigabyte gap fill.
+constexpr int kMaxExcelRows = 1048576;
+constexpr int kMaxExcelCols = 16384;
+
+// Markdown-table cell sanitization shared by the DOM and streaming paths.
+static void sanitize_cell(std::string& v) {
+    for (auto& ch : v) {
+        if (ch == '|') ch = '/';
+        if (ch == '\n') ch = ' ';
+    }
+}
+
 } // namespace
 
 // ── Constructor ─────────────────────────────────────────
@@ -57,6 +78,14 @@ XlsxParser::XlsxParser(ZipReader& zip) : zip_(zip) {
 // ── Shared strings (xl/sharedStrings.xml) ───────────────
 
 void XlsxParser::parse_shared_strings() {
+    const auto* entry = zip_.find_entry("xl/sharedStrings.xml");
+    if (!entry) return;
+
+    if (entry->uncompressed_size > stream_threshold()) {
+        parse_shared_strings_streamed(*entry);
+        return;
+    }
+
     std::vector<char> data;
     pugi::xml_document doc;
     if (!xml_load_part(zip_, "xl/sharedStrings.xml", doc, data,
@@ -68,13 +97,13 @@ void XlsxParser::parse_shared_strings() {
     std::vector<pugi::xml_node> si_nodes;
     xml_find_all(doc, "si", si_nodes);
 
-    shared_strings_.reserve(si_nodes.size());
+    shared_strings_.reserve(si_nodes.size(), 0);
 
     for (auto& si : si_nodes) {
         // Try direct <t> child first
         auto t_node = xml_child(si, "t");
         if (t_node) {
-            shared_strings_.push_back(xml_text_content(t_node));
+            shared_strings_.push(xml_text_content(t_node));
             continue;
         }
 
@@ -85,7 +114,124 @@ void XlsxParser::parse_shared_strings() {
         for (auto& t : t_nodes) {
             text += xml_text_content(t);
         }
-        shared_strings_.push_back(std::move(text));
+        shared_strings_.push(text);
+    }
+}
+
+// ── Streaming (SAX) path ────────────────────────────────
+//
+// Parts above stream_threshold() are decompressed chunk-by-chunk and scanned
+// without a DOM: pugixml's node overhead on a multi-gigabyte sheet exceeds
+// any realistic memory budget, and read_entry()'s 1 GiB cap made such parts
+// silently vanish ("Empty sheet"). The scanner keeps only one row (sheet) or
+// one string (sharedStrings) of state, so peak memory tracks the shared-string
+// arena plus the emitted markdown, not the XML.
+
+uint64_t XlsxParser::stream_threshold() {
+    // Re-read each call (a few per workbook): tests toggle the env var to
+    // force both paths through the same fixtures.
+    if (const char* e = std::getenv("JDOC_XLSX_STREAM_THRESHOLD")) {
+        char* end = nullptr;
+        unsigned long long n = std::strtoull(e, &end, 10);
+        if (end && end != e) return static_cast<uint64_t>(n);
+    }
+    return kDefaultStreamThreshold;
+}
+
+bool XlsxParser::sheet_is_streamed(const SheetInfo& info) const {
+    if (info.file_path.empty()) return false;
+    const auto* e = zip_.find_entry(info.file_path);
+    return e && e->uncompressed_size > stream_threshold();
+}
+
+void XlsxParser::parse_shared_strings_streamed(const ZipReader::Entry& entry) {
+    // Mirrors the DOM rule: a <si> with a direct <t> child contributes only
+    // that text; otherwise every descendant <t> outside mc:Fallback counts
+    // (rich-text <r><t> runs, and — matching the DOM walker — <rPh> phonetic
+    // runs as well).
+    struct SstHandler {
+        SharedStringStore& store;
+        uint64_t part_size;
+        bool in_si = false;
+        int si_depth = 0;          // element depth below <si>
+        int fallback_depth = 0;
+        bool has_direct_t = false;
+        bool in_direct_t = false;
+        bool in_any_t = false;
+        std::string acc_direct, acc_all;
+
+        void on_start(std::string_view name, std::string_view tag_body, bool) {
+            if (!in_si) {
+                if (name == "sst") {
+                    // Reserve from the declared uniqueCount, bounded by what
+                    // the part size can physically hold (5 bytes = "<si/>").
+                    auto uc = xml_stream_attr(tag_body, "uniqueCount");
+                    if (uc.empty()) uc = xml_stream_attr(tag_body, "count");
+                    uint64_t n = 0;
+                    for (char c : uc) {
+                        if (c < '0' || c > '9') { n = 0; break; }
+                        n = n * 10 + static_cast<uint64_t>(c - '0');
+                        if (n > (1ull << 32)) break;
+                    }
+                    uint64_t bound = part_size / 5;
+                    if (n > bound) n = bound;
+                    store.reserve(static_cast<size_t>(n),
+                                  static_cast<size_t>(part_size * 11 / 20));
+                } else if (name == "si") {
+                    in_si = true;
+                    si_depth = 0;
+                    has_direct_t = false;
+                    acc_direct.clear();
+                    acc_all.clear();
+                }
+                return;
+            }
+            si_depth++;
+            if (name == "Fallback") fallback_depth++;
+            else if (name == "t" && fallback_depth == 0) {
+                in_any_t = true;
+                if (si_depth == 1) { has_direct_t = true; in_direct_t = true; }
+            }
+        }
+        void on_end(std::string_view name) {
+            if (!in_si) return;
+            if (si_depth == 0) {
+                if (name == "si") {
+                    store.push(has_direct_t ? acc_direct : acc_all);
+                    in_si = false;
+                }
+                return;
+            }
+            if (name == "t") { in_any_t = false; in_direct_t = false; }
+            else if (name == "Fallback" && fallback_depth > 0) fallback_depth--;
+            si_depth--;
+        }
+        void on_text(const char* d, size_t n) {
+            if (!in_any_t) return;
+            acc_all.append(d, n);
+            if (in_direct_t) acc_direct.append(d, n);
+        }
+    };
+
+    SstHandler handler{shared_strings_, entry.uncompressed_size};
+    XmlStreamScanner<SstHandler> scanner(handler);
+
+    uint64_t fed = 0;
+    bool over_cap = false;
+    std::string zip_err;
+    bool ok = zip_.read_entry_streamed(entry, [&](const char* d, size_t n) {
+        fed += n;
+        if (fed > kMaxStreamPartBytes) { over_cap = true; return false; }
+        return scanner.feed(d, n);
+    }, &zip_err);
+    if (ok) ok = scanner.finish();
+
+    if (!ok) {
+        std::string why = over_cap ? "part exceeds size cap"
+                        : scanner.error() ? scanner.error()
+                        : zip_err;
+        throw std::runtime_error(
+            "XLSX: cannot read xl/sharedStrings.xml (streaming): " + why);
     }
 }
 
@@ -691,8 +837,9 @@ XlsxParser::SheetData XlsxParser::parse_sheet(const SheetInfo& info) {
                     if (!idx_str.empty()) {
                         int idx = std::atoi(idx_str.c_str());
                         if (idx >= 0 &&
-                            idx < static_cast<int>(shared_strings_.size())) {
-                            value = shared_strings_[idx];
+                            static_cast<size_t>(idx) < shared_strings_.size()) {
+                            auto sv = shared_strings_.get(static_cast<size_t>(idx));
+                            value.assign(sv.data(), sv.size());
                         }
                     }
                 }
@@ -793,6 +940,348 @@ XlsxParser::SheetData XlsxParser::parse_sheet(const SheetInfo& info) {
               });
 
     return sheet;
+}
+
+// ── Streaming sheet → markdown ──────────────────────────
+//
+// Emits the same dense grid format_sheet_as_table() renders, but row by row
+// as the XML streams past, so neither the XML nor the cell set is ever
+// resident. Cells arrive in row-major order in real files; the only buffered
+// state is the current row. Empty rows are emitted lazily (a run of trailing
+// empty rows is never emitted), matching the DOM grid, which ends at the last
+// nonempty cell.
+
+uint64_t XlsxParser::stream_sheet_markdown(const SheetInfo& info,
+                                           std::string& out) {
+    const auto* entry = zip_.find_entry(info.file_path);
+    if (!entry) return 0;
+
+    // Comments are human-authored (tiny); group by 0-based (row, col) so the
+    // stream can merge them in order, matching the DOM's ref-keyed merge.
+    auto comments = parse_comments(info);
+    std::map<int, std::map<int, const std::string*>> comments_by_row;
+    for (auto& [ref, text] : comments) {
+        auto [c, r] = parse_cell_ref(ref);
+        if (r >= 0 && r < kMaxExcelRows && c >= 0 && c < kMaxExcelCols)
+            comments_by_row[r][c] = &text;
+    }
+
+    struct RowCell {
+        int col;
+        std::string value;
+        bool bold;
+    };
+
+    struct SheetHandler {
+        XlsxParser* p;
+        std::string& out;
+        const std::map<int, std::map<int, const std::string*>>& cmts;
+
+        // Grid geometry: fixed once the first row is emitted. Zero until the
+        // <dimension> element (or, absent one, the first nonempty row) sets it.
+        int total_cols = 0;
+
+        // Emission state: rows [0, emitted_rows) are already written.
+        int emitted_rows = 0;
+        uint64_t cells_out = 0;
+
+        // Current-row state
+        bool in_sheet_data = false;
+        bool in_row = false;
+        int cur_row = -1;
+        int next_auto_row = 0;
+        std::vector<RowCell> row_cells;
+
+        // Current-cell state
+        bool in_c = false;
+        int cell_col = 0;
+        int next_auto_col = 0;
+        char cell_type = 'n';       // 's'hared, 'i'nlineStr, 'b'ool, 'e'rror, 'n'umeric
+        int style_idx = -1;
+        bool in_v = false, v_seen = false;
+        std::string vtext;
+        // <is> text collection (direct-<t>-wins rule, same as sharedStrings)
+        bool in_is = false;
+        int is_depth = 0, fallback_depth = 0;
+        bool is_has_direct = false, in_is_direct_t = false, in_is_any_t = false;
+        std::string is_direct, is_all;
+
+        static int parse_int(std::string_view s) {
+            int v = 0;
+            for (char c : s) {
+                if (c < '0' || c > '9') return -1;
+                if (v > 214748363) return -1;  // overflow guard
+                v = v * 10 + (c - '0');
+            }
+            return s.empty() ? -1 : v;
+        }
+
+        void on_start(std::string_view name, std::string_view tag_body,
+                      bool /*self_closing*/) {
+            if (in_c) {
+                if (name == "v") { in_v = true; v_seen = true; vtext.clear(); }
+                else if (name == "is") {
+                    in_is = true; is_depth = 0; fallback_depth = 0;
+                    is_has_direct = false;
+                    is_direct.clear(); is_all.clear();
+                } else if (in_is) {
+                    is_depth++;
+                    if (name == "Fallback") fallback_depth++;
+                    else if (name == "t" && fallback_depth == 0) {
+                        in_is_any_t = true;
+                        if (is_depth == 1) { is_has_direct = true; in_is_direct_t = true; }
+                    }
+                }
+                return;
+            }
+            if (in_row && name == "c") {
+                in_c = true;
+                v_seen = false;
+                vtext.clear();
+                in_is = false;
+                style_idx = -1;
+                cell_type = 'n';
+
+                auto ref = xml_stream_attr(tag_body, "r");
+                if (!ref.empty()) {
+                    // column letters only; the row is taken from <row r>
+                    int col = 0;
+                    bool any = false;
+                    for (char ch : ref) {
+                        if (ch >= 'A' && ch <= 'Z') { col = col * 26 + (ch - 'A' + 1); any = true; }
+                        else if (ch >= 'a' && ch <= 'z') { col = col * 26 + (ch - 'a' + 1); any = true; }
+                        else break;
+                        if (col > kMaxExcelCols) { any = false; break; }
+                    }
+                    cell_col = any ? col - 1 : next_auto_col;
+                } else {
+                    cell_col = next_auto_col;
+                }
+                if (cell_col < 0 || cell_col >= kMaxExcelCols) cell_col = next_auto_col;
+
+                auto t = xml_stream_attr(tag_body, "t");
+                if (t == "s") cell_type = 's';
+                else if (t == "inlineStr") cell_type = 'i';
+                else if (t == "b") cell_type = 'b';
+                else if (t == "e") cell_type = 'e';
+                else cell_type = 'n';   // numeric, "str", or absent
+
+                auto s = xml_stream_attr(tag_body, "s");
+                if (!s.empty()) style_idx = parse_int(s);
+                return;
+            }
+            if (in_sheet_data && name == "row") {
+                in_row = true;
+                row_cells.clear();
+                next_auto_col = 0;
+                int r = parse_int(xml_stream_attr(tag_body, "r"));
+                // r is 1-based; fall back to sequential numbering, and clamp
+                // out-of-order rows forward (the grid cannot rewind).
+                cur_row = (r >= 1 && r <= kMaxExcelRows) ? r - 1 : next_auto_row;
+                if (cur_row < emitted_rows) cur_row = emitted_rows;
+                return;
+            }
+            if (name == "sheetData") { in_sheet_data = true; return; }
+            if (name == "dimension" && total_cols == 0) {
+                // "A1:AS1000000" → column extent from the part after ':'
+                auto ref = xml_stream_attr(tag_body, "ref");
+                auto colon = ref.rfind(':');
+                auto last = (colon == std::string_view::npos)
+                    ? ref : ref.substr(colon + 1);
+                int col = 0;
+                for (char ch : last) {
+                    if (ch >= 'A' && ch <= 'Z') col = col * 26 + (ch - 'A' + 1);
+                    else if (ch >= 'a' && ch <= 'z') col = col * 26 + (ch - 'a' + 1);
+                    else break;
+                    if (col > kMaxExcelCols) { col = kMaxExcelCols; break; }
+                }
+                total_cols = col;
+            }
+        }
+
+        void on_end(std::string_view name) {
+            if (in_c) {
+                if (name == "c") { finish_cell(); in_c = false; }
+                else if (name == "v") in_v = false;
+                else if (name == "is" && is_depth == 0) in_is = false;
+                else if (in_is) {
+                    if (name == "t") { in_is_any_t = false; in_is_direct_t = false; }
+                    else if (name == "Fallback" && fallback_depth > 0) fallback_depth--;
+                    is_depth--;
+                }
+                return;
+            }
+            if (in_row && name == "row") { finish_row(); in_row = false; }
+            else if (name == "sheetData") in_sheet_data = false;
+        }
+
+        void on_text(const char* d, size_t n) {
+            if (in_v) vtext.append(d, n);
+            else if (in_is_any_t) {
+                is_all.append(d, n);
+                if (in_is_direct_t) is_direct.append(d, n);
+            }
+        }
+
+        void finish_cell() {
+            next_auto_col = cell_col + 1;
+
+            std::string value;
+            switch (cell_type) {
+            case 's':
+                if (v_seen && !vtext.empty()) {
+                    int idx = parse_int(vtext);
+                    if (idx >= 0 &&
+                        static_cast<size_t>(idx) < p->shared_strings_.size()) {
+                        auto sv = p->shared_strings_.get(static_cast<size_t>(idx));
+                        value.assign(sv.data(), sv.size());
+                    }
+                }
+                break;
+            case 'i':
+                value = is_has_direct ? is_direct : is_all;
+                break;
+            case 'b':
+                if (v_seen) value = (vtext == "1") ? "TRUE" : "FALSE";
+                break;
+            case 'e':
+                if (v_seen) value = vtext;
+                break;
+            default:
+                if (v_seen) value = p->format_number(vtext, style_idx);
+                break;
+            }
+
+            // Merge this cell's comment (same rule as the DOM path: a comment
+            // makes even a value-less cell nonempty).
+            auto rit = cmts.find(cur_row);
+            if (rit != cmts.end()) {
+                auto cit = rit->second.find(cell_col);
+                if (cit != rit->second.end()) {
+                    if (!value.empty()) value += " ";
+                    value += "[" + *cit->second + "]";
+                }
+            }
+
+            if (value.empty()) return;
+            sanitize_cell(value);
+            bool bold = p->is_bold_style(style_idx);
+            row_cells.push_back({cell_col, std::move(value), bold});
+            cells_out++;
+        }
+
+        // Inject comments anchored to cells the XML never visited in row r.
+        void inject_comment_cells(int r, std::vector<RowCell>& cells) {
+            auto rit = cmts.find(r);
+            if (rit == cmts.end()) return;
+            for (auto& [c, text] : rit->second) {
+                bool present = false;
+                for (auto& rc : cells) {
+                    if (rc.col == c) { present = true; break; }
+                }
+                if (present) continue;
+                std::string v = "[" + *text + "]";
+                sanitize_cell(v);
+                cells.push_back({c, std::move(v), false});
+                cells_out++;
+            }
+        }
+
+        void finish_row() {
+            next_auto_row = cur_row + 1;
+            inject_comment_cells(cur_row, row_cells);
+            if (row_cells.empty()) return;  // all-empty row: emit lazily
+            emit_gap_rows(cur_row);
+            emit_row(cur_row, row_cells);
+        }
+
+        // Emit rows [emitted_rows, upto) — grid filler. A gap row is empty
+        // except for comment-only cells anchored inside it.
+        void emit_gap_rows(int upto) {
+            std::vector<RowCell> gap;
+            for (int g = emitted_rows; g < upto; ++g) {
+                gap.clear();
+                inject_comment_cells(g, gap);
+                emit_row(g, gap);
+            }
+        }
+
+        void emit_row(int r, std::vector<RowCell>& cells) {
+            std::sort(cells.begin(), cells.end(),
+                      [](const RowCell& a, const RowCell& b) {
+                          return a.col < b.col;
+                      });
+            // Fix geometry on first emission if <dimension> was absent/empty.
+            if (total_cols == 0)
+                total_cols = cells.empty() ? 1 : cells.back().col + 1;
+
+            // Width extends past total_cols when a row overflows a lying
+            // dimension — content is never dropped, the row is just ragged.
+            int width = total_cols;
+            if (!cells.empty() && cells.back().col + 1 > width)
+                width = cells.back().col + 1;
+
+            size_t ci = 0;
+            out += "|";
+            for (int c = 0; c < width; ++c) {
+                out += " ";
+                while (ci < cells.size() && cells[ci].col < c) ++ci;
+                if (ci < cells.size() && cells[ci].col == c) {
+                    const auto& cell = cells[ci];
+                    if (!cell.value.empty() && cell.bold) {
+                        out += "**"; out += cell.value; out += "**";
+                    } else {
+                        out += cell.value;
+                    }
+                }
+                out += " |";
+            }
+            out += "\n";
+
+            if (r == 0) {
+                out += "|";
+                for (int c = 0; c < total_cols; ++c) out += " --- |";
+                out += "\n";
+            }
+            emitted_rows = r + 1;
+        }
+
+        // Trailing comment-only rows (anchored past the last XML row).
+        void flush_trailing() {
+            for (auto& [r, cols] : cmts) {
+                if (r < emitted_rows) continue;
+                std::vector<RowCell> cells;
+                inject_comment_cells(r, cells);
+                if (cells.empty()) continue;
+                emit_gap_rows(r);
+                emit_row(r, cells);
+            }
+        }
+    };
+
+    SheetHandler handler{this, out, comments_by_row};
+    XmlStreamScanner<SheetHandler> scanner(handler);
+
+    uint64_t fed = 0;
+    bool over_cap = false;
+    std::string zip_err;
+    bool ok = zip_.read_entry_streamed(*entry, [&](const char* d, size_t n) {
+        fed += n;
+        if (fed > kMaxStreamPartBytes) { over_cap = true; return false; }
+        return scanner.feed(d, n);
+    }, &zip_err);
+    if (ok) ok = scanner.finish();
+
+    if (!ok) {
+        std::string why = over_cap ? "part exceeds size cap"
+                        : scanner.error() ? scanner.error()
+                        : zip_err;
+        throw std::runtime_error(
+            "XLSX: cannot read sheet '" + info.name + "' (streaming): " + why);
+    }
+
+    handler.flush_trailing();
+    return handler.cells_out;
 }
 
 // ── Format sheet data as markdown table ─────────────────
@@ -1006,7 +1495,9 @@ std::vector<ImageData> XlsxParser::extract_images(
 // ── to_markdown ─────────────────────────────────────────
 
 std::string XlsxParser::to_markdown(const ConvertOptions& opts) {
-    std::ostringstream out;
+    // Accumulate into a plain string: a streamed multi-GB sheet appends here
+    // directly, and an ostringstream would double the peak (buffer + .str()).
+    std::string out;
 
     for (size_t i = 0; i < sheets_.size(); ++i) {
         int sheet_num = static_cast<int>(i) + 1;
@@ -1020,34 +1511,45 @@ std::string XlsxParser::to_markdown(const ConvertOptions& opts) {
             if (!found) continue;
         }
 
-        auto sheet = parse_sheet(sheets_[i]);
-
-        if (i > 0) out << "\n";
-        std::string display_name = sheet.name.empty()
-            ? ("Sheet " + std::to_string(sheet_num))
-            : sheet.name;
-        out << "## " << display_name << "\n\n";
-
-        if (sheet.cells.empty()) {
-            out << "*Empty sheet*\n\n";
+        if (sheet_is_streamed(sheets_[i])) {
+            if (i > 0) out += "\n";
+            std::string display_name = sheets_[i].name.empty()
+                ? ("Sheet " + std::to_string(sheet_num))
+                : sheets_[i].name;
+            out += "## "; out += display_name; out += "\n\n";
+            if (stream_sheet_markdown(sheets_[i], out) == 0)
+                out += "*Empty sheet*\n\n";
+            else
+                out += "\n";
             continue;
         }
 
-        out << format_sheet_as_table(sheet) << "\n";
+        auto sheet = parse_sheet(sheets_[i]);
+
+        if (i > 0) out += "\n";
+        std::string display_name = sheet.name.empty()
+            ? ("Sheet " + std::to_string(sheet_num))
+            : sheet.name;
+        out += "## "; out += display_name; out += "\n\n";
+
+        if (sheet.cells.empty()) {
+            out += "*Empty sheet*\n\n";
+            continue;
+        }
+
+        out += format_sheet_as_table(sheet); out += "\n";
     }
 
     // Extract and reference images
     auto images = extract_images(opts);
-    if (!images.empty()) {
-        for (auto& img : images) {
-            if (opts.images)
-                out << "![" << img.name << "](" << opts.image_ref_prefix << img.name << ")\n\n";
-            else
-                out << "![" << img.name << "](" << img.name << "." << img.format << ")\n\n";
-        }
+    for (auto& img : images) {
+        out += "![" ; out += img.name; out += "](";
+        if (opts.images) { out += opts.image_ref_prefix; out += img.name; }
+        else { out += img.name; out += "."; out += img.format; }
+        out += ")\n\n";
     }
 
-    return out.str();
+    return out;
 }
 
 // ── to_chunks ───────────────────────────────────────────
@@ -1063,6 +1565,25 @@ bool XlsxParser::sheet_wanted(int sheet_num, const ConvertOptions& opts) {
 // images are distributed after all sheet chunks are built.
 PageChunk XlsxParser::build_sheet_chunk(size_t i, const ConvertOptions& opts) {
     int sheet_num = static_cast<int>(i) + 1;
+
+    if (sheet_is_streamed(sheets_[i])) {
+        PageChunk chunk;
+        chunk.page_number = sheet_num;
+        std::string display_name = sheets_[i].name.empty()
+            ? ("Sheet " + std::to_string(sheet_num))
+            : sheets_[i].name;
+        chunk.text += "## "; chunk.text += display_name; chunk.text += "\n\n";
+        if (stream_sheet_markdown(sheets_[i], chunk.text) == 0)
+            chunk.text += "*Empty sheet*\n\n";
+        else
+            chunk.text += "\n";
+        // Structured chunk.tables are intentionally skipped for streamed
+        // sheets: a per-cell std::string grid over tens of millions of cells
+        // is exactly the allocation pattern this path exists to avoid. The
+        // markdown text carries the full content.
+        return chunk;
+    }
+
     auto sheet = parse_sheet(sheets_[i]);
 
     PageChunk chunk;

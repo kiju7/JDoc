@@ -5,6 +5,7 @@
 #include "zip_reader.h"
 #include "jdoc/types.h"
 #include <string>
+#include <string_view>
 #include <vector>
 #include <map>
 
@@ -31,8 +32,29 @@ public:
 private:
     ZipReader& zip_;
 
-    // Shared strings table (index -> string)
-    std::vector<std::string> shared_strings_;
+    // Shared strings table (index -> string), stored as one text arena plus
+    // an offset per entry. A workbook can carry tens of millions of shared
+    // strings; per-entry std::string would mean that many separate heap
+    // allocations, while the arena keeps it to two.
+    class SharedStringStore {
+    public:
+        void reserve(size_t count, size_t bytes) {
+            offs_.reserve(count + 1);
+            arena_.reserve(bytes);
+        }
+        void push(std::string_view s) {
+            arena_.append(s.data(), s.size());
+            offs_.push_back(arena_.size());
+        }
+        size_t size() const { return offs_.size() - 1; }
+        std::string_view get(size_t i) const {
+            return {arena_.data() + offs_[i], offs_[i + 1] - offs_[i]};
+        }
+    private:
+        std::string arena_;
+        std::vector<uint64_t> offs_ = {0};
+    };
+    SharedStringStore shared_strings_;
 
     // Sheet info
     struct SheetInfo {
@@ -59,6 +81,22 @@ private:
     void parse_workbook_rels();
     void parse_persons();
     void parse_styles();
+
+    // ── Streaming (SAX) path for parts too large for the DOM ─────────
+    // Threshold above which a part is scanned in streaming mode instead of
+    // being loaded into pugixml (env JDOC_XLSX_STREAM_THRESHOLD overrides,
+    // for tests / tuning).
+    static uint64_t stream_threshold();
+    // True when this sheet's XML part exceeds the streaming threshold.
+    bool sheet_is_streamed(const SheetInfo& info) const;
+    // Load xl/sharedStrings.xml through the chunked scanner into the arena.
+    // Throws std::runtime_error on a corrupt or oversized part.
+    void parse_shared_strings_streamed(const ZipReader::Entry& entry);
+    // Stream one sheet's XML directly into `out` as a markdown table,
+    // without materializing SheetData. Grid semantics match parse_sheet +
+    // format_sheet_as_table. Returns the number of nonempty cells emitted.
+    // Throws std::runtime_error on a corrupt or oversized part.
+    uint64_t stream_sheet_markdown(const SheetInfo& info, std::string& out);
 
     // Parse a cell reference like "A1" -> (col_index, row_index) both 0-based
     static std::pair<int, int> parse_cell_ref(const std::string& ref);

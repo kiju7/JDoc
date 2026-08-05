@@ -342,10 +342,14 @@ bool ZipReader::extract_entry_to_file(const Entry& entry, const std::string& out
 }
 
 bool ZipReader::has_entry(const std::string& name) const {
+    return find_entry(name) != nullptr;
+}
+
+const ZipReader::Entry* ZipReader::find_entry(const std::string& name) const {
     for (auto& e : entries_) {
-        if (e.name == name) return true;
+        if (e.name == name) return &e;
     }
-    return false;
+    return nullptr;
 }
 
 } // namespace jdoc
