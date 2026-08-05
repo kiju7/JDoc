@@ -97,7 +97,8 @@ ImageData render_page_composite(PdfDoc& doc, const PdfObj& page_obj,
                                 const std::string& output_dir);
 void collect_bookmarks(PdfDoc& doc, const PdfObj& node, int depth,
                        std::vector<BookmarkEntry>& out);
-std::vector<AnnotEntry> extract_annotations(PdfDoc& doc, const PdfObj& page_obj, double page_h);
+std::vector<AnnotEntry> extract_annotations(PdfDoc& doc, const PdfObj& page_obj, double page_h,
+                                            const double* view_ctm = nullptr);
 std::string result_to_markdown(ExtractResult& r, const ConvertOptions& opts);
 std::vector<PageChunk> result_to_chunks(ExtractResult& r, const ConvertOptions& opts);
 void stream_result_chunks(ExtractResult& r, const ConvertOptions& opts,
