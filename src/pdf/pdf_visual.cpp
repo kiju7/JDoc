@@ -479,7 +479,46 @@ static std::vector<char> pixels_to_bmp(const uint8_t* pixels, int w, int h,
 
 // ── Image Extraction ─────────────────────────────────────
 
+// Axis-aligned rotation (degrees, clockwise) a placement CTM applies to the
+// raster, or 0 for upright/mirrored/skewed placements. The CTM is in viewing
+// coordinates, so this covers both rotated placements and page /Rotate: either
+// way the stored raster is sideways relative to what the viewer shows.
+static int ctm_axis_rotation(const double* m) {
+    double diag = std::abs(m[0]) + std::abs(m[3]);
+    double off = std::abs(m[1]) + std::abs(m[2]);
+    if (off > diag * 50.0) {
+        if (m[1] < 0 && m[2] > 0) return 90;
+        if (m[1] > 0 && m[2] < 0) return 270;
+        return 0; // rotation + mirror: leave untouched
+    }
+    if (diag > off * 50.0 && m[0] < 0 && m[3] < 0) return 180;
+    return 0;
+}
 
+// In-place raster rotation by 90/180/270 degrees clockwise.
+static void rotate_raster(std::vector<uint8_t>& px, unsigned& w, unsigned& h,
+                          int comps, int deg) {
+    if (comps <= 0) return;
+    const size_t n = static_cast<size_t>(w) * h * comps;
+    if (px.size() < n) return;
+    std::vector<uint8_t> out(n);
+    const unsigned ow = (deg == 180) ? w : h;
+    const unsigned oh = (deg == 180) ? h : w;
+    for (unsigned y = 0; y < oh; y++) {
+        for (unsigned x = 0; x < ow; x++) {
+            unsigned sx, sy;
+            if (deg == 90)       { sx = y;         sy = h - 1 - x; }
+            else if (deg == 270) { sx = w - 1 - y; sy = x; }
+            else                 { sx = w - 1 - x; sy = h - 1 - y; }
+            const uint8_t* s = px.data() + (static_cast<size_t>(sy) * w + sx) * comps;
+            uint8_t* d = out.data() + (static_cast<size_t>(y) * ow + x) * comps;
+            for (int c = 0; c < comps; c++) d[c] = s[c];
+        }
+    }
+    px = std::move(out);
+    w = ow;
+    h = oh;
+}
 
 std::vector<ExtractedImage> extract_page_images(PdfDoc& doc, const PdfObj& page_obj,
                                                  const ContentParseResult& parse_result,
@@ -713,12 +752,52 @@ std::vector<ExtractedImage> extract_page_images(PdfDoc& doc, const PdfObj& page_
                 components = indexed_base_comps;
             }
 
+            // Unpack 1-bit rows to bytes: Flate-compressed bitonal scans
+            // otherwise fail the PNG encoder's size check and are dropped.
+            if (bpc == 1 && components == 1 && !is_indexed) {
+                size_t row_bytes = (width + 7) / 8;
+                if (decoded.size() >= row_bytes * height) {
+                    std::vector<uint8_t> unpacked(pixel_count);
+                    for (size_t uy = 0; uy < height; uy++)
+                        for (size_t ux = 0; ux < width; ux++) {
+                            bool bit = (decoded[uy * row_bytes + ux / 8]
+                                        >> (7 - (ux & 7))) & 1;
+                            unpacked[uy * width + ux] = bit ? 255 : 0;
+                        }
+                    decoded = std::move(unpacked);
+                }
+            }
+
             img.format = "raw";
             img.components = components;
             img.pixels = std::move(decoded);
         }
 
         if (!img.data.empty() || !img.pixels.empty()) {
+            // Save in the viewer's orientation: a raster stored sideways
+            // (rotated placement, or an unrotated placement on a /Rotate
+            // page) is rotated upright first. JPEG passthrough only survives
+            // when no rotation is needed; JP2 stays as-is (no decoder).
+            int save_rot = ctm_axis_rotation(ip.ctm);
+            if (save_rot != 0) {
+                if (img.format == "jpeg" && !img.data.empty()) {
+                    auto jr = jpeg_decode(
+                        reinterpret_cast<const uint8_t*>(img.data.data()),
+                        img.data.size());
+                    if (!jr.pixels.empty()) {
+                        img.format = "raw";
+                        img.width = static_cast<unsigned>(jr.width);
+                        img.height = static_cast<unsigned>(jr.height);
+                        img.components = jr.components;
+                        img.pixels = std::move(jr.pixels);
+                        img.data.clear();
+                    }
+                }
+                if (img.format == "raw" && !img.pixels.empty())
+                    rotate_raster(img.pixels, img.width, img.height,
+                                  img.components, save_rot);
+            }
+
             // Encode raw pixels to PNG for in-memory delivery
             if (img.format == "raw" && img.data.empty() && !img.pixels.empty()) {
                 auto png = pixels_to_png(img.pixels.data(), img.pixels.size(),
@@ -905,9 +984,40 @@ ImageData render_page_composite(PdfDoc& doc, const PdfObj& page_obj,
                                  const ContentParseResult& parse_result,
                                  int page_num, double page_w, double page_h,
                                  const std::string& output_dir) {
-    constexpr double kDPI = 150.0;
+    constexpr double kMinDPI = 150.0;
+    constexpr double kMaxDPI = 600.0;
     constexpr double kBase = 72.0;
-    double scale = kDPI / kBase;
+    // Composite output was fixed at 150 DPI, which silently downsampled
+    // high-resolution scans (drawings especially). Raise the render DPI to
+    // the densest embedded image's effective resolution, within bounds.
+    double dpi = kMinDPI;
+    {
+        auto pre_res = doc.resolve(page_obj.get("Resources"));
+        for (auto& ip : parse_result.images) {
+            PdfObj xobj;
+            if (ip.xobj_ref >= 0) {
+                xobj = doc.get_obj(ip.xobj_ref);
+            } else if (!ip.xobj_name.empty()) {
+                auto xd = doc.resolve(pre_res.get("XObject"));
+                if (xd.is_dict()) xobj = doc.resolve(xd.get(ip.xobj_name));
+            }
+            if (!xobj.is_stream()) continue;
+            int iw = xobj.get("Width").as_int();
+            int ih = xobj.get("Height").as_int();
+            double pw_pt = std::hypot(ip.ctm[0], ip.ctm[1]);
+            double ph_pt = std::hypot(ip.ctm[2], ip.ctm[3]);
+            if (iw > 0 && pw_pt > 1.0) dpi = std::max(dpi, iw / (pw_pt / kBase));
+            if (ih > 0 && ph_pt > 1.0) dpi = std::max(dpi, ih / (ph_pt / kBase));
+        }
+        if (dpi > kMaxDPI) dpi = kMaxDPI;
+    }
+    double scale = dpi / kBase;
+    // Bound total canvas pixels; a runaway page size must not exhaust memory.
+    constexpr double kMaxPixels = 64e6;
+    if (page_w * scale * page_h * scale > kMaxPixels) {
+        scale *= std::sqrt(kMaxPixels / (page_w * scale * page_h * scale));
+        if (scale < kMinDPI / kBase / 8) scale = kMinDPI / kBase / 8;
+    }
     int rw = static_cast<int>(page_w * scale);
     int rh = static_cast<int>(page_h * scale);
     if (rw <= 0 || rh <= 0) return {};
@@ -1289,6 +1399,30 @@ ImageData render_page_composite(PdfDoc& doc, const PdfObj& page_obj,
                     } else if (cs_name == "Separation") {
                         components = 1;
                     }
+                    if (is_image_mask) components = 1;
+                    // Unpack 1-bit rows to bytes; CCITT masks arrive unpacked
+                    // above, but Flate-compressed bitonal layers (stamps,
+                    // signature masks) reach here still packed and previously
+                    // fell out on the size check below, vanishing from the
+                    // composite. ImageMask default /Decode [0 1]: sample 0
+                    // paints; plain gray: bit 1 is white.
+                    int bpc1 = xobj.get("BitsPerComponent").as_int();
+                    if (bpc1 == 1 && components == 1 &&
+                        cs_name != "Indexed" && cs_name != "I") {
+                        size_t row_bytes = (static_cast<size_t>(w) + 7) / 8;
+                        if (decoded.size() >= row_bytes * h) {
+                            std::vector<uint8_t> unpacked(static_cast<size_t>(w) * h);
+                            for (int uy = 0; uy < h; uy++)
+                                for (int ux = 0; ux < w; ux++) {
+                                    bool bit = (decoded[uy * row_bytes + ux / 8]
+                                                >> (7 - (ux & 7))) & 1;
+                                    unpacked[static_cast<size_t>(uy) * w + ux] =
+                                        is_image_mask ? (bit ? 0 : 255)
+                                                      : (bit ? 255 : 0);
+                                }
+                            decoded = std::move(unpacked);
+                        }
+                    }
                     pixels = std::move(decoded);
                 }
             }
@@ -1304,6 +1438,45 @@ ImageData render_page_composite(PdfDoc& doc, const PdfObj& page_obj,
             uint8_t fr = static_cast<uint8_t>(std::min(255.0, std::max(0.0, ip.fill_r * 255)));
             uint8_t fg = static_cast<uint8_t>(std::min(255.0, std::max(0.0, ip.fill_g * 255)));
             uint8_t fb = static_cast<uint8_t>(std::min(255.0, std::max(0.0, ip.fill_b * 255)));
+            // Rotated placement (e.g. a /Rotate page normalized into viewing
+            // coordinates): the axis-aligned coverage loop below would place
+            // the mask wrong, so inverse-map each destination pixel instead.
+            if (std::abs(ip.ctm[1]) >= 0.001 || std::abs(ip.ctm[2]) >= 0.001) {
+                double inv_det = ip.ctm[0]*ip.ctm[3] - ip.ctm[1]*ip.ctm[2];
+                if (std::abs(inv_det) < 1e-10) continue;
+                double cmin_x = 1e18, cmax_x = -1e18, cmin_y = 1e18, cmax_y = -1e18;
+                for (int i = 0; i < 4; i++) {
+                    double ix = (i & 1) ? 1.0 : 0.0;
+                    double iy = (i & 2) ? 1.0 : 0.0;
+                    double gx = ip.ctm[0]*ix + ip.ctm[2]*iy + ip.ctm[4];
+                    double gy = ip.ctm[1]*ix + ip.ctm[3]*iy + ip.ctm[5];
+                    double cx2 = gx * scale, cy2 = (page_h - gy) * scale;
+                    cmin_x = std::min(cmin_x, cx2); cmax_x = std::max(cmax_x, cx2);
+                    cmin_y = std::min(cmin_y, cy2); cmax_y = std::max(cmax_y, cy2);
+                }
+                int bx0 = std::max(0, static_cast<int>(cmin_x));
+                int bx1 = std::min(canvas.width - 1, static_cast<int>(cmax_x) + 1);
+                int by0 = std::max(0, static_cast<int>(cmin_y));
+                int by1 = std::min(canvas.height - 1, static_cast<int>(cmax_y) + 1);
+                for (int cy2 = by0; cy2 <= by1; cy2++) {
+                    for (int cx2 = bx0; cx2 <= bx1; cx2++) {
+                        double gx = cx2 / scale;
+                        double gy = page_h - cy2 / scale;
+                        double lx = gx - ip.ctm[4];
+                        double ly = gy - ip.ctm[5];
+                        double ix = (ip.ctm[3]*lx - ip.ctm[2]*ly) / inv_det;
+                        double iy = (-ip.ctm[1]*lx + ip.ctm[0]*ly) / inv_det;
+                        if (ix < 0 || ix > 1 || iy < 0 || iy > 1) continue;
+                        int sx = static_cast<int>(ix * (w - 1));
+                        int sy = static_cast<int>((1 - iy) * (h - 1));
+                        if (sx < 0) sx = 0; if (sx >= w) sx = w - 1;
+                        if (sy < 0) sy = 0; if (sy >= h) sy = h - 1;
+                        if (pixels[static_cast<size_t>(sy) * w + sx] > 128)
+                            canvas.blend_pixel(cx2, cy2, fr, fg, fb, 255);
+                    }
+                }
+                continue;
+            }
             // Blit with alpha — use Canvas blit for proper CTM handling
             double px = ip.ctm[4] * scale;
             double py = (page_h - ip.ctm[5] - ip.ctm[3]) * scale;
