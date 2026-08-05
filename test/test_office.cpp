@@ -887,6 +887,24 @@ void test_xlsx_streaming() {
     TEST_END
 }
 
+// ── XLS SST CONTINUE-boundary decoding ───────────────────────
+
+void test_xls_sst_continue() {
+    std::cerr << "\nXLS SST continuation:\n";
+
+    // 1000 unique strings — the SST spans multiple CONTINUE records, and a
+    // string straddles nearly every boundary. Flat concatenation used to feed
+    // the continuation's option-flags byte into the character stream,
+    // corrupting or dropping everything after the first split (~450 strings).
+    TEST(sst_survives_continue_boundaries)
+        auto md = jdoc::office_to_markdown("test/fixtures/xls/sst_continue.xls");
+        ASSERT(count_occurrences(md, "unique_string_number_") == 1000);
+        ASSERT(md.find("unique_string_number_0000@example.com") != std::string::npos);
+        ASSERT(md.find("unique_string_number_0446@example.com") != std::string::npos);
+        ASSERT(md.find("unique_string_number_0999@example.com") != std::string::npos);
+    TEST_END
+}
+
 // ── XLSB sparse-cell storage ────────────────────────────────
 
 static void put_xlsb_varint(std::string& out, uint32_t value) {
@@ -1079,6 +1097,7 @@ int main() {
     test_docx_header_footer();
     test_xlsx_fixes();
     test_xlsx_streaming();
+    test_xls_sst_continue();
     test_xlsb_sparse_cells();
     test_html_charset();
     test_pptx_linebreak();
