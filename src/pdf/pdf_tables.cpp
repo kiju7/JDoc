@@ -399,6 +399,7 @@ TableData build_table(const std::vector<double>& row_ys,
     }
 
     std::vector<double> actual_ys;
+    bool merge_wrap_rows = false;
     {
         double tl = col_xs.front(), tr = col_xs.back();
         double row_h = (row_ys.size() >= 2) ? (row_ys[1] - row_ys[0]) : 18.0;
@@ -414,7 +415,10 @@ TableData build_table(const std::vector<double>& row_ys,
 
         std::vector<double> cy_vals;
         for (auto& cp : cchars) cy_vals.push_back(cp.y);
-        auto text_row_ys = cluster_values(cy_vals, row_h * 0.4);
+        // Row-height-relative tolerances break down when the grid has one
+        // huge interval (sparsely ruled tables): clamp to text-line scale.
+        double line_tol = std::min(row_h * 0.4, 8.0);
+        auto text_row_ys = cluster_values(cy_vals, line_tol);
 
         std::vector<std::vector<double>> col_char_ys(n_cols_found);
         for (auto& cp : cchars) {
@@ -427,7 +431,7 @@ TableData build_table(const std::vector<double>& row_ys,
         }
 
         std::vector<double> table_row_centers;
-        double tol = row_h * 0.4;
+        double tol = line_tol;
         for (double ry : text_row_ys) {
             int cols_hit = 0;
             for (int c = 0; c < n_cols_found; c++) {
@@ -450,12 +454,20 @@ TableData build_table(const std::vector<double>& row_ys,
         int rows_in_grid = (int)grid_centers.size();
 
         int n_rows_expected = (int)row_ys.size() - 1;
-        bool use_text_rows = (rows_in_grid < n_rows_expected * 0.9) &&
-                             (rows_in_grid >= n_rows_expected * 0.8);
+        // Text rows replace the grid rows in two cases: slightly fewer text
+        // rows than intervals (empty rows in the grid), or far more (a
+        // sparsely ruled table whose data rows have no rules at all — the
+        // grid would jam whole row groups into single cells).
+        bool under_segmented = rows_in_grid >= n_rows_expected * 2.5 &&
+                               rows_in_grid >= n_rows_expected + 3;
+        bool use_text_rows = ((rows_in_grid < n_rows_expected * 0.9) &&
+                              (rows_in_grid >= n_rows_expected * 0.8)) ||
+                             under_segmented;
+        merge_wrap_rows = under_segmented;
 
         if (use_text_rows && !grid_centers.empty()) {
             std::sort(grid_centers.begin(), grid_centers.end());
-            double half = row_h / 2.0;
+            double half = std::min(row_h / 2.0, 10.0);
             // Clamp to h-line grid boundaries — don't extend beyond the table
             double grid_top = row_ys.back() + half;
             double grid_bot = row_ys.front() - half;
@@ -551,6 +563,32 @@ TableData build_table(const std::vector<double>& row_ys,
     }
 
     std::reverse(table.rows.begin(), table.rows.end());
+
+    // Text-row splitting of an under-segmented grid separates the wrap
+    // lines of multi-line cells into their own rows; a row with a single
+    // filled cell under a filled cell is such a fragment.
+    if (merge_wrap_rows) {
+        for (size_t r = 1; r < table.rows.size(); ) {
+            auto& row = table.rows[r];
+            int filled = 0, fc = -1;
+            for (int c = 0; c < (int)row.size(); c++)
+                if (!row[c].empty()) { filled++; fc = c; }
+            auto& prev = table.rows[r - 1];
+            if (filled == 1 && fc < (int)prev.size() && !prev[fc].empty()) {
+                bool digit_wrap = prev[fc].size() >= 2 &&
+                                  prev[fc].back() == '-' &&
+                                  prev[fc][prev[fc].size() - 2] >= '0' &&
+                                  prev[fc][prev[fc].size() - 2] <= '9' &&
+                                  row[fc][0] >= '0' && row[fc][0] <= '9';
+                if (!digit_wrap) prev[fc] += " ";
+                prev[fc] += row[fc];
+                table.rows.erase(table.rows.begin() + r);
+            } else {
+                r++;
+            }
+        }
+    }
+
     trim_table(table);
 
     // Extract title rows: rows at top where only one cell has content,
@@ -2220,23 +2258,29 @@ static bool accept_table(TableData& table) {
         }
     }
 
-    // 2-column body-text heuristic
+    // 2-column body-text heuristic. A populated third column exempts the
+    // long-first-column test: prose with a stray fringe never fills three
+    // columns row after row, while question/answer tables (long question,
+    // short verdict columns) legitimately do.
     if (n_cols <= 3) {
         int total_rows = 0;
         double sum_first = 0, sum_second = 0;
-        int unbalanced = 0;
+        int unbalanced = 0, third_filled = 0;
         for (auto& row : table.rows) {
             if (row.empty() || row[0].empty()) continue;
             total_rows++;
             sum_first += row[0].size();
             if (n_cols >= 2 && row.size() >= 2) sum_second += row[1].size();
+            if (n_cols >= 3 && row.size() >= 3 && !row[2].empty()) third_filled++;
             if (n_cols == 2 && row.size() >= 2 && !row[1].empty() &&
                 row[0].size() > row[1].size() * 5) unbalanced++;
         }
         if (total_rows >= 3) {
             double avg_first = sum_first / total_rows;
             double avg_second = (n_cols >= 2) ? sum_second / total_rows : 0;
-            if (avg_first > 30 && avg_second > 0 && avg_first > avg_second * 2.5)
+            bool dense_third = n_cols >= 3 && third_filled * 10 >= total_rows * 7;
+            if (!dense_third &&
+                avg_first > 30 && avg_second > 0 && avg_first > avg_second * 2.5)
                 return false;
             if (n_cols == 2 && avg_first > 30 && avg_second > 30)
                 return false;
@@ -2288,9 +2332,11 @@ static bool accept_table(TableData& table) {
 
 } // namespace text_tables
 
-std::vector<TableData> detect_text_tables(const PageCharCache& cache,
-                                           const std::vector<TableData>& existing_tables,
-                                           double page_width, double page_height) {
+static std::vector<TableData> detect_text_tables_range(
+        const PageCharCache& cache,
+        const std::vector<TableData>& existing_tables,
+        double page_width, double page_height,
+        double x_lo, double x_hi) {
     using namespace text_tables;
     if (cache.chars.size() < 10) return {};
 
@@ -2299,6 +2345,7 @@ std::vector<TableData> detect_text_tables(const PageCharCache& cache,
     for (auto& ch : cache.chars) {
         if (ch.unicode == ' ' || ch.unicode == '\t' || ch.unicode == 0xA0) continue;
         if (ch.x < 0 || ch.x > page_width || ch.y < 0 || ch.y > page_height) continue;
+        if (ch.x < x_lo || ch.x >= x_hi) continue;
         chars.push_back({ch.x, ch.y, ch.left, ch.right, ch.top, ch.bot,
                          ch.unicode});
     }
@@ -2374,12 +2421,17 @@ std::vector<TableData> detect_text_tables(const PageCharCache& cache,
         r.is_multi_cell = row_is_multi_cell(r, cell_merge_gap);
     }
 
-    // drop rows entirely inside an existing line-based table
+    // drop rows inside an existing line-based table; x-overlap is required
+    // too, or a table in one page column would erase the rows of a table
+    // beside it in the other column
     auto row_in_existing = [&](const TextRow& r) {
         for (auto& t : existing_tables) {
             double tb = std::min(t.y0, t.y1) - 5.0;
             double tt = std::max(t.y0, t.y1) + 5.0;
-            if (r.y_center >= tb && r.y_center <= tt) return true;
+            if (r.y_center < tb || r.y_center > tt) continue;
+            double tl = std::min(t.x0, t.x1) - 5.0;
+            double tr = std::max(t.x0, t.x1) + 5.0;
+            if (r.x_max >= tl && r.x_min <= tr) return true;
         }
         return false;
     };
@@ -2461,6 +2513,36 @@ std::vector<TableData> detect_text_tables(const PageCharCache& cache,
         if (!accept_table(table)) continue;
 
         result.push_back(std::move(table));
+    }
+    return result;
+}
+
+std::vector<TableData> detect_text_tables(const PageCharCache& cache,
+                                           const std::vector<TableData>& existing_tables,
+                                           double page_width, double page_height,
+                                           double col_boundary) {
+    auto result = detect_text_tables_range(cache, existing_tables,
+                                           page_width, page_height,
+                                           0.0, page_width);
+
+    // Two-column pages: rows built across the gutter glue a column's table
+    // to the prose beside it, so the full-width pass misses column-local
+    // tables. Retry per column, with the full-width finds suppressing
+    // duplicates.
+    if (col_boundary > 0) {
+        std::vector<TableData> known = existing_tables;
+        known.insert(known.end(), result.begin(), result.end());
+        for (int side = 0; side < 2; side++) {
+            double x_lo = side == 0 ? 0.0 : col_boundary;
+            double x_hi = side == 0 ? col_boundary : page_width;
+            auto part = detect_text_tables_range(cache, known,
+                                                 page_width, page_height,
+                                                 x_lo, x_hi);
+            for (auto& t : part) {
+                known.push_back(t);
+                result.push_back(std::move(t));
+            }
+        }
     }
     return result;
 }
