@@ -1002,6 +1002,17 @@ ImageData render_page_composite(PdfDoc& doc, const PdfObj& page_obj,
                 if (xd.is_dict()) xobj = doc.resolve(xd.get(ip.xobj_name));
             }
             if (!xobj.is_stream()) continue;
+            // Images the compositor cannot decode must not inflate the
+            // canvas: they contribute nothing but would still be paid for
+            // in raster and PNG-encode time.
+            auto pre_filter = doc.resolve(xobj.get("Filter"));
+            std::string pre_last;
+            if (pre_filter.is_name()) pre_last = pre_filter.str_val;
+            else if (pre_filter.is_arr() && !pre_filter.arr.empty()) {
+                auto last = doc.resolve(pre_filter.arr.back());
+                if (last.is_name()) pre_last = last.str_val;
+            }
+            if (pre_last == "JBIG2Decode" || pre_last == "JPXDecode") continue;
             int iw = xobj.get("Width").as_int();
             int ih = xobj.get("Height").as_int();
             double pw_pt = std::hypot(ip.ctm[0], ip.ctm[1]);
