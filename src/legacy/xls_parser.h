@@ -67,14 +67,10 @@ private:
     // Parse the Workbook (or Book) stream.
     void parse_workbook();
 
-    // Parse the SST record (and CONTINUE records that follow).
+    // Parse the SST record (and CONTINUE records that follow). Strings are
+    // decoded across record boundaries per MS-XLS 2.5.293 — see SstCursor.
     void parse_sst(const char* data, size_t len,
                    const std::vector<std::vector<char>>& continues);
-
-    // Parse a single XLUnicodeRichExtendedString from a buffer.
-    // Returns the string and advances pos past the string data.
-    std::string parse_xl_string(const char* data, size_t len, size_t& pos,
-                                bool* crossed_continue = nullptr) const;
 
     // Decode an RK value to a double.
     static double decode_rk(uint32_t rk);

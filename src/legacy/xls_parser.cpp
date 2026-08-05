@@ -250,61 +250,127 @@ std::string XlsParser::format_cell_number(double val, int xf_index) const {
     return format_number(val);
 }
 
-// ---------- XL Unicode string parsing ----------------------------------------
+// ---------- SST parsing ------------------------------------------------------
 
-std::string XlsParser::parse_xl_string(const char* data, size_t len, size_t& pos,
-                                        bool* crossed_continue) const {
-    if (pos + 3 > len) { pos = len; return ""; }
+namespace {
 
-    uint16_t cch = util::read_u16_le(data + pos); pos += 2;
-    uint8_t flags = static_cast<uint8_t>(data[pos]); pos += 1;
+// Cursor over the SST record body plus its CONTINUE payloads, decoding
+// XLUnicodeRichExtendedStrings across record boundaries (MS-XLS 2.5.293).
+// Header fields, rich-text runs and ext data flow across a boundary as plain
+// bytes, but character data that resumes in a new record starts with a fresh
+// option-flags byte — which may switch the encoding width mid-string. The
+// old flat-concatenation approach fed that flags byte into the character
+// stream, corrupting every string after the first split (~450 unique strings
+// is enough to hit it).
+class SstCursor {
+public:
+    explicit SstCursor(std::vector<std::pair<const char*, size_t>> segs)
+        : segs_(std::move(segs)) {}
 
-    bool high_byte = (flags & 0x01) != 0;
-    bool rich      = (flags & 0x08) != 0;
-    bool ext_st    = (flags & 0x04) != 0;
-
-    uint16_t run_count = 0;
-    uint32_t ext_size = 0;
-
-    if (rich) {
-        if (pos + 2 > len) { pos = len; return ""; }
-        run_count = util::read_u16_le(data + pos); pos += 2;
+    bool at_end() {
+        norm();
+        return si_ >= segs_.size();
     }
-    if (ext_st) {
-        if (pos + 4 > len) { pos = len; return ""; }
-        ext_size = util::read_u32_le(data + pos); pos += 4;
+    bool failed() const { return failed_; }
+
+    // Read one XLUnicodeRichExtendedString.
+    std::string read_string() {
+        std::string out;
+        uint16_t cch = 0;
+        uint8_t flags = 0;
+        if (!u16(cch) || !u8(flags)) { failed_ = true; return out; }
+        bool high  = (flags & 0x01) != 0;
+        bool ext   = (flags & 0x04) != 0;
+        bool rich  = (flags & 0x08) != 0;
+
+        uint16_t run_count = 0;
+        uint32_t ext_size = 0;
+        if (rich && !u16(run_count)) { failed_ = true; return out; }
+        if (ext && !u32(ext_size))   { failed_ = true; return out; }
+
+        size_t remaining = cch;
+        while (remaining > 0) {
+            if (!norm()) { failed_ = true; break; }
+            if (entered_mid_chars_) {
+                // First byte of a record continuing character data is a new
+                // option-flags byte; only bit 0 (fHighByte) applies here.
+                uint8_t g = static_cast<uint8_t>(segs_[si_].first[off_]);
+                off_++;
+                high = (g & 0x01) != 0;
+                entered_mid_chars_ = false;
+                continue;  // re-normalize (the flags byte may end the record)
+            }
+            size_t avail = segs_[si_].second - off_;
+            size_t width = high ? 2 : 1;
+            size_t take = std::min(remaining, avail / width);
+            if (take == 0) {
+                // A code unit straddles the boundary — forbidden by the spec;
+                // drop the stray byte rather than derail the whole table.
+                off_ = segs_[si_].second;
+                entered_mid_chars_ = true;
+                continue;
+            }
+            const char* p = segs_[si_].first + off_;
+            if (high) {
+                out += util::utf16le_to_utf8(p, take * 2);
+            } else {
+                for (size_t i = 0; i < take; ++i)
+                    util::append_cp1252(out, static_cast<uint8_t>(p[i]));
+            }
+            off_ += take * width;
+            remaining -= take;
+            if (remaining > 0 && off_ == segs_[si_].second)
+                entered_mid_chars_ = true;
+        }
+
+        skip(size_t(run_count) * 4 + ext_size);
+        return out;
     }
 
-    std::string result;
-    size_t bytes_needed = high_byte ? (size_t(cch) * 2) : size_t(cch);
+private:
+    std::vector<std::pair<const char*, size_t>> segs_;
+    size_t si_ = 0, off_ = 0;
+    bool entered_mid_chars_ = false;
+    bool failed_ = false;
 
-    if (pos + bytes_needed > len) {
-        bytes_needed = len - pos;
+    // Advance past exhausted segments; false at end of data.
+    bool norm() {
+        while (si_ < segs_.size() && off_ == segs_[si_].second) {
+            si_++;
+            off_ = 0;
+        }
+        return si_ < segs_.size();
     }
 
-    if (high_byte) {
-        result = util::utf16le_to_utf8(data + pos, bytes_needed);
-    } else {
-        for (size_t i = 0; i < bytes_needed; ++i) {
-            uint8_t ch = static_cast<uint8_t>(data[pos + i]);
-            util::append_cp1252(result, ch);
+    // Plain byte reads that cross segment boundaries transparently (headers,
+    // rich runs, ext data — no flags byte is inserted for these).
+    bool u8(uint8_t& v) {
+        if (!norm()) return false;
+        v = static_cast<uint8_t>(segs_[si_].first[off_++]);
+        return true;
+    }
+    bool u16(uint16_t& v) {
+        uint8_t a, b;
+        if (!u8(a) || !u8(b)) return false;
+        v = static_cast<uint16_t>(a | (b << 8));
+        return true;
+    }
+    bool u32(uint32_t& v) {
+        uint16_t a, b;
+        if (!u16(a) || !u16(b)) return false;
+        v = static_cast<uint32_t>(a) | (static_cast<uint32_t>(b) << 16);
+        return true;
+    }
+    void skip(size_t n) {
+        while (n > 0 && norm()) {
+            size_t step = std::min(n, segs_[si_].second - off_);
+            off_ += step;
+            n -= step;
         }
     }
-    pos += bytes_needed;
+};
 
-    // Skip rich text runs.
-    size_t rich_bytes = size_t(run_count) * 4;
-    if (pos + rich_bytes <= len) pos += rich_bytes;
-    else pos = len;
-
-    // Skip ext data.
-    if (pos + ext_size <= len) pos += ext_size;
-    else pos = len;
-
-    return result;
-}
-
-// ---------- SST parsing ------------------------------------------------------
+} // namespace
 
 void XlsParser::parse_sst(const char* data, size_t len,
                            const std::vector<std::vector<char>>& continues) {
@@ -312,16 +378,26 @@ void XlsParser::parse_sst(const char* data, size_t len,
 
     uint32_t unique_count = util::read_u32_le(data + 4);
 
-    // Concatenate the SST record data with all CONTINUE records to form one buffer.
-    std::vector<char> buf(data + 8, data + len);
+    // The SST body and each CONTINUE payload stay separate segments so the
+    // reader can apply the record-boundary rules above.
+    std::vector<std::pair<const char*, size_t>> segs;
+    segs.reserve(continues.size() + 1);
+    segs.push_back({data + 8, len - 8});
+    uint64_t total = len - 8;
     for (const auto& cont : continues) {
-        buf.insert(buf.end(), cont.begin(), cont.end());
+        segs.push_back({cont.data(), cont.size()});
+        total += cont.size();
     }
 
-    size_t pos = 0;
-    sst_.reserve(unique_count);
-    for (uint32_t i = 0; i < unique_count && pos < buf.size(); ++i) {
-        sst_.push_back(parse_xl_string(buf.data(), buf.size(), pos));
+    // Bound the reserve by what the bytes can physically hold (3-byte header
+    // minimum per string) so a lying count cannot balloon the allocation.
+    sst_.reserve(static_cast<size_t>(
+        std::min<uint64_t>(unique_count, total / 3 + 1)));
+
+    SstCursor cur(std::move(segs));
+    for (uint32_t i = 0; i < unique_count && !cur.at_end(); ++i) {
+        sst_.push_back(cur.read_string());
+        if (cur.failed()) break;
     }
 }
 
