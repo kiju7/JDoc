@@ -67,6 +67,14 @@ struct PdfLineSegment {
     bool is_vertical()   const { return std::abs(x1 - x0) < 2.0f; }
 };
 
+// Axis-aligned filled rectangle (cell shading, highlight bands). Kept apart
+// from PdfLineSegment: shading edges are weaker evidence than drawn rules and
+// must not enter the line pools directly.
+struct PdfFillRect {
+    float x0, y0, x1, y1;      // normalized: x0<x1, y0<y1
+    float r, g, b;
+};
+
 struct ImagePlacement {
     int xobj_ref = -1;
     std::string xobj_name;
@@ -85,6 +93,7 @@ struct RenderPath {
 struct ContentParseResult {
     std::vector<TextChar> chars;
     std::vector<PdfLineSegment> segments;
+    std::vector<PdfFillRect> fill_rects; // sizable pure-fill rects (cell shading)
     std::vector<ImagePlacement> images;
     std::vector<RenderPath> paths; // for vector rendering
 };

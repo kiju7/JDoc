@@ -191,6 +191,10 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
 
             result.all_tables[p] = detect_tables(parse_result.segments, cache,
                 page_w, page_h);
+            auto shade_tables = detect_shading_tables(parse_result.fill_rects,
+                cache, result.all_tables[p], page_w, page_h);
+            for (auto& st : shade_tables)
+                result.all_tables[p].push_back(std::move(st));
             auto text_tables = detect_text_tables(cache, result.all_tables[p],
                 page_w, page_h);
             for (auto& tt : text_tables)
