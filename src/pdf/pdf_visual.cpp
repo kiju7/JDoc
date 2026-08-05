@@ -985,7 +985,7 @@ ImageData render_page_composite(PdfDoc& doc, const PdfObj& page_obj,
                                  int page_num, double page_w, double page_h,
                                  const std::string& output_dir) {
     constexpr double kMinDPI = 150.0;
-    constexpr double kMaxDPI = 600.0;
+    constexpr double kMaxDPI = 300.0;
     constexpr double kBase = 72.0;
     // Composite output was fixed at 150 DPI, which silently downsampled
     // high-resolution scans (drawings especially). Raise the render DPI to
