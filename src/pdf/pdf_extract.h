@@ -76,6 +76,11 @@ struct ExtractResult {
 std::vector<TableData> detect_tables(const std::vector<PdfLineSegment>& lines,
                                      const PageCharCache& cache,
                                      double page_width, double page_height);
+std::vector<TableData> detect_shading_tables(
+    const std::vector<PdfFillRect>& fill_rects,
+    const PageCharCache& cache,
+    const std::vector<TableData>& existing_tables,
+    double page_width, double page_height);
 std::vector<TableData> detect_text_tables(const PageCharCache& cache,
                                           const std::vector<TableData>& existing_tables,
                                           double page_width, double page_height);
