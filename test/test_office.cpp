@@ -775,6 +775,136 @@ void test_xlsx_fixes() {
     TEST_END
 }
 
+// ── XLSX streaming (SAX) path ────────────────────────────────
+
+// A workbook exercising every construct the streaming scanner must replicate
+// from the DOM path: shared strings (entities, rich runs, CRLF), inlineStr,
+// bold styles, date formats, comments (incl. one on a cell with no <c>),
+// row gaps, and a <dimension> extent.
+static std::string make_streaming_xlsx() {
+    std::string sst =
+        "<?xml version=\"1.0\"?><sst xmlns=\"http://schemas.openxmlformats.org/"
+        "spreadsheetml/2006/main\" count=\"4\" uniqueCount=\"4\">"
+        "<si><t>plain &amp; escaped &lt;x&gt;</t></si>"
+        "<si><r><t>rich</t></r><r><t xml:space=\"preserve\"> runs</t></r></si>"
+        "<si><t>line1\r\nline2</t></si>"
+        "<si><t/></si></sst>";
+    std::string styles =
+        "<?xml version=\"1.0\"?><styleSheet xmlns=\"http://schemas.openxmlformats.org/"
+        "spreadsheetml/2006/main\">"
+        "<fonts count=\"2\"><font/><font><b/></font></fonts>"
+        "<cellXfs count=\"3\"><xf numFmtId=\"0\" fontId=\"0\"/>"
+        "<xf numFmtId=\"0\" fontId=\"1\"/>"
+        "<xf numFmtId=\"14\" fontId=\"0\"/></cellXfs></styleSheet>";
+    std::string sheet =
+        "<row r=\"1\"><c r=\"A1\" t=\"s\"><v>0</v></c>"
+        "<c r=\"B1\" t=\"s\" s=\"1\"><v>1</v></c>"
+        "<c r=\"C1\" t=\"s\"><v>2</v></c></row>"
+        // gap: rows 2-4 empty
+        "<row r=\"5\"><c r=\"B5\" s=\"2\"><v>45108</v></c>"
+        "<c r=\"D5\" t=\"inlineStr\"><is><t>inline&#65;</t></is></c>"
+        "<c r=\"E5\" t=\"b\"><v>1</v></c></row>";
+    std::string sheet_rels =
+        "<?xml version=\"1.0\"?><Relationships xmlns=\"http://schemas.openxmlformats.org/"
+        "package/2006/relationships\"><Relationship Id=\"rIdC\" Type=\""
+        "http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments\""
+        " Target=\"../comments1.xml\"/></Relationships>";
+    std::string comments =
+        "<?xml version=\"1.0\"?><comments xmlns=\"http://schemas.openxmlformats.org/"
+        "spreadsheetml/2006/main\"><authors><author>R</author></authors>"
+        "<commentList><comment ref=\"A1\" authorId=\"0\"><text><t>on cell</t></text>"
+        "</comment><comment ref=\"C7\" authorId=\"0\"><text><t>past end</t></text>"
+        "</comment></commentList></comments>";
+    // dimension present; sheet body wrapped manually to include it
+    std::string sheet_xml =
+        "<?xml version=\"1.0\"?><worksheet xmlns=\"http://schemas.openxmlformats.org/"
+        "spreadsheetml/2006/main\"><dimension ref=\"A1:E5\"/><sheetData>" + sheet +
+        "</sheetData></worksheet>";
+    std::vector<std::pair<std::string, std::string>> entries = {
+        {"[Content_Types].xml",
+         "<?xml version=\"1.0\"?><Types xmlns=\"http://schemas.openxmlformats.org/"
+         "package/2006/content-types\"><Default Extension=\"xml\" "
+         "ContentType=\"application/xml\"/></Types>"},
+        {"xl/workbook.xml",
+         "<?xml version=\"1.0\"?><workbook xmlns=\"http://schemas.openxmlformats.org/"
+         "spreadsheetml/2006/main\" xmlns:r=\"http://schemas.openxmlformats.org/"
+         "officeDocument/2006/relationships\"><sheets>"
+         "<sheet name=\"Sheet1\" sheetId=\"1\" r:id=\"rId1\"/></sheets></workbook>"},
+        {"xl/_rels/workbook.xml.rels",
+         "<?xml version=\"1.0\"?><Relationships xmlns=\"http://schemas.openxmlformats.org/"
+         "package/2006/relationships\"><Relationship Id=\"rId1\" Type=\""
+         "http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\""
+         " Target=\"worksheets/sheet1.xml\"/></Relationships>"},
+        {"xl/sharedStrings.xml", sst},
+        {"xl/styles.xml", styles},
+        {"xl/worksheets/sheet1.xml", sheet_xml},
+        {"xl/worksheets/_rels/sheet1.xml.rels", sheet_rels},
+        {"xl/comments1.xml", comments},
+    };
+    return make_zip(entries);
+}
+
+void test_xlsx_streaming() {
+    std::cerr << "\nXLSX streaming path:\n";
+
+    std::string book = make_streaming_xlsx();
+
+    TEST(streamed_output_matches_dom)
+        unsetenv("JDOC_XLSX_STREAM_THRESHOLD");
+        auto dom = convert_xlsx(book);
+        setenv("JDOC_XLSX_STREAM_THRESHOLD", "0", 1);
+        auto sax = convert_xlsx(book);
+        unsetenv("JDOC_XLSX_STREAM_THRESHOLD");
+        ASSERT(!dom.empty());
+        ASSERT(dom == sax);
+    TEST_END
+
+    TEST(streamed_content_correct)
+        setenv("JDOC_XLSX_STREAM_THRESHOLD", "0", 1);
+        auto md = convert_xlsx(book);
+        unsetenv("JDOC_XLSX_STREAM_THRESHOLD");
+        // shared string with entities + merged comment
+        ASSERT(md.find("plain & escaped <x> [on cell]") != std::string::npos);
+        // bold shared string
+        ASSERT(md.find("**rich runs**") != std::string::npos);
+        // CRLF normalized then sanitized to a space
+        ASSERT(md.find("line1 line2") != std::string::npos);
+        // date format applied to numeric cell (45108 = 2023-07-01)
+        ASSERT(md.find("2023-07-01") != std::string::npos);
+        // inlineStr with numeric char ref, boolean
+        ASSERT(md.find("inlineA") != std::string::npos);
+        ASSERT(md.find("TRUE") != std::string::npos);
+        // comment anchored past the last row appears
+        ASSERT(md.find("[past end]") != std::string::npos);
+        ASSERT(md.find("Empty sheet") == std::string::npos);
+    TEST_END
+
+    TEST(streamed_empty_sheet)
+        setenv("JDOC_XLSX_STREAM_THRESHOLD", "0", 1);
+        auto md = convert_xlsx(make_xlsx("worksheets/sheet1.xml", ""));
+        unsetenv("JDOC_XLSX_STREAM_THRESHOLD");
+        ASSERT(md.find("Empty sheet") != std::string::npos);
+    TEST_END
+}
+
+// ── XLS SST CONTINUE-boundary decoding ───────────────────────
+
+void test_xls_sst_continue() {
+    std::cerr << "\nXLS SST continuation:\n";
+
+    // 1000 unique strings — the SST spans multiple CONTINUE records, and a
+    // string straddles nearly every boundary. Flat concatenation used to feed
+    // the continuation's option-flags byte into the character stream,
+    // corrupting or dropping everything after the first split (~450 strings).
+    TEST(sst_survives_continue_boundaries)
+        auto md = jdoc::office_to_markdown("test/fixtures/xls/sst_continue.xls");
+        ASSERT(count_occurrences(md, "unique_string_number_") == 1000);
+        ASSERT(md.find("unique_string_number_0000@example.com") != std::string::npos);
+        ASSERT(md.find("unique_string_number_0446@example.com") != std::string::npos);
+        ASSERT(md.find("unique_string_number_0999@example.com") != std::string::npos);
+    TEST_END
+}
+
 // ── XLSB sparse-cell storage ────────────────────────────────
 
 static void put_xlsb_varint(std::string& out, uint32_t value) {
@@ -966,6 +1096,8 @@ int main() {
     test_pptx_shared_media();
     test_docx_header_footer();
     test_xlsx_fixes();
+    test_xlsx_streaming();
+    test_xls_sst_continue();
     test_xlsb_sparse_cells();
     test_html_charset();
     test_pptx_linebreak();

@@ -41,6 +41,23 @@ std::vector<uint8_t> get_page_content(PdfDoc& doc, const PdfObj& page_obj) {
     return {};
 }
 
+// Base CTM that maps the page's unrotated coordinate space (origin shifted
+// to the MediaBox corner) into viewing coordinates. Landscape drawings are
+// routinely stored as portrait pages with /Rotate 90; without this, every
+// glyph on such a page looks vertical and is dropped by the rotated-text
+// filter, and rendered composites come out sideways.
+static void page_view_ctm(int rotate, double w, double h,
+                          double llx, double lly, double out[6]) {
+    const double T[6] = {1, 0, 0, 1, -llx, -lly};
+    const double R90[6]  = {0, -1, 1, 0, 0, w};
+    const double R180[6] = {-1, 0, 0, -1, w, h};
+    const double R270[6] = {0, 1, -1, 0, h, 0};
+    const double RID[6]  = {1, 0, 0, 1, 0, 0};
+    const double* R = rotate == 90 ? R90 : rotate == 180 ? R180 :
+                      rotate == 270 ? R270 : RID;
+    mat_multiply(out, T, R);
+}
+
 // Extract from an in-memory buffer; pdf_path is used for error messages only.
 static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
                                         const std::string& pdf_path,
@@ -140,13 +157,50 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
         if (p < 0 || p >= tp) continue;
         auto& page_obj = page_objs[p];
 
-        // Get page dimensions from MediaBox
-        auto mediabox = doc.resolve(page_obj.get("MediaBox"));
+        // Page geometry: MediaBox and /Rotate are inheritable, so climb the
+        // page tree for both (CAD exports often keep them on the Pages node).
         double page_w = 612, page_h = 792; // default letter
-        if (mediabox.is_arr() && mediabox.arr.size() >= 4) {
-            page_w = mediabox.arr[2].as_num() - mediabox.arr[0].as_num();
-            page_h = mediabox.arr[3].as_num() - mediabox.arr[1].as_num();
+        double mb_llx = 0, mb_lly = 0;
+        int page_rotate = 0;
+        {
+            bool have_box = false, have_rot = false;
+            PdfObj node = page_obj;
+            for (int hop = 0; hop < 64 && (!have_box || !have_rot); hop++) {
+                if (!have_box) {
+                    auto mediabox = doc.resolve(node.get("MediaBox"));
+                    if (mediabox.is_arr() && mediabox.arr.size() >= 4) {
+                        mb_llx = mediabox.arr[0].as_num();
+                        mb_lly = mediabox.arr[1].as_num();
+                        page_w = mediabox.arr[2].as_num() - mb_llx;
+                        page_h = mediabox.arr[3].as_num() - mb_lly;
+                        have_box = true;
+                    }
+                }
+                if (!have_rot) {
+                    auto rot = doc.resolve(node.get("Rotate"));
+                    if (rot.is_num()) {
+                        page_rotate = ((rot.as_int() % 360) + 360) % 360;
+                        page_rotate -= page_rotate % 90;
+                        have_rot = true;
+                    }
+                }
+                auto parent = doc.resolve(node.get("Parent"));
+                if (!parent.is_dict()) break;
+                node = std::move(parent);
+            }
         }
+
+        // Normalize into viewing coordinates so downstream consumers (text
+        // filter, tables, composites, image placement) never see the raw
+        // rotated space. Identity pages keep the historical fast path.
+        double base_ctm[6];
+        const double* initial_ctm = nullptr;
+        if (page_rotate != 0 || mb_llx != 0 || mb_lly != 0) {
+            page_view_ctm(page_rotate, page_w, page_h, mb_llx, mb_lly, base_ctm);
+            initial_ctm = base_ctm;
+        }
+        if (page_rotate == 90 || page_rotate == 270)
+            std::swap(page_w, page_h);
         result.page_widths[p] = page_w;
         result.page_heights[p] = page_h;
 
@@ -178,12 +232,13 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
         bool need_graphics = need_tables || opts.images;
 
         auto parse_result = parse_content_stream(doc, content_data, resources, page_h,
-                                                  &font_cache, !need_graphics);
+                                                  &font_cache, !need_graphics,
+                                                  initial_ctm);
 
         result.all_lines[p] = chars_to_lines(parse_result.chars, &result.col_boundaries[p]);
 
         // Extract annotations (text notes, links)
-        result.all_annots[p] = extract_annotations(doc, page_obj, page_h);
+        result.all_annots[p] = extract_annotations(doc, page_obj, page_h, initial_ctm);
 
         if (need_tables) {
             PageCharCache cache;
@@ -191,8 +246,12 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
 
             result.all_tables[p] = detect_tables(parse_result.segments, cache,
                 page_w, page_h);
+            auto shade_tables = detect_shading_tables(parse_result.fill_rects,
+                cache, result.all_tables[p], page_w, page_h);
+            for (auto& st : shade_tables)
+                result.all_tables[p].push_back(std::move(st));
             auto text_tables = detect_text_tables(cache, result.all_tables[p],
-                page_w, page_h);
+                page_w, page_h, result.col_boundaries[p]);
             for (auto& tt : text_tables)
                 result.all_tables[p].push_back(std::move(tt));
         }

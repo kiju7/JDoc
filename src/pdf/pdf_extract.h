@@ -76,9 +76,15 @@ struct ExtractResult {
 std::vector<TableData> detect_tables(const std::vector<PdfLineSegment>& lines,
                                      const PageCharCache& cache,
                                      double page_width, double page_height);
+std::vector<TableData> detect_shading_tables(
+    const std::vector<PdfFillRect>& fill_rects,
+    const PageCharCache& cache,
+    const std::vector<TableData>& existing_tables,
+    double page_width, double page_height);
 std::vector<TableData> detect_text_tables(const PageCharCache& cache,
                                           const std::vector<TableData>& existing_tables,
-                                          double page_width, double page_height);
+                                          double page_width, double page_height,
+                                          double col_boundary = 0.0);
 std::string format_table(const TableData& table);
 std::vector<ExtractedImage> extract_page_images(PdfDoc& doc, const PdfObj& page_obj,
                                                 const ContentParseResult& parse_result,
@@ -91,7 +97,8 @@ ImageData render_page_composite(PdfDoc& doc, const PdfObj& page_obj,
                                 const std::string& output_dir);
 void collect_bookmarks(PdfDoc& doc, const PdfObj& node, int depth,
                        std::vector<BookmarkEntry>& out);
-std::vector<AnnotEntry> extract_annotations(PdfDoc& doc, const PdfObj& page_obj, double page_h);
+std::vector<AnnotEntry> extract_annotations(PdfDoc& doc, const PdfObj& page_obj, double page_h,
+                                            const double* view_ctm = nullptr);
 std::string result_to_markdown(ExtractResult& r, const ConvertOptions& opts);
 std::vector<PageChunk> result_to_chunks(ExtractResult& r, const ConvertOptions& opts);
 void stream_result_chunks(ExtractResult& r, const ConvertOptions& opts,

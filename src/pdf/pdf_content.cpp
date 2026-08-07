@@ -221,6 +221,77 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
         return false;
     };
 
+    // Pure-fill (f/F/f*) rect handling: thin rects become rules, sizable
+    // rects are cell shading recorded as PdfFillRect — their edges stay OUT
+    // of the segment pool (a shading edge is not a drawn rule; the table
+    // pass weighs it separately). Word emits several `re` subpaths under a
+    // single fill, so the path is decomposed subpath by subpath; any
+    // non-rect subpath bails out to the generic edge flush.
+    auto capture_fill_rect = [&]() -> bool {
+        struct Rect { double x0, y0, x1, y1; };
+        std::vector<Rect> rs;
+        size_t i = 0, n = current_path.size();
+        while (i < n) {
+            if (current_path[i].type != PathPoint::MOVE) return false;
+            double px[5], py[5];
+            px[0] = current_path[i].x;
+            py[0] = current_path[i].y;
+            size_t j = i + 1;
+            int pts = 1;
+            while (j < n && current_path[j].type == PathPoint::LINE && pts < 5) {
+                px[pts] = current_path[j].x;
+                py[pts] = current_path[j].y;
+                pts++;
+                j++;
+            }
+            if (pts == 5) {
+                // explicit return to the start corner
+                if (std::abs(px[4] - px[0]) >= 2 || std::abs(py[4] - py[0]) >= 2)
+                    return false;
+                pts = 4;
+            }
+            if (pts != 4) return false;
+            if (j < n && current_path[j].type == PathPoint::CLOSE) j++;
+            double min_x = px[0], max_x = px[0], min_y = py[0], max_y = py[0];
+            for (int k = 1; k < 4; k++) {
+                min_x = std::min(min_x, px[k]);
+                max_x = std::max(max_x, px[k]);
+                min_y = std::min(min_y, py[k]);
+                max_y = std::max(max_y, py[k]);
+            }
+            for (int k = 0; k < 4; k++) {
+                bool on_x = std::abs(px[k] - min_x) < 2 || std::abs(px[k] - max_x) < 2;
+                bool on_y = std::abs(py[k] - min_y) < 2 || std::abs(py[k] - max_y) < 2;
+                if (!on_x || !on_y) return false;   // not axis-aligned
+            }
+            rs.push_back({min_x, min_y, max_x, max_y});
+            i = j;
+        }
+        if (rs.empty()) return false;
+        for (auto& r : rs) {
+            double w = r.x1 - r.x0, h = r.y1 - r.y0;
+            if (h < 3.0 && w >= 20.0) {
+                float cy = static_cast<float>((r.y0 + r.y1) / 2.0);
+                result.segments.push_back({static_cast<float>(r.x0), cy,
+                                           static_cast<float>(r.x1), cy});
+            } else if (w < 3.0 && h >= 5.0) {
+                float cx = static_cast<float>((r.x0 + r.x1) / 2.0);
+                result.segments.push_back({cx, static_cast<float>(r.y0),
+                                           cx, static_cast<float>(r.y1)});
+            } else if (w >= 15.0 && h >= 8.0) {
+                result.fill_rects.push_back({static_cast<float>(r.x0),
+                                             static_cast<float>(r.y0),
+                                             static_cast<float>(r.x1),
+                                             static_cast<float>(r.y1),
+                                             static_cast<float>(gs.fill_r),
+                                             static_cast<float>(gs.fill_g),
+                                             static_cast<float>(gs.fill_b)});
+            }
+            // else: tiny rect (border joints, specks) — swallow
+        }
+        return true;
+    };
+
     // Show one text string: decode codes, map to Unicode, advance the text
     // matrix and emit a TextChar per rendered glyph. Shared by Tj/'/" and by
     // each string element of TJ (TJ handles its numeric adjustments itself), so
@@ -642,7 +713,7 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
                   result.paths.push_back(std::move(rp)); }
                 current_path.clear();
             } else if (op.is("f") || op.is("F") || op.is("f*")) {
-                if (!filter_small_rect()) flush_path_segments();
+                if (!capture_fill_rect()) flush_path_segments();
                 { RenderPath rp; rp.points = std::move(current_path);
                   rp.fill_r = gs.fill_r; rp.fill_g = gs.fill_g; rp.fill_b = gs.fill_b;
                   rp.stroke_r = gs.stroke_r; rp.stroke_g = gs.stroke_g; rp.stroke_b = gs.stroke_b;
@@ -704,6 +775,9 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
                                 result.segments.insert(result.segments.end(),
                                     std::make_move_iterator(sub.segments.begin()),
                                     std::make_move_iterator(sub.segments.end()));
+                                result.fill_rects.insert(result.fill_rects.end(),
+                                    std::make_move_iterator(sub.fill_rects.begin()),
+                                    std::make_move_iterator(sub.fill_rects.end()));
                                 result.images.insert(result.images.end(),
                                     std::make_move_iterator(sub.images.begin()),
                                     std::make_move_iterator(sub.images.end()));

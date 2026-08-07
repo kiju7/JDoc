@@ -67,6 +67,14 @@ struct PdfLineSegment {
     bool is_vertical()   const { return std::abs(x1 - x0) < 2.0f; }
 };
 
+// Axis-aligned filled rectangle (cell shading, highlight bands). Kept apart
+// from PdfLineSegment: shading edges are weaker evidence than drawn rules and
+// must not enter the line pools directly.
+struct PdfFillRect {
+    float x0, y0, x1, y1;      // normalized: x0<x1, y0<y1
+    float r, g, b;
+};
+
 struct ImagePlacement {
     int xobj_ref = -1;
     std::string xobj_name;
@@ -85,6 +93,7 @@ struct RenderPath {
 struct ContentParseResult {
     std::vector<TextChar> chars;
     std::vector<PdfLineSegment> segments;
+    std::vector<PdfFillRect> fill_rects; // sizable pure-fill rects (cell shading)
     std::vector<ImagePlacement> images;
     std::vector<RenderPath> paths; // for vector rendering
 };
@@ -164,7 +173,16 @@ struct PageCharCache {
                 if (y_tol < 2.0) y_tol = 2.0;
                 bool new_row = std::abs(ch.y - prev_y) > y_tol;
                 if (new_row) {
-                    if (!text.empty() && text.back() != ' ') text += ' ';
+                    // A number wrapped across cell lines ("991225-" /
+                    // "1234567") continues without a space; only the
+                    // digit-hyphen-digit shape is joined, so hyphenated
+                    // words keep their space.
+                    bool digit_wrap = text.size() >= 2 && text.back() == '-' &&
+                                      text[text.size() - 2] >= '0' &&
+                                      text[text.size() - 2] <= '9' &&
+                                      ch.unicode >= '0' && ch.unicode <= '9';
+                    if (!digit_wrap && !text.empty() && text.back() != ' ')
+                        text += ' ';
                 } else {
                     // Insert a space when the positional gap exceeds the
                     // word-spacing threshold used by chars_to_lines.

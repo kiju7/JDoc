@@ -97,7 +97,8 @@ void collect_bookmarks(PdfDoc& doc, const PdfObj& node, int depth,
 // ── Annotation Extraction ────────────────────────────────
 
 
-std::vector<AnnotEntry> extract_annotations(PdfDoc& doc, const PdfObj& page_obj, double page_h) {
+std::vector<AnnotEntry> extract_annotations(PdfDoc& doc, const PdfObj& page_obj, double page_h,
+                                            const double* view_ctm) {
     std::vector<AnnotEntry> result;
 
     auto annots_ref = page_obj.get("Annots");
@@ -116,10 +117,28 @@ std::vector<AnnotEntry> extract_annotations(PdfDoc& doc, const PdfObj& page_obj,
         auto& subtype = annot.get("Subtype");
         if (subtype.is_name()) entry.subtype = subtype.str_val;
 
-        // Get position from Rect
+        // Get position from Rect (top y in viewing coordinates)
         auto& rect = annot.get("Rect");
-        if (rect.is_arr() && rect.arr.size() >= 4)
-            entry.y = rect.arr[3].as_num(); // top y
+        if (rect.is_arr() && rect.arr.size() >= 4) {
+            if (view_ctm) {
+                // Rotated/offset page: the visual top is the max transformed y
+                // over the rect corners.
+                double x0 = rect.arr[0].as_num(), y0 = rect.arr[1].as_num();
+                double x1 = rect.arr[2].as_num(), y1 = rect.arr[3].as_num();
+                double top = -1e18;
+                const double cx[4] = {x0, x1, x0, x1};
+                const double cy[4] = {y0, y0, y1, y1};
+                for (int i = 0; i < 4; i++) {
+                    double vx, vy;
+                    transform_point(view_ctm, cx[i], cy[i], vx, vy);
+                    (void)vx;
+                    if (vy > top) top = vy;
+                }
+                entry.y = top;
+            } else {
+                entry.y = rect.arr[3].as_num(); // top y
+            }
+        }
 
         // Extract text content (Contents key)
         auto& contents = annot.get("Contents");

@@ -66,6 +66,10 @@ public:
     // Check if entry exists
     bool has_entry(const std::string& name) const;
 
+    // Look up an entry by exact name (nullptr if absent) — lets callers
+    // inspect sizes/method before deciding how to read it.
+    const Entry* find_entry(const std::string& name) const;
+
 private:
     std::unique_ptr<DataSource> src_;
     bool open_ = false;
