@@ -55,7 +55,7 @@ from _jdoc import (
     format_name,
 )
 
-__version__ = "1.2.2"
+from _jdoc import __version__
 __all__ = [
     "OutputFormat",
     "DocFormat",

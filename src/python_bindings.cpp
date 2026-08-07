@@ -119,6 +119,7 @@ private:
 
 PYBIND11_MODULE(_jdoc, m) {
     m.doc() = "JDoc - Universal document converter (PDF, Office, HTML, HWP/HWPX)";
+    m.attr("__version__") = JDOC_VERSION;
 
     // OutputFormat enum
     py::enum_<jdoc::OutputFormat>(m, "OutputFormat")
