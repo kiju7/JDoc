@@ -337,6 +337,7 @@ if(BUILD_PYTHON)
     pybind11_add_module(_jdoc src/python_bindings.cpp)
     target_link_libraries(_jdoc PRIVATE jdoc_lib)
     target_include_directories(_jdoc PRIVATE include src)
+    target_compile_definitions(_jdoc PRIVATE JDOC_VERSION="${PROJECT_VERSION}")
     if(APPLE)
         set_target_properties(_jdoc PROPERTIES
             INSTALL_RPATH "@loader_path"

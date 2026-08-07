@@ -1,6 +1,7 @@
 """Build script for jdoc Python extension module."""
 
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -8,6 +9,13 @@ from pathlib import Path
 
 from setuptools import setup, Extension
 from setuptools.command.build_ext import build_ext
+
+# Single source of truth for the version is CMakeLists.txt.
+VERSION = re.search(
+    r"^project\(jdoc VERSION (\d+\.\d+\.\d+)",
+    (Path(__file__).parent / "CMakeLists.txt").read_text(),
+    re.MULTILINE,
+).group(1)
 
 
 class CMakeExtension(Extension):
@@ -49,6 +57,7 @@ class CMakeBuild(build_ext):
 
 
 setup(
+    version=VERSION,
     ext_modules=[CMakeExtension("_jdoc")],
     cmdclass={"build_ext": CMakeBuild},
     package_dir={"": "python"},
