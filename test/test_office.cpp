@@ -8,6 +8,7 @@
 #include <iostream>
 #include <cassert>
 #include <fstream>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <set>
@@ -31,6 +32,14 @@ static int tests_failed = 0;
 
 #define ASSERT(cond) \
     if (!(cond)) throw std::runtime_error("Assertion failed: " #cond);
+
+#ifdef _WIN32
+static void set_env(const char* name, const char* value) { _putenv_s(name, value); }
+static void unset_env(const char* name) { _putenv_s(name, ""); }
+#else
+static void set_env(const char* name, const char* value) { setenv(name, value, 1); }
+static void unset_env(const char* name) { unsetenv(name); }
+#endif
 
 // ── Tests ───────────────────────────────────────────────────
 
@@ -850,19 +859,19 @@ void test_xlsx_streaming() {
     std::string book = make_streaming_xlsx();
 
     TEST(streamed_output_matches_dom)
-        unsetenv("JDOC_XLSX_STREAM_THRESHOLD");
+        unset_env("JDOC_XLSX_STREAM_THRESHOLD");
         auto dom = convert_xlsx(book);
-        setenv("JDOC_XLSX_STREAM_THRESHOLD", "0", 1);
+        set_env("JDOC_XLSX_STREAM_THRESHOLD", "0");
         auto sax = convert_xlsx(book);
-        unsetenv("JDOC_XLSX_STREAM_THRESHOLD");
+        unset_env("JDOC_XLSX_STREAM_THRESHOLD");
         ASSERT(!dom.empty());
         ASSERT(dom == sax);
     TEST_END
 
     TEST(streamed_content_correct)
-        setenv("JDOC_XLSX_STREAM_THRESHOLD", "0", 1);
+        set_env("JDOC_XLSX_STREAM_THRESHOLD", "0");
         auto md = convert_xlsx(book);
-        unsetenv("JDOC_XLSX_STREAM_THRESHOLD");
+        unset_env("JDOC_XLSX_STREAM_THRESHOLD");
         // shared string with entities + merged comment
         ASSERT(md.find("plain & escaped <x> [on cell]") != std::string::npos);
         // bold shared string
@@ -880,9 +889,9 @@ void test_xlsx_streaming() {
     TEST_END
 
     TEST(streamed_empty_sheet)
-        setenv("JDOC_XLSX_STREAM_THRESHOLD", "0", 1);
+        set_env("JDOC_XLSX_STREAM_THRESHOLD", "0");
         auto md = convert_xlsx(make_xlsx("worksheets/sheet1.xml", ""));
-        unsetenv("JDOC_XLSX_STREAM_THRESHOLD");
+        unset_env("JDOC_XLSX_STREAM_THRESHOLD");
         ASSERT(md.find("Empty sheet") != std::string::npos);
     TEST_END
 }
