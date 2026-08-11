@@ -471,6 +471,15 @@ struct PdfFont {
     double missing_width = 0;    // /MissingWidth from FontDescriptor
     int cmap_code_bytes = 0;     // 0=auto, 1 or 2 from codespacerange
 
+    // Type3 fonts whose codes map to nothing readable (no ToUnicode, private
+    // glyph names — DRM-scrambled "secure documents"): text extraction would
+    // emit noise, but the glyph programs still draw the real shapes. The
+    // parser expands CharProcs into vector paths instead of recording chars.
+    bool opaque_type3 = false;
+    double font_matrix[6] = {0.001, 0, 0, 0.001, 0, 0}; // Type3 glyph→text space
+    PdfObj charprocs;    // resolved /CharProcs dict (glyph name → stream)
+    PdfObj t3_resources; // resolved Type3 /Resources (may be none)
+
     double get_width(uint32_t code) const {
         auto it = widths.find(code);
         if (it != widths.end()) return it->second;

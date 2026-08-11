@@ -1155,7 +1155,11 @@ PdfFont load_font(PdfDoc& doc, const PdfObj& font_ref) {
         if (fm.is_arr() && fm.arr.size() >= 4) {
             double a = fm.arr[0].as_num();
             if (a > 0) font.glyph_space_scale = a;
+            for (size_t i = 0; i < 6 && i < fm.arr.size(); i++)
+                font.font_matrix[i] = fm.arr[i].as_num();
         }
+        font.charprocs = doc.resolve(fobj.get("CharProcs"));
+        font.t3_resources = doc.resolve(fobj.get("Resources"));
     }
 
     if (font_type == "Type0") {
@@ -1251,6 +1255,16 @@ PdfFont load_font(PdfDoc& doc, const PdfObj& font_ref) {
     // Default encoding if nothing set
     if (!font.encoding_table && font.to_unicode.empty() && !font.is_identity) {
         font.encoding_table = kWinAnsi;
+    }
+
+    // A Type3 font with no ToUnicode whose glyph names carry no meaning
+    // (subset scrambles like /HFT191) cannot yield readable text; flag it so
+    // the content parser draws its CharProcs instead of emitting noise.
+    if (font.is_type3 && font.to_unicode.empty() && font.charprocs.is_dict()) {
+        bool any_named_unicode = false;
+        for (auto& [code, gname] : font.differences)
+            if (glyph_name_to_unicode(gname)) { any_named_unicode = true; break; }
+        font.opaque_type3 = !any_named_unicode;
     }
 
     return font;
