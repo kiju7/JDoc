@@ -1,7 +1,9 @@
 #pragma once
 // pdf_content.h — internal: content-stream parse vocabulary and line layout.
 #include "pdf_core.h"
+#include <array>
 #include <cstring>
+#include <memory>
 #include <unordered_map>
 #include <vector>
 
@@ -14,6 +16,19 @@ struct TextChar {
     uint32_t unicode;
     bool is_bold;
     bool is_italic;
+};
+
+struct PathPoint {
+    double x, y;
+    enum Type { MOVE, LINE, CURVE, CLOSE } type;
+    double cx1, cy1, cx2, cy2; // for CURVE
+};
+
+// Semantic of the colorspace selected by cs/CS, driving sc/scn interpretation.
+struct CsInfo {
+    enum Kind { NUMERIC, CMYK4, TINT, INDEXED } kind = NUMERIC;
+    // TINT: 256-entry tint→RGB ramp; INDEXED: palette RGB entries
+    std::vector<std::array<uint8_t, 3>> lut;
 };
 
 struct GfxState {
@@ -32,6 +47,12 @@ struct GfxState {
     // Graphics state for paths
     double stroke_r = 0, stroke_g = 0, stroke_b = 0;
     double fill_r = 0, fill_g = 0, fill_b = 0;
+    double fill_alpha = 1, stroke_alpha = 1; // ExtGState /ca and /CA
+    std::shared_ptr<const CsInfo> fill_cs, stroke_cs; // active cs/CS for sc/scn
+    // Last clip path set by W/W*. Fills whose bbox fully covers the clip are
+    // replaced by it (the "clip to shape, paint a rect" idiom); a real clip
+    // intersection stack is not modeled.
+    std::shared_ptr<const std::vector<PathPoint>> clip_path;
     double line_width = 1;
     int line_cap = 0, line_join = 0;
     double miter_limit = 10;
@@ -55,12 +76,6 @@ inline void transform_point(const double* m, double x, double y, double& ox, dou
     oy = m[1]*x + m[3]*y + m[5];
 }
 
-struct PathPoint {
-    double x, y;
-    enum Type { MOVE, LINE, CURVE, CLOSE } type;
-    double cx1, cy1, cx2, cy2; // for CURVE
-};
-
 struct PdfLineSegment {
     float x0, y0, x1, y1;
     bool is_horizontal() const { return std::abs(y1 - y0) < 2.0f; }
@@ -80,14 +95,19 @@ struct ImagePlacement {
     std::string xobj_name;
     double ctm[6];
     double fill_r = 0, fill_g = 0, fill_b = 0; // fill color for ImageMask
+    double alpha = 1; // ExtGState /ca in force at the Do (watermark fades)
+    int seq = 0; // draw order shared with RenderPath (z-order for compositing)
 };
 
 struct RenderPath {
     std::vector<PathPoint> points;
     double fill_r, fill_g, fill_b;
     double stroke_r, stroke_g, stroke_b;
+    double fill_alpha = 1, stroke_alpha = 1; // ExtGState /ca, /CA
     double line_width;
     bool do_fill, do_stroke;
+    bool even_odd = false; // f*/B*/b*: even-odd fill rule (default nonzero)
+    int seq = 0; // draw order shared with ImagePlacement
 };
 
 struct ContentParseResult {
@@ -96,6 +116,7 @@ struct ContentParseResult {
     std::vector<PdfFillRect> fill_rects; // sizable pure-fill rects (cell shading)
     std::vector<ImagePlacement> images;
     std::vector<RenderPath> paths; // for vector rendering
+    int draw_ops = 0; // total paths+images recorded (seq offset for nested forms)
 };
 
 struct TextLine {
