@@ -258,47 +258,87 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
 
         // Image extraction
         if (opts.images) {
-            // Check for layered page
-            bool has_regular = false, has_mask = false;
-            for (auto& ip : parse_result.images) {
-                PdfObj xobj;
-                if (ip.xobj_ref >= 0) xobj = doc.get_obj(ip.xobj_ref);
-                if (!xobj.is_stream()) continue;
-                int bpc = xobj.get("BitsPerComponent").as_int();
-                if (bpc == 1) has_mask = true;
-                else has_regular = true;
+            // Pages whose content is drawn as vector glyph outlines (GDI
+            // print-to-PDF: no text operators, hundreds of filled paths)
+            // have nothing text extraction can reach; render the whole page
+            // instead and skip per-XObject extraction — the embedded images
+            // on such pages are watermark/logo layers, not the document.
+            constexpr size_t kVectorTextMinPaths = 50;
+            bool no_text = result.all_lines[p].size() <= 2;
+            bool vector_text_page = no_text &&
+                                    parse_result.paths.size() >= kVectorTextMinPaths;
+            // Banded raster pages: the same print pipeline may store the page
+            // scan as horizontal strips instead. Extracting them individually
+            // yields disjoint fragments; composite the full page instead.
+            bool banded_scan_page = false;
+            if (no_text && !vector_text_page) {
+                int bands = 0;
+                double covered_h = 0;
+                for (auto& ip : parse_result.images) {
+                    if (std::abs(ip.ctm[1]) >= 0.001 || std::abs(ip.ctm[2]) >= 0.001)
+                        continue; // rotated placement: not a scan band
+                    double iw = std::abs(ip.ctm[0]), ih = std::abs(ip.ctm[3]);
+                    if (iw >= page_w * 0.5 && ih < page_h * 0.5) {
+                        bands++;
+                        covered_h += ih;
+                    }
+                }
+                banded_scan_page = bands >= 3 && covered_h >= page_h * 0.4;
             }
-
-            if (has_regular && has_mask) {
-                // Layered: render as composite
+            bool composited = false;
+            if (vector_text_page || banded_scan_page) {
                 auto rendered = render_page_composite(doc, page_obj, parse_result,
                                                       p, page_w, page_h, image_dir);
                 if (!rendered.data.empty() || !rendered.pixels.empty() || !rendered.saved_path.empty()) {
                     result.all_images[p].push_back(std::move(rendered));
                     result.all_image_y[p].push_back(page_h);
                     result.all_image_x[p].push_back(0);
-                }
-            } else {
-                auto extracted = extract_page_images(doc, page_obj, parse_result, p, image_dir, opts.min_image_size);
-                for (auto& ei : extracted) {
-                    // ctm[5] is the Y translation in PDF coordinates (origin bottom-left)
-                    // ctm[3] is vertical scale; y_top = ctm[5] + abs(ctm[3])
-                    double y_top = ei.ctm[5] + std::abs(ei.ctm[3]);
-                    result.all_image_y[p].push_back(y_top);
-                    result.all_image_x[p].push_back(ei.ctm[4]); // X position
-                    result.all_images[p].push_back(std::move(ei.img));
+                    composited = true;
                 }
             }
+            if (!composited) {
+                // Check for layered page
+                bool has_regular = false, has_mask = false;
+                for (auto& ip : parse_result.images) {
+                    PdfObj xobj;
+                    if (ip.xobj_ref >= 0) xobj = doc.get_obj(ip.xobj_ref);
+                    if (!xobj.is_stream()) continue;
+                    int bpc = xobj.get("BitsPerComponent").as_int();
+                    if (bpc == 1) has_mask = true;
+                    else has_regular = true;
+                }
 
-            // Fallback: render page for scanned/vector-only pages
-            if (result.all_images[p].empty() && result.all_lines[p].empty()) {
-                if (!parse_result.images.empty() || !parse_result.segments.empty()) {
+                if (has_regular && has_mask) {
+                    // Layered: render as composite
                     auto rendered = render_page_composite(doc, page_obj, parse_result,
                                                           p, page_w, page_h, image_dir);
                     if (!rendered.data.empty() || !rendered.pixels.empty() || !rendered.saved_path.empty()) {
                         result.all_images[p].push_back(std::move(rendered));
                         result.all_image_y[p].push_back(page_h);
                         result.all_image_x[p].push_back(0);
+                    }
+                } else {
+                    auto extracted = extract_page_images(doc, page_obj, parse_result, p, image_dir, opts.min_image_size);
+                    for (auto& ei : extracted) {
+                        // ctm[5] is the Y translation in PDF coordinates (origin bottom-left)
+                        // ctm[3] is vertical scale; y_top = ctm[5] + abs(ctm[3])
+                        double y_top = ei.ctm[5] + std::abs(ei.ctm[3]);
+                        result.all_image_y[p].push_back(y_top);
+                        result.all_image_x[p].push_back(ei.ctm[4]); // X position
+                        result.all_images[p].push_back(std::move(ei.img));
+                    }
+                }
+
+                // Fallback: render page for scanned/vector-only pages
+                if (result.all_images[p].empty() && result.all_lines[p].empty()) {
+                    if (!parse_result.images.empty() || !parse_result.segments.empty()) {
+                        auto rendered = render_page_composite(doc, page_obj, parse_result,
+                                                              p, page_w, page_h, image_dir);
+                        if (!rendered.data.empty() || !rendered.pixels.empty() || !rendered.saved_path.empty()) {
+                            result.all_images[p].push_back(std::move(rendered));
+                            result.all_image_y[p].push_back(page_h);
+                            result.all_image_x[p].push_back(0);
+                        }
                     }
                 }
             }
