@@ -78,6 +78,39 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    // Test 5: Raster drawing primitives composite instead of fragmenting.
+    // The fixture models a print pipeline that emits text as image strips.
+    // Those XObjects are one page drawing, so both Markdown and the chunk API
+    // must expose exactly one PNG rather than the constituent strips.
+    std::cout << "[5] Testing line-raster page compositing...\n";
+    {
+        const char* fixture = "test/fixtures/pdf/line_raster.pdf";
+        std::ifstream f(fixture);
+        if (!f.good()) {
+            std::cout << "    SKIP: fixture not found\n";
+        } else {
+            f.close();
+            try {
+                auto chunks = jdoc::pdf_to_markdown_chunks(fixture);
+                assert(chunks.size() == 1);
+                assert(chunks[0].images.size() == 1);
+                assert(chunks[0].images[0].format == "png");
+
+                const std::string& md = chunks[0].text;
+                size_t refs = 0;
+                for (size_t i = md.find("!["); i != std::string::npos;
+                     i = md.find("![", i + 2))
+                    refs++;
+                std::cout << "    Chunk images: " << chunks[0].images.size()
+                          << ", image refs: " << refs << " (expected 1 each)\n";
+                assert(refs == 1);
+            } catch (const std::exception& e) {
+                std::cerr << "    FAIL: " << e.what() << "\n";
+                return 1;
+            }
+        }
+    }
+
     std::cout << "\n=== All tests passed ===\n";
     return 0;
 }
