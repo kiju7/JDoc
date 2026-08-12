@@ -557,6 +557,11 @@ static bool setup_tile(Codestream& cs, Tile& tile) {
                 ceil_ratio(res.y1, 1 << ppy) - floor_ratio(res.y0, 1 << ppy) > 1)
                 return false;
 
+            // T.800 Table A.21 permits precinct exponent 0 only at
+            // resolution 0; accepting it above would drive the code-block
+            // exponents below to -1, a negative (undefined) shift count.
+            if (r > 0 && (ppx == 0 || ppy == 0)) return false;
+
             int cbxe = std::min(st.cb_xexp, r == 0 ? ppx : ppx - 1);
             int cbye = std::min(st.cb_yexp, r == 0 ? ppy : ppy - 1);
 
@@ -848,8 +853,11 @@ JpxImage jpx_decode(const uint8_t* data, size_t len) {
     Codestream cs;
     std::vector<bool> tile_started;
 
-    // Main header
+    // Main header. Marker order after SIZ is unconstrained, so a per-component
+    // override (COC/QCC) may legally precede its default (COD/QCD); overrides
+    // are flagged here and the defaults materialized only after the loop.
     bool have_siz = false, have_cod = false, have_qcd = false;
+    std::vector<char> coc_set, qcc_set;
     while (r.ok(4)) {
         uint32_t marker = r.u16();
         if (marker == 0xFF90) { r.pos -= 2; break; } // SOT
@@ -881,8 +889,12 @@ JpxImage jpx_decode(const uint8_t* data, size_t len) {
                     int yr = static_cast<int>(r.u8());
                     if (xr != 1 || yr != 1) return img; // subsampling
                     if (cs.depth.back() > 16) return img;
+                    if (cs.depth.back() > img.src_depth)
+                        img.src_depth = cs.depth.back();
                 }
                 have_siz = true;
+                coc_set.assign(static_cast<size_t>(cs.ncomp), 0);
+                qcc_set.assign(static_cast<size_t>(cs.ncomp), 0);
                 break;
             }
             case 0xFF52: { // COD
@@ -908,6 +920,7 @@ JpxImage jpx_decode(const uint8_t* data, size_t len) {
                 CodingStyle st = cs.cs;
                 if (!parse_cod_style(r, st, static_cast<int>(scoc & 1))) return img;
                 cs.comp_cs[c] = st;
+                coc_set[static_cast<size_t>(c)] = 1;
                 break;
             }
             case 0xFF5C: // QCD
@@ -923,6 +936,7 @@ JpxImage jpx_decode(const uint8_t* data, size_t len) {
                 if (c < 0 || c >= cs.ncomp) return img;
                 if (cs.comp_qs.empty()) cs.comp_qs.assign(cs.ncomp, cs.qs);
                 if (!parse_quant(r, cs.comp_qs[c], body)) return img;
+                qcc_set[static_cast<size_t>(c)] = 1;
                 break;
             }
             case 0xFF5F: // POC
@@ -936,9 +950,22 @@ JpxImage jpx_decode(const uint8_t* data, size_t len) {
     }
     if (!have_siz || !have_cod || !have_qcd) return img;
 
-    // Fill per-component defaults
+    // Fill per-component defaults now that COD/QCD are final. Components an
+    // early COC snapshotted before COD arrived still owe it the COD-only
+    // fields (SOP/EPH markers); a QCC body is self-contained.
     if (cs.comp_cs.empty()) cs.comp_cs.assign(cs.ncomp, cs.cs);
+    else
+        for (int c = 0; c < cs.ncomp; c++) {
+            if (!coc_set[static_cast<size_t>(c)]) cs.comp_cs[c] = cs.cs;
+            else {
+                cs.comp_cs[c].sop = cs.cs.sop;
+                cs.comp_cs[c].eph = cs.cs.eph;
+            }
+        }
     if (cs.comp_qs.empty()) cs.comp_qs.assign(cs.ncomp, cs.qs);
+    else
+        for (int c = 0; c < cs.ncomp; c++)
+            if (!qcc_set[static_cast<size_t>(c)]) cs.comp_qs[c] = cs.qs;
 
     const int ntx = ceil_ratio(cs.xsiz - cs.xto, cs.xt);
     const int nty = ceil_ratio(cs.ysiz - cs.yto, cs.yt);
@@ -978,8 +1005,12 @@ JpxImage jpx_decode(const uint8_t* data, size_t len) {
                 tile.comps[c].qs = cs.comp_qs[c];
             }
         }
-        // Tile-part header: markers until SOD
+        // Tile-part header: markers until SOD. Same ordering rule as the main
+        // header: a tile COC/QCC override survives a later tile COD/QCD
+        // blanket write instead of being clobbered by it.
         bool ok_header = true;
+        std::vector<char> t_coc(static_cast<size_t>(cs.ncomp), 0);
+        std::vector<char> t_qcc(static_cast<size_t>(cs.ncomp), 0);
         while (r.ok(4)) {
             uint32_t m2 = r.u16();
             if (m2 == 0xFF93) break; // SOD
@@ -996,7 +1027,15 @@ JpxImage jpx_decode(const uint8_t* data, size_t len) {
                     st.sop = (scod & 2) != 0;
                     st.eph = (scod & 4) != 0;
                     if (!parse_cod_style(r, st, static_cast<int>(scod))) return img;
-                    for (auto& tcc : tile.comps) tcc.cs = st;
+                    for (int c = 0; c < cs.ncomp; c++) {
+                        if (t_coc[static_cast<size_t>(c)]) {
+                            // COC carries no SOP/EPH; those follow the COD.
+                            tile.comps[c].cs.sop = st.sop;
+                            tile.comps[c].cs.eph = st.eph;
+                        } else {
+                            tile.comps[c].cs = st;
+                        }
+                    }
                     break;
                 }
                 case 0xFF53: { // tile COC
@@ -1006,12 +1045,14 @@ JpxImage jpx_decode(const uint8_t* data, size_t len) {
                     CodingStyle st = tile.comps[c].cs;
                     if (!parse_cod_style(r, st, static_cast<int>(scoc & 1))) return img;
                     tile.comps[c].cs = st;
+                    t_coc[static_cast<size_t>(c)] = 1;
                     break;
                 }
                 case 0xFF5C: { // tile QCD
                     QuantStyle q;
                     if (!parse_quant(r, q, l2 - 2)) return img;
-                    for (auto& tcc : tile.comps) tcc.qs = q;
+                    for (int c = 0; c < cs.ncomp; c++)
+                        if (!t_qcc[static_cast<size_t>(c)]) tile.comps[c].qs = q;
                     break;
                 }
                 case 0xFF5D: { // tile QCC
@@ -1021,6 +1062,7 @@ JpxImage jpx_decode(const uint8_t* data, size_t len) {
                     else { c = static_cast<int>(r.u16()); body -= 2; }
                     if (c < 0 || c >= cs.ncomp) return img;
                     if (!parse_quant(r, tile.comps[c].qs, body)) return img;
+                    t_qcc[static_cast<size_t>(c)] = 1;
                     break;
                 }
                 case 0xFF61: // PPT

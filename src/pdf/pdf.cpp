@@ -144,7 +144,11 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
     if (opts.pages.empty()) {
         for (int i = 0; i < tp; i++) page_indices.push_back(i);
     } else {
-        page_indices = opts.pages;
+        // Two workers must never own the same result slot, so duplicate
+        // page requests collapse to their first occurrence.
+        std::unordered_set<int> requested;
+        for (int p : opts.pages)
+            if (requested.insert(p).second) page_indices.push_back(p);
     }
 
     std::string image_dir;
@@ -379,6 +383,7 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
         for (int p : page_indices) process_page(p);
     } else {
         std::atomic<size_t> next_page{0};
+        std::atomic<bool> failed{false};
         std::mutex err_mu;
         std::exception_ptr first_error;
         std::vector<std::thread> workers;
@@ -386,10 +391,16 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
         for (size_t t = 0; t < n_workers; t++) {
             workers.emplace_back([&]() {
                 size_t i;
-                while ((i = next_page.fetch_add(1)) < page_indices.size()) {
+                // Match the sequential loop's abort semantics: once a page
+                // throws, no worker starts another page (in-flight pages
+                // finish), instead of rendering the whole rest of the
+                // document for a result the rethrow below discards.
+                while (!failed.load(std::memory_order_relaxed) &&
+                       (i = next_page.fetch_add(1)) < page_indices.size()) {
                     try {
                         process_page(page_indices[i]);
                     } catch (...) {
+                        failed.store(true, std::memory_order_relaxed);
                         std::lock_guard<std::mutex> lock(err_mu);
                         if (!first_error)
                             first_error = std::current_exception();

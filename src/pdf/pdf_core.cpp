@@ -847,6 +847,14 @@ std::vector<uint8_t> PdfDoc::decode_stream(const PdfObj& obj, int obj_num, int g
             int jw = 0, jh = 0;
             result = jbig2_decode(result.data(), result.size(),
                                   globals.data(), globals.size(), jw, jh);
+            // Every downstream unpack strides rows by the dict /Width and
+            // reads /Height rows. A stream whose page-info size disagrees
+            // would shear each row; keep the old clean-drop contract there.
+            // (Extra decoded rows beyond /Height are harmless and ignored.)
+            const int dict_w = resolve(obj.get("Width")).as_int();
+            const int dict_h = resolve(obj.get("Height")).as_int();
+            if (!result.empty() && (jw != dict_w || jh < dict_h))
+                result.clear();
         }
         // DCTDecode, CCITTFaxDecode, JPXDecode: leave raw data for caller
     }

@@ -8,13 +8,22 @@
 #include "pdf/jbig2.h"
 #include "pdf/jpx.h"
 
-#include <cassert>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <fstream>
 #include <iostream>
 #include <vector>
+
+// CHECK() vanishes under the default Release build (-DNDEBUG), which would
+// let a decoder regression print OK and exit 0 — so checks stay live always.
+#define CHECK(cond) do { \
+        if (!(cond)) { \
+            std::cerr << "FAIL " << __FILE__ << ":" << __LINE__ \
+                      << ": " #cond "\n"; \
+            exit(1); \
+        } \
+    } while (0)
 
 static std::vector<uint8_t> slurp(const char* path) {
     std::ifstream f(path, std::ios::binary);
@@ -47,11 +56,11 @@ int main() {
         int w = 0, h = 0;
         auto bits = jdoc::pdf_detail::jbig2_decode(stream.data(), stream.size(),
                                                    nullptr, 0, w, h);
-        assert(!bits.empty());
-        assert(w == 215 && h == 215);
+        CHECK(!bits.empty());
+        CHECK(w == 215 && h == 215);
         auto expect = pnm_payload(slurp("test/fixtures/pdf/circle_expected.pbm"), 3);
-        assert(bits.size() == expect.size());
-        assert(std::memcmp(bits.data(), expect.data(), bits.size()) == 0);
+        CHECK(bits.size() == expect.size());
+        CHECK(std::memcmp(bits.data(), expect.data(), bits.size()) == 0);
         std::cout << "[1] jbig2 generic region: OK (" << w << "x" << h << ")\n";
     }
 
@@ -59,10 +68,10 @@ int main() {
     {
         auto stream = slurp("test/fixtures/pdf/jpx_lossless.j2k");
         auto img = jdoc::pdf_detail::jpx_decode(stream.data(), stream.size());
-        assert(img.width == 21 && img.height == 17 && img.components == 3);
+        CHECK(img.width == 21 && img.height == 17 && img.components == 3);
         auto src = pnm_payload(slurp("test/fixtures/pdf/jpx_src.ppm"), 4);
-        assert(img.pixels.size() == src.size());
-        assert(std::memcmp(img.pixels.data(), src.data(), src.size()) == 0);
+        CHECK(img.pixels.size() == src.size());
+        CHECK(std::memcmp(img.pixels.data(), src.data(), src.size()) == 0);
         std::cout << "[2] jpx 5/3 lossless: OK (byte-exact)\n";
     }
 
@@ -70,9 +79,9 @@ int main() {
     {
         auto stream = slurp("test/fixtures/pdf/jpx_lossy.j2k");
         auto img = jdoc::pdf_detail::jpx_decode(stream.data(), stream.size());
-        assert(img.width == 21 && img.height == 17 && img.components == 3);
+        CHECK(img.width == 21 && img.height == 17 && img.components == 3);
         auto src = pnm_payload(slurp("test/fixtures/pdf/jpx_src.ppm"), 4);
-        assert(img.pixels.size() == src.size());
+        CHECK(img.pixels.size() == src.size());
         double se = 0;
         int maxdiff = 0;
         for (size_t i = 0; i < src.size(); i++) {
@@ -83,8 +92,8 @@ int main() {
         double psnr = 10.0 * std::log10(255.0 * 255.0 * src.size() / se);
         std::cout << "[3] jpx 9/7 lossy: maxdiff " << maxdiff
                   << ", PSNR " << psnr << " dB\n";
-        assert(maxdiff <= 20);
-        assert(psnr > 32.0);
+        CHECK(maxdiff <= 20);
+        CHECK(psnr > 32.0);
     }
 
     // [4] Robustness: truncated / corrupt streams must fail cleanly

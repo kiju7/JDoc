@@ -8,6 +8,11 @@ namespace jdoc { namespace pdf_detail {
 
 struct JpxImage {
     int width = 0, height = 0, components = 0;
+    // Largest component bit depth declared by the codestream. Samples above
+    // 8 bits are flattened into the 8-bit pixels below — fine for canvas
+    // compositing, lossy as an extraction deliverable, so extraction checks
+    // this to prefer the byte-exact passthrough.
+    int src_depth = 8;
     std::vector<uint8_t> pixels; // interleaved samples, 8 bits per component
 };
 

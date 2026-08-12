@@ -202,6 +202,10 @@ std::vector<uint8_t> jbig2_decode(const uint8_t* data, size_t len,
                     if (rw == 0 || rh == 0 || rw > 1u << 20 || rh > 1u << 20 ||
                         static_cast<uint64_t>(rw) * rh > 64ull << 20)
                         return false;
+                    // Offsets get the same range cap: a wild rx/ry would wrap
+                    // the int casts below negative, sailing past the signed
+                    // px/py guards into unchecked Bitmap::set writes.
+                    if (rx > 1u << 20 || ry > 1u << 20) return false;
 
                     Bitmap region;
                     region.init(static_cast<int>(rw), static_cast<int>(rh), 0);
@@ -212,11 +216,16 @@ std::vector<uint8_t> jbig2_decode(const uint8_t* data, size_t len,
 
                     if (!page_ready) {
                         // Degenerate stream without page info: adopt the region
+                        if (static_cast<uint64_t>(rw + rx) * (rh + ry) > 64ull << 20)
+                            return false;
                         page.init(static_cast<int>(rw + rx), static_cast<int>(rh + ry), 0);
                         page_ready = true;
                     }
                     if (static_cast<int>(ry + rh) > page.h) {
-                        // Striped/unknown-height page grows to fit each region
+                        // Striped/unknown-height page grows to fit each region;
+                        // the grown area gets the same 64 Mpx budget as regions.
+                        if (static_cast<uint64_t>(page.w) * (ry + rh) > 64ull << 20)
+                            return false;
                         Bitmap grown;
                         grown.init(page.w, static_cast<int>(ry + rh), page_default);
                         std::memcpy(grown.rows.data(), page.rows.data(), page.rows.size());

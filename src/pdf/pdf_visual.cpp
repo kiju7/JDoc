@@ -729,14 +729,15 @@ std::vector<ExtractedImage> extract_page_images(PdfDoc& doc, const PdfObj& page_
             auto decoded = doc.decode_stream(xobj);
             if (decoded.empty()) continue;
             auto jr = jpx_decode(decoded.data(), decoded.size());
-            if (!jr.pixels.empty()) {
+            if (!jr.pixels.empty() && jr.src_depth <= 8) {
                 img.format = "raw";
                 img.width = static_cast<unsigned>(jr.width);
                 img.height = static_cast<unsigned>(jr.height);
                 img.components = jr.components;
                 img.pixels = std::move(jr.pixels);
             } else if (single_filter) {
-                // Feature outside the baseline decoder: keep the passthrough
+                // Feature outside the baseline decoder, or a >8-bit source
+                // the decoder would flatten: extraction stays byte-exact.
                 img.format = "jp2";
                 img.data.assign(reinterpret_cast<const char*>(decoded.data()),
                                 reinterpret_cast<const char*>(decoded.data()) + decoded.size());
@@ -1282,9 +1283,13 @@ ImageData render_page_composite(PdfDoc& doc, const PdfObj& page_obj,
                 if (xd.is_dict()) xobj = doc.resolve(xd.get(ip.xobj_name));
             }
             if (!xobj.is_stream()) continue;
-            // Images the compositor cannot decode must not inflate the
-            // canvas: they contribute nothing but would still be paid for
-            // in raster and PNG-encode time.
+            // Images the compositor may fail to decode must not inflate the
+            // canvas. The in-tree JBIG2/JPX decoders cover subsets
+            // (arithmetic generic regions; baseline codestreams), and a
+            // variant they reject would leave a large, mostly blank canvas
+            // still paid for in raster and PNG-encode time — while their
+            // decodable payloads (stamps, logos, signatures) don't need a
+            // DPI raise to read.
             auto pre_filter = doc.resolve(xobj.get("Filter"));
             std::string pre_last;
             if (pre_filter.is_name()) pre_last = pre_filter.str_val;
@@ -1292,6 +1297,7 @@ ImageData render_page_composite(PdfDoc& doc, const PdfObj& page_obj,
                 auto last = doc.resolve(pre_filter.arr.back());
                 if (last.is_name()) pre_last = last.str_val;
             }
+            if (pre_last == "JBIG2Decode" || pre_last == "JPXDecode") continue;
             int iw = xobj.get("Width").as_int();
             int ih = xobj.get("Height").as_int();
             double pw_pt = std::hypot(ip.ctm[0], ip.ctm[1]);
