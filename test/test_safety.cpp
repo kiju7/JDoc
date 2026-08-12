@@ -241,6 +241,12 @@ void test_pdf_honors_images_option() {
         reinterpret_cast<const uint8_t*>(pdf.data()), pdf.size(), opts);
     CHECK(with_images.size() == 1);
     CHECK(with_images[0].images.size() == 1);
+    CHECK(!with_images[0].images[0].data.empty() ||
+          !with_images[0].images[0].pixels.empty());
+
+    const auto markdown = jdoc::pdf_to_markdown_mem(
+        reinterpret_cast<const uint8_t*>(pdf.data()), pdf.size(), opts);
+    CHECK(markdown.find("![") != std::string::npos);
 }
 
 void test_pdf_decodes_surrogate_pair() {

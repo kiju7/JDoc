@@ -44,6 +44,11 @@ struct ExtractedImage {
     double ctm[6];
 };
 
+inline void discard_image_payload(ImageData& image) {
+    decltype(image.data){}.swap(image.data);
+    decltype(image.pixels){}.swap(image.pixels);
+}
+
 struct BookmarkEntry {
     std::string title;
     int page = -1;

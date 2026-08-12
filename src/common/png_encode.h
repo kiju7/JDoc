@@ -15,6 +15,7 @@
 #include <cstring>
 #include <algorithm>
 #include <limits>
+#include <memory>
 
 namespace jdoc { namespace util {
 
@@ -37,6 +38,66 @@ inline void png_write_chunk(std::vector<char>& out, const char type[4],
     uint32_t crc = static_cast<uint32_t>(
         crc32(0, reinterpret_cast<const Bytef*>(&out[type_pos]), 4 + len));
     png_put32(out, crc);
+}
+
+inline std::vector<char> png_compress_rows(const uint8_t* rows, size_t row_size,
+                                           unsigned w, unsigned h,
+                                           uint8_t color_type, int level) {
+    int ld_level = (level <= 0) ? 6 : (level > 12 ? 12 : level);
+    using CompressorPtr = std::unique_ptr<libdeflate_compressor,
+        decltype(&libdeflate_free_compressor)>;
+    CompressorPtr comp(libdeflate_alloc_compressor(ld_level),
+                       &libdeflate_free_compressor);
+    if (!comp) return {};
+
+    const size_t bound = libdeflate_zlib_compress_bound(comp.get(), row_size);
+    if (bound > std::numeric_limits<uint32_t>::max()) return {};
+
+    std::vector<char> png;
+    const uint8_t sig[] = {0x89,'P','N','G',0x0D,0x0A,0x1A,0x0A};
+    png.insert(png.end(), sig, sig + 8);
+
+    uint8_t ihdr[13] = {};
+    ihdr[0] = static_cast<uint8_t>(w >> 24);
+    ihdr[1] = static_cast<uint8_t>(w >> 16);
+    ihdr[2] = static_cast<uint8_t>(w >> 8);
+    ihdr[3] = static_cast<uint8_t>(w);
+    ihdr[4] = static_cast<uint8_t>(h >> 24);
+    ihdr[5] = static_cast<uint8_t>(h >> 16);
+    ihdr[6] = static_cast<uint8_t>(h >> 8);
+    ihdr[7] = static_cast<uint8_t>(h);
+    ihdr[8] = 8;
+    ihdr[9] = color_type;
+    png_write_chunk(png, "IHDR", ihdr, 13);
+
+    const size_t idat_pos = png.size();
+    png.resize(idat_pos + 8 + bound);
+    std::memcpy(png.data() + idat_pos + 4, "IDAT", 4);
+    const size_t compressed_size = libdeflate_zlib_compress(
+        comp.get(), rows, row_size, png.data() + idat_pos + 8, bound);
+    if (compressed_size == 0 ||
+        compressed_size > std::numeric_limits<uInt>::max() - 4)
+        return {};
+
+    const uint32_t chunk_size = static_cast<uint32_t>(compressed_size);
+    png[idat_pos] = static_cast<char>(chunk_size >> 24);
+    png[idat_pos + 1] = static_cast<char>(chunk_size >> 16);
+    png[idat_pos + 2] = static_cast<char>(chunk_size >> 8);
+    png[idat_pos + 3] = static_cast<char>(chunk_size);
+    png.resize(idat_pos + 8 + compressed_size);
+    const uint32_t crc = static_cast<uint32_t>(crc32(
+        0, reinterpret_cast<const Bytef*>(png.data() + idat_pos + 4),
+        static_cast<uInt>(4 + compressed_size)));
+    png_put32(png, crc);
+    png_write_chunk(png, "IEND", nullptr, 0);
+    // libdeflate's worst-case bound can substantially exceed highly
+    // compressible line-art output. Do not retain that unused capacity in an
+    // ImageData that may live until all pages finish.
+    if (png.capacity() - png.size() > (1u << 20)) {
+        std::vector<char> compact(png.begin(), png.end());
+        png.swap(compact);
+    }
+    return png;
 }
 
 // components==4 defaults to CMYK input (converted to RGB); rgba=true makes a
@@ -119,46 +180,10 @@ inline std::vector<char> pixels_to_png(const uint8_t* pixels, size_t pixel_size,
         }
     }
 
-    // libdeflate compresses the IDAT payload 2-3x faster than zlib. The bytes
-    // differ from zlib's (different encoder) but the decoded pixels are
-    // identical — PNG is lossless — and the files are typically smaller.
-    // Map the zlib level (Z_BEST_SPEED default) onto libdeflate's 1-12 scale.
-    int ld_level = (level <= 0) ? 6 : (level > 12 ? 12 : level);
-    libdeflate_compressor* comp = libdeflate_alloc_compressor(ld_level);
-    if (!comp) return {};
-    size_t bound = libdeflate_zlib_compress_bound(comp, raw.size());
-    std::vector<uint8_t> deflated(bound);
-    size_t deflated_size = libdeflate_zlib_compress(
-        comp, raw.data(), raw.size(), deflated.data(), bound);
-    libdeflate_free_compressor(comp);
-    if (deflated_size == 0) return {};
-
-    raw.clear(); raw.shrink_to_fit();
-
-    std::vector<char> png;
-    png.reserve(8 + 25 + deflated_size + 24);
-
-    const uint8_t sig[] = {0x89,'P','N','G',0x0D,0x0A,0x1A,0x0A};
-    png.insert(png.end(), sig, sig + 8);
-
-    uint8_t ihdr[13] = {};
-    const uint32_t png_width = w;
-    const uint32_t png_height = h;
-    ihdr[0] = static_cast<uint8_t>(png_width >> 24);
-    ihdr[1] = static_cast<uint8_t>(png_width >> 16);
-    ihdr[2] = static_cast<uint8_t>(png_width >> 8);
-    ihdr[3] = static_cast<uint8_t>(png_width);
-    ihdr[4] = static_cast<uint8_t>(png_height >> 24);
-    ihdr[5] = static_cast<uint8_t>(png_height >> 16);
-    ihdr[6] = static_cast<uint8_t>(png_height >> 8);
-    ihdr[7] = static_cast<uint8_t>(png_height);
-    ihdr[8] = 8;
-    ihdr[9] = rgba ? 6 : (grayscale ? 0 : 2); // grayscale, RGB, or RGBA
-    png_write_chunk(png, "IHDR", ihdr, 13);
-    png_write_chunk(png, "IDAT", deflated.data(), static_cast<uint32_t>(deflated_size));
-    png_write_chunk(png, "IEND", nullptr, 0);
-
-    return png;
+    // Compress directly into the final IDAT slot. This avoids retaining and
+    // copying a second full compressed buffer while the scanlines are live.
+    const uint8_t color_type = rgba ? 6 : (grayscale ? 0 : 2);
+    return png_compress_rows(raw.data(), raw.size(), w, h, color_type, level);
 }
 
 // Encode an RGB buffer that already carries the PNG row layout — one leading
@@ -196,35 +221,8 @@ inline std::vector<char> prefiltered_to_png(const uint8_t* rows, size_t size,
         payload_size = gray.size();
     }
 
-    int ld_level = (level <= 0) ? 6 : (level > 12 ? 12 : level);
-    libdeflate_compressor* comp = libdeflate_alloc_compressor(ld_level);
-    if (!comp) return {};
-    size_t bound = libdeflate_zlib_compress_bound(comp, payload_size);
-    std::vector<uint8_t> deflated(bound);
-    size_t deflated_size = libdeflate_zlib_compress(
-        comp, payload, payload_size, deflated.data(), bound);
-    libdeflate_free_compressor(comp);
-    if (deflated_size == 0) return {};
-
-    std::vector<char> png;
-    png.reserve(8 + 25 + deflated_size + 24);
-    const uint8_t sig[] = {0x89,'P','N','G',0x0D,0x0A,0x1A,0x0A};
-    png.insert(png.end(), sig, sig + 8);
-    uint8_t ihdr[13] = {};
-    ihdr[0] = static_cast<uint8_t>(w >> 24);
-    ihdr[1] = static_cast<uint8_t>(w >> 16);
-    ihdr[2] = static_cast<uint8_t>(w >> 8);
-    ihdr[3] = static_cast<uint8_t>(w);
-    ihdr[4] = static_cast<uint8_t>(h >> 24);
-    ihdr[5] = static_cast<uint8_t>(h >> 16);
-    ihdr[6] = static_cast<uint8_t>(h >> 8);
-    ihdr[7] = static_cast<uint8_t>(h);
-    ihdr[8] = 8;
-    ihdr[9] = grayscale ? 0 : 2;
-    png_write_chunk(png, "IHDR", ihdr, 13);
-    png_write_chunk(png, "IDAT", deflated.data(), static_cast<uint32_t>(deflated_size));
-    png_write_chunk(png, "IEND", nullptr, 0);
-    return png;
+    return png_compress_rows(payload, payload_size, w, h,
+                             grayscale ? 0 : 2, level);
 }
 
 // Convert BMP data to PNG. Returns empty vector on failure or non-BMP input.

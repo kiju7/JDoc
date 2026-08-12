@@ -14,6 +14,7 @@
 // openjpeg and pdf.js implementations served as behavioral references for
 // the underspecified corners (bit-stuffing alignment, context numbering).
 #include "jpx.h"
+#include "pdf_limits.h"
 #include "mq_decoder.h"
 
 #include <algorithm>
@@ -228,7 +229,10 @@ static bool parse_cod_style(Reader& r, CodingStyle& cs, int scod) {
     cs.cb_yexp = static_cast<int>(r.u8() & 0x0F) + 2;
     cs.cb_style = static_cast<int>(r.u8());
     cs.transform = static_cast<int>(r.u8());
-    if (cs.levels > 32) return false;
+    // The geometry below uses 32-bit coordinates and power-of-two divisors.
+    // Thirty decomposition levels already exceed any image admitted by the
+    // decoded-pixel budget; rejecting larger values also avoids 1 << 32 UB.
+    if (cs.levels > 30) return false;
     if (scod & 1) {
         for (int i = 0; i <= cs.levels && i < 34; i++)
             cs.precinct_size[i] = static_cast<uint8_t>(r.u8());
@@ -880,7 +884,17 @@ JpxImage jpx_decode(const uint8_t* data, size_t len) {
                 if (cs.xsiz <= cs.xo || cs.ysiz <= cs.yo) return img;
                 if (cs.xt <= 0 || cs.yt <= 0) return img;
                 if (cs.ncomp < 1 || cs.ncomp > 8) return img;
-                if (static_cast<int64_t>(cs.xsiz) * cs.ysiz > 1LL << 28) return img;
+                const int64_t image_w = static_cast<int64_t>(cs.xsiz) - cs.xo;
+                const int64_t image_h = static_cast<int64_t>(cs.ysiz) - cs.yo;
+                if (image_w <= 0 || image_h <= 0 ||
+                    image_w > static_cast<int64_t>(limits::kMaxDecodedPixels) /
+                                  image_h)
+                    return img;
+                const int64_t pixels = image_w * image_h;
+                if (pixels > static_cast<int64_t>(limits::kMaxDecodedPixels) ||
+                    pixels > static_cast<int64_t>(limits::kMaxDecodedSamples) /
+                                 cs.ncomp)
+                    return img;
                 for (int c = 0; c < cs.ncomp; c++) {
                     uint32_t ssiz = r.u8();
                     cs.depth.push_back(static_cast<int>(ssiz & 0x7F) + 1);
@@ -1023,6 +1037,7 @@ JpxImage jpx_decode(const uint8_t* data, size_t len) {
                     tile.progression = static_cast<int>(r.u8());
                     tile.nlayers = static_cast<int>(r.u16());
                     cs.mct = static_cast<int>(r.u8());
+                    if (tile.nlayers < 1 || tile.nlayers > 256) return img;
                     CodingStyle st;
                     st.sop = (scod & 2) != 0;
                     st.eph = (scod & 4) != 0;

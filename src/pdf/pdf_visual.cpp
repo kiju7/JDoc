@@ -1,4 +1,5 @@
 #include "pdf_extract.h"
+#include "pdf_limits.h"
 #include "jpx.h"
 #include "common/png_encode.h"
 #include <chrono>
@@ -1068,8 +1069,7 @@ std::vector<ExtractedImage> extract_page_images(PdfDoc& doc, const PdfObj& page_
                     img.saved_path = path;
                 }
                 if (!img.saved_path.empty()) {
-                    img.data.clear();
-                    img.data.shrink_to_fit();
+                    discard_image_payload(img);
                 }
             }
 
@@ -1309,7 +1309,8 @@ ImageData render_page_composite(PdfDoc& doc, const PdfObj& page_obj,
     }
     double scale = dpi / kBase;
     // Bound total canvas pixels; a runaway page size must not exhaust memory.
-    constexpr double kMaxPixels = 64e6;
+    constexpr double kMaxPixels =
+        static_cast<double>(limits::kMaxDecodedPixels);
     if (page_w * scale * page_h * scale > kMaxPixels) {
         scale *= std::sqrt(kMaxPixels / (page_w * scale * page_h * scale));
         if (scale < kMinDPI / kBase / 8) scale = kMinDPI / kBase / 8;
@@ -1924,8 +1925,7 @@ ImageData render_page_composite(PdfDoc& doc, const PdfObj& page_obj,
             img.saved_path = path;
         }
         if (!img.saved_path.empty()) {
-            img.data.clear();
-            img.data.shrink_to_fit();
+            discard_image_payload(img);
         }
     }
     return img;

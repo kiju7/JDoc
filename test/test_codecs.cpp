@@ -8,6 +8,7 @@
 #include "pdf/jbig2.h"
 #include "pdf/jpx.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -45,6 +46,25 @@ static std::vector<uint8_t> pnm_payload(const std::vector<uint8_t>& d, int field
     }
     pos++; // single whitespace before payload
     return std::vector<uint8_t>(d.begin() + pos, d.end());
+}
+
+static size_t find_bytes(const std::vector<uint8_t>& data,
+                         const std::vector<uint8_t>& needle) {
+    auto it = std::search(data.begin(), data.end(), needle.begin(), needle.end());
+    return it == data.end() ? data.size() :
+           static_cast<size_t>(it - data.begin());
+}
+
+static size_t find_marker(const std::vector<uint8_t>& data, uint8_t marker) {
+    return find_bytes(data, {0xFF, marker});
+}
+
+static void put_be32(std::vector<uint8_t>& data, size_t pos, uint32_t value) {
+    CHECK(pos + 4 <= data.size());
+    data[pos] = static_cast<uint8_t>(value >> 24);
+    data[pos + 1] = static_cast<uint8_t>(value >> 16);
+    data[pos + 2] = static_cast<uint8_t>(value >> 8);
+    data[pos + 3] = static_cast<uint8_t>(value);
 }
 
 int main() {
@@ -107,6 +127,28 @@ int main() {
         for (size_t cut : {size_t(0), size_t(2), size_t(16), jp.size() / 2})
             jdoc::pdf_detail::jpx_decode(jp.data(), cut);
         std::cout << "[4] truncated streams: no crash\n";
+    }
+
+    // [5] Declared dimensions and decomposition levels are attacker-controlled.
+    // Reject them before allocating page/component buffers or shifting by 32.
+    {
+        auto jb = slurp("test/fixtures/pdf/circle.jbig2");
+        const size_t dimensions = find_bytes(
+            jb, {0x00, 0x00, 0x00, 0xD7, 0x00, 0x00, 0x00, 0xD7});
+        CHECK(dimensions != jb.size());
+        put_be32(jb, dimensions, 1u << 20);
+        put_be32(jb, dimensions + 4, 1u << 20);
+        int w = 0, h = 0;
+        CHECK(jdoc::pdf_detail::jbig2_decode(
+                  jb.data(), jb.size(), nullptr, 0, w, h).empty());
+
+        auto jp = slurp("test/fixtures/pdf/jpx_lossless.j2k");
+        const size_t cod_pos = find_marker(jp, 0x52);
+        CHECK(cod_pos != jp.size());
+        CHECK(cod_pos + 9 < jp.size());
+        jp[cod_pos + 9] = 32;
+        CHECK(jdoc::pdf_detail::jpx_decode(jp.data(), jp.size()).pixels.empty());
+        std::cout << "[5] oversized codec headers: rejected\n";
     }
 
     std::cout << "\nAll codec tests passed.\n";

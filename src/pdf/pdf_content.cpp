@@ -282,11 +282,15 @@ static std::shared_ptr<const CsInfo> load_colorspace(PdfDoc& doc,
 ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>& stream,
                                          const PdfObj& resources, double page_height,
                                          FontCache* font_cache,
-                                         bool skip_graphics,
+                                         const ContentParseOptions& options,
                                          const double* initial_ctm,
                                          int depth,
                                          const GfxState* inherit_gs) {
     ContentParseResult result;
+    const bool skip_graphics =
+        options.graphics == GraphicsCollection::None;
+    const bool collect_render_paths =
+        options.graphics == GraphicsCollection::RenderPaths;
 
     // Load fonts from resources, using cross-page cache when available.
     // The lock covers only lookup/insert; load_font runs outside it.
@@ -588,6 +592,24 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
         return true;
     };
 
+    auto record_render_path = [&](bool do_fill, bool do_stroke,
+                                  bool even_odd = false) {
+        if (collect_render_paths) {
+            RenderPath rp;
+            rp.points = std::move(current_path);
+            rp.fill_r = gs.fill_r; rp.fill_g = gs.fill_g; rp.fill_b = gs.fill_b;
+            rp.stroke_r = gs.stroke_r; rp.stroke_g = gs.stroke_g;
+            rp.stroke_b = gs.stroke_b;
+            rp.fill_alpha = gs.fill_alpha; rp.stroke_alpha = gs.stroke_alpha;
+            rp.line_width = gs.line_width;
+            rp.do_fill = do_fill; rp.do_stroke = do_stroke;
+            rp.even_odd = even_odd;
+            rp.seq = draw_seq++;
+            result.paths.push_back(std::move(rp));
+        }
+        current_path.clear();
+    };
+
     // Show one text string: decode codes, map to Unicode, advance the text
     // matrix and emit a TextChar per rendered glyph. Shared by Tj/'/" and by
     // each string element of TJ (TJ handles its numeric adjustments itself), so
@@ -611,9 +633,11 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
                     if (!data.empty()) {
                         const PdfObj& sub_res = gs.font->t3_resources.is_none()
                             ? resources : gs.font->t3_resources;
+                        ContentParseOptions glyph_options;
+                        glyph_options.graphics = GraphicsCollection::RenderPaths;
                         auto sub = parse_content_stream(doc, data, sub_res,
                                                         page_height, font_cache,
-                                                        skip_graphics, nullptr,
+                                                        glyph_options, nullptr,
                                                         depth + 1);
                         glyph = std::move(sub.paths);
                     }
@@ -654,7 +678,8 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
     auto show_text_string = [&](GfxState& gs, const std::string& s) {
         double fs = gs.font_size;
         double h_scale = gs.h_scaling / 100.0;
-        bool t3_expand = gs.font && gs.font->opaque_type3 && !skip_graphics;
+        bool t3_expand = gs.font && gs.font->opaque_type3 &&
+                         collect_render_paths;
         double gw_scale = (gs.font && gs.font->is_type3) ? gs.font->glyph_space_scale : 0.001;
         bool use_2byte = gs.font && (gs.font->is_identity || gs.font->is_type0);
         if (gs.font && gs.font->cmap_code_bytes == 1) use_2byte = false;
@@ -1127,40 +1152,18 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
                 if (!filter_white_stroke() && !filter_small_rect())
                     flush_path_segments();
                 commit_pending_clip(gs);
-                { RenderPath rp; rp.points = std::move(current_path);
-                  rp.stroke_r = gs.stroke_r; rp.stroke_g = gs.stroke_g; rp.stroke_b = gs.stroke_b;
-                  rp.fill_r = gs.fill_r; rp.fill_g = gs.fill_g; rp.fill_b = gs.fill_b;
-                  rp.fill_alpha = gs.fill_alpha; rp.stroke_alpha = gs.stroke_alpha;
-                  rp.line_width = gs.line_width; rp.do_fill = false; rp.do_stroke = true;
-                  rp.seq = draw_seq++;
-                  result.paths.push_back(std::move(rp)); }
-                current_path.clear();
+                record_render_path(false, true);
             } else if (op.is("s")) {
                 current_path.push_back({0, 0, PathPoint::CLOSE});
                 if (!filter_white_stroke() && !filter_small_rect())
                     flush_path_segments();
                 commit_pending_clip(gs);
-                { RenderPath rp; rp.points = std::move(current_path);
-                  rp.stroke_r = gs.stroke_r; rp.stroke_g = gs.stroke_g; rp.stroke_b = gs.stroke_b;
-                  rp.fill_r = gs.fill_r; rp.fill_g = gs.fill_g; rp.fill_b = gs.fill_b;
-                  rp.fill_alpha = gs.fill_alpha; rp.stroke_alpha = gs.stroke_alpha;
-                  rp.line_width = gs.line_width; rp.do_fill = false; rp.do_stroke = true;
-                  rp.seq = draw_seq++;
-                  result.paths.push_back(std::move(rp)); }
-                current_path.clear();
+                record_render_path(false, true);
             } else if (op.is("f") || op.is("F") || op.is("f*")) {
                 apply_clip_substitution(gs);
                 if (!capture_fill_rect()) flush_path_segments();
                 commit_pending_clip(gs);
-                { RenderPath rp; rp.points = std::move(current_path);
-                  rp.even_odd = op.is("f*");
-                  rp.fill_r = gs.fill_r; rp.fill_g = gs.fill_g; rp.fill_b = gs.fill_b;
-                  rp.stroke_r = gs.stroke_r; rp.stroke_g = gs.stroke_g; rp.stroke_b = gs.stroke_b;
-                  rp.fill_alpha = gs.fill_alpha; rp.stroke_alpha = gs.stroke_alpha;
-                  rp.line_width = gs.line_width; rp.do_fill = true; rp.do_stroke = false;
-                  rp.seq = draw_seq++;
-                  result.paths.push_back(std::move(rp)); }
-                current_path.clear();
+                record_render_path(true, false, op.is("f*"));
             } else if (op.is("B") || op.is("B*") || op.is("b") || op.is("b*")) {
                 if (op.is("b") || op.is("b*"))
                     current_path.push_back({0, 0, PathPoint::CLOSE});
@@ -1168,15 +1171,8 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
                 if (!filter_white_stroke() && !filter_small_rect())
                     flush_path_segments();
                 commit_pending_clip(gs);
-                { RenderPath rp; rp.points = std::move(current_path);
-                  rp.even_odd = op.is("B*") || op.is("b*");
-                  rp.fill_r = gs.fill_r; rp.fill_g = gs.fill_g; rp.fill_b = gs.fill_b;
-                  rp.stroke_r = gs.stroke_r; rp.stroke_g = gs.stroke_g; rp.stroke_b = gs.stroke_b;
-                  rp.fill_alpha = gs.fill_alpha; rp.stroke_alpha = gs.stroke_alpha;
-                  rp.line_width = gs.line_width; rp.do_fill = true; rp.do_stroke = true;
-                  rp.seq = draw_seq++;
-                  result.paths.push_back(std::move(rp)); }
-                current_path.clear();
+                record_render_path(true, true,
+                                   op.is("B*") || op.is("b*"));
             } else if (op.is("W") || op.is("W*")) {
                 pending_clip = current_path;
                 has_pending_clip = true;
@@ -1216,7 +1212,8 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
                                 const PdfObj& sub_res = form_res.is_none() ? res : form_res;
                                 auto sub = parse_content_stream(
                                     doc, form_stream, sub_res, page_height,
-                                    font_cache, skip_graphics, form_ctm, depth + 1,
+                                    font_cache, options,
+                                    form_ctm, depth + 1,
                                     &gs);
                                 // sub is a temporary discarded right after — move
                                 // its elements into the parent instead of copying.
@@ -1241,7 +1238,7 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
                                     std::make_move_iterator(sub.paths.begin()),
                                     std::make_move_iterator(sub.paths.end()));
                             }
-                        } else {
+                        } else if (collect_render_paths) {
                             ImagePlacement ip;
                             ip.xobj_name = xname;
                             if (xref.is_ref()) ip.xobj_ref = xref.ref_num;

@@ -8,6 +8,7 @@
 // their skip behavior.
 #include "jbig2.h"
 #include "mq_decoder.h"
+#include "pdf_limits.h"
 
 #include <algorithm>
 #include <cstring>
@@ -32,11 +33,16 @@ struct Bitmap {
     size_t stride = 0;
     std::vector<uint8_t> rows;
 
-    void init(int width, int height, int fill_bit) {
+    bool init(int width, int height, int fill_bit) {
+        if (width <= 0 || height < 0 ||
+            static_cast<uint64_t>(width) * static_cast<uint64_t>(height) >
+                limits::kMaxDecodedPixels)
+            return false;
         w = width;
         h = height;
         stride = (static_cast<size_t>(w) + 7) / 8;
         rows.assign(stride * h, fill_bit ? 0xFF : 0x00);
+        return true;
     }
     int get(int x, int y) const {
         if (static_cast<unsigned>(x) >= static_cast<unsigned>(w) ||
@@ -174,7 +180,9 @@ std::vector<uint8_t> jbig2_decode(const uint8_t* data, size_t len,
                     if (ph == 0xFFFFFFFF || ph == 0)
                         ph = 0; // striped page: grown by region extents below
                     if (ph > 1u << 20) return false;
-                    page.init(static_cast<int>(pw), static_cast<int>(ph), page_default);
+                    if (!page.init(static_cast<int>(pw), static_cast<int>(ph),
+                                   page_default))
+                        return false;
                     page_ready = true;
                     break;
                 }
@@ -208,7 +216,8 @@ std::vector<uint8_t> jbig2_decode(const uint8_t* data, size_t len,
                     if (rx > 1u << 20 || ry > 1u << 20) return false;
 
                     Bitmap region;
-                    region.init(static_cast<int>(rw), static_cast<int>(rh), 0);
+                    if (!region.init(static_cast<int>(rw), static_cast<int>(rh), 0))
+                        return false;
                     if (!decode_generic_region(region, tmpl, at, at_count, tpgdon,
                                                p + body + b.pos,
                                                sh.data_length - b.pos))
@@ -218,7 +227,9 @@ std::vector<uint8_t> jbig2_decode(const uint8_t* data, size_t len,
                         // Degenerate stream without page info: adopt the region
                         if (static_cast<uint64_t>(rw + rx) * (rh + ry) > 64ull << 20)
                             return false;
-                        page.init(static_cast<int>(rw + rx), static_cast<int>(rh + ry), 0);
+                        if (!page.init(static_cast<int>(rw + rx),
+                                       static_cast<int>(rh + ry), 0))
+                            return false;
                         page_ready = true;
                     }
                     if (static_cast<int>(ry + rh) > page.h) {
@@ -227,7 +238,8 @@ std::vector<uint8_t> jbig2_decode(const uint8_t* data, size_t len,
                         if (static_cast<uint64_t>(page.w) * (ry + rh) > 64ull << 20)
                             return false;
                         Bitmap grown;
-                        grown.init(page.w, static_cast<int>(ry + rh), page_default);
+                        if (!grown.init(page.w, static_cast<int>(ry + rh), page_default))
+                            return false;
                         std::memcpy(grown.rows.data(), page.rows.data(), page.rows.size());
                         page = std::move(grown);
                     }

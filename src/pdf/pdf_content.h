@@ -252,13 +252,23 @@ struct FontCache {
     std::mutex mu;
 };
 
+enum class GraphicsCollection {
+    None,
+    TableGeometry,
+    RenderPaths,
+};
+
+struct ContentParseOptions {
+    GraphicsCollection graphics = GraphicsCollection::RenderPaths;
+};
+
 // Cross-translation-unit declarations.
 // inherit_gs: graphics state a Form XObject inherits from its caller (colors,
 // /ca alpha, clip). initial_ctm still overrides the CTM after the copy.
 ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>& stream,
                                          const PdfObj& resources, double page_height,
                                          FontCache* font_cache = nullptr,
-                                         bool skip_graphics = false,
+                                         const ContentParseOptions& options = {},
                                          const double* initial_ctm = nullptr,
                                          int depth = 0,
                                          const GfxState* inherit_gs = nullptr);

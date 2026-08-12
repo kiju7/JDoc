@@ -1,5 +1,6 @@
 // pdf.cpp — facade: orchestration + public API (PDF -> Markdown, no PDFium).
 #include "pdf_extract.h"
+#include "pdf_limits.h"
 #include "common/cpu_budget.h"
 #include "common/string_utils.h"
 #include "common/file_utils.h"
@@ -9,6 +10,7 @@
 #include <atomic>
 #include <cassert>
 #include <cmath>
+#include <condition_variable>
 #include <cstdlib>
 #include <cstring>
 #include <functional>
@@ -23,6 +25,76 @@
 #include <vector>
 
 namespace jdoc { namespace pdf_detail {
+
+namespace {
+
+// Limit simultaneous page-composite working sets process-wide. An A4 RGB
+// canvas at 300 DPI is about 26 MiB, while compression and decoded source
+// rasters add further transient allocations. Text-only pages do not take a
+// lease and can still use the full CPU worker pool.
+class CompositeMemoryGate {
+public:
+    void acquire(size_t bytes) {
+        bytes = std::min(bytes, limits::kCompositeMemoryBudget);
+        std::unique_lock<std::mutex> lock(mu_);
+        cv_.wait(lock, [&] {
+            return bytes <= limits::kCompositeMemoryBudget - used_;
+        });
+        used_ += bytes;
+    }
+
+    void release(size_t bytes) {
+        bytes = std::min(bytes, limits::kCompositeMemoryBudget);
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            assert(used_ >= bytes);
+            used_ -= bytes;
+        }
+        cv_.notify_all();
+    }
+
+private:
+    std::mutex mu_;
+    std::condition_variable cv_;
+    size_t used_ = 0;
+};
+
+class CompositeMemoryLease {
+public:
+    CompositeMemoryLease(CompositeMemoryGate& gate, size_t bytes)
+        : gate_(gate), bytes_(bytes) {
+        gate_.acquire(bytes_);
+    }
+
+    ~CompositeMemoryLease() { gate_.release(bytes_); }
+
+    CompositeMemoryLease(const CompositeMemoryLease&) = delete;
+    CompositeMemoryLease& operator=(const CompositeMemoryLease&) = delete;
+
+private:
+    CompositeMemoryGate& gate_;
+    size_t bytes_;
+};
+
+size_t composite_memory_cost(double page_w, double page_h) {
+    constexpr long double kScale = 300.0L / 72.0L;
+    constexpr long double kMaxPixels =
+        static_cast<long double>(limits::kMaxDecodedPixels);
+    long double pixels = std::max(0.0L,
+        static_cast<long double>(page_w) * page_h * kScale * kScale);
+    pixels = std::min(pixels, kMaxPixels);
+    // RGB canvas + DEFLATE destination + decoded/mask scratch, with a small
+    // fixed allowance for renderer vectors and compression state.
+    long double bytes =
+        pixels * limits::kCompositeBytesPerPixel +
+        static_cast<long double>(limits::kCompositeFixedBytes);
+    return static_cast<size_t>(std::min<long double>(
+        bytes, limits::kCompositeMemoryBudget));
+}
+
+enum class ImagePayloadPolicy { MetadataOnly, Retain };
+
+} // namespace
 
 std::vector<uint8_t> get_page_content(PdfDoc& doc, const PdfObj& page_obj) {
     auto contents = doc.resolve(page_obj.get("Contents"));
@@ -64,7 +136,8 @@ static void page_view_ctm(int rotate, double w, double h,
 // Extract from an in-memory buffer; pdf_path is used for error messages only.
 static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
                                         const std::string& pdf_path,
-                                        const ConvertOptions& opts) {
+                                        const ConvertOptions& opts,
+                                        ImagePayloadPolicy payload_policy) {
     ExtractResult result;
 
     // Check PDF header
@@ -159,15 +232,13 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
     }
 
     FontCache font_cache;
+    // Shared across simultaneous conversions so document-level parallelism
+    // cannot multiply every conversion's page-canvas budget.
+    static CompositeMemoryGate composite_memory;
 
-    // Page workers only — no intra-page (strip) parallelism. Splitting pages
-    // never spends more total CPU than the sequential loop, so it stays
-    // throughput-neutral when the embedding server already runs one
-    // conversion per core; per-page parallel compression was measured to
-    // trade ~4x the cycles for its wall-clock win and was dropped for that
-    // reason. The count comes from available_cpus(), not
-    // hardware_concurrency: inside a CPU-capped container the latter reports
-    // the host's cores, and each extra worker holds another full-page canvas.
+    // Parallelize independent pages, while respecting affinity/container CPU
+    // limits. CompositeMemoryGate separately bounds concurrent raster working
+    // sets; text-only pages do not pay that serialization cost.
     constexpr size_t kMaxPageWorkers = 8;
     const size_t hw = util::available_cpus();
     const size_t n_workers = std::min({page_indices.size(), hw, kMaxPageWorkers});
@@ -250,9 +321,17 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
         bool need_tables = opts.tables && !plaintext;
         bool need_graphics = need_tables || opts.images;
 
-        auto parse_result = parse_content_stream(doc, content_data, resources, page_h,
-                                                  &font_cache, !need_graphics,
-                                                  initial_ctm);
+        ContentParseOptions parse_options;
+        if (!need_graphics) {
+            parse_options.graphics = GraphicsCollection::None;
+        } else if (opts.images) {
+            parse_options.graphics = GraphicsCollection::RenderPaths;
+        } else {
+            parse_options.graphics = GraphicsCollection::TableGeometry;
+        }
+        auto parse_result = parse_content_stream(
+            doc, content_data, resources, page_h, &font_cache, parse_options,
+            initial_ctm);
 
         result.all_lines[p] = chars_to_lines(parse_result.chars, &result.col_boundaries[p]);
 
@@ -277,6 +356,13 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
 
         // Image extraction
         if (opts.images) {
+            auto render_composite = [&]() {
+                const size_t memory_cost = composite_memory_cost(page_w, page_h);
+                CompositeMemoryLease lease(composite_memory, memory_cost);
+                return render_page_composite(
+                    doc, page_obj, parse_result, p, page_w, page_h, image_dir);
+            };
+
             // Decide whether image XObjects are independent assets or drawing
             // primitives that only make sense after page-level composition.
             // This intentionally uses their role in the page instead of a
@@ -339,8 +425,7 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
             bool composited = false;
             if (vector_text_page || banded_scan_page || fragmented_raster_page ||
                 layered_image_page) {
-                auto rendered = render_page_composite(doc, page_obj, parse_result,
-                                                      p, page_w, page_h, image_dir);
+                auto rendered = render_composite();
                 if (!rendered.data.empty() || !rendered.pixels.empty() || !rendered.saved_path.empty()) {
                     result.all_images[p].push_back(std::move(rendered));
                     result.all_image_y[p].push_back(page_h);
@@ -364,8 +449,7 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
                 // Fallback: render page for scanned/vector-only pages
                 if (result.all_images[p].empty() && result.all_lines[p].empty()) {
                     if (!parse_result.images.empty() || !parse_result.segments.empty()) {
-                        auto rendered = render_page_composite(doc, page_obj, parse_result,
-                                                              p, page_w, page_h, image_dir);
+                        auto rendered = render_composite();
                         if (!rendered.data.empty() || !rendered.pixels.empty() || !rendered.saved_path.empty()) {
                             result.all_images[p].push_back(std::move(rendered));
                             result.all_image_y[p].push_back(page_h);
@@ -375,26 +459,21 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
                 }
             }
 
-            // Release pixel data after writing to disk
-            if (!image_dir.empty()) {
-                for (auto& img : result.all_images[p]) {
-                    if (!img.saved_path.empty()) {
-                        img.data.clear();
-                        img.data.shrink_to_fit();
-                        img.pixels.clear();
-                        img.pixels.shrink_to_fit();
-                    }
+            // The string-only API emits image references but cannot expose the
+            // encoded bytes. Drop them per page instead of retaining an entire
+            // scanned document until Markdown assembly finishes. Chunk APIs
+            // keep ownership unless the image was successfully written out.
+            for (auto& img : result.all_images[p]) {
+                if (payload_policy == ImagePayloadPolicy::MetadataOnly ||
+                    (!image_dir.empty() && !img.saved_path.empty())) {
+                    discard_image_payload(img);
                 }
             }
         }
     };
 
-    // Pages are independent: each iteration writes only its own slot of the
-    // pre-sized result vectors, PdfDoc object loading serializes on load_mu,
-    // and the font cache locks internally — so multi-page documents fan out
-    // over a small pool. Output is byte-identical to the sequential order.
-    // The worker cap bounds peak memory: every in-flight composite page owns
-    // a full-page canvas (~26 MB for A4 at 300 DPI).
+    // Each worker owns one pre-sized result slot. Shared object/font caches
+    // synchronize internally, preserving deterministic output order.
     if (n_workers <= 1) {
         for (int p : page_indices) process_page(p);
     } else {
@@ -404,25 +483,31 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
         std::exception_ptr first_error;
         std::vector<std::thread> workers;
         workers.reserve(n_workers);
-        for (size_t t = 0; t < n_workers; t++) {
-            workers.emplace_back([&]() {
-                size_t i;
-                // Match the sequential loop's abort semantics: once a page
-                // throws, no worker starts another page (in-flight pages
-                // finish), instead of rendering the whole rest of the
-                // document for a result the rethrow below discards.
-                while (!failed.load(std::memory_order_relaxed) &&
-                       (i = next_page.fetch_add(1)) < page_indices.size()) {
-                    try {
-                        process_page(page_indices[i]);
-                    } catch (...) {
-                        failed.store(true, std::memory_order_relaxed);
-                        std::lock_guard<std::mutex> lock(err_mu);
-                        if (!first_error)
-                            first_error = std::current_exception();
+        try {
+            for (size_t t = 0; t < n_workers; t++) {
+                workers.emplace_back([&]() {
+                    size_t i;
+                    // Match the sequential loop's abort semantics: once a page
+                    // throws, no worker starts another page (in-flight pages
+                    // finish), instead of rendering the whole rest of the
+                    // document for a result the rethrow below discards.
+                    while (!failed.load(std::memory_order_relaxed) &&
+                           (i = next_page.fetch_add(1)) < page_indices.size()) {
+                        try {
+                            process_page(page_indices[i]);
+                        } catch (...) {
+                            failed.store(true, std::memory_order_relaxed);
+                            std::lock_guard<std::mutex> lock(err_mu);
+                            if (!first_error)
+                                first_error = std::current_exception();
+                        }
                     }
-                }
-            });
+                });
+            }
+        } catch (...) {
+            failed.store(true, std::memory_order_relaxed);
+            for (auto& w : workers) w.join();
+            throw;
         }
         for (auto& w : workers) w.join();
         if (first_error) std::rethrow_exception(first_error);
@@ -452,7 +537,9 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
     return result;
 }
 
-static ExtractResult extract_pdf(const std::string& pdf_path, const ConvertOptions& opts) {
+static ExtractResult extract_pdf(const std::string& pdf_path,
+                                 const ConvertOptions& opts,
+                                 ImagePayloadPolicy payload_policy) {
     // Map the file read-only: the parser treats its input as const (the
     // convert_bytes path already feeds it read-only buffers), so mapping avoids
     // a whole-file heap allocation and the read() copy. Falls back to a heap
@@ -461,7 +548,8 @@ static ExtractResult extract_pdf(const std::string& pdf_path, const ConvertOptio
     if (!mf.valid()) throw std::runtime_error("Cannot open PDF: " + pdf_path);
     if (mf.size() == 0) throw std::runtime_error("Empty PDF file: " + pdf_path);
 
-    return extract_pdf_buffer(mf.data(), mf.size(), pdf_path, opts);
+    return extract_pdf_buffer(mf.data(), mf.size(), pdf_path, opts,
+                              payload_policy);
 }
 
 
@@ -471,25 +559,27 @@ namespace jdoc {
 using namespace pdf_detail;
 
 std::string pdf_to_markdown(const std::string& pdf_path, ConvertOptions opts) {
-    auto r = extract_pdf(pdf_path, opts);
+    auto r = extract_pdf(pdf_path, opts, ImagePayloadPolicy::MetadataOnly);
     return result_to_markdown(r, opts);
 }
 
 std::vector<PageChunk> pdf_to_markdown_chunks(const std::string& pdf_path,
                                               ConvertOptions opts) {
-    auto r = extract_pdf(pdf_path, opts);
+    auto r = extract_pdf(pdf_path, opts, ImagePayloadPolicy::Retain);
     return result_to_chunks(r, opts);
 }
 
 std::string pdf_to_markdown_mem(const uint8_t* data, size_t size,
                                 ConvertOptions opts) {
-    auto r = extract_pdf_buffer(data, size, "<memory>", opts);
+    auto r = extract_pdf_buffer(data, size, "<memory>", opts,
+                                ImagePayloadPolicy::MetadataOnly);
     return result_to_markdown(r, opts);
 }
 
 std::vector<PageChunk> pdf_to_markdown_chunks_mem(const uint8_t* data, size_t size,
                                                   ConvertOptions opts) {
-    auto r = extract_pdf_buffer(data, size, "<memory>", opts);
+    auto r = extract_pdf_buffer(data, size, "<memory>", opts,
+                                ImagePayloadPolicy::Retain);
     return result_to_chunks(r, opts);
 }
 
@@ -510,13 +600,14 @@ void pdf_to_markdown_chunks_stream(const std::string& pdf_path,
     // the sink owns and frees one page at a time. Producer peak is bounded by
     // image_dir (its existing per-page disk flush) when set. Output is
     // byte-identical to pdf_to_markdown_chunks.
-    auto r = extract_pdf(pdf_path, opts);
+    auto r = extract_pdf(pdf_path, opts, ImagePayloadPolicy::Retain);
     stream_result_chunks(r, opts, sink);
 }
 
 void pdf_to_markdown_chunks_mem_stream(const uint8_t* data, size_t size,
                                        const ConvertOptions& opts, const PageSink& sink) {
-    auto r = extract_pdf_buffer(data, size, "<memory>", opts);
+    auto r = extract_pdf_buffer(data, size, "<memory>", opts,
+                                ImagePayloadPolicy::Retain);
     stream_result_chunks(r, opts, sink);
 }
 } // namespace jdoc
