@@ -5,6 +5,7 @@
 #include "common/mapped_file.h"
 #include <fstream>
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <cmath>
 #include <cstdlib>
@@ -15,6 +16,7 @@
 #include <numeric>
 #include <sstream>
 #include <stdexcept>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -151,10 +153,20 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
         util::ensure_dir(image_dir);
     }
 
-    std::unordered_map<int, PdfFont> font_cache;
+    FontCache font_cache;
 
-    for (int p : page_indices) {
-        if (p < 0 || p >= tp) continue;
+    // Split the cores between the two parallel axes up front: page workers
+    // carry multi-page documents, and whatever they leave idle goes to
+    // strip-parallel PNG encoding inside each composite render (the dominant
+    // cost of single-page image documents).
+    constexpr size_t kMaxPageWorkers = 8;
+    const size_t hw = std::max<size_t>(1, std::thread::hardware_concurrency());
+    const size_t n_workers = std::min({page_indices.size(), hw, kMaxPageWorkers});
+    const int encode_threads = static_cast<int>(
+        std::min(kMaxPageWorkers, hw / std::max<size_t>(1, n_workers)));
+
+    auto process_page = [&](int p) {
+        if (p < 0 || p >= tp) return;
         auto& page_obj = page_objs[p];
 
         // Page geometry: MediaBox and /Rotate are inheritable, so climb the
@@ -220,11 +232,11 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
                 has_fonts = fd.is_dict() && !fd.dict.empty();
             }
         }
-        if (!has_fonts && !opts.images) continue;
+        if (!has_fonts && !opts.images) return;
 
         // Parse content stream
         auto content_data = get_page_content(doc, page_obj);
-        if (content_data.empty()) continue;
+        if (content_data.empty()) return;
 
         // Extract text lines
         bool plaintext = (opts.format == OutputFormat::PLAINTEXT);
@@ -288,7 +300,8 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
             bool composited = false;
             if (vector_text_page || banded_scan_page) {
                 auto rendered = render_page_composite(doc, page_obj, parse_result,
-                                                      p, page_w, page_h, image_dir);
+                                                      p, page_w, page_h, image_dir,
+                                                      encode_threads);
                 if (!rendered.data.empty() || !rendered.pixels.empty() || !rendered.saved_path.empty()) {
                     result.all_images[p].push_back(std::move(rendered));
                     result.all_image_y[p].push_back(page_h);
@@ -311,7 +324,8 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
                 if (has_regular && has_mask) {
                     // Layered: render as composite
                     auto rendered = render_page_composite(doc, page_obj, parse_result,
-                                                          p, page_w, page_h, image_dir);
+                                                          p, page_w, page_h, image_dir,
+                                                          encode_threads);
                     if (!rendered.data.empty() || !rendered.pixels.empty() || !rendered.saved_path.empty()) {
                         result.all_images[p].push_back(std::move(rendered));
                         result.all_image_y[p].push_back(page_h);
@@ -333,7 +347,8 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
                 if (result.all_images[p].empty() && result.all_lines[p].empty()) {
                     if (!parse_result.images.empty() || !parse_result.segments.empty()) {
                         auto rendered = render_page_composite(doc, page_obj, parse_result,
-                                                              p, page_w, page_h, image_dir);
+                                                              p, page_w, page_h, image_dir,
+                                                              encode_threads);
                         if (!rendered.data.empty() || !rendered.pixels.empty() || !rendered.saved_path.empty()) {
                             result.all_images[p].push_back(std::move(rendered));
                             result.all_image_y[p].push_back(page_h);
@@ -355,6 +370,38 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
                 }
             }
         }
+    };
+
+    // Pages are independent: each iteration writes only its own slot of the
+    // pre-sized result vectors, PdfDoc object loading serializes on load_mu,
+    // and the font cache locks internally — so multi-page documents fan out
+    // over a small pool. Output is byte-identical to the sequential order.
+    // The worker cap bounds peak memory: every in-flight composite page owns
+    // a full-page canvas (~26 MB for A4 at 300 DPI).
+    if (n_workers <= 1) {
+        for (int p : page_indices) process_page(p);
+    } else {
+        std::atomic<size_t> next_page{0};
+        std::mutex err_mu;
+        std::exception_ptr first_error;
+        std::vector<std::thread> workers;
+        workers.reserve(n_workers);
+        for (size_t t = 0; t < n_workers; t++) {
+            workers.emplace_back([&]() {
+                size_t i;
+                while ((i = next_page.fetch_add(1)) < page_indices.size()) {
+                    try {
+                        process_page(page_indices[i]);
+                    } catch (...) {
+                        std::lock_guard<std::mutex> lock(err_mu);
+                        if (!first_error)
+                            first_error = std::current_exception();
+                    }
+                }
+            });
+        }
+        for (auto& w : workers) w.join();
+        if (first_error) std::rethrow_exception(first_error);
     }
 
     // Extract bookmarks

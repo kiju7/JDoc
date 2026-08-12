@@ -281,13 +281,14 @@ static std::shared_ptr<const CsInfo> load_colorspace(PdfDoc& doc,
 
 ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>& stream,
                                          const PdfObj& resources, double page_height,
-                                         std::unordered_map<int, PdfFont>* font_cache,
+                                         FontCache* font_cache,
                                          bool skip_graphics,
                                          const double* initial_ctm,
                                          int depth) {
     ContentParseResult result;
 
-    // Load fonts from resources, using cross-page cache when available
+    // Load fonts from resources, using cross-page cache when available.
+    // The lock covers only lookup/insert; load_font runs outside it.
     std::unordered_map<std::string, PdfFont> fonts;
     auto res = doc.resolve(resources);
     auto& font_dict = res.get("Font");
@@ -297,15 +298,18 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
             for (auto& [name, ref] : fd.dict) {
                 int rn = ref.is_ref() ? ref.ref_num : -1;
                 if (font_cache && rn >= 0) {
-                    auto it = font_cache->find(rn);
-                    if (it != font_cache->end()) {
+                    std::lock_guard<std::mutex> lock(font_cache->mu);
+                    auto it = font_cache->map.find(rn);
+                    if (it != font_cache->map.end()) {
                         fonts[name] = it->second;
                         continue;
                     }
                 }
                 fonts[name] = load_font(doc, ref);
-                if (font_cache && rn >= 0)
-                    (*font_cache)[rn] = fonts[name];
+                if (font_cache && rn >= 0) {
+                    std::lock_guard<std::mutex> lock(font_cache->mu);
+                    font_cache->map.emplace(rn, fonts[name]);
+                }
             }
         }
     }

@@ -243,10 +243,19 @@ struct PageCharCache {
     }
 };
 
+// Cross-page font cache keyed by font object number. Shared by the parallel
+// page workers, so lookups/inserts go through the lock. load_font is
+// deterministic, so two workers racing on a miss both compute the same value
+// and the duplicate insert is harmless.
+struct FontCache {
+    std::unordered_map<int, PdfFont> map;
+    std::mutex mu;
+};
+
 // Cross-translation-unit declarations.
 ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>& stream,
                                          const PdfObj& resources, double page_height,
-                                         std::unordered_map<int, PdfFont>* font_cache = nullptr,
+                                         FontCache* font_cache = nullptr,
                                          bool skip_graphics = false,
                                          const double* initial_ctm = nullptr,
                                          int depth = 0);
