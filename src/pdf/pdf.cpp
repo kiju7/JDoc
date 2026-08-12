@@ -155,15 +155,15 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
 
     FontCache font_cache;
 
-    // Split the cores between the two parallel axes up front: page workers
-    // carry multi-page documents, and whatever they leave idle goes to
-    // strip-parallel PNG encoding inside each composite render (the dominant
-    // cost of single-page image documents).
+    // Page workers only — no intra-page (strip) parallelism. Splitting pages
+    // never spends more total CPU than the sequential loop, so it stays
+    // throughput-neutral when the embedding server already runs one
+    // conversion per core; per-page parallel compression was measured to
+    // trade ~4x the cycles for its wall-clock win and was dropped for that
+    // reason.
     constexpr size_t kMaxPageWorkers = 8;
     const size_t hw = std::max<size_t>(1, std::thread::hardware_concurrency());
     const size_t n_workers = std::min({page_indices.size(), hw, kMaxPageWorkers});
-    const int encode_threads = static_cast<int>(
-        std::min(kMaxPageWorkers, hw / std::max<size_t>(1, n_workers)));
 
     auto process_page = [&](int p) {
         if (p < 0 || p >= tp) return;
@@ -300,8 +300,7 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
             bool composited = false;
             if (vector_text_page || banded_scan_page) {
                 auto rendered = render_page_composite(doc, page_obj, parse_result,
-                                                      p, page_w, page_h, image_dir,
-                                                      encode_threads);
+                                                      p, page_w, page_h, image_dir);
                 if (!rendered.data.empty() || !rendered.pixels.empty() || !rendered.saved_path.empty()) {
                     result.all_images[p].push_back(std::move(rendered));
                     result.all_image_y[p].push_back(page_h);
@@ -324,8 +323,7 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
                 if (has_regular && has_mask) {
                     // Layered: render as composite
                     auto rendered = render_page_composite(doc, page_obj, parse_result,
-                                                          p, page_w, page_h, image_dir,
-                                                          encode_threads);
+                                                          p, page_w, page_h, image_dir);
                     if (!rendered.data.empty() || !rendered.pixels.empty() || !rendered.saved_path.empty()) {
                         result.all_images[p].push_back(std::move(rendered));
                         result.all_image_y[p].push_back(page_h);
@@ -347,8 +345,7 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
                 if (result.all_images[p].empty() && result.all_lines[p].empty()) {
                     if (!parse_result.images.empty() || !parse_result.segments.empty()) {
                         auto rendered = render_page_composite(doc, page_obj, parse_result,
-                                                              p, page_w, page_h, image_dir,
-                                                              encode_threads);
+                                                              p, page_w, page_h, image_dir);
                         if (!rendered.data.empty() || !rendered.pixels.empty() || !rendered.saved_path.empty()) {
                             result.all_images[p].push_back(std::move(rendered));
                             result.all_image_y[p].push_back(page_h);

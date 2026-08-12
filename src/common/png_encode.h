@@ -10,7 +10,6 @@
 #include <libdeflate.h>    // faster DEFLATE compression for the IDAT payload
 #include <fstream>
 #include <string>
-#include <thread>
 #include <vector>
 #include <cstdint>
 #include <cstring>
@@ -38,73 +37,6 @@ inline void png_write_chunk(std::vector<char>& out, const char type[4],
     uint32_t crc = static_cast<uint32_t>(
         crc32(0, reinterpret_cast<const Bytef*>(&out[type_pos]), 4 + len));
     png_put32(out, crc);
-}
-
-// Compress a buffer into one zlib stream using parallel strips, pigz-style:
-// each strip is raw-deflated independently, non-final strips end on a
-// Z_SYNC_FLUSH (byte-aligned, no BFINAL), and the byte-concatenation of the
-// strips is a single valid DEFLATE stream whose adler32 is stitched with
-// adler32_combine. libdeflate cannot serve here — it has no flush API, so its
-// streams always terminate — hence zlib per strip. Level 3 was measured on
-// page-composite payloads as the tradeoff point: ~2x faster than a single
-// whole-buffer libdeflate level-1 pass with equal-or-smaller total output.
-// Returns empty on any strip failure (caller falls back to the serial path).
-inline std::vector<uint8_t> parallel_zlib_deflate(const uint8_t* payload,
-                                                  size_t size, int nstrips) {
-    struct Strip {
-        const uint8_t* src; size_t len; bool last;
-        std::vector<uint8_t> out;
-        uint32_t adler = 1;
-        bool ok = false;
-    };
-    std::vector<Strip> strips;
-    size_t per = size / nstrips;
-    for (int i = 0; i < nstrips; i++) {
-        size_t begin = per * i;
-        size_t end = (i + 1 == nstrips) ? size : per * (i + 1);
-        strips.push_back({payload + begin, end - begin, i + 1 == nstrips, {}, 1, false});
-    }
-    std::vector<std::thread> pool;
-    pool.reserve(strips.size());
-    for (auto& s : strips) {
-        pool.emplace_back([&s]() {
-            z_stream zs = {};
-            if (deflateInit2(&zs, 3, Z_DEFLATED, -15, 8,
-                             Z_DEFAULT_STRATEGY) != Z_OK) return;
-            s.out.resize(deflateBound(&zs, s.len) + 16);
-            zs.next_in = const_cast<Bytef*>(s.src);
-            zs.avail_in = static_cast<uInt>(s.len);
-            zs.next_out = s.out.data();
-            zs.avail_out = static_cast<uInt>(s.out.size());
-            int ret = deflate(&zs, s.last ? Z_FINISH : Z_SYNC_FLUSH);
-            if (s.last ? (ret == Z_STREAM_END) : (ret == Z_OK)) {
-                s.out.resize(zs.total_out);
-                s.adler = adler32(1, s.src, static_cast<uInt>(s.len));
-                s.ok = true;
-            }
-            deflateEnd(&zs);
-        });
-    }
-    for (auto& t : pool) t.join();
-
-    size_t total = 2 + 4; // zlib header + adler32 trailer
-    uint32_t adler = 1;
-    for (auto& s : strips) {
-        if (!s.ok) return {};
-        total += s.out.size();
-        adler = static_cast<uint32_t>(
-            adler32_combine(adler, s.adler, static_cast<z_off_t>(s.len)));
-    }
-    std::vector<uint8_t> out;
-    out.reserve(total);
-    out.push_back(0x78); out.push_back(0x01);
-    for (auto& s : strips)
-        out.insert(out.end(), s.out.begin(), s.out.end());
-    out.push_back(static_cast<uint8_t>(adler >> 24));
-    out.push_back(static_cast<uint8_t>(adler >> 16));
-    out.push_back(static_cast<uint8_t>(adler >> 8));
-    out.push_back(static_cast<uint8_t>(adler));
-    return out;
 }
 
 // components==4 defaults to CMYK input (converted to RGB); rgba=true makes a
@@ -234,14 +166,9 @@ inline std::vector<char> pixels_to_png(const uint8_t* pixels, size_t pixel_size,
 // intermediate raw-buffer copy pixels_to_png() makes (26 MB per A4 page at
 // 300 DPI). Grayscale pages are still repacked to 1-channel rows first: the
 // smaller DEFLATE input more than pays for that copy.
-// encode_threads > 1 switches the IDAT compression to parallel strips
-// (parallel_zlib_deflate) when the payload is large enough to amortize the
-// threads; pass it only when idle cores are actually available (the page
-// workers already saturate multi-page documents).
 inline std::vector<char> prefiltered_to_png(const uint8_t* rows, size_t size,
                                             unsigned w, unsigned h,
-                                            int level = Z_BEST_SPEED,
-                                            int encode_threads = 1) {
+                                            int level = Z_BEST_SPEED) {
     if (!rows || w == 0 || h == 0) return {};
     const size_t stride = static_cast<size_t>(w) * 3 + 1;
     if (size < stride * h) return {};
@@ -269,32 +196,15 @@ inline std::vector<char> prefiltered_to_png(const uint8_t* rows, size_t size,
         payload_size = gray.size();
     }
 
-    // Strips below ~1 MB don't amortize their thread; clamp the strip count
-    // to keep every strip at least that large. And zlib level 3 costs ~4x a
-    // whole-buffer libdeflate level-1 pass per byte, so the parallel path
-    // only wins from 4 strips up — below that, stay serial.
-    constexpr size_t kMinStripBytes = 1u << 20;
-    constexpr int kMinStrips = 4;
-    int nstrips = static_cast<int>(std::min<size_t>(
-        {static_cast<size_t>(encode_threads), size_t{8},
-         payload_size / kMinStripBytes}));
-    std::vector<uint8_t> deflated;
-    size_t deflated_size = 0;
-    if (nstrips >= kMinStrips) {
-        deflated = parallel_zlib_deflate(payload, payload_size, nstrips);
-        deflated_size = deflated.size();
-    }
-    if (deflated_size == 0) {
-        int ld_level = (level <= 0) ? 6 : (level > 12 ? 12 : level);
-        libdeflate_compressor* comp = libdeflate_alloc_compressor(ld_level);
-        if (!comp) return {};
-        size_t bound = libdeflate_zlib_compress_bound(comp, payload_size);
-        deflated.assign(bound, 0);
-        deflated_size = libdeflate_zlib_compress(
-            comp, payload, payload_size, deflated.data(), bound);
-        libdeflate_free_compressor(comp);
-        if (deflated_size == 0) return {};
-    }
+    int ld_level = (level <= 0) ? 6 : (level > 12 ? 12 : level);
+    libdeflate_compressor* comp = libdeflate_alloc_compressor(ld_level);
+    if (!comp) return {};
+    size_t bound = libdeflate_zlib_compress_bound(comp, payload_size);
+    std::vector<uint8_t> deflated(bound);
+    size_t deflated_size = libdeflate_zlib_compress(
+        comp, payload, payload_size, deflated.data(), bound);
+    libdeflate_free_compressor(comp);
+    if (deflated_size == 0) return {};
 
     std::vector<char> png;
     png.reserve(8 + 25 + deflated_size + 24);

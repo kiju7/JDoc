@@ -91,13 +91,10 @@ std::vector<ExtractedImage> extract_page_images(PdfDoc& doc, const PdfObj& page_
                                                 int page_num,
                                                 const std::string& output_dir,
                                                 unsigned min_image_size = 0);
-// encode_threads: strip-parallelism budget for the PNG encode of the finished
-// canvas — >1 only when the page loop itself is not already using the cores.
 ImageData render_page_composite(PdfDoc& doc, const PdfObj& page_obj,
                                 const ContentParseResult& parse_result,
                                 int page_num, double page_w, double page_h,
-                                const std::string& output_dir,
-                                int encode_threads = 1);
+                                const std::string& output_dir);
 void collect_bookmarks(PdfDoc& doc, const PdfObj& node, int depth,
                        std::vector<BookmarkEntry>& out);
 std::vector<AnnotEntry> extract_annotations(PdfDoc& doc, const PdfObj& page_obj, double page_h,

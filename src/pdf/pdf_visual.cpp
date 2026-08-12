@@ -1251,11 +1251,10 @@ struct Canvas {
         }
     }
 
-    std::vector<char> to_png(int level = Z_BEST_SPEED, int encode_threads = 1) const {
+    std::vector<char> to_png(int level = Z_BEST_SPEED) const {
         return util::prefiltered_to_png(pixels.data(), pixels.size(),
                                   static_cast<unsigned>(width),
-                                  static_cast<unsigned>(height), level,
-                                  encode_threads);
+                                  static_cast<unsigned>(height), level);
     }
 };
 
@@ -1264,8 +1263,7 @@ struct Canvas {
 ImageData render_page_composite(PdfDoc& doc, const PdfObj& page_obj,
                                  const ContentParseResult& parse_result,
                                  int page_num, double page_w, double page_h,
-                                 const std::string& output_dir,
-                                 int encode_threads) {
+                                 const std::string& output_dir) {
     constexpr double kMinDPI = 150.0;
     constexpr double kMaxDPI = 300.0;
     constexpr double kBase = 72.0;
@@ -1908,7 +1906,7 @@ ImageData render_page_composite(PdfDoc& doc, const PdfObj& page_obj,
     img.components = 3;
 
     // Canvas rows are already in PNG layout — deflate them in place
-    auto png = canvas.to_png(Z_BEST_SPEED, encode_threads);
+    auto png = canvas.to_png(Z_BEST_SPEED);
     img.format = "png";
     img.data = std::move(png);
 
