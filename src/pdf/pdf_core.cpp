@@ -1,4 +1,5 @@
 #include "pdf_core.h"
+#include "jbig2.h"
 #include "common/string_utils.h"
 #include "common/file_utils.h"
 #include "common/inflate.h"
@@ -839,8 +840,15 @@ std::vector<uint8_t> PdfDoc::decode_stream(const PdfObj& obj, int obj_num, int g
             }
             if (hi >= 0) out.push_back(static_cast<uint8_t>(hi << 4));
             result = std::move(out);
+        } else if (fname == "JBIG2Decode") {
+            std::vector<uint8_t> globals;
+            auto g = resolve(fparm.get("JBIG2Globals"));
+            if (g.is_stream()) globals = decode_stream(g);
+            int jw = 0, jh = 0;
+            result = jbig2_decode(result.data(), result.size(),
+                                  globals.data(), globals.size(), jw, jh);
         }
-        // DCTDecode, CCITTFaxDecode: leave raw data for caller to handle
+        // DCTDecode, CCITTFaxDecode, JPXDecode: leave raw data for caller
     }
     return result;
 }
