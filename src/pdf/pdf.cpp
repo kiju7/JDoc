@@ -1,5 +1,6 @@
 // pdf.cpp — facade: orchestration + public API (PDF -> Markdown, no PDFium).
 #include "pdf_extract.h"
+#include "common/cpu_budget.h"
 #include "common/string_utils.h"
 #include "common/file_utils.h"
 #include "common/mapped_file.h"
@@ -164,9 +165,11 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
     // throughput-neutral when the embedding server already runs one
     // conversion per core; per-page parallel compression was measured to
     // trade ~4x the cycles for its wall-clock win and was dropped for that
-    // reason.
+    // reason. The count comes from available_cpus(), not
+    // hardware_concurrency: inside a CPU-capped container the latter reports
+    // the host's cores, and each extra worker holds another full-page canvas.
     constexpr size_t kMaxPageWorkers = 8;
-    const size_t hw = std::max<size_t>(1, std::thread::hardware_concurrency());
+    const size_t hw = util::available_cpus();
     const size_t n_workers = std::min({page_indices.size(), hw, kMaxPageWorkers});
 
     auto process_page = [&](int p) {
