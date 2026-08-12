@@ -18,6 +18,17 @@
 // Test file generators
 // ---------------------------------------------------------------------------
 
+// Hardcoded /tmp does not exist on Windows, so every generated file silently
+// failed to write there and the whole suite ran on nothing. (Avoids
+// std::filesystem: gcc 8 still needs -lstdc++fs for it.)
+static std::string temp_dir() {
+    for (const char* var : {"TMPDIR", "TEMP", "TMP"}) {
+        const char* v = std::getenv(var);
+        if (v && *v) return v;
+    }
+    return "/tmp";
+}
+
 static void create_test_pdf(const std::string& path, int id) {
     std::string content = "Document " + std::to_string(id) +
         " - thread safety benchmark. "
@@ -261,16 +272,17 @@ int main() {
     const int NUM_PDF = 100;
     const int NUM_HTML = 100;
     std::vector<std::string> pdf_paths, html_paths, mixed_paths;
+    const std::string tmp = temp_dir();
 
     std::cout << "\nGenerating " << NUM_PDF << " PDFs + " << NUM_HTML << " HTMLs..." << std::endl;
     for (int i = 0; i < NUM_PDF; i++) {
-        std::string p = "/tmp/bench_" + std::to_string(i) + ".pdf";
+        std::string p = tmp + "/bench_" + std::to_string(i) + ".pdf";
         create_test_pdf(p, i);
         pdf_paths.push_back(p);
         mixed_paths.push_back(p);
     }
     for (int i = 0; i < NUM_HTML; i++) {
-        std::string p = "/tmp/bench_" + std::to_string(i) + ".html";
+        std::string p = tmp + "/bench_" + std::to_string(i) + ".html";
         create_test_html(p, i);
         html_paths.push_back(p);
         mixed_paths.push_back(p);
@@ -375,7 +387,7 @@ int main() {
     int exit_code = 0;
     std::cout << "\n--- [6] Multi-page parallel render (same document) ---" << std::endl;
     {
-        const std::string mp_path = "/tmp/bench_multipage.pdf";
+        const std::string mp_path = tmp + "/bench_multipage.pdf";
         create_multipage_pdf(mp_path, 8);
 
         std::string baseline = pages_signature(mp_path);
