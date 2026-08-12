@@ -51,6 +51,61 @@ static void create_test_pdf(const std::string& path, int id) {
     f << pdf.str();
 }
 
+// Multi-page PDF with computed xref offsets. Odd pages are plain text; even
+// pages carry 60 filled rects and no text operator, which trips the
+// vector-glyph fallback so every conversion runs the composite renderer and
+// PNG encoder inside the parallel page workers.
+static void create_multipage_pdf(const std::string& path, int n_pages) {
+    std::vector<std::string> objs;
+    std::string kids;
+    for (int p = 0; p < n_pages; p++)
+        kids += std::to_string(4 + 2 * p) + " 0 R ";
+    objs.push_back("<</Type/Catalog/Pages 2 0 R>>");
+    objs.push_back("<</Type/Pages/Kids[" + kids + "]/Count " +
+                   std::to_string(n_pages) + "/MediaBox[0 0 612 792]>>");
+    objs.push_back("<</Type/Font/Subtype/Type1/BaseFont/Helvetica>>");
+    for (int p = 0; p < n_pages; p++) {
+        std::string page =
+            "<</Type/Page/Parent 2 0 R/Contents " +
+            std::to_string(5 + 2 * p) + " 0 R";
+        std::string content;
+        if (p % 2 == 0) {
+            page += "/Resources<</Font<</F1 3 0 R>>>>>>";
+            content = "BT /F1 12 Tf 72 720 Td (Page " + std::to_string(p + 1) +
+                      " body: parallel page render check) Tj ET";
+        } else {
+            page += "/Resources<<>>>>";
+            content = "0 0 0 rg\n";
+            for (int k = 0; k < 60; k++)
+                content += std::to_string(72 + (k % 10) * 45) + " " +
+                           std::to_string(120 + (k / 10) * 100) + " 20 20 re f\n";
+        }
+        objs.push_back(page);
+        objs.push_back("<</Length " + std::to_string(content.size()) +
+                       ">>\nstream\n" + content + "\nendstream");
+    }
+
+    std::string pdf = "%PDF-1.4\n";
+    std::vector<size_t> offsets;
+    for (size_t i = 0; i < objs.size(); i++) {
+        offsets.push_back(pdf.size());
+        pdf += std::to_string(i + 1) + " 0 obj" + objs[i] + "endobj\n";
+    }
+    size_t xref_pos = pdf.size();
+    pdf += "xref\n0 " + std::to_string(objs.size() + 1) + "\n";
+    pdf += "0000000000 65535 f \n";
+    char line[32];
+    for (size_t off : offsets) {
+        std::snprintf(line, sizeof(line), "%010zu 00000 n \n", off);
+        pdf += line;
+    }
+    pdf += "trailer<</Size " + std::to_string(objs.size() + 1) +
+           "/Root 1 0 R>>\nstartxref\n" + std::to_string(xref_pos) + "\n%%EOF\n";
+
+    std::ofstream f(path, std::ios::binary);
+    f << pdf;
+}
+
 static void create_test_html(const std::string& path, int id) {
     std::ostringstream html;
     html << "<html><head><title>Test " << id << "</title></head><body>"
@@ -139,6 +194,36 @@ static bool extract_text(const std::string& path) {
     }
     if (text) jdoc_free_string(text);
     return false;
+}
+
+// Full per-page conversion collapsed into one comparable string: page texts
+// plus every image's name, format and raw bytes. Two conversions of the same
+// document must produce identical signatures regardless of thread schedule.
+static std::string pages_signature(const std::string& path) {
+    char err[256] = {};
+    JDocOptions opts = jdoc_default_options();
+    opts.images = 1;
+    int count = 0;
+    JDocPage* pages = jdoc_convert_pages(path.c_str(), &opts, &count, err, sizeof(err));
+    if (!pages) return "";
+    std::string sig = "pages=" + std::to_string(count) + ";";
+    for (int i = 0; i < count; i++) {
+        sig += "p" + std::to_string(pages[i].page_number) + ":";
+        if (pages[i].text) sig += pages[i].text;
+        sig += "|imgs=" + std::to_string(pages[i].image_count) + ";";
+        for (int j = 0; j < pages[i].image_count; j++) {
+            const JDocImage& im = pages[i].images[j];
+            sig += im.name ? im.name : "";
+            sig += "/";
+            sig += im.format ? im.format : "";
+            sig += "/" + std::to_string(im.data_size) + "/";
+            if (im.data && im.data_size > 0)
+                sig.append(im.data, im.data + im.data_size);
+            sig += ";";
+        }
+    }
+    jdoc_free_pages(pages, count);
+    return sig;
 }
 
 static bool extract_all_paged(const std::string& path) {
@@ -282,6 +367,43 @@ int main() {
                   << " | " << (r.fail == 0 ? "PASS" : "FAIL") << std::endl;
     }
 
+    // --- 6. Same-document parallel page rendering ---
+    // One multi-page PDF converted concurrently from many threads. The
+    // internal page workers (PdfDoc load_mu, shared font cache, composite
+    // render + PNG encode) overlap with the outer threads, and every result
+    // must be byte-identical to the single-threaded baseline signature.
+    int exit_code = 0;
+    std::cout << "\n--- [6] Multi-page parallel render (same document) ---" << std::endl;
+    {
+        const std::string mp_path = "/tmp/bench_multipage.pdf";
+        create_multipage_pdf(mp_path, 8);
+
+        std::string baseline = pages_signature(mp_path);
+        bool base_ok = baseline.compare(0, 8, "pages=8;") == 0 &&
+                       baseline.find("Page 7 body") != std::string::npos &&
+                       baseline.find("/png/") != std::string::npos;
+        std::cout << "  Baseline: 8 pages, text + composite PNG "
+                  << (base_ok ? "PASS" : "FAIL") << std::endl;
+        if (!base_ok) exit_code = 1;
+
+        std::cout << "  " << std::left << std::setw(36) << "Test"
+                  << " | " << std::right << std::setw(11) << "OK/Total"
+                  << " |  Time   | Throughput | Result" << std::endl;
+        std::cout << "  " << std::string(85, '-') << std::endl;
+
+        const int MP_OPS = 64;
+        for (int t : THREADS) {
+            auto r = run_bench("MP-PDF " + std::to_string(t) + "T signature match",
+                               {mp_path}, t, MP_OPS,
+                               [&](const std::string& p) {
+                                   return pages_signature(p) == baseline;
+                               });
+            print_result(r);
+            if (r.fail != 0) exit_code = 1;
+        }
+        std::remove(mp_path.c_str());
+    }
+
     // Cleanup
     for (auto& p : pdf_paths) std::remove(p.c_str());
     for (auto& p : html_paths) std::remove(p.c_str());
@@ -289,5 +411,5 @@ int main() {
     std::cout << "\n==========================================================" << std::endl;
     std::cout << "  All tests complete." << std::endl;
     std::cout << "==========================================================" << std::endl;
-    return 0;
+    return exit_code;
 }

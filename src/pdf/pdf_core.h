@@ -9,6 +9,7 @@
 #include <cstring>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -425,6 +426,14 @@ struct PdfDoc {
     PdfCrypt crypt;
     int encrypt_ref_num = -1;  // /Encrypt object number (never decrypted)
 
+    // Threading contract: parse()/init_encryption() are setup, single-threaded.
+    // Afterwards get_obj/resolve/decode_stream may be called from parallel
+    // page workers; obj_cache and xref (lazily grown by parse_obj_stream for
+    // object-stream members) are the only state still mutating, so get_obj
+    // serializes on this lock. Recursive because object loading re-enters it:
+    // get_obj → parse_obj_stream → get_obj / decode_stream → resolve.
+    mutable std::recursive_mutex load_mu;
+
     PdfDoc(const uint8_t* d, size_t l) : data(d), len(l) {}
 
     // Recursively decrypt all string values within an object (annotations,
@@ -470,6 +479,15 @@ struct PdfFont {
     double default_width = 1000; // default glyph width in 1/1000 units
     double missing_width = 0;    // /MissingWidth from FontDescriptor
     int cmap_code_bytes = 0;     // 0=auto, 1 or 2 from codespacerange
+
+    // Type3 fonts whose codes map to nothing readable (no ToUnicode, private
+    // glyph names — DRM-scrambled "secure documents"): text extraction would
+    // emit noise, but the glyph programs still draw the real shapes. The
+    // parser expands CharProcs into vector paths instead of recording chars.
+    bool opaque_type3 = false;
+    double font_matrix[6] = {0.001, 0, 0, 0.001, 0, 0}; // Type3 glyph→text space
+    PdfObj charprocs;    // resolved /CharProcs dict (glyph name → stream)
+    PdfObj t3_resources; // resolved Type3 /Resources (may be none)
 
     double get_width(uint32_t code) const {
         auto it = widths.find(code);

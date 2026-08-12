@@ -1,4 +1,5 @@
 #include "pdf_content.h"
+#include "common/image_utils.h"
 #include "common/string_utils.h"
 #include <algorithm>
 #include <cassert>
@@ -56,15 +57,239 @@ private:
     uint32_t code_ = 0;
 };
 
+// ── Colorspace resolution for cs/CS + sc/scn ─────────────
+// sc/scn operands mean different things per selected colorspace: a Separation
+// tint of 1.0 is solid ink (usually black), not white — misreading it as
+// DeviceGray blanks text. Tint ramps and palettes are precomputed to RGB.
+
+static void cmyk_to_rgb8(double c, double m, double y, double k,
+                         std::array<uint8_t, 3>& out) {
+    util::cmyk_to_rgb(c, m, y, k, out[0], out[1], out[2]);
+}
+
+// Evaluate a 1-in/N-out PDF function at t ∈ [0,1]. Supports sampled (type 0),
+// exponential (type 2) and stitching (type 3); empty result = unsupported
+// (e.g. type 4 PostScript calculator) — caller falls back to an ink ramp.
+static std::vector<double> eval_function_1d(PdfDoc& doc, const PdfObj& fn_ref,
+                                            double t, int depth = 0) {
+    if (depth > 4) return {};
+    auto fn = doc.resolve(fn_ref);
+    if (!fn.is_dict() && !fn.is_stream()) return {};
+    int type = fn.get("FunctionType").as_int();
+    auto domain = doc.resolve(fn.get("Domain"));
+    double d0 = 0, d1 = 1;
+    if (domain.is_arr() && domain.arr.size() >= 2) {
+        d0 = domain.arr[0].as_num();
+        d1 = domain.arr[1].as_num();
+    }
+    if (t < d0) t = d0;
+    if (t > d1) t = d1;
+
+    if (type == 2) {
+        auto c0 = doc.resolve(fn.get("C0"));
+        auto c1 = doc.resolve(fn.get("C1"));
+        double n = fn.get("N").as_num();
+        if (n <= 0) n = 1;
+        size_t outs = std::max(c0.is_arr() ? c0.arr.size() : 1,
+                               c1.is_arr() ? c1.arr.size() : 1);
+        std::vector<double> out(outs);
+        double x = (d1 > d0) ? (t - d0) / (d1 - d0) : 0;
+        double f = std::pow(x, n);
+        for (size_t i = 0; i < outs; i++) {
+            double a = (c0.is_arr() && i < c0.arr.size()) ? c0.arr[i].as_num() : 0.0;
+            double b = (c1.is_arr() && i < c1.arr.size()) ? c1.arr[i].as_num() : 1.0;
+            out[i] = a + f * (b - a);
+        }
+        return out;
+    }
+
+    if (type == 3) {
+        auto funcs = doc.resolve(fn.get("Functions"));
+        auto bounds = doc.resolve(fn.get("Bounds"));
+        auto encode = doc.resolve(fn.get("Encode"));
+        if (!funcs.is_arr() || funcs.arr.empty()) return {};
+        size_t k = 0;
+        double lo = d0, hi = d1;
+        while (k < funcs.arr.size() - 1 && bounds.is_arr() && k < bounds.arr.size() &&
+               t >= bounds.arr[k].as_num())
+            k++;
+        if (bounds.is_arr()) {
+            lo = (k == 0) ? d0 : bounds.arr[k - 1].as_num();
+            hi = (k < bounds.arr.size()) ? bounds.arr[k].as_num() : d1;
+        }
+        double e0 = 0, e1 = 1;
+        if (encode.is_arr() && encode.arr.size() >= (k + 1) * 2) {
+            e0 = encode.arr[k * 2].as_num();
+            e1 = encode.arr[k * 2 + 1].as_num();
+        }
+        double x = (hi > lo) ? (t - lo) / (hi - lo) : 0;
+        return eval_function_1d(doc, funcs.arr[k], e0 + x * (e1 - e0), depth + 1);
+    }
+
+    if (type == 0) {
+        if (!fn.is_stream()) return {};
+        auto range = doc.resolve(fn.get("Range"));
+        auto size_arr = doc.resolve(fn.get("Size"));
+        int bps = fn.get("BitsPerSample").as_int();
+        if (!range.is_arr() || range.arr.size() < 2 || !size_arr.is_arr() ||
+            size_arr.arr.empty() || (bps != 8 && bps != 16))
+            return {};
+        int outs = static_cast<int>(range.arr.size() / 2);
+        int size0 = size_arr.arr[0].as_int();
+        if (size0 <= 0 || outs <= 0) return {};
+        auto samples = doc.decode_stream(fn);
+        double e0 = 0, e1 = size0 - 1;
+        auto encode = doc.resolve(fn.get("Encode"));
+        if (encode.is_arr() && encode.arr.size() >= 2) {
+            e0 = encode.arr[0].as_num();
+            e1 = encode.arr[1].as_num();
+        }
+        double x = (d1 > d0) ? (t - d0) / (d1 - d0) : 0;
+        long idx = std::lround(e0 + x * (e1 - e0));
+        if (idx < 0) idx = 0;
+        if (idx >= size0) idx = size0 - 1;
+        std::vector<double> out(outs);
+        for (int i = 0; i < outs; i++) {
+            double r0 = range.arr[i * 2].as_num();
+            double r1 = range.arr[i * 2 + 1].as_num();
+            double v = 0;
+            if (bps == 8) {
+                size_t off = static_cast<size_t>(idx) * outs + i;
+                if (off >= samples.size()) return {};
+                v = samples[off] / 255.0;
+            } else {
+                size_t off = (static_cast<size_t>(idx) * outs + i) * 2;
+                if (off + 1 >= samples.size()) return {};
+                v = ((samples[off] << 8) | samples[off + 1]) / 65535.0;
+            }
+            out[i] = r0 + v * (r1 - r0);
+        }
+        return out;
+    }
+
+    return {};
+}
+
+// Map N alternate-space components to RGB (N=1 gray, 3 RGB, 4 CMYK).
+static void alt_components_to_rgb(const std::vector<double>& comps,
+                                  std::array<uint8_t, 3>& out) {
+    auto b = [](double v) {
+        return static_cast<uint8_t>(
+            std::min(255.0, std::max(0.0, v * 255.0 + 0.5)));
+    };
+    if (comps.size() >= 4) cmyk_to_rgb8(comps[0], comps[1], comps[2], comps[3], out);
+    else if (comps.size() == 3) out = {b(comps[0]), b(comps[1]), b(comps[2])};
+    else if (comps.size() == 1) out = {b(comps[0]), b(comps[0]), b(comps[0])};
+    else out = {0, 0, 0};
+}
+
+static int colorspace_component_count(PdfDoc& doc, const PdfObj& cs_resolved) {
+    if (cs_resolved.is_name()) {
+        const std::string& n = cs_resolved.str_val;
+        if (n == "DeviceGray" || n == "CalGray" || n == "G") return 1;
+        if (n == "DeviceCMYK" || n == "CMYK") return 4;
+        return 3;
+    }
+    if (cs_resolved.is_arr() && !cs_resolved.arr.empty()) {
+        auto head = doc.resolve(cs_resolved.arr[0]);
+        if (head.is_name()) {
+            if (head.str_val == "ICCBased" && cs_resolved.arr.size() >= 2) {
+                int n = doc.resolve(cs_resolved.arr[1]).get("N").as_int();
+                if (n == 1 || n == 3 || n == 4) return n;
+            }
+            if (head.str_val == "CalGray") return 1;
+            if (head.str_val == "CalRGB" || head.str_val == "Lab") return 3;
+        }
+    }
+    return 3;
+}
+
+static std::shared_ptr<const CsInfo> load_colorspace(PdfDoc& doc,
+                                                     const PdfObj& cs_ref) {
+    auto cs = doc.resolve(cs_ref);
+    auto info = std::make_shared<CsInfo>();
+
+    if (cs.is_name()) {
+        info->kind = (cs.str_val == "DeviceCMYK") ? CsInfo::CMYK4 : CsInfo::NUMERIC;
+        return info;
+    }
+    if (!cs.is_arr() || cs.arr.empty()) return info;
+    auto head = doc.resolve(cs.arr[0]);
+    if (!head.is_name()) return info;
+    const std::string& kindname = head.str_val;
+
+    if (kindname == "ICCBased") {
+        info->kind = (colorspace_component_count(doc, cs) == 4) ? CsInfo::CMYK4
+                                                                : CsInfo::NUMERIC;
+        return info;
+    }
+
+    if (kindname == "Separation" || kindname == "DeviceN") {
+        info->kind = CsInfo::TINT;
+        info->lut.resize(256);
+        std::string colorant;
+        if (kindname == "Separation" && cs.arr.size() >= 2) {
+            auto cn = doc.resolve(cs.arr[1]);
+            if (cn.is_name()) colorant = cn.str_val;
+        }
+        bool have_fn = false;
+        // /All and /Black are defined by name; others via the tint transform.
+        if (colorant != "All" && colorant != "Black" &&
+            kindname == "Separation" && cs.arr.size() >= 4) {
+            have_fn = true;
+            for (int v = 0; v < 256; v++) {
+                auto comps = eval_function_1d(doc, cs.arr[3], v / 255.0);
+                if (comps.empty()) { have_fn = false; break; }
+                alt_components_to_rgb(comps, info->lut[v]);
+            }
+        }
+        if (!have_fn) {
+            // Ink-coverage ramp: tint 0 = paper (white), tint 1 = solid ink.
+            for (int v = 0; v < 256; v++) {
+                uint8_t g = static_cast<uint8_t>(255 - v);
+                info->lut[v] = {g, g, g};
+            }
+        }
+        return info;
+    }
+
+    if (kindname == "Indexed" || kindname == "I") {
+        if (cs.arr.size() < 4) return info;
+        int base_comps = colorspace_component_count(doc, doc.resolve(cs.arr[1]));
+        int hival = doc.resolve(cs.arr[2]).as_int();
+        if (hival < 0) return info;
+        auto lut_obj = doc.resolve(cs.arr[3]);
+        std::vector<uint8_t> raw;
+        if (lut_obj.is_str()) raw.assign(lut_obj.str_val.begin(), lut_obj.str_val.end());
+        else if (lut_obj.is_stream()) raw = doc.decode_stream(lut_obj);
+        if (raw.empty()) return info;
+        info->kind = CsInfo::INDEXED;
+        info->lut.resize(static_cast<size_t>(hival) + 1);
+        for (int i = 0; i <= hival; i++) {
+            size_t off = static_cast<size_t>(i) * base_comps;
+            std::vector<double> comps;
+            for (int c = 0; c < base_comps; c++)
+                comps.push_back(off + c < raw.size() ? raw[off + c] / 255.0 : 0.0);
+            alt_components_to_rgb(comps, info->lut[i]);
+        }
+        return info;
+    }
+
+    if (kindname == "DeviceCMYK") info->kind = CsInfo::CMYK4;
+    return info;
+}
+
 ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>& stream,
                                          const PdfObj& resources, double page_height,
-                                         std::unordered_map<int, PdfFont>* font_cache,
+                                         FontCache* font_cache,
                                          bool skip_graphics,
                                          const double* initial_ctm,
-                                         int depth) {
+                                         int depth,
+                                         const GfxState* inherit_gs) {
     ContentParseResult result;
 
-    // Load fonts from resources, using cross-page cache when available
+    // Load fonts from resources, using cross-page cache when available.
+    // The lock covers only lookup/insert; load_font runs outside it.
     std::unordered_map<std::string, PdfFont> fonts;
     auto res = doc.resolve(resources);
     auto& font_dict = res.get("Font");
@@ -74,23 +299,94 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
             for (auto& [name, ref] : fd.dict) {
                 int rn = ref.is_ref() ? ref.ref_num : -1;
                 if (font_cache && rn >= 0) {
-                    auto it = font_cache->find(rn);
-                    if (it != font_cache->end()) {
+                    std::lock_guard<std::mutex> lock(font_cache->mu);
+                    auto it = font_cache->map.find(rn);
+                    if (it != font_cache->map.end()) {
                         fonts[name] = it->second;
                         continue;
                     }
                 }
                 fonts[name] = load_font(doc, ref);
-                if (font_cache && rn >= 0)
-                    (*font_cache)[rn] = fonts[name];
+                if (font_cache && rn >= 0) {
+                    std::lock_guard<std::mutex> lock(font_cache->mu);
+                    font_cache->map.emplace(rn, fonts[name]);
+                }
             }
         }
     }
 
     std::vector<GfxState> state_stack;
     GfxState gs;
+    if (inherit_gs) {
+        // Form XObjects inherit the caller's full graphics state (PDF 8.10.1):
+        // fill/stroke color, /ca /CA alpha, clip. The text machinery restarts.
+        gs = *inherit_gs;
+        gs.in_text = false;
+        gs.font = nullptr;
+    }
     if (initial_ctm) std::memcpy(gs.ctm, initial_ctm, sizeof(gs.ctm));
     std::vector<PathPoint> current_path;
+    std::vector<PathPoint> pending_clip; // path named by W, active after next paint op
+    bool has_pending_clip = false;
+    int draw_seq = 0; // shared z-order counter for recorded paths and images
+
+    auto path_bbox = [](const std::vector<PathPoint>& pts, double& x0, double& y0,
+                        double& x1, double& y1) {
+        x0 = y0 = 1e18; x1 = y1 = -1e18;
+        for (auto& pt : pts) {
+            if (pt.type == PathPoint::CLOSE) continue;
+            x0 = std::min(x0, pt.x); x1 = std::max(x1, pt.x);
+            y0 = std::min(y0, pt.y); y1 = std::max(y1, pt.y);
+            if (pt.type == PathPoint::CURVE) {
+                x0 = std::min({x0, pt.cx1, pt.cx2}); x1 = std::max({x1, pt.cx1, pt.cx2});
+                y0 = std::min({y0, pt.cy1, pt.cy2}); y1 = std::max({y1, pt.cy1, pt.cy2});
+            }
+        }
+    };
+
+    auto commit_pending_clip = [&](GfxState& g) {
+        if (has_pending_clip) {
+            g.clip_path = std::make_shared<const std::vector<PathPoint>>(
+                std::move(pending_clip));
+            pending_clip.clear();
+            has_pending_clip = false;
+        }
+    };
+
+    // "Clip to the shape, then paint a covering rect" draws the clip shape;
+    // without a clip stack, substituting the clip path is the faithful read.
+    auto apply_clip_substitution = [&](GfxState& g) {
+        if (!g.clip_path || g.clip_path->empty() || current_path.empty()) return;
+        double fx0, fy0, fx1, fy1, cx0, cy0, cx1, cy1;
+        path_bbox(current_path, fx0, fy0, fx1, fy1);
+        path_bbox(*g.clip_path, cx0, cy0, cx1, cy1);
+        if (fx0 <= cx0 + 0.1 && fy0 <= cy0 + 0.1 &&
+            fx1 >= cx1 - 0.1 && fy1 >= cy1 - 0.1 &&
+            (fx1 - fx0) * (fy1 - fy0) > (cx1 - cx0) * (cy1 - cy0) + 0.01)
+            current_path = *g.clip_path;
+    };
+
+    std::unordered_map<std::string, std::shared_ptr<const CsInfo>> cs_cache;
+    auto lookup_colorspace =
+        [&](const std::string& name) -> std::shared_ptr<const CsInfo> {
+        auto it = cs_cache.find(name);
+        if (it != cs_cache.end()) return it->second;
+        std::shared_ptr<const CsInfo> info;
+        if (name == "DeviceRGB" || name == "DeviceGray" || name == "CalRGB" ||
+            name == "CalGray" || name == "Pattern") {
+            info = std::make_shared<CsInfo>();
+        } else if (name == "DeviceCMYK") {
+            auto ci = std::make_shared<CsInfo>();
+            ci->kind = CsInfo::CMYK4;
+            info = ci;
+        } else {
+            auto cs_dict = doc.resolve(res.get("ColorSpace"));
+            info = cs_dict.is_dict() ? load_colorspace(doc, cs_dict.get(name))
+                                     : std::make_shared<CsInfo>();
+        }
+        cs_cache.emplace(name, info);
+        return info;
+    };
 
     PdfLexer lex(stream.data(), stream.size());
     // Content streams are overwhelmingly numeric: coordinates, matrices and
@@ -298,9 +594,67 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
     // the two show paths cannot drift apart. Rotated glyphs advance but are not
     // emitted; unmappable/PUA glyphs are skipped without advancing (matching the
     // original per-operator loops).
+    // Opaque-Type3 glyph programs, parsed once per (font, code) in glyph
+    // space; each show instance transforms a copy to page space.
+    std::unordered_map<const PdfFont*, std::unordered_map<uint32_t, std::vector<RenderPath>>> t3_glyph_cache;
+
+    auto expand_type3_glyph = [&](GfxState& gs, uint32_t code) {
+        auto& per_font = t3_glyph_cache[gs.font];
+        auto it = per_font.find(code);
+        if (it == per_font.end()) {
+            std::vector<RenderPath> glyph;
+            auto name_it = gs.font->differences.find(static_cast<int>(code));
+            if (name_it != gs.font->differences.end() && depth < 8) {
+                auto proc = doc.resolve(gs.font->charprocs.get(name_it->second));
+                if (proc.is_stream()) {
+                    auto data = doc.decode_stream(proc);
+                    if (!data.empty()) {
+                        const PdfObj& sub_res = gs.font->t3_resources.is_none()
+                            ? resources : gs.font->t3_resources;
+                        auto sub = parse_content_stream(doc, data, sub_res,
+                                                        page_height, font_cache,
+                                                        skip_graphics, nullptr,
+                                                        depth + 1);
+                        glyph = std::move(sub.paths);
+                    }
+                }
+            }
+            it = per_font.emplace(code, std::move(glyph)).first;
+        }
+        if (it->second.empty()) return;
+
+        // glyph space → page space: FontMatrix, then the text rendering chain
+        double trm[6], final_mat[6], M[6];
+        double scale_mat[6] = {gs.font_size * gs.h_scaling / 100.0, 0, 0,
+                               gs.font_size, 0, gs.text_rise};
+        mat_multiply(trm, scale_mat, gs.text_mat);
+        mat_multiply(final_mat, trm, gs.ctm);
+        mat_multiply(M, gs.font->font_matrix, final_mat);
+        double lw_scale = (std::hypot(M[0], M[1]) + std::hypot(M[2], M[3])) / 2.0;
+
+        for (auto rp : it->second) {
+            for (auto& pt : rp.points) {
+                transform_point(M, pt.x, pt.y, pt.x, pt.y);
+                if (pt.type == PathPoint::CURVE) {
+                    transform_point(M, pt.cx1, pt.cy1, pt.cx1, pt.cy1);
+                    transform_point(M, pt.cx2, pt.cy2, pt.cx2, pt.cy2);
+                }
+            }
+            // d1 glyphs (the near-universal case) take the color in force at
+            // the show operator, not any color set inside the glyph program.
+            rp.fill_r = gs.fill_r; rp.fill_g = gs.fill_g; rp.fill_b = gs.fill_b;
+            rp.stroke_r = gs.stroke_r; rp.stroke_g = gs.stroke_g; rp.stroke_b = gs.stroke_b;
+            rp.fill_alpha = gs.fill_alpha; rp.stroke_alpha = gs.stroke_alpha;
+            rp.line_width *= lw_scale;
+            rp.seq = draw_seq++;
+            result.paths.push_back(std::move(rp));
+        }
+    };
+
     auto show_text_string = [&](GfxState& gs, const std::string& s) {
         double fs = gs.font_size;
         double h_scale = gs.h_scaling / 100.0;
+        bool t3_expand = gs.font && gs.font->opaque_type3 && !skip_graphics;
         double gw_scale = (gs.font && gs.font->is_type3) ? gs.font->glyph_space_scale : 0.001;
         bool use_2byte = gs.font && (gs.font->is_identity || gs.font->is_type0);
         if (gs.font && gs.font->cmap_code_bytes == 1) use_2byte = false;
@@ -315,6 +669,17 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
             } else {
                 code = static_cast<uint8_t>(s[i]);
                 i++;
+            }
+
+            // Scrambled Type3: draw the glyph program, advance, emit no char.
+            if (t3_expand) {
+                expand_type3_glyph(gs, code);
+                double glyph_w = gs.font->get_width(code);
+                if (glyph_w <= 0) glyph_w = 600;
+                double advance = glyph_w * gw_scale * fs * h_scale + gs.char_spacing;
+                gs.text_mat[4] += advance * gs.text_mat[0];
+                gs.text_mat[5] += advance * gs.text_mat[1];
+                continue;
             }
 
             uint32_t unicode = gs.font ? gs.font->decode_char(code) : code;
@@ -492,26 +857,91 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
                 double g = pop_num(0); gs.fill_r = gs.fill_g = gs.fill_b = g;
             } else if (op.is("K")) {
                 if (operands.size() >= 4) {
-                    double c = pop_num(3), m = pop_num(2), y = pop_num(1), k = pop_num(0);
-                    gs.stroke_r = 1 - std::min(1.0, c + k);
-                    gs.stroke_g = 1 - std::min(1.0, m + k);
-                    gs.stroke_b = 1 - std::min(1.0, y + k);
+                    std::array<uint8_t, 3> px;
+                    cmyk_to_rgb8(pop_num(3), pop_num(2), pop_num(1), pop_num(0), px);
+                    gs.stroke_r = px[0] / 255.0; gs.stroke_g = px[1] / 255.0; gs.stroke_b = px[2] / 255.0;
                 }
             } else if (op.is("k")) {
                 if (operands.size() >= 4) {
-                    double c = pop_num(3), m = pop_num(2), y = pop_num(1), k = pop_num(0);
-                    gs.fill_r = 1 - std::min(1.0, c + k);
-                    gs.fill_g = 1 - std::min(1.0, m + k);
-                    gs.fill_b = 1 - std::min(1.0, y + k);
+                    std::array<uint8_t, 3> px;
+                    cmyk_to_rgb8(pop_num(3), pop_num(2), pop_num(1), pop_num(0), px);
+                    gs.fill_r = px[0] / 255.0; gs.fill_g = px[1] / 255.0; gs.fill_b = px[2] / 255.0;
                 }
-            } else if (op.is("SC") || op.is("SCN")) {
-                if (operands.size() >= 3) { gs.stroke_r = pop_num(2); gs.stroke_g = pop_num(1); gs.stroke_b = pop_num(0); }
-                else if (operands.size() >= 1) { double g = pop_num(0); gs.stroke_r = gs.stroke_g = gs.stroke_b = g; }
-            } else if (op.is("sc") || op.is("scn")) {
-                if (operands.size() >= 3) { gs.fill_r = pop_num(2); gs.fill_g = pop_num(1); gs.fill_b = pop_num(0); }
-                else if (operands.size() >= 1) { double g = pop_num(0); gs.fill_r = gs.fill_g = gs.fill_b = g; }
+            } else if (op.is("SC") || op.is("SCN") || op.is("sc") || op.is("scn")) {
+                bool is_fill = (op.is("sc") || op.is("scn"));
+                const auto& cs = is_fill ? gs.fill_cs : gs.stroke_cs;
+                double r = -1, g = -1, b = -1;
+                if (cs && cs->kind == CsInfo::TINT && operands.size() >= 1 &&
+                    !cs->lut.empty()) {
+                    double t = std::min(1.0, std::max(0.0, pop_num(0)));
+                    auto& px = cs->lut[static_cast<size_t>(t * 255.0 + 0.5)];
+                    r = px[0] / 255.0; g = px[1] / 255.0; b = px[2] / 255.0;
+                } else if (cs && cs->kind == CsInfo::INDEXED &&
+                           operands.size() >= 1 && !cs->lut.empty()) {
+                    long idx = std::lround(pop_num(0));
+                    if (idx < 0) idx = 0;
+                    if (idx >= static_cast<long>(cs->lut.size()))
+                        idx = static_cast<long>(cs->lut.size()) - 1;
+                    auto& px = cs->lut[idx];
+                    r = px[0] / 255.0; g = px[1] / 255.0; b = px[2] / 255.0;
+                } else if (operands.size() >= 4 &&
+                           (!cs || cs->kind == CsInfo::CMYK4)) {
+                    std::array<uint8_t, 3> px;
+                    cmyk_to_rgb8(pop_num(3), pop_num(2), pop_num(1), pop_num(0), px);
+                    r = px[0] / 255.0; g = px[1] / 255.0; b = px[2] / 255.0;
+                } else if (operands.size() >= 3) {
+                    r = pop_num(2); g = pop_num(1); b = pop_num(0);
+                } else if (operands.size() >= 1 && operands.back().is_number) {
+                    r = g = b = pop_num(0);
+                }
+                if (r >= 0) {
+                    if (is_fill) { gs.fill_r = r; gs.fill_g = g; gs.fill_b = b; }
+                    else { gs.stroke_r = r; gs.stroke_g = g; gs.stroke_b = b; }
+                }
+            } else if (op.is("gs")) {
+                // ExtGState: constant alpha is how watermarks are faded;
+                // ignoring it paints them solid over the page.
+                const PdfObj* name = operands.empty()
+                    ? nullptr : operand_object(operands.size() - 1);
+                if (name && name->is_name()) {
+                    auto egs_dict = doc.resolve(res.get("ExtGState"));
+                    if (egs_dict.is_dict()) {
+                        auto egs = doc.resolve(egs_dict.get(name->str_val));
+                        if (egs.is_dict()) {
+                            auto& ca = egs.get("ca");
+                            if (ca.is_num()) gs.fill_alpha = ca.as_num();
+                            auto& CA = egs.get("CA");
+                            if (CA.is_num()) gs.stroke_alpha = CA.as_num();
+                            auto& lw = egs.get("LW");
+                            if (lw.is_num()) gs.line_width = lw.as_num();
+                        }
+                    }
+                }
             } else if (op.is("CS") || op.is("cs")) {
-                // Colorspace name — just consume
+                const PdfObj* name = operands.empty()
+                    ? nullptr : operand_object(operands.size() - 1);
+                if (name && name->is_name()) {
+                    auto info = lookup_colorspace(name->str_val);
+                    bool is_fill = op.is("cs");
+                    // Spec initial color: black for device spaces, tint 1.0
+                    // (solid ink) for Separation/DeviceN, index 0 for Indexed.
+                    double r = 0, g = 0, b = 0;
+                    if (info && info->kind == CsInfo::TINT && !info->lut.empty()) {
+                        auto& px = info->lut.back();
+                        r = px[0] / 255.0; g = px[1] / 255.0; b = px[2] / 255.0;
+                    } else if (info && info->kind == CsInfo::INDEXED &&
+                               !info->lut.empty()) {
+                        auto& px = info->lut.front();
+                        r = px[0] / 255.0; g = px[1] / 255.0; b = px[2] / 255.0;
+                    }
+                    if (is_fill) {
+                        gs.fill_cs = info;
+                        gs.fill_r = r; gs.fill_g = g; gs.fill_b = b;
+                    } else {
+                        gs.stroke_cs = info;
+                        gs.stroke_r = r; gs.stroke_g = g; gs.stroke_b = b;
+                    }
+                }
             }
 
             // ── Text ──
@@ -696,43 +1126,63 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
             else if (op.is("S")) {
                 if (!filter_white_stroke() && !filter_small_rect())
                     flush_path_segments();
+                commit_pending_clip(gs);
                 { RenderPath rp; rp.points = std::move(current_path);
                   rp.stroke_r = gs.stroke_r; rp.stroke_g = gs.stroke_g; rp.stroke_b = gs.stroke_b;
                   rp.fill_r = gs.fill_r; rp.fill_g = gs.fill_g; rp.fill_b = gs.fill_b;
+                  rp.fill_alpha = gs.fill_alpha; rp.stroke_alpha = gs.stroke_alpha;
                   rp.line_width = gs.line_width; rp.do_fill = false; rp.do_stroke = true;
+                  rp.seq = draw_seq++;
                   result.paths.push_back(std::move(rp)); }
                 current_path.clear();
             } else if (op.is("s")) {
                 current_path.push_back({0, 0, PathPoint::CLOSE});
                 if (!filter_white_stroke() && !filter_small_rect())
                     flush_path_segments();
+                commit_pending_clip(gs);
                 { RenderPath rp; rp.points = std::move(current_path);
                   rp.stroke_r = gs.stroke_r; rp.stroke_g = gs.stroke_g; rp.stroke_b = gs.stroke_b;
                   rp.fill_r = gs.fill_r; rp.fill_g = gs.fill_g; rp.fill_b = gs.fill_b;
+                  rp.fill_alpha = gs.fill_alpha; rp.stroke_alpha = gs.stroke_alpha;
                   rp.line_width = gs.line_width; rp.do_fill = false; rp.do_stroke = true;
+                  rp.seq = draw_seq++;
                   result.paths.push_back(std::move(rp)); }
                 current_path.clear();
             } else if (op.is("f") || op.is("F") || op.is("f*")) {
+                apply_clip_substitution(gs);
                 if (!capture_fill_rect()) flush_path_segments();
+                commit_pending_clip(gs);
                 { RenderPath rp; rp.points = std::move(current_path);
+                  rp.even_odd = op.is("f*");
                   rp.fill_r = gs.fill_r; rp.fill_g = gs.fill_g; rp.fill_b = gs.fill_b;
                   rp.stroke_r = gs.stroke_r; rp.stroke_g = gs.stroke_g; rp.stroke_b = gs.stroke_b;
+                  rp.fill_alpha = gs.fill_alpha; rp.stroke_alpha = gs.stroke_alpha;
                   rp.line_width = gs.line_width; rp.do_fill = true; rp.do_stroke = false;
+                  rp.seq = draw_seq++;
                   result.paths.push_back(std::move(rp)); }
                 current_path.clear();
             } else if (op.is("B") || op.is("B*") || op.is("b") || op.is("b*")) {
                 if (op.is("b") || op.is("b*"))
                     current_path.push_back({0, 0, PathPoint::CLOSE});
+                apply_clip_substitution(gs);
                 if (!filter_white_stroke() && !filter_small_rect())
                     flush_path_segments();
+                commit_pending_clip(gs);
                 { RenderPath rp; rp.points = std::move(current_path);
+                  rp.even_odd = op.is("B*") || op.is("b*");
                   rp.fill_r = gs.fill_r; rp.fill_g = gs.fill_g; rp.fill_b = gs.fill_b;
                   rp.stroke_r = gs.stroke_r; rp.stroke_g = gs.stroke_g; rp.stroke_b = gs.stroke_b;
+                  rp.fill_alpha = gs.fill_alpha; rp.stroke_alpha = gs.stroke_alpha;
                   rp.line_width = gs.line_width; rp.do_fill = true; rp.do_stroke = true;
+                  rp.seq = draw_seq++;
                   result.paths.push_back(std::move(rp)); }
                 current_path.clear();
+            } else if (op.is("W") || op.is("W*")) {
+                pending_clip = current_path;
+                has_pending_clip = true;
             } else if (op.is("n")) {
                 current_path.clear();
+                commit_pending_clip(gs);
             }
 
             // ── XObject (images) ──
@@ -766,7 +1216,8 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
                                 const PdfObj& sub_res = form_res.is_none() ? res : form_res;
                                 auto sub = parse_content_stream(
                                     doc, form_stream, sub_res, page_height,
-                                    font_cache, skip_graphics, form_ctm, depth + 1);
+                                    font_cache, skip_graphics, form_ctm, depth + 1,
+                                    &gs);
                                 // sub is a temporary discarded right after — move
                                 // its elements into the parent instead of copying.
                                 result.chars.insert(result.chars.end(),
@@ -778,6 +1229,11 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
                                 result.fill_rects.insert(result.fill_rects.end(),
                                     std::make_move_iterator(sub.fill_rects.begin()),
                                     std::make_move_iterator(sub.fill_rects.end()));
+                                // Rebase the form's draw order to this Do's
+                                // position so z-order survives the merge.
+                                for (auto& si : sub.images) si.seq += draw_seq;
+                                for (auto& sp : sub.paths) sp.seq += draw_seq;
+                                draw_seq += sub.draw_ops;
                                 result.images.insert(result.images.end(),
                                     std::make_move_iterator(sub.images.begin()),
                                     std::make_move_iterator(sub.images.end()));
@@ -793,6 +1249,8 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
                             ip.fill_r = gs.fill_r;
                             ip.fill_g = gs.fill_g;
                             ip.fill_b = gs.fill_b;
+                            ip.alpha = gs.fill_alpha;
+                            ip.seq = draw_seq++;
                             result.images.push_back(ip);
                         }
                     }
@@ -804,6 +1262,7 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
         }
     }
 
+    result.draw_ops = draw_seq;
     return result;
 }
 

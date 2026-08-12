@@ -1,4 +1,5 @@
 #include "pdf_core.h"
+#include "jbig2.h"
 #include "common/string_utils.h"
 #include "common/file_utils.h"
 #include "common/inflate.h"
@@ -614,6 +615,7 @@ bool PdfDoc::init_encryption(const std::string& password) {
 
 PdfObj PdfDoc::get_obj(int num) {
     static const PdfObj empty;
+    std::lock_guard<std::recursive_mutex> lock(load_mu);
     auto cached = obj_cache.find(num);
     if (cached != obj_cache.end()) return cached->second;
 
@@ -707,6 +709,7 @@ PdfObj PdfDoc::get_obj(int num) {
 }
 
 void PdfDoc::parse_obj_stream(int stream_num) {
+    std::lock_guard<std::recursive_mutex> lock(load_mu);
     PdfObj stm_obj = get_obj(stream_num);
     if (!stm_obj.is_stream()) return;
 
@@ -837,8 +840,23 @@ std::vector<uint8_t> PdfDoc::decode_stream(const PdfObj& obj, int obj_num, int g
             }
             if (hi >= 0) out.push_back(static_cast<uint8_t>(hi << 4));
             result = std::move(out);
+        } else if (fname == "JBIG2Decode") {
+            std::vector<uint8_t> globals;
+            auto g = resolve(fparm.get("JBIG2Globals"));
+            if (g.is_stream()) globals = decode_stream(g);
+            int jw = 0, jh = 0;
+            result = jbig2_decode(result.data(), result.size(),
+                                  globals.data(), globals.size(), jw, jh);
+            // Every downstream unpack strides rows by the dict /Width and
+            // reads /Height rows. A stream whose page-info size disagrees
+            // would shear each row; keep the old clean-drop contract there.
+            // (Extra decoded rows beyond /Height are harmless and ignored.)
+            const int dict_w = resolve(obj.get("Width")).as_int();
+            const int dict_h = resolve(obj.get("Height")).as_int();
+            if (!result.empty() && (jw != dict_w || jh < dict_h))
+                result.clear();
         }
-        // DCTDecode, CCITTFaxDecode: leave raw data for caller to handle
+        // DCTDecode, CCITTFaxDecode, JPXDecode: leave raw data for caller
     }
     return result;
 }
@@ -1155,7 +1173,11 @@ PdfFont load_font(PdfDoc& doc, const PdfObj& font_ref) {
         if (fm.is_arr() && fm.arr.size() >= 4) {
             double a = fm.arr[0].as_num();
             if (a > 0) font.glyph_space_scale = a;
+            for (size_t i = 0; i < 6 && i < fm.arr.size(); i++)
+                font.font_matrix[i] = fm.arr[i].as_num();
         }
+        font.charprocs = doc.resolve(fobj.get("CharProcs"));
+        font.t3_resources = doc.resolve(fobj.get("Resources"));
     }
 
     if (font_type == "Type0") {
@@ -1251,6 +1273,16 @@ PdfFont load_font(PdfDoc& doc, const PdfObj& font_ref) {
     // Default encoding if nothing set
     if (!font.encoding_table && font.to_unicode.empty() && !font.is_identity) {
         font.encoding_table = kWinAnsi;
+    }
+
+    // A Type3 font with no ToUnicode whose glyph names carry no meaning
+    // (subset scrambles like /HFT191) cannot yield readable text; flag it so
+    // the content parser draws its CharProcs instead of emitting noise.
+    if (font.is_type3 && font.to_unicode.empty() && font.charprocs.is_dict()) {
+        bool any_named_unicode = false;
+        for (auto& [code, gname] : font.differences)
+            if (glyph_name_to_unicode(gname)) { any_named_unicode = true; break; }
+        font.opaque_type3 = !any_named_unicode;
     }
 
     return font;

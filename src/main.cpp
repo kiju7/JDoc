@@ -162,7 +162,24 @@ int main(int argc, char* argv[]) {
             : fs::weakly_canonical(fs::absolute(output_path)).parent_path();
         fs::path rel = fs::relative(img_dir, md_dir);
         if (rel != ".") {
-            opts.image_ref_prefix = rel.string() + "/";
+            // The prefix is spliced verbatim into markdown "![](...)" URLs;
+            // a ')' or space in the directory name (taken from the source
+            // file name) terminates the inline link early and the image no
+            // longer renders. Percent-encode the offending characters.
+            std::string encoded;
+            encoded.reserve(rel.string().size());
+            for (unsigned char c : rel.string()) {
+                switch (c) {
+                    case '%': encoded += "%25"; break;
+                    case ' ': encoded += "%20"; break;
+                    case '(': encoded += "%28"; break;
+                    case ')': encoded += "%29"; break;
+                    case '<': encoded += "%3C"; break;
+                    case '>': encoded += "%3E"; break;
+                    default: encoded += static_cast<char>(c);
+                }
+            }
+            opts.image_ref_prefix = encoded + "/";
         }
     }
 

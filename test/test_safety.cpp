@@ -221,7 +221,9 @@ void test_png_converts_cmyk() {
     CHECK(uncompress(raw, &raw_size, bytes + 41, compressed_size) == Z_OK);
     CHECK(raw_size == sizeof(raw));
     CHECK(raw[0] == 0);
-    CHECK(raw[1] == 255 && raw[2] == 0 && raw[3] == 0);
+    // Full magenta+yellow ink through the Acrobat-matching conversion is a
+    // printed red, not the additive primary the old linear formula produced.
+    CHECK(raw[1] == 255 && raw[2] == 46 && raw[3] == 23);
 }
 
 void test_pdf_honors_images_option() {

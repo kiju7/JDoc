@@ -5,6 +5,7 @@
 #include "common/binary_utils.h"
 #include "common/file_utils.h"
 #include "common/image_magic.h"
+#include "common/image_utils.h"
 #include <zlib.h>          // crc32 for PNG chunk checksums
 #include <libdeflate.h>    // faster DEFLATE compression for the IDAT payload
 #include <fstream>
@@ -38,12 +39,16 @@ inline void png_write_chunk(std::vector<char>& out, const char type[4],
     png_put32(out, crc);
 }
 
+// components==4 defaults to CMYK input (converted to RGB); rgba=true makes a
+// 4-component input encode as a true RGBA PNG (color type 6) instead.
 inline std::vector<char> pixels_to_png(const uint8_t* pixels, size_t pixel_size,
                                        unsigned w, unsigned h, int components,
-                                       int level = Z_BEST_SPEED) {
+                                       int level = Z_BEST_SPEED,
+                                       bool rgba = false) {
     if (!pixels || w == 0 || h == 0 ||
         (components != 1 && components != 3 && components != 4))
         return {};
+    if (rgba && components != 4) rgba = false;
 
     const size_t width = static_cast<size_t>(w);
     const size_t height = static_cast<size_t>(h);
@@ -60,6 +65,7 @@ inline std::vector<char> pixels_to_png(const uint8_t* pixels, size_t pixel_size,
     // arrives as RGB with R == G == B throughout, so detect that case before
     // allocating and compressing three times as much scanline data.
     bool grayscale = components == 1;
+    if (rgba) grayscale = false;
     if (components == 3) {
         grayscale = true;
         for (size_t i = 0; i < height * source_row_bytes; i += 3) {
@@ -70,7 +76,7 @@ inline std::vector<char> pixels_to_png(const uint8_t* pixels, size_t pixel_size,
         }
     }
 
-    const size_t output_components = grayscale ? 1 : 3;
+    const size_t output_components = rgba ? 4 : (grayscale ? 1 : 3);
     if (width > (std::numeric_limits<size_t>::max() - 1) /
                     output_components)
         return {};
@@ -92,13 +98,17 @@ inline std::vector<char> pixels_to_png(const uint8_t* pixels, size_t pixel_size,
             }
             continue;
         }
+        if (rgba) {
+            std::memcpy(dr + 1, sr, width * 4);
+            continue;
+        }
         for (unsigned x = 0; x < w; x++) {
             if (components == 4) {
                 // CMYK to RGB
-                int c = sr[x*4], m = sr[x*4+1], yy = sr[x*4+2], k = sr[x*4+3];
-                dr[1 + x*3]     = static_cast<uint8_t>(255 - std::min(255, c + k));
-                dr[1 + x*3 + 1] = static_cast<uint8_t>(255 - std::min(255, m + k));
-                dr[1 + x*3 + 2] = static_cast<uint8_t>(255 - std::min(255, yy + k));
+                jdoc::util::cmyk_to_rgb(sr[x*4] / 255.0, sr[x*4+1] / 255.0,
+                                        sr[x*4+2] / 255.0, sr[x*4+3] / 255.0,
+                                        dr[1 + x*3], dr[1 + x*3 + 1],
+                                        dr[1 + x*3 + 2]);
             } else if (components == 3) {
                 dr[1 + x*3]     = sr[x*3];     // R
                 dr[1 + x*3 + 1] = sr[x*3 + 1]; // G
@@ -143,11 +153,77 @@ inline std::vector<char> pixels_to_png(const uint8_t* pixels, size_t pixel_size,
     ihdr[6] = static_cast<uint8_t>(png_height >> 8);
     ihdr[7] = static_cast<uint8_t>(png_height);
     ihdr[8] = 8;
-    ihdr[9] = grayscale ? 0 : 2; // 8-bit grayscale or RGB
+    ihdr[9] = rgba ? 6 : (grayscale ? 0 : 2); // grayscale, RGB, or RGBA
     png_write_chunk(png, "IHDR", ihdr, 13);
     png_write_chunk(png, "IDAT", deflated.data(), static_cast<uint32_t>(deflated_size));
     png_write_chunk(png, "IEND", nullptr, 0);
 
+    return png;
+}
+
+// Encode an RGB buffer that already carries the PNG row layout — one leading
+// filter byte (0) per row, then w*3 samples — straight to PNG. Skips the
+// intermediate raw-buffer copy pixels_to_png() makes (26 MB per A4 page at
+// 300 DPI). Grayscale pages are still repacked to 1-channel rows first: the
+// smaller DEFLATE input more than pays for that copy.
+inline std::vector<char> prefiltered_to_png(const uint8_t* rows, size_t size,
+                                            unsigned w, unsigned h,
+                                            int level = Z_BEST_SPEED) {
+    if (!rows || w == 0 || h == 0) return {};
+    const size_t stride = static_cast<size_t>(w) * 3 + 1;
+    if (size < stride * h) return {};
+
+    bool grayscale = true;
+    for (size_t y = 0; y < h && grayscale; y++) {
+        const uint8_t* r = rows + y * stride + 1;
+        for (size_t x = 0; x < static_cast<size_t>(w) * 3; x += 3) {
+            if (r[x] != r[x + 1] || r[x] != r[x + 2]) { grayscale = false; break; }
+        }
+    }
+
+    std::vector<uint8_t> gray;
+    const uint8_t* payload = rows;
+    size_t payload_size = stride * h;
+    if (grayscale) {
+        gray.resize((static_cast<size_t>(w) + 1) * h);
+        for (size_t y = 0; y < h; y++) {
+            uint8_t* dr = gray.data() + y * (static_cast<size_t>(w) + 1);
+            const uint8_t* sr = rows + y * stride;
+            dr[0] = 0;
+            for (size_t x = 0; x < w; x++) dr[1 + x] = sr[1 + x * 3];
+        }
+        payload = gray.data();
+        payload_size = gray.size();
+    }
+
+    int ld_level = (level <= 0) ? 6 : (level > 12 ? 12 : level);
+    libdeflate_compressor* comp = libdeflate_alloc_compressor(ld_level);
+    if (!comp) return {};
+    size_t bound = libdeflate_zlib_compress_bound(comp, payload_size);
+    std::vector<uint8_t> deflated(bound);
+    size_t deflated_size = libdeflate_zlib_compress(
+        comp, payload, payload_size, deflated.data(), bound);
+    libdeflate_free_compressor(comp);
+    if (deflated_size == 0) return {};
+
+    std::vector<char> png;
+    png.reserve(8 + 25 + deflated_size + 24);
+    const uint8_t sig[] = {0x89,'P','N','G',0x0D,0x0A,0x1A,0x0A};
+    png.insert(png.end(), sig, sig + 8);
+    uint8_t ihdr[13] = {};
+    ihdr[0] = static_cast<uint8_t>(w >> 24);
+    ihdr[1] = static_cast<uint8_t>(w >> 16);
+    ihdr[2] = static_cast<uint8_t>(w >> 8);
+    ihdr[3] = static_cast<uint8_t>(w);
+    ihdr[4] = static_cast<uint8_t>(h >> 24);
+    ihdr[5] = static_cast<uint8_t>(h >> 16);
+    ihdr[6] = static_cast<uint8_t>(h >> 8);
+    ihdr[7] = static_cast<uint8_t>(h);
+    ihdr[8] = 8;
+    ihdr[9] = grayscale ? 0 : 2;
+    png_write_chunk(png, "IHDR", ihdr, 13);
+    png_write_chunk(png, "IDAT", deflated.data(), static_cast<uint32_t>(deflated_size));
+    png_write_chunk(png, "IEND", nullptr, 0);
     return png;
 }
 

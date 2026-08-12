@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(jdoc VERSION 1.3.0 LANGUAGES CXX C)
+project(jdoc VERSION 1.4.0 LANGUAGES CXX C)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -217,6 +217,8 @@ add_library(jdoc_lib STATIC
     src/pdf/pdf_markdown.cpp
     src/pdf/pdf.cpp
     src/pdf/pdf_crypt.cpp
+    src/pdf/jbig2.cpp
+    src/pdf/jpx.cpp
     # hwpx
     src/hwpx.cpp
     # hwp
@@ -308,7 +310,8 @@ if(JDOC_BUILD_TESTS)
     enable_testing()
     foreach(t IN ITEMS test_pdf test_pdf_crypt test_office test_archive
                        test_hwp3 test_hwp5 test_hwpx test_eml test_msg test_odf
-                       test_detect test_stream test_emf test_wmf test_safety)
+                       test_detect test_stream test_emf test_wmf test_safety
+                       test_codecs)
         add_executable(${t} test/${t}.cpp)
         target_link_libraries(${t} PRIVATE jdoc_lib ${JDOC_FILESYSTEM_LIB})
         target_include_directories(${t} PRIVATE include src)

@@ -5,6 +5,7 @@
 #include "common/mapped_file.h"
 #include <fstream>
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <cmath>
 #include <cstdlib>
@@ -15,6 +16,7 @@
 #include <numeric>
 #include <sstream>
 #include <stdexcept>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -142,7 +144,11 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
     if (opts.pages.empty()) {
         for (int i = 0; i < tp; i++) page_indices.push_back(i);
     } else {
-        page_indices = opts.pages;
+        // Two workers must never own the same result slot, so duplicate
+        // page requests collapse to their first occurrence.
+        std::unordered_set<int> requested;
+        for (int p : opts.pages)
+            if (requested.insert(p).second) page_indices.push_back(p);
     }
 
     std::string image_dir;
@@ -151,10 +157,20 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
         util::ensure_dir(image_dir);
     }
 
-    std::unordered_map<int, PdfFont> font_cache;
+    FontCache font_cache;
 
-    for (int p : page_indices) {
-        if (p < 0 || p >= tp) continue;
+    // Page workers only — no intra-page (strip) parallelism. Splitting pages
+    // never spends more total CPU than the sequential loop, so it stays
+    // throughput-neutral when the embedding server already runs one
+    // conversion per core; per-page parallel compression was measured to
+    // trade ~4x the cycles for its wall-clock win and was dropped for that
+    // reason.
+    constexpr size_t kMaxPageWorkers = 8;
+    const size_t hw = std::max<size_t>(1, std::thread::hardware_concurrency());
+    const size_t n_workers = std::min({page_indices.size(), hw, kMaxPageWorkers});
+
+    auto process_page = [&](int p) {
+        if (p < 0 || p >= tp) return;
         auto& page_obj = page_objs[p];
 
         // Page geometry: MediaBox and /Rotate are inheritable, so climb the
@@ -220,11 +236,11 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
                 has_fonts = fd.is_dict() && !fd.dict.empty();
             }
         }
-        if (!has_fonts && !opts.images) continue;
+        if (!has_fonts && !opts.images) return;
 
         // Parse content stream
         auto content_data = get_page_content(doc, page_obj);
-        if (content_data.empty()) continue;
+        if (content_data.empty()) return;
 
         // Extract text lines
         bool plaintext = (opts.format == OutputFormat::PLAINTEXT);
@@ -258,47 +274,87 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
 
         // Image extraction
         if (opts.images) {
-            // Check for layered page
-            bool has_regular = false, has_mask = false;
-            for (auto& ip : parse_result.images) {
-                PdfObj xobj;
-                if (ip.xobj_ref >= 0) xobj = doc.get_obj(ip.xobj_ref);
-                if (!xobj.is_stream()) continue;
-                int bpc = xobj.get("BitsPerComponent").as_int();
-                if (bpc == 1) has_mask = true;
-                else has_regular = true;
+            // Pages whose content is drawn as vector glyph outlines (GDI
+            // print-to-PDF: no text operators, hundreds of filled paths)
+            // have nothing text extraction can reach; render the whole page
+            // instead and skip per-XObject extraction — the embedded images
+            // on such pages are watermark/logo layers, not the document.
+            constexpr size_t kVectorTextMinPaths = 50;
+            bool no_text = result.all_lines[p].size() <= 2;
+            bool vector_text_page = no_text &&
+                                    parse_result.paths.size() >= kVectorTextMinPaths;
+            // Banded raster pages: the same print pipeline may store the page
+            // scan as horizontal strips instead. Extracting them individually
+            // yields disjoint fragments; composite the full page instead.
+            bool banded_scan_page = false;
+            if (no_text && !vector_text_page) {
+                int bands = 0;
+                double covered_h = 0;
+                for (auto& ip : parse_result.images) {
+                    if (std::abs(ip.ctm[1]) >= 0.001 || std::abs(ip.ctm[2]) >= 0.001)
+                        continue; // rotated placement: not a scan band
+                    double iw = std::abs(ip.ctm[0]), ih = std::abs(ip.ctm[3]);
+                    if (iw >= page_w * 0.5 && ih < page_h * 0.5) {
+                        bands++;
+                        covered_h += ih;
+                    }
+                }
+                banded_scan_page = bands >= 3 && covered_h >= page_h * 0.4;
             }
-
-            if (has_regular && has_mask) {
-                // Layered: render as composite
+            bool composited = false;
+            if (vector_text_page || banded_scan_page) {
                 auto rendered = render_page_composite(doc, page_obj, parse_result,
                                                       p, page_w, page_h, image_dir);
                 if (!rendered.data.empty() || !rendered.pixels.empty() || !rendered.saved_path.empty()) {
                     result.all_images[p].push_back(std::move(rendered));
                     result.all_image_y[p].push_back(page_h);
                     result.all_image_x[p].push_back(0);
-                }
-            } else {
-                auto extracted = extract_page_images(doc, page_obj, parse_result, p, image_dir, opts.min_image_size);
-                for (auto& ei : extracted) {
-                    // ctm[5] is the Y translation in PDF coordinates (origin bottom-left)
-                    // ctm[3] is vertical scale; y_top = ctm[5] + abs(ctm[3])
-                    double y_top = ei.ctm[5] + std::abs(ei.ctm[3]);
-                    result.all_image_y[p].push_back(y_top);
-                    result.all_image_x[p].push_back(ei.ctm[4]); // X position
-                    result.all_images[p].push_back(std::move(ei.img));
+                    composited = true;
                 }
             }
+            if (!composited) {
+                // Check for layered page
+                bool has_regular = false, has_mask = false;
+                for (auto& ip : parse_result.images) {
+                    PdfObj xobj;
+                    if (ip.xobj_ref >= 0) xobj = doc.get_obj(ip.xobj_ref);
+                    if (!xobj.is_stream()) continue;
+                    int bpc = xobj.get("BitsPerComponent").as_int();
+                    if (bpc == 1) has_mask = true;
+                    else has_regular = true;
+                }
 
-            // Fallback: render page for scanned/vector-only pages
-            if (result.all_images[p].empty() && result.all_lines[p].empty()) {
-                if (!parse_result.images.empty() || !parse_result.segments.empty()) {
+                if (has_regular && has_mask) {
+                    // Layered: render as composite
                     auto rendered = render_page_composite(doc, page_obj, parse_result,
                                                           p, page_w, page_h, image_dir);
                     if (!rendered.data.empty() || !rendered.pixels.empty() || !rendered.saved_path.empty()) {
                         result.all_images[p].push_back(std::move(rendered));
                         result.all_image_y[p].push_back(page_h);
                         result.all_image_x[p].push_back(0);
+                    }
+                } else {
+                    auto extracted = extract_page_images(doc, page_obj, parse_result, p, image_dir, opts.min_image_size);
+                    for (auto& ei : extracted) {
+                        // ctm[5] is the Y translation in PDF coordinates (origin bottom-left)
+                        // ctm[3] is vertical scale; y_top = ctm[5] + abs(ctm[3])
+                        double y_top = ei.ctm[5] + std::abs(ei.ctm[3]);
+                        result.all_image_y[p].push_back(y_top);
+                        result.all_image_x[p].push_back(ei.ctm[4]); // X position
+                        result.all_images[p].push_back(std::move(ei.img));
+                    }
+                }
+
+                // Fallback: render page for scanned/vector-only pages
+                if (result.all_images[p].empty() && result.all_lines[p].empty()) {
+                    if (!parse_result.images.empty() || !parse_result.segments.empty()) {
+                        auto rendered = render_page_composite(doc, page_obj, parse_result,
+                                                              p, page_w, page_h, image_dir);
+                        if (!rendered.data.empty() || !rendered.pixels.empty() || !rendered.saved_path.empty()) {
+                            result.all_images[p].push_back(std::move(rendered));
+                            result.all_image_y[p].push_back(page_h);
+                            result.all_image_x[p].push_back(0);
+                        }
                     }
                 }
             }
@@ -315,6 +371,45 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
                 }
             }
         }
+    };
+
+    // Pages are independent: each iteration writes only its own slot of the
+    // pre-sized result vectors, PdfDoc object loading serializes on load_mu,
+    // and the font cache locks internally — so multi-page documents fan out
+    // over a small pool. Output is byte-identical to the sequential order.
+    // The worker cap bounds peak memory: every in-flight composite page owns
+    // a full-page canvas (~26 MB for A4 at 300 DPI).
+    if (n_workers <= 1) {
+        for (int p : page_indices) process_page(p);
+    } else {
+        std::atomic<size_t> next_page{0};
+        std::atomic<bool> failed{false};
+        std::mutex err_mu;
+        std::exception_ptr first_error;
+        std::vector<std::thread> workers;
+        workers.reserve(n_workers);
+        for (size_t t = 0; t < n_workers; t++) {
+            workers.emplace_back([&]() {
+                size_t i;
+                // Match the sequential loop's abort semantics: once a page
+                // throws, no worker starts another page (in-flight pages
+                // finish), instead of rendering the whole rest of the
+                // document for a result the rethrow below discards.
+                while (!failed.load(std::memory_order_relaxed) &&
+                       (i = next_page.fetch_add(1)) < page_indices.size()) {
+                    try {
+                        process_page(page_indices[i]);
+                    } catch (...) {
+                        failed.store(true, std::memory_order_relaxed);
+                        std::lock_guard<std::mutex> lock(err_mu);
+                        if (!first_error)
+                            first_error = std::current_exception();
+                    }
+                }
+            });
+        }
+        for (auto& w : workers) w.join();
+        if (first_error) std::rethrow_exception(first_error);
     }
 
     // Extract bookmarks
