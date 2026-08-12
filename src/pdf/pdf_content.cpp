@@ -284,7 +284,8 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
                                          FontCache* font_cache,
                                          bool skip_graphics,
                                          const double* initial_ctm,
-                                         int depth) {
+                                         int depth,
+                                         const GfxState* inherit_gs) {
     ContentParseResult result;
 
     // Load fonts from resources, using cross-page cache when available.
@@ -316,6 +317,13 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
 
     std::vector<GfxState> state_stack;
     GfxState gs;
+    if (inherit_gs) {
+        // Form XObjects inherit the caller's full graphics state (PDF 8.10.1):
+        // fill/stroke color, /ca /CA alpha, clip. The text machinery restarts.
+        gs = *inherit_gs;
+        gs.in_text = false;
+        gs.font = nullptr;
+    }
     if (initial_ctm) std::memcpy(gs.ctm, initial_ctm, sizeof(gs.ctm));
     std::vector<PathPoint> current_path;
     std::vector<PathPoint> pending_clip; // path named by W, active after next paint op
@@ -1208,7 +1216,8 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
                                 const PdfObj& sub_res = form_res.is_none() ? res : form_res;
                                 auto sub = parse_content_stream(
                                     doc, form_stream, sub_res, page_height,
-                                    font_cache, skip_graphics, form_ctm, depth + 1);
+                                    font_cache, skip_graphics, form_ctm, depth + 1,
+                                    &gs);
                                 // sub is a temporary discarded right after — move
                                 // its elements into the parent instead of copying.
                                 result.chars.insert(result.chars.end(),
