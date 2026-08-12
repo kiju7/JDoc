@@ -1,4 +1,5 @@
 #include "pdf_extract.h"
+#include "jpx.h"
 #include "common/png_encode.h"
 #include <chrono>
 #include <jpeglib.h>
@@ -611,6 +612,35 @@ static bool decode_smask(PdfDoc& doc, const PdfObj& xobj,
     return true;
 }
 
+// Decode an explicit stencil /Mask (an image XObject with ImageMask true)
+// into an 8-bit alpha plane (255 = base image shows). The sample the Decode
+// array maps to 1 is the visible area — the polarity Acrobat and mupdf
+// render for the JBIG2-masked logos in Korean office documents.
+static bool decode_stencil_mask(PdfDoc& doc, const PdfObj& xobj,
+                                std::vector<uint8_t>& alpha, int& aw, int& ah) {
+    auto mk = doc.resolve(xobj.get("Mask"));
+    if (!mk.is_stream() || !mk.get("ImageMask").bool_val) return false;
+    int w = mk.get("Width").as_int();
+    int h = mk.get("Height").as_int();
+    if (w <= 0 || h <= 0) return false;
+    auto data = doc.decode_stream(mk);
+    size_t row_bytes = (static_cast<size_t>(w) + 7) / 8;
+    if (data.size() < row_bytes * h) return false;
+    auto mdec = doc.resolve(mk.get("Decode"));
+    bool flip = mdec.is_arr() && mdec.arr.size() >= 2 &&
+                mdec.arr[0].as_num() >= 0.5;
+    alpha.assign(static_cast<size_t>(w) * h, 0);
+    for (int y = 0; y < h; y++)
+        for (int x = 0; x < w; x++) {
+            bool bit = (data[static_cast<size_t>(y) * row_bytes + (x >> 3)]
+                        >> (7 - (x & 7))) & 1;
+            alpha[static_cast<size_t>(y) * w + x] = (bit != flip) ? 255 : 0;
+        }
+    aw = w;
+    ah = h;
+    return true;
+}
+
 std::vector<ExtractedImage> extract_page_images(PdfDoc& doc, const PdfObj& page_obj,
                                                  const ContentParseResult& parse_result,
                                                  int page_num,
@@ -649,6 +679,10 @@ std::vector<ExtractedImage> extract_page_images(PdfDoc& doc, const PdfObj& page_
         img.name = "page" + std::to_string(page_num + 1) + "_img" + std::to_string(img_idx);
         img.width = static_cast<unsigned>(w);
         img.height = static_cast<unsigned>(h);
+        // Set when 1-bit samples were unpacked in stencil sense (255 =
+        // painted, /Decode honored) — the CCITT branch unpacks black/white
+        // instead and must not feed the fill-colored RGBA conversion.
+        bool mask_alpha_pixels = false;
 
         // Determine filter chain
         auto filter_obj = doc.resolve(xobj.get("Filter"));
@@ -689,11 +723,26 @@ std::vector<ExtractedImage> extract_page_images(PdfDoc& doc, const PdfObj& page_
                     img.pixels = std::move(jr.pixels);
                 }
             }
-        } else if (last_filter == "JPXDecode" && single_filter) {
-            if (!xobj.raw_stream_data() || xobj.raw_stream_size() == 0) continue;
-            img.format = "jp2";
-            img.data.assign(reinterpret_cast<const char*>(xobj.raw_stream_data()),
-                           reinterpret_cast<const char*>(xobj.raw_stream_data()) + xobj.raw_stream_size());
+        } else if (last_filter == "JPXDecode") {
+            // decode_stream applies decryption and pre-filters, leaving the
+            // JPEG 2000 codestream raw for the decoder.
+            auto decoded = doc.decode_stream(xobj);
+            if (decoded.empty()) continue;
+            auto jr = jpx_decode(decoded.data(), decoded.size());
+            if (!jr.pixels.empty()) {
+                img.format = "raw";
+                img.width = static_cast<unsigned>(jr.width);
+                img.height = static_cast<unsigned>(jr.height);
+                img.components = jr.components;
+                img.pixels = std::move(jr.pixels);
+            } else if (single_filter) {
+                // Feature outside the baseline decoder: keep the passthrough
+                img.format = "jp2";
+                img.data.assign(reinterpret_cast<const char*>(decoded.data()),
+                                reinterpret_cast<const char*>(decoded.data()) + decoded.size());
+            } else {
+                continue;
+            }
         } else if (last_filter == "CCITTFaxDecode") {
             auto parms = doc.resolve(xobj.get("DecodeParms"));
             int k = parms.get("K").as_int();
@@ -847,7 +896,17 @@ std::vector<ExtractedImage> extract_page_images(PdfDoc& doc, const PdfObj& page_
 
             // Unpack 1-bit rows to bytes: Flate-compressed bitonal scans
             // otherwise fail the PNG encoder's size check and are dropped.
+            // ImageMask samples keep the painted/clear sense (255 = painted,
+            // honoring /Decode [1 0]); JBIG2 gray delivers 1 = black ink.
             if (bpc == 1 && components == 1 && !is_indexed) {
+                bool is_image_mask = xobj.get("ImageMask").bool_val;
+                bool mask_flip = false;
+                if (is_image_mask) {
+                    auto mdec = doc.resolve(xobj.get("Decode"));
+                    mask_flip = mdec.is_arr() && mdec.arr.size() >= 2 &&
+                                mdec.arr[0].as_num() >= 0.5;
+                }
+                bool ink_is_one = (last_filter == "JBIG2Decode");
                 size_t row_bytes = (width + 7) / 8;
                 if (decoded.size() >= row_bytes * height) {
                     std::vector<uint8_t> unpacked(pixel_count);
@@ -855,9 +914,14 @@ std::vector<ExtractedImage> extract_page_images(PdfDoc& doc, const PdfObj& page_
                         for (size_t ux = 0; ux < width; ux++) {
                             bool bit = (decoded[uy * row_bytes + ux / 8]
                                         >> (7 - (ux & 7))) & 1;
-                            unpacked[uy * width + ux] = bit ? 255 : 0;
+                            uint8_t v;
+                            if (is_image_mask) v = (bit == mask_flip) ? 255 : 0;
+                            else if (ink_is_one) v = bit ? 0 : 255;
+                            else v = bit ? 255 : 0;
+                            unpacked[uy * width + ux] = v;
                         }
                     decoded = std::move(unpacked);
+                    mask_alpha_pixels = is_image_mask;
                 }
             }
 
@@ -869,15 +933,38 @@ std::vector<ExtractedImage> extract_page_images(PdfDoc& doc, const PdfObj& page_
             img.pixels = std::move(decoded);
         }
 
+        // A stencil-mask image (stamp, signature) delivers no color of its
+        // own — it paints the fill color in force at its Do. Deliver it as
+        // fill-colored RGBA with a transparent background instead of an
+        // unreadable black-and-white block.
+        bool img_rgba = false;
+        if (mask_alpha_pixels && img.format == "raw" &&
+            img.components == 1 && !img.pixels.empty()) {
+            uint8_t fr = static_cast<uint8_t>(std::min(255.0, std::max(0.0, ip.fill_r * 255)));
+            uint8_t fg = static_cast<uint8_t>(std::min(255.0, std::max(0.0, ip.fill_g * 255)));
+            uint8_t fb = static_cast<uint8_t>(std::min(255.0, std::max(0.0, ip.fill_b * 255)));
+            std::vector<uint8_t> rgba(img.pixels.size() * 4);
+            for (size_t i = 0; i < img.pixels.size(); i++) {
+                uint8_t* dp = rgba.data() + i * 4;
+                dp[0] = fr; dp[1] = fg; dp[2] = fb;
+                dp[3] = img.pixels[i]; // 255 where painted
+            }
+            img.pixels = std::move(rgba);
+            img.components = 4;
+            img_rgba = true;
+        }
+
         // Soft-masked images (logo/watermark transparency): merge the alpha
         // into an RGBA raster. A passthrough JPEG is decoded first — its
         // pixels beneath transparent areas hold arbitrary color (often
-        // black) that must not show as background.
-        bool img_rgba = false;
+        // black) that must not show as background. An explicit stencil
+        // /Mask (JBIG2 logo cutouts) merges the same way.
         {
             std::vector<uint8_t> alpha;
             int amw = 0, amh = 0;
-            if (decode_smask(doc, xobj, alpha, amw, amh)) {
+            if (!img_rgba &&
+                (decode_smask(doc, xobj, alpha, amw, amh) ||
+                 decode_stencil_mask(doc, xobj, alpha, amw, amh))) {
                 if (img.format == "jpeg" && !img.data.empty()) {
                     auto jr = jpeg_decode(
                         reinterpret_cast<const uint8_t*>(img.data.data()),
@@ -1207,7 +1294,6 @@ ImageData render_page_composite(PdfDoc& doc, const PdfObj& page_obj,
                 auto last = doc.resolve(pre_filter.arr.back());
                 if (last.is_name()) pre_last = last.str_val;
             }
-            if (pre_last == "JBIG2Decode" || pre_last == "JPXDecode") continue;
             int iw = xobj.get("Width").as_int();
             int ih = xobj.get("Height").as_int();
             double pw_pt = std::hypot(ip.ctm[0], ip.ctm[1]);
@@ -1578,6 +1664,14 @@ ImageData render_page_composite(PdfDoc& doc, const PdfObj& page_obj,
                 // Use decode_stream for everything else (handles filter chains)
                 auto decoded = doc.decode_stream(xobj);
 
+                if (last_filter == "JPXDecode") {
+                    auto jr = jpx_decode(decoded.data(), decoded.size());
+                    if (jr.pixels.empty()) return;
+                    pixels = std::move(jr.pixels);
+                    w = jr.width;
+                    h = jr.height;
+                    components = jr.components;
+                } else
                 // Check if result is JPEG (decode_stream leaves DCTDecode raw)
                 if (decoded.size() >= 2 && decoded[0] == 0xFF && decoded[1] == 0xD8) {
                     auto jr = jpeg_decode(decoded.data(), decoded.size());
@@ -1657,6 +1751,8 @@ ImageData render_page_composite(PdfDoc& doc, const PdfObj& page_obj,
                             mask_flip = mdec.is_arr() && mdec.arr.size() >= 2 &&
                                         mdec.arr[0].as_num() >= 0.5;
                         }
+                        // JBIG2 gray (not a mask): decoded 1 = black ink
+                        bool ink_is_one = (last_filter == "JBIG2Decode");
                         size_t row_bytes = (static_cast<size_t>(w) + 7) / 8;
                         if (decoded.size() >= row_bytes * h) {
                             std::vector<uint8_t> unpacked(static_cast<size_t>(w) * h);
@@ -1664,9 +1760,11 @@ ImageData render_page_composite(PdfDoc& doc, const PdfObj& page_obj,
                                 for (int ux = 0; ux < w; ux++) {
                                     bool bit = (decoded[uy * row_bytes + ux / 8]
                                                 >> (7 - (ux & 7))) & 1;
-                                    unpacked[static_cast<size_t>(uy) * w + ux] =
-                                        is_image_mask ? ((bit != mask_flip) ? 0 : 255)
-                                                      : (bit ? 255 : 0);
+                                    uint8_t v;
+                                    if (is_image_mask) v = (bit != mask_flip) ? 0 : 255;
+                                    else if (ink_is_one) v = bit ? 0 : 255;
+                                    else v = bit ? 255 : 0;
+                                    unpacked[static_cast<size_t>(uy) * w + ux] = v;
                                 }
                             decoded = std::move(unpacked);
                         }
@@ -1777,7 +1875,8 @@ ImageData render_page_composite(PdfDoc& doc, const PdfObj& page_obj,
         } else {
             std::vector<uint8_t> smask;
             int smw = 0, smh = 0;
-            decode_smask(doc, xobj, smask, smw, smh);
+            if (!decode_smask(doc, xobj, smask, smw, smh))
+                decode_stencil_mask(doc, xobj, smask, smw, smh);
             canvas.blit_image(pixels.data(), w, h, components, ip.ctm, page_h, scale,
                               smask.empty() ? nullptr : smask.data(), smw, smh,
                               ip_alpha);
