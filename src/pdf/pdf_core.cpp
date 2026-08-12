@@ -614,6 +614,7 @@ bool PdfDoc::init_encryption(const std::string& password) {
 
 PdfObj PdfDoc::get_obj(int num) {
     static const PdfObj empty;
+    std::lock_guard<std::recursive_mutex> lock(load_mu);
     auto cached = obj_cache.find(num);
     if (cached != obj_cache.end()) return cached->second;
 
@@ -707,6 +708,7 @@ PdfObj PdfDoc::get_obj(int num) {
 }
 
 void PdfDoc::parse_obj_stream(int stream_num) {
+    std::lock_guard<std::recursive_mutex> lock(load_mu);
     PdfObj stm_obj = get_obj(stream_num);
     if (!stm_obj.is_stream()) return;
 

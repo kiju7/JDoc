@@ -9,6 +9,7 @@
 #include <cstring>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -424,6 +425,14 @@ struct PdfDoc {
     std::map<int, PdfObj> obj_cache;
     PdfCrypt crypt;
     int encrypt_ref_num = -1;  // /Encrypt object number (never decrypted)
+
+    // Threading contract: parse()/init_encryption() are setup, single-threaded.
+    // Afterwards get_obj/resolve/decode_stream may be called from parallel
+    // page workers; obj_cache and xref (lazily grown by parse_obj_stream for
+    // object-stream members) are the only state still mutating, so get_obj
+    // serializes on this lock. Recursive because object loading re-enters it:
+    // get_obj → parse_obj_stream → get_obj / decode_stream → resolve.
+    mutable std::recursive_mutex load_mu;
 
     PdfDoc(const uint8_t* d, size_t l) : data(d), len(l) {}
 
