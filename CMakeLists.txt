@@ -196,6 +196,7 @@ option(JDOC_WITH_BZIP2 "Decode bzip2 (.bz2, alz/egg members) via system libbz2" 
 add_library(jdoc_lib STATIC
     # common + zip
     src/common/string_utils.cpp
+    src/common/cpu_budget.cpp
     src/common/inflate.cpp
     src/common/emf_text.cpp
     src/common/wmf_text.cpp
