@@ -20,6 +20,11 @@
 #include <vector>
 
 #if defined(_WIN32)
+// windows.h defines function-like min/max macros that mangle any later
+// std::min(/std::max( in every TU including this header (MSVC C2589).
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <windows.h>
 #elif defined(__unix__) || defined(__APPLE__)
 #include <fcntl.h>
