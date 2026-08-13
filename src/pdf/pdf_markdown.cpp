@@ -237,7 +237,7 @@ std::vector<AnnotEntry> extract_annotations(PdfDoc& doc, const PdfObj& page_obj,
             AttachmentEntry att;
             if (read_filespec(doc, annot.get("FS"), att)) {
                 if (!entry.text.empty()) entry.text += " ";
-                entry.text += "[" + att.name + "]";
+                entry.text += "[" + util::to_single_line(att.name) + "]";
             }
         }
 
@@ -317,19 +317,36 @@ std::vector<TextLine> merge_colinear_lines(const std::vector<TextLine>& lines) {
         for (auto gi : group)
             if (lines[gi].is_column_split) has_col_split = true;
 
-        if (group.size() == 1 || has_col_split) {
-            for (auto gi : group)
+        // Lines sharing a y band may still belong to different runs: a
+        // vertical caption's page-space midpoint can land on a body line's
+        // baseline, and joining them by x_left welds the caption into the
+        // sentence. Merge within a direction only, keeping each direction's
+        // lines in the order they were first seen so page order is unchanged.
+        std::vector<int16_t> dirs;
+        for (auto gi : group)
+            if (std::find(dirs.begin(), dirs.end(), lines[gi].rot) == dirs.end())
+                dirs.push_back(lines[gi].rot);
+
+        for (int16_t dir : dirs) {
+        std::vector<size_t> same;
+        for (auto gi : group)
+            if (lines[gi].rot == dir) same.push_back(gi);
+
+        if (same.size() == 1 || has_col_split) {
+            for (auto gi : same)
                 merged.push_back(lines[gi]);
         } else {
-            std::sort(group.begin(), group.end(), [&](size_t a, size_t b) {
+            std::sort(same.begin(), same.end(), [&](size_t a, size_t b) {
                 return lines[a].x_left < lines[b].x_left;
             });
+            const std::vector<size_t>& group = same;
             TextLine m;
             m.y_center = lines[group[0]].y_center;
             m.x_left = lines[group[0]].x_left;
             m.font_size = lines[group[0]].font_size;
             m.is_bold = lines[group[0]].is_bold;
             m.is_italic = lines[group[0]].is_italic;
+            m.rot = dir;
             for (size_t k = 0; k < group.size(); k++) {
                 if (k > 0) {
                     double gap = lines[group[k]].x_left - lines[group[k-1]].x_right;
@@ -347,6 +364,7 @@ std::vector<TextLine> merge_colinear_lines(const std::vector<TextLine>& lines) {
                     m.x_right = lines[group[k]].x_right;
             }
             merged.push_back(std::move(m));
+        }
         }
         i = j;
     }
@@ -652,9 +670,13 @@ static std::string format_attachments(
     const std::vector<AttachmentEntry>& attachments) {
     std::string out;
     for (auto& a : attachments) {
-        out += "- " + a.name;
+        // /UF, /F and /Desc are producer-supplied and may carry newlines, so
+        // they are flattened before reaching the list — a filespec named
+        // "x\n\n## Table of Contents" would otherwise forge document
+        // structure in the extracted text.
+        out += "- " + util::to_single_line(a.name);
         if (a.size > 0) out += " (" + util::human_bytes(a.size) + ")";
-        if (!a.desc.empty()) out += " — " + a.desc;
+        if (!a.desc.empty()) out += " — " + util::to_single_line(a.desc);
         out += "\n";
     }
     return out;

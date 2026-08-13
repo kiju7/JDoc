@@ -559,6 +559,42 @@ static void test_basic_zip() {
         }
     TEST_END
 
+    TEST(top_level_cad_reports_unsupported_not_convert_failed)
+        // Same drawing, two entry points: a caller that quarantines
+        // CONVERT_FAILED and skips UNSUPPORTED must not be alerted by one and
+        // not the other.
+        std::string dwg = "AC1032";
+        dwg.resize(2048, '\0');
+        auto top = write_tmp("top.dwg", dwg);
+        auto rs = jdoc::convert_archive(top);
+        ASSERT(rs.size() == 1);
+        ASSERT(rs[0].format == "CAD");
+        ASSERT(rs[0].error_code == jdoc::MemberErrorCode::UNSUPPORTED);
+
+        auto nested = write_tmp("nested.zip", make_zip({{"plan.dwg", dwg}}));
+        jdoc::ConvertOptions opts;
+        opts.archive.include_unsupported = true;
+        auto rs2 = jdoc::convert_archive(nested, opts);
+        ASSERT(rs2.size() == 1);
+        ASSERT(rs2[0].error_code == rs[0].error_code);
+        ASSERT(rs2[0].format == rs[0].format);
+    TEST_END
+
+    TEST(skipped_member_format_names_the_extension)
+        // Pins the contract change: these used to come back with an empty
+        // format because nothing was ever inflated to identify them.
+        auto path = write_tmp("media.zip", make_zip(
+            {{"clip.mp4", std::string(64, 'm')}, {"font.ttf", std::string(64, 'f')},
+             {"ok.txt", "fine"}}));
+        jdoc::ConvertOptions opts;
+        opts.archive.include_unsupported = true;
+        auto rs = jdoc::convert_archive(path, opts);
+        for (const char* name : {"clip.mp4", "font.ttf"}) {
+            auto* m = find_member(rs, name);
+            ASSERT(m && m->format == "UNKNOWN");
+        }
+    TEST_END
+
     TEST(ascii_dxf_member_still_yields_its_text)
         // An ASCII DXF is text. Skipping it as a drawing would drop the
         // TEXT/MTEXT strings, which are the only searchable content a drawing
@@ -1021,6 +1057,23 @@ static void test_egg() {
         ASSERT(rs.size() == 2);
         ASSERT(find_member(rs, "s.txt")->markdown == "egg stored member");
         ASSERT(find_member(rs, "dir/d.md")->markdown == "# egg deflated");
+    TEST_END
+
+    TEST(egg_solid_skipped_member_is_named)
+        // The solid layout reports skipped members through its own code path,
+        // separate from every other container's — it handles encryption in the
+        // same branch and so could not share the helper.
+        EggEntrySpec dwg{"plan.dwg", {{std::string("AC1032") + std::string(64, '\0'), 0}}};
+        EggEntrySpec txt{"ok.txt", {{"fine", 0}}};
+        auto path = write_tmp("solid.egg", make_egg({dwg, txt}, /*solid=*/true));
+        jdoc::ConvertOptions opts;
+        opts.archive.include_unsupported = true;
+        auto rs = jdoc::convert_archive(path, opts);
+        auto* m = find_member(rs, "plan.dwg");
+        ASSERT(m && !m->ok());
+        ASSERT(m->error_code == jdoc::MemberErrorCode::UNSUPPORTED);
+        ASSERT(m->format == "CAD");
+        ASSERT(find_member(rs, "ok.txt")->markdown == "fine");
     TEST_END
 
     TEST(egg_korean_utf8_name)

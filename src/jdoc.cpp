@@ -139,13 +139,19 @@ static FileFormat classify_zip(const ZipReader& zip) {
     if (zip.has_entry("[Content_Types].xml")) {
         // DWFx is an XPS package, so it reaches here like an OOXML document
         // and used to be handed to the office layer, which rejected it as an
-        // unsupported document. The drawing parts under dwf/ are what separate
-        // it from plain XPS — the sequence part is not, since Autodesk names
-        // it FixedDocumentSequence.fdseq in 2D packages and
-        // DWFDocumentSequence.dwfseq in 3D ones. Requiring the OPC marker
-        // first keeps an ordinary zip that happens to hold a dwf/ folder from
-        // being mistaken for a drawing.
-        if (!zip.entries_with_prefix("dwf/").empty())
+        // unsupported document. Its drawing parts live under dwf/documents/;
+        // the sequence part does not identify it, since Autodesk names that
+        // FixedDocumentSequence.fdseq in 2D packages and
+        // DWFDocumentSequence.dwfseq in 3D ones.
+        //
+        // A real document is checked for first, so that a docx or xlsx which
+        // happens to carry a dwf/ part stays convertible — misreading one as a
+        // drawing would silently drop its whole body.
+        bool office_root = zip.has_entry("word/document.xml") ||
+                           zip.has_entry("xl/workbook.xml") ||
+                           zip.has_entry("xl/workbook.bin") ||
+                           zip.has_entry("ppt/presentation.xml");
+        if (!office_root && !zip.entries_with_prefix("dwf/documents/").empty())
             return FileFormat::CAD;
         return FileFormat::OFFICE;
     }
@@ -695,7 +701,11 @@ void convert_archive(const std::string& file_path, const MemberCallback& cb,
         try {
             r.markdown = convert(file_path, opts);
         } catch (const std::exception& e) {
-            r.error_code = fmt == FileFormat::UNKNOWN
+            // CAD sits with UNKNOWN: it is a format jdoc cannot convert, not
+            // a document whose parser failed. The archive walker already
+            // buckets it that way, and a caller that quarantines
+            // CONVERT_FAILED should not be alerted by every drawing.
+            r.error_code = (fmt == FileFormat::UNKNOWN || fmt == FileFormat::CAD)
                 ? MemberErrorCode::UNSUPPORTED
                 : MemberErrorCode::CONVERT_FAILED;
             r.error = e.what();

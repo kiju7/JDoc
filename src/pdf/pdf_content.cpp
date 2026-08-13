@@ -1644,6 +1644,10 @@ std::vector<TextLine> chars_to_lines(const std::vector<TextChar>& chars,
             ln.x_right = *std::max_element(px, px + 4);
             ln.y_center = (*std::min_element(py, py + 4) +
                            *std::max_element(py, py + 4)) / 2;
+            // The geometry is page-space now, so the direction is the only
+            // thing left saying this line does not belong to a body row it
+            // happens to sit beside.
+            ln.rot = r;
             lines.push_back(std::move(ln));
         }
     }

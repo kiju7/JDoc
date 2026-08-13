@@ -208,7 +208,11 @@ std::string rotated_table_pdf() {
         "1 0 0 1 126 64 Tm (KILO) Tj\n"
         "1 0 0 1 216 64 Tm (LIMA) Tj\n"
         // Advances toward -x, so the origin is the run's top-right corner.
-        "-1 0 0 -1 185 150 Tm (ECHO) Tj\n"
+        // Placed on INDIA's baseline on purpose: the borderless table builder
+        // groups rows by page-space y, so this is what puts an upright run and
+        // a half-turn run in the SAME cell and exercises the separator between
+        // two writing frames. Give it its own y and the two never meet.
+        "-1 0 0 -1 275 104 Tm (ECHO) Tj\n"
         "ET";
     return assemble_pdf({
         "<< /Type /Catalog /Pages 2 0 R >>",
@@ -461,6 +465,11 @@ void test_pdf_table_cell_rotated_text() {
     // the half-turn run the same way line layout used to.
     CHECK(text.find("ECHO") != std::string::npos);
     CHECK(text.find("OHCE") == std::string::npos);
+    // Sharing a cell with the upright run: the two frames have no common axis,
+    // so the word gap between them cannot be measured and the separator is
+    // unconditional. Without it they run together as "INDIAECHO".
+    CHECK(text.find("INDIA ECHO") != std::string::npos);
+    CHECK(text.find("INDIAECHO") == std::string::npos);
     // The upright cells are untouched by grouping runs per direction.
     CHECK(text.find("CHARLIE") != std::string::npos);
     CHECK(text.find("JULIET") != std::string::npos);
@@ -485,6 +494,63 @@ void test_pdf_lists_attachments() {
     // mention from the document-level list.
     CHECK(text.find("drawing attached [\xEB\x8F\x84\xEB\xA9\xB4.dwg]") !=
           std::string::npos);
+}
+
+// /UF, /F and /Desc are producer-supplied. A filespec carrying newlines would
+// otherwise forge headings and list items in the extracted text — the same
+// threat the OOXML embedded-part listing already defends against.
+void test_pdf_attachment_name_cannot_forge_structure() {
+    const std::string pdf = assemble_pdf({
+        "<< /Type /Catalog /Pages 2 0 R /Names << /EmbeddedFiles 5 0 R >> >>",
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] "
+        "/Resources << >> /Contents 4 0 R >>",
+        stream_object("", "BT ET"),
+        "<< /Names [ (a) 6 0 R ] >>",
+        "<< /Type /Filespec "
+        "/F (benign.txt\\n\\n## Table of Contents\\n\\n- INJECTED\\n\\nmore) "
+        "/Desc (note\\n\\n## Forged) /EF << /F 7 0 R >> >>",
+        stream_object("/Type /EmbeddedFile /Params << /Size 13 >>", "payload bytes"),
+    });
+    const std::string text = jdoc::pdf_to_markdown_mem(
+        reinterpret_cast<const uint8_t*>(pdf.data()), pdf.size());
+
+    // Reported in full — only prevented from starting a line.
+    CHECK(text.find("INJECTED") != std::string::npos);
+    CHECK(text.find("\n## Table of Contents") == std::string::npos);
+    CHECK(text.find("\n## Forged") == std::string::npos);
+    // One list item, one heading.
+    size_t items = 0;
+    for (size_t p = text.find("\n- "); p != std::string::npos;
+         p = text.find("\n- ", p + 3))
+        items++;
+    CHECK(items == 1);
+}
+
+// Rotated runs reach the line list in page space, so a vertical caption whose
+// midpoint lands on a body line's baseline used to be merged into it.
+void test_pdf_rotated_run_not_merged_into_body_line() {
+    const std::string content =
+        "BT /F1 12 Tf\n"
+        "1 0 0 1 200 300 Tm (MIDDLE LINE OF BODY) Tj\n"
+        "0 1 -1 0 160 272 Tm (SIDEBAR) Tj\n"
+        "ET";
+    const std::string pdf = assemble_pdf({
+        "<< /Type /Catalog /Pages 2 0 R >>",
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 400 400] "
+        "/Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>",
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+        stream_object("", content),
+    });
+    const std::string text = jdoc::pdf_to_markdown_mem(
+        reinterpret_cast<const uint8_t*>(pdf.data()), pdf.size());
+
+    CHECK(text.find("SIDEBAR") != std::string::npos);
+    CHECK(text.find("MIDDLE LINE OF BODY") != std::string::npos);
+    // Never welded together, with or without a separator.
+    CHECK(text.find("SIDEBAR MIDDLE") == std::string::npos);
+    CHECK(text.find("SIDEBARMIDDLE") == std::string::npos);
 }
 
 void test_pdf_name_tree_cycle_terminates() {
@@ -538,6 +604,8 @@ int main() {
     test_pdf_line_width_follows_ctm();
     test_pdf_cell_assembly_reading_order();
     test_pdf_lists_attachments();
+    test_pdf_attachment_name_cannot_forge_structure();
+    test_pdf_rotated_run_not_merged_into_body_line();
     test_pdf_name_tree_cycle_terminates();
     test_pdf_decodes_surrogate_pair();
     test_memory_streaming_supports_eml();

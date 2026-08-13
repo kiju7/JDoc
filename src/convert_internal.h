@@ -15,8 +15,10 @@ enum class FileFormat {
     EMF, WMF,   // metafiles — vector records carrying text (+ images)
     IMAGE,      // standalone raster image (jpeg/png/gif/bmp/webp) — no text,
                 // saved as-is when image extraction is on
-    CAD,        // dwg/dxf/dwf/dwfx drawing — recognized so callers can route or
-                // skip it, but jdoc extracts nothing from it
+    CAD,        // dwg/dwf/dwfx drawing (and binary dxf) — recognized so callers
+                // can route or skip it, but jdoc extracts nothing from it.
+                // An ASCII DXF is TXT instead: it is text, and dropping it
+                // would lose the TEXT records a drawing does carry.
     ZIP, GZIP, BZIP2, TAR, SEVENZIP, ALZ, EGG, RAR,
     UNKNOWN
 };

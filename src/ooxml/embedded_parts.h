@@ -9,24 +9,14 @@
 // License: MIT
 
 #include "zip_reader.h"
+#include "jdoc/types.h"
 #include "common/file_utils.h"
 
 #include <cstring>
 #include <string>
+#include <vector>
 
 namespace jdoc {
-
-// The part name is attacker-controlled — a zip entry name may hold newlines,
-// and one carrying "\n\n## Table of Contents\n\n- ..." would forge headings in
-// the output. Control characters collapse to spaces so a name can only ever be
-// one list item.
-inline std::string sanitize_part_name(const std::string& name) {
-    std::string out;
-    out.reserve(name.size());
-    for (unsigned char c : name)
-        out += (c < 0x20 || c == 0x7F) ? ' ' : static_cast<char>(c);
-    return util::trim(out);
-}
 
 // True for a part directly inside one of the three embedding directories.
 // Matching the "/embeddings/" segment anywhere would also claim
@@ -53,7 +43,7 @@ inline std::string format_embedded_parts(const ZipReader& zip) {
     for (const auto& e : zip.entries()) {
         std::string leaf;
         if (!is_embedding_part(e.name, leaf)) continue;
-        std::string base = sanitize_part_name(leaf);
+        std::string base = util::to_single_line(leaf);
         if (base.empty()) continue;
         list += "- " + base;
         if (e.uncompressed_size > 0)
@@ -62,6 +52,21 @@ inline std::string format_embedded_parts(const ZipReader& zip) {
     }
     if (list.empty()) return "";
     return "\n## Attachments\n\n" + list + "\n";
+}
+
+// Mirror the listing into the last chunk, so the chunk APIs and the
+// whole-document API agree about what the package contains. This is what the
+// header/footer and master-layout trailers already do.
+inline void append_embedded_parts(const ZipReader& zip,
+                                  std::vector<PageChunk>& chunks) {
+    std::string block = format_embedded_parts(zip);
+    if (block.empty()) return;
+    if (chunks.empty()) {
+        PageChunk c;
+        c.page_number = 1;
+        chunks.push_back(std::move(c));
+    }
+    chunks.back().text += block;
 }
 
 } // namespace jdoc

@@ -58,9 +58,11 @@ bool has_skippable_ext(const std::string& name, bool extracting_images) {
     return false;
 }
 
-// Report for a member skipped on its extension alone. It is still named from
-// that extension: a caller that asked for unsupported members wants to know a
-// drawing was in the archive, not merely that something was.
+// Report for a member skipped on its extension alone. The extension still
+// names the format family — "CAD" rather than the exact "DWG" that detect()
+// would report from the bytes, which is the point: nothing was inflated. A
+// caller that asked for unsupported members learns a drawing was in the
+// archive, not merely that something was.
 MemberResult skipped_member(const std::string& member_path, uint64_t size) {
     MemberResult r;
     r.member_path = member_path;

@@ -965,9 +965,11 @@ std::vector<PageChunk> DocxParser::to_chunks(
                 }
             }
         }
+        append_embedded_parts(zip_, filtered);
         return filtered;
     }
 
+    append_embedded_parts(zip_, chunks);
     return chunks;
 }
 

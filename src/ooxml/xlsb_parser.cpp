@@ -627,6 +627,7 @@ std::vector<PageChunk> XlsbParser::to_chunks(const ConvertOptions& opts) {
         chunk.text = text;
         chunks.push_back(std::move(chunk));
     }
+    append_embedded_parts(zip_, chunks);
     return chunks;
 }
 

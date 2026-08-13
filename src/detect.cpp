@@ -61,8 +61,9 @@ static const char* cad_from_magic(const unsigned char* b, size_t n,
         std::string ext = name.substr(dot);
         for (auto& c : ext) c = static_cast<char>(std::tolower(
             static_cast<unsigned char>(c)));
+        // No ".dxf" here: an ASCII DXF never reaches FileFormat::CAD, and a
+        // binary one is already claimed by its signature above.
         if (ext == ".dwg")  return "DWG";
-        if (ext == ".dxf")  return "DXF";
         if (ext == ".dwfx") return "DWFX";
         if (ext == ".dwf")  return "DWF";
     }

@@ -143,6 +143,11 @@ struct TextLine {
     double y_center = 0;
     double x_left = 1e9;
     double x_right = 0;
+    // Writing direction of the run this line came from, as TextChar::rot.
+    // The geometry above is page-space whatever the direction, so without
+    // this a vertical caption whose page-space midpoint lands on a body
+    // line's baseline reads as part of that line.
+    int16_t rot = 0;
 };
 
 // ── Reading order for rotated runs ──────────────────────

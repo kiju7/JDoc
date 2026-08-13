@@ -1650,6 +1650,7 @@ std::vector<PageChunk> XlsxParser::to_chunks(const ConvertOptions& opts) {
         chunks.push_back(std::move(c));
         return true;
     });
+    append_embedded_parts(zip_, chunks);
     return chunks;
 }
 

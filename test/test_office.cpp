@@ -4,6 +4,7 @@
 #include "jdoc/office.h"
 #include "jdoc/detect.h"
 #include "zip_reader.h"
+#include "common/string_utils.h"
 #include "legacy/ole_reader.h"
 #include "ooxml/xlsb_parser.h"
 #include <iostream>
@@ -293,6 +294,40 @@ void test_ooxml_embedded_parts() {
         ASSERT(count_occurrences(md, "\n- ") == 1);
     TEST_END
 
+    TEST(chunk_api_agrees_with_whole_document)
+        // A chunk pipeline must not be told less than convert() is: the
+        // listing mirrors into the last chunk, the way the header/footer and
+        // master-layout trailers already do.
+        auto pptx = make_pptx(text_shape("sp", "slide body"),
+                              {{"ppt/embeddings/plan.dwg", std::string(2048, 'd')}});
+        auto md = convert_pptx(pptx);
+        auto chunks = jdoc::office_to_markdown_chunks_mem(
+            reinterpret_cast<const uint8_t*>(pptx.data()), pptx.size(), "deck.pptx");
+        ASSERT(md.find("plan.dwg (2.0 KB)") != std::string::npos);
+        ASSERT(!chunks.empty());
+        std::string joined;
+        for (auto& c : chunks) joined += c.text;
+        ASSERT(joined.find("## Attachments") != std::string::npos);
+        ASSERT(joined.find("plan.dwg (2.0 KB)") != std::string::npos);
+    TEST_END
+
+    TEST(part_name_bytes_cannot_break_utf8)
+        // make_zip sets the UTF-8 name flag, so ZipReader passes these bytes
+        // through untouched. A caller that demands UTF-8 (pybind11 does) would
+        // fail to decode the whole conversion over one bad part name.
+        std::string bad = "ppt/embeddings/";
+        bad += "\xff\xfe\x80"; bad += "bad.xlsx";
+        auto md = convert_pptx(make_pptx(text_shape("sp", "slide body"),
+                                         {{bad, std::string(512, 'z')}}));
+        // Well-formed already, so repairing it changes nothing. (is_valid_utf8
+        // is the wrong oracle here — it reports U+FFFD itself as invalid, and
+        // repair is exactly what puts one there.)
+        ASSERT(jdoc::util::sanitize_utf8(md) == md);
+        ASSERT(md.find('\xff') == std::string::npos);
+        ASSERT(md.find("bad.xlsx") != std::string::npos);
+        ASSERT(md.find("slide body") != std::string::npos);
+    TEST_END
+
     TEST(only_direct_children_of_embeddings_listed)
         // A substring match on "/embeddings/" would also claim these.
         auto md = convert_pptx(make_pptx(
@@ -334,6 +369,21 @@ void test_dwfx_not_office() {
                              {"FixedDocumentSequence.fdseq", "<x/>"},
                              {"Documents/1/Pages/1.fpage", "<p/>"}});
         ASSERT(detect_zip(zip).format != "DWFX");
+    TEST_END
+
+    TEST(office_document_carrying_a_dwf_part_stays_convertible)
+        // Misreading a real document as a drawing would drop its whole body.
+        auto zip = make_zip({{"[Content_Types].xml", ct},
+                             {"word/document.xml",
+                              "<?xml version=\"1.0\"?><w:document xmlns:w=\"http://"
+                              "schemas.openxmlformats.org/wordprocessingml/2006/main\">"
+                              "<w:body><w:p><w:r><w:t>quarterly report body</w:t>"
+                              "</w:r></w:p></w:body></w:document>"},
+                             {"dwf/documents/1/manifest.xml", "<m/>"}});
+        ASSERT(detect_zip(zip).format != "DWFX");
+        auto md = jdoc::office_to_markdown_mem(
+            reinterpret_cast<const uint8_t*>(zip.data()), zip.size(), "report.docx");
+        ASSERT(md.find("quarterly report body") != std::string::npos);
     TEST_END
 
     TEST(ordinary_zip_with_dwf_folder_stays_archive)

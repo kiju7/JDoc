@@ -25,7 +25,9 @@ enum class FormatCategory {
     Email,         // eml, msg
     Text,          // txt/csv/json/xml/source code …
     Image,         // png, jpeg, gif, bmp, tiff, webp, ico, psd (detect-only),
-                   // emf/wmf metafiles, and dwg/dxf/dwf CAD drawings
+                   // emf/wmf metafiles, and dwg/dwf/dwfx CAD drawings.
+                   // An ASCII DXF is Text: it is plain text, and its TEXT
+                   // records are the one part of a drawing jdoc can read.
     Unknown
 };
 
