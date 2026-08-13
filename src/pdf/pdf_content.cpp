@@ -601,7 +601,12 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
             rp.stroke_r = gs.stroke_r; rp.stroke_g = gs.stroke_g;
             rp.stroke_b = gs.stroke_b;
             rp.fill_alpha = gs.fill_alpha; rp.stroke_alpha = gs.stroke_alpha;
-            rp.line_width = gs.line_width;
+            // Line width is a user-space quantity — the CTM scales the pen
+            // along with the geometry, and these points are already in page
+            // space. Leaving it raw drew a CAD sheet's hairlines, set to 24
+            // units under a 1:2.8 plot matrix, as 50-pixel bars instead of
+            // 0.72pt lines.
+            rp.line_width = gs.line_width * ctm_pen_scale(gs.ctm);
             rp.do_fill = do_fill; rp.do_stroke = do_stroke;
             rp.even_odd = even_odd;
             rp.seq = draw_seq++;
@@ -654,7 +659,10 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
         mat_multiply(trm, scale_mat, gs.text_mat);
         mat_multiply(final_mat, trm, gs.ctm);
         mat_multiply(M, gs.font->font_matrix, final_mat);
-        double lw_scale = (std::hypot(M[0], M[1]) + std::hypot(M[2], M[3])) / 2.0;
+        // The glyph program was parsed with an identity CTM, so its widths
+        // carry only whatever `cm` the charproc set itself; this adds the
+        // show-time chain on top.
+        double lw_scale = ctm_pen_scale(M);
 
         for (auto rp : it->second) {
             for (auto& pt : rp.points) {

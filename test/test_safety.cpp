@@ -1,6 +1,7 @@
 #include "legacy/ole_reader.h"
 #include "common/png_encode.h"
 #include "common/string_utils.h"
+#include "pdf/pdf_content.h"
 #include "jdoc/jdoc.h"
 #include "jdoc/pdf.h"
 
@@ -388,6 +389,33 @@ void test_pdf_reads_rotated_text() {
     CHECK(text.find("NRUTFLAH") == std::string::npos);
 }
 
+// Line width is set in user space, so the CTM has to scale the pen the same
+// way it scales the geometry. A CAD sheet plotted at 1:2.8 sets `24 w` under a
+// 0.03 matrix — 0.72pt on the page. Recording the 24 raw drew it as a bar wide
+// enough to swallow the drawing when the page was composited to a raster.
+void test_pdf_line_width_follows_ctm() {
+    using namespace jdoc::pdf_detail;
+    const std::string ops =
+        "q 0.03 0 0 0.03 0 0 cm 24 w 0 0 m 1000 0 l S Q\n"   // scaled pen
+        "q 2 0 0 2 0 0 cm 3 w 0 0 m 100 0 l S Q\n"           // magnified pen
+        "1.5 w 0 0 m 100 0 l S";                             // identity CTM
+    std::vector<uint8_t> stream(ops.begin(), ops.end());
+
+    uint8_t placeholder = 0;
+    PdfDoc doc(&placeholder, 1);
+    PdfObj resources;
+    ContentParseOptions options;
+    options.graphics = GraphicsCollection::RenderPaths;
+    auto parsed = parse_content_stream(doc, stream, resources, 800.0, nullptr,
+                                       options, nullptr);
+
+    CHECK(parsed.paths.size() == 3);
+    CHECK(std::abs(parsed.paths[0].line_width - 24.0 * 0.03) < 1e-9);
+    CHECK(std::abs(parsed.paths[1].line_width - 3.0 * 2.0) < 1e-9);
+    // No CTM in force: the width travels through unchanged.
+    CHECK(std::abs(parsed.paths[2].line_width - 1.5) < 1e-9);
+}
+
 void test_pdf_table_cell_rotated_text() {
     const std::string pdf = rotated_table_pdf();
     const std::string text = jdoc::pdf_to_markdown_mem(
@@ -470,6 +498,7 @@ int main() {
     test_pdf_honors_images_option();
     test_pdf_reads_rotated_text();
     test_pdf_table_cell_rotated_text();
+    test_pdf_line_width_follows_ctm();
     test_pdf_lists_attachments();
     test_pdf_name_tree_cycle_terminates();
     test_pdf_decodes_surrogate_pair();

@@ -83,6 +83,14 @@ inline void transform_point(const double* m, double x, double y, double& ox, dou
     oy = m[1]*x + m[3]*y + m[5];
 }
 
+// How much a matrix scales a stroke pen. Line width is a user-space quantity,
+// so it has to travel through the same transform as the geometry. A non-uniform
+// matrix turns the round pen elliptical; averaging the two axis lengths is the
+// usual stand-in for the width a viewer draws.
+inline double ctm_pen_scale(const double* m) {
+    return (std::hypot(m[0], m[1]) + std::hypot(m[2], m[3])) / 2.0;
+}
+
 struct PdfLineSegment {
     float x0, y0, x1, y1;
     bool is_horizontal() const { return std::abs(y1 - y0) < 2.0f; }
