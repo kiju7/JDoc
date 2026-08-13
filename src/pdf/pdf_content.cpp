@@ -734,11 +734,16 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
             double advance = char_w_ts + gs.char_spacing;
             if (unicode == ' ') advance += gs.word_spacing;
 
-            // Skip rotated text (vertical direction dominates) but still advance.
-            if (std::abs(final_mat[1]) > std::abs(final_mat[0]) * 2) {
-                gs.text_mat[4] += advance * gs.text_mat[0];
-                gs.text_mat[5] += advance * gs.text_mat[1];
-                continue;
+            // Writing direction, quantized to 15° buckets. Upright text lands
+            // on 0 even when b is rounding noise rather than a true tilt, and
+            // takes the no-trig path — every glyph of ordinary prose runs
+            // through here, and almost none of them are rotated.
+            int16_t rot = 0;
+            if (final_mat[1] != 0 || final_mat[0] < 0) {
+                double deg = std::atan2(final_mat[1], final_mat[0]) *
+                             (180.0 / 3.14159265358979323846);
+                int q = static_cast<int>(std::lround(deg / 15.0));
+                rot = static_cast<int16_t>((q % 24 + 24) % 24);
             }
 
             double gx, gy;
@@ -759,11 +764,40 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
             TextChar tc;
             tc.x = gx;
             tc.y = gy;
-            tc.left = gx;
-            tc.right = next_gx;
-            tc.top = gy + char_h * 0.8;
-            tc.bot = gy - char_h * 0.2;
-            tc.font_size = char_h;
+            tc.rot = rot;
+            if (rot == 0) {
+                tc.left = gx;
+                tc.right = next_gx;
+                tc.top = gy + char_h * 0.8;
+                tc.bot = gy - char_h * 0.2;
+                tc.font_size = char_h;
+            } else {
+                // A rotated glyph's baseline does not run along +x, so the box
+                // has to be built from the transformed axes: the baseline from
+                // this origin to the next, raised by the ascender and dropped
+                // by the descender along the "up" vector. Its em height is that
+                // vector's length, which for upright text is the |d| read above.
+                double ux = final_mat[2], uy = final_mat[3];
+                double up_len = std::hypot(ux, uy);
+                if (up_len < 1) {
+                    // Degenerate up vector: size from the baseline instead and
+                    // stand the ascender perpendicular to it.
+                    up_len = std::hypot(final_mat[0], final_mat[1]);
+                    double bx = -final_mat[1], by = final_mat[0];
+                    double bl = std::hypot(bx, by);
+                    if (bl > 0) { ux = bx / bl * up_len; uy = by / bl * up_len; }
+                    else { ux = 0; uy = up_len; }
+                }
+                double ax = ux * 0.8, ay = uy * 0.8;
+                double dxx = ux * -0.2, dyy = uy * -0.2;
+                double cx[4] = {gx + ax, gx + dxx, next_gx + ax, next_gx + dxx};
+                double cy[4] = {gy + ay, gy + dyy, next_gy + ay, next_gy + dyy};
+                tc.left = *std::min_element(cx, cx + 4);
+                tc.right = *std::max_element(cx, cx + 4);
+                tc.top = *std::max_element(cy, cy + 4);
+                tc.bot = *std::min_element(cy, cy + 4);
+                tc.font_size = up_len;
+            }
             tc.unicode = unicode;
             tc.is_bold = (gs.font && gs.font->is_bold) ||
                          gs.render_mode == 2 || gs.render_mode == 6;
@@ -1395,8 +1429,11 @@ std::vector<TextLine> reorder_column_lines(std::vector<TextLine>& lines,
     return result;
 }
 
-std::vector<TextLine> chars_to_lines(const std::vector<TextChar>& chars,
-                                    double* out_col_boundary) {
+// Group chars that all share one writing direction into lines. Callers reach
+// this through chars_to_lines(), which rotates each non-upright direction into
+// this function's frame first.
+static std::vector<TextLine> lines_from_upright_chars(
+    const std::vector<TextChar>& chars, double* out_col_boundary) {
     if (chars.empty()) return {};
 
     // Sort by y (descending, top-first) then x (left-to-right)
@@ -1520,6 +1557,88 @@ std::vector<TextLine> chars_to_lines(const std::vector<TextChar>& chars,
 
     if (col_boundary > 0)
         lines = reorder_column_lines(lines, col_boundary);
+
+    return lines;
+}
+
+std::vector<TextLine> chars_to_lines(const std::vector<TextChar>& chars,
+                                    double* out_col_boundary) {
+    if (out_col_boundary) *out_col_boundary = 0;
+    if (chars.empty()) return {};
+
+    // Which writing directions are present. A page of ordinary prose has only
+    // the upright one, and takes the same path it always did.
+    bool present[24] = {};
+    for (auto& ch : chars)
+        if (ch.rot >= 0 && ch.rot < 24) present[ch.rot] = true;
+    int directions = 0;
+    for (bool p : present) directions += p ? 1 : 0;
+    if (directions <= 1 && present[0])
+        return lines_from_upright_chars(chars, out_col_boundary);
+
+    // Upright text first and unchanged — it drives the column boundary and
+    // keeps the body's reading order. Rotated runs follow, each grouped in its
+    // own frame, so a 90° dimension label reads along its baseline.
+    std::vector<TextLine> lines;
+    if (present[0]) {
+        std::vector<TextChar> upright;
+        upright.reserve(chars.size());
+        for (auto& ch : chars)
+            if (ch.rot == 0) upright.push_back(ch);
+        lines = lines_from_upright_chars(upright, out_col_boundary);
+    }
+
+    const double kDegToRad = 3.14159265358979323846 / 180.0;
+    for (int r = 1; r < 24; r++) {
+        if (!present[r]) continue;
+        const double theta = r * 15.0 * kDegToRad;
+        const double cs = std::cos(theta), sn = std::sin(theta);
+        // Into the direction's own frame (rotate by -theta), and back out.
+        auto fwd = [&](double px, double py, double& ox, double& oy) {
+            ox = px * cs + py * sn;
+            oy = -px * sn + py * cs;
+        };
+        auto back = [&](double px, double py, double& ox, double& oy) {
+            ox = px * cs - py * sn;
+            oy = px * sn + py * cs;
+        };
+
+        std::vector<TextChar> rot_chars;
+        for (auto& ch : chars) {
+            if (ch.rot != r) continue;
+            TextChar t = ch;
+            fwd(ch.x, ch.y, t.x, t.y);
+            // Rotating the page-space AABB is exact on the quarter turns that
+            // real documents use, and a slight over-estimate off them.
+            double bx[4] = {ch.left, ch.right, ch.left, ch.right};
+            double by[4] = {ch.top, ch.top, ch.bot, ch.bot};
+            double rx[4], ry[4];
+            for (int k = 0; k < 4; k++) fwd(bx[k], by[k], rx[k], ry[k]);
+            t.left = *std::min_element(rx, rx + 4);
+            t.right = *std::max_element(rx, rx + 4);
+            t.top = *std::max_element(ry, ry + 4);
+            t.bot = *std::min_element(ry, ry + 4);
+            t.rot = 0;
+            rot_chars.push_back(t);
+        }
+
+        for (auto& ln : lines_from_upright_chars(rot_chars, nullptr)) {
+            // Report the line where it sits on the page, not where it sat in
+            // the rotated frame: table matching and ordering work in page
+            // space. The line's box maps back to a page-space AABB.
+            double top = ln.y_center + ln.font_size * 0.8;
+            double bot = ln.y_center - ln.font_size * 0.2;
+            double bx[4] = {ln.x_left, ln.x_right, ln.x_left, ln.x_right};
+            double by[4] = {top, top, bot, bot};
+            double px[4], py[4];
+            for (int k = 0; k < 4; k++) back(bx[k], by[k], px[k], py[k]);
+            ln.x_left = *std::min_element(px, px + 4);
+            ln.x_right = *std::max_element(px, px + 4);
+            ln.y_center = (*std::min_element(py, py + 4) +
+                           *std::max_element(py, py + 4)) / 2;
+            lines.push_back(std::move(ln));
+        }
+    }
 
     return lines;
 }

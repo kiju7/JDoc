@@ -10,12 +10,18 @@
 namespace jdoc { namespace pdf_detail {
 
 struct TextChar {
-    double x, y;
-    double left, right, top, bot;
+    double x, y;                     // glyph origin, page space
+    double left, right, top, bot;    // page-space AABB of the glyph box
     double font_size;
     uint32_t unicode;
     bool is_bold;
     bool is_italic;
+    // Writing direction quantized to 15° steps (0 = upright, 6 = 90°, 12 =
+    // 180°, 18 = 270°). CAD drawings label vertical dimensions with rotated
+    // text; chars_to_lines groups each direction separately so a rotated run
+    // reads along its own baseline instead of being scattered across the
+    // page's rows. Fits the padding after the flags — TextChar stays 64 bytes.
+    int16_t rot;
 };
 
 struct PathPoint {
