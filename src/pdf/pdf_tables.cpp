@@ -1834,6 +1834,7 @@ static TableData build_table_from_band(
 
         std::vector<std::string> cells(n_cols);
         std::vector<double> last_right(n_cols, -1e9);
+        std::vector<int16_t> last_rot(n_cols, 0);
 
         // Column assignment above works in page space, but the text of a cell
         // has to be emitted in the run's own reading order — a 180° run
@@ -1884,13 +1885,18 @@ static TableData build_table_from_band(
             }
             // Word gaps are measured along the advance too, so a rotated run
             // does not read as one gapless word (its page-space gaps run
-            // backwards and never clear the threshold).
+            // backwards and never clear the threshold). Across a direction
+            // change the two frames share no axis, so the difference is
+            // meaningless — the runs are separated unconditionally instead,
+            // which is what get_text_in_rect does by breaking the row there.
             double lo, hi;
             text_along_span(ch.rot, ch.left, ch.right, ch.top, ch.bot, lo, hi);
-            if (!cells[col].empty() && (lo - last_right[col]) >= word_gap)
+            if (!cells[col].empty() &&
+                (ch.rot != last_rot[col] || (lo - last_right[col]) >= word_gap))
                 cells[col] += ' ';
             util::append_utf8(cells[col], ch.unicode);
             last_right[col] = hi;
+            last_rot[col] = ch.rot;
         }
 
         for (auto& c : cells) c = util::trim(c);

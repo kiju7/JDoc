@@ -2,6 +2,7 @@
 // License: MIT
 
 #include "jdoc/office.h"
+#include "jdoc/detect.h"
 #include "zip_reader.h"
 #include "legacy/ole_reader.h"
 #include "ooxml/xlsb_parser.h"
@@ -274,6 +275,74 @@ void test_ooxml_embedded_parts() {
     TEST(no_attachments_section_without_embeddings)
         auto md = convert_pptx(make_pptx(text_shape("sp", "slide body")));
         ASSERT(md.find("## Attachments") == std::string::npos);
+    TEST_END
+
+    TEST(part_name_cannot_forge_document_structure)
+        // Zip entry names are attacker-controlled and may hold newlines. One
+        // carrying markdown would otherwise fabricate headings in the output.
+        std::string evil = "ppt/embeddings/benign.xlsx\n\n## Table of Contents"
+                           "\n\n- INJECTED HEADING\n\nmore.bin";
+        auto md = convert_pptx(make_pptx(text_shape("sp", "slide body"),
+                                         {{evil, std::string(1234, 'x')}}));
+        // The name is still reported in full — it is only prevented from
+        // starting a line, which is what makes markdown structure.
+        ASSERT(md.find("INJECTED HEADING") != std::string::npos);
+        ASSERT(md.find("\n## Table of Contents") == std::string::npos);
+        ASSERT(count_occurrences(md, "\n## Attachments") == 1);
+        // Collapsed to a single list item.
+        ASSERT(count_occurrences(md, "\n- ") == 1);
+    TEST_END
+
+    TEST(only_direct_children_of_embeddings_listed)
+        // A substring match on "/embeddings/" would also claim these.
+        auto md = convert_pptx(make_pptx(
+            text_shape("sp", "slide body"),
+            {{"ppt/media/embeddings/logo.png", std::string(4096, 'p')},
+             {"ppt/embeddings/nested/deep.bin", std::string(512, 'd')},
+             {"ppt/embeddings/", ""}}));
+        ASSERT(md.find("## Attachments") == std::string::npos);
+    TEST_END
+}
+
+// DWFx is an XPS package: it carries [Content_Types].xml like an OOXML
+// document, so without a separate check it lands in the office layer and is
+// rejected as an unsupported document.
+void test_dwfx_not_office() {
+    std::cerr << "\nDWFx vs OOXML package:\n";
+
+    auto detect_zip = [](const std::string& zip) {
+        return jdoc::detect(zip.data(), zip.size(), "");
+    };
+    const std::string ct =
+        "<?xml version=\"1.0\"?><Types xmlns=\"http://schemas.openxmlformats.org/"
+        "package/2006/content-types\"/>";
+
+    TEST(dwfx_3d_without_fdseq_detected)
+        // Autodesk names the sequence part FixedDocumentSequence.fdseq in 2D
+        // packages but DWFDocumentSequence.dwfseq in 3D ones, so only the
+        // dwf/ parts are a reliable marker.
+        auto zip = make_zip({{"[Content_Types].xml", ct},
+                             {"DWFDocumentSequence.dwfseq", "<x/>"},
+                             {"dwf/documents/1/manifest.xml", "<m/>"}});
+        auto info = detect_zip(zip);
+        ASSERT(info.format == "DWFX");
+        ASSERT(!info.convertible);
+    TEST_END
+
+    TEST(plain_xps_stays_office)
+        auto zip = make_zip({{"[Content_Types].xml", ct},
+                             {"FixedDocumentSequence.fdseq", "<x/>"},
+                             {"Documents/1/Pages/1.fpage", "<p/>"}});
+        ASSERT(detect_zip(zip).format != "DWFX");
+    TEST_END
+
+    TEST(ordinary_zip_with_dwf_folder_stays_archive)
+        // No OPC marker: a user's zip that happens to hold a dwf/ directory
+        // must still be walked as an archive.
+        auto zip = make_zip({{"dwf/notes.txt", "hello"}, {"readme.txt", "hi"}});
+        auto info = detect_zip(zip);
+        ASSERT(info.format == "ZIP");
+        ASSERT(info.convertible);
     TEST_END
 }
 
@@ -1128,6 +1197,7 @@ int main() {
     test_ole_reader();
     test_rtf_parser();
     test_ooxml_embedded_parts();
+    test_dwfx_not_office();
     test_pptx_shape_tree();
     test_pptx_master_layout();
     test_pptx_shared_media();

@@ -48,8 +48,10 @@ bool has_skippable_ext(const std::string& name, bool extracting_images) {
         "ttf", "otf", "woff", "woff2",
         // CAD drawings: jdoc extracts nothing from them, and a set of sheets
         // runs to hundreds of megabytes that used to be inflated in full
-        // before being discarded.
-        "dwg", "dxf", "dwf", "dwfx",
+        // before being discarded. "dxf" is not here — an ASCII DXF is text,
+        // and skipping it would lose the TEXT/MTEXT strings that are the only
+        // searchable content a drawing carries.
+        "dwg", "dwf", "dwfx",
     };
     for (auto* s : kSkip)
         if (ext == s) return true;
@@ -781,8 +783,12 @@ bool walk_egg_solid(EggReader& egg, const std::string& prefix, int depth,
                 }
                 if (has_skippable_ext(mem.name, opts.images) || mem.encrypted) {
                     if (mem.encrypted || opts.archive.include_unsupported) {
+                        // Named from the extension like every other skipped
+                        // member; this site handles encryption too, so it
+                        // could not share the helper wholesale.
                         MemberResult r;
                         r.member_path = path;
+                        r.format = file_format_name(format_from_extension(mem.name));
                         r.uncompressed_size = mem.uncompressed_size;
                         r.error_code = mem.encrypted
                             ? MemberErrorCode::ENCRYPTED

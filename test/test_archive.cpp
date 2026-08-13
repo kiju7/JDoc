@@ -540,7 +540,6 @@ static void test_basic_zip() {
         std::string dwg = "AC1032";
         dwg.resize(4096, '\0');
         auto zip = make_zip({{"plan.dwg", dwg},
-                             {"sheet.dxf", "  0\r\nSECTION\r\n"},
                              {"model.dwf", "(DWF V06.00)PK\x03\x04"},
                              {"ok.txt", "fine"}});
         auto path = write_tmp("cad.zip", zip);
@@ -551,13 +550,40 @@ static void test_basic_zip() {
         jdoc::ConvertOptions opts;
         opts.archive.include_unsupported = true;
         rs = jdoc::convert_archive(path, opts);
-        ASSERT(rs.size() == 4);
-        for (const char* name : {"plan.dwg", "sheet.dxf", "model.dwf"}) {
+        ASSERT(rs.size() == 3);
+        for (const char* name : {"plan.dwg", "model.dwf"}) {
             auto* m = find_member(rs, name);
             ASSERT(m && !m->ok());
             ASSERT(m->error_code == jdoc::MemberErrorCode::UNSUPPORTED);
             ASSERT(m->format == "CAD");
         }
+    TEST_END
+
+    TEST(ascii_dxf_member_still_yields_its_text)
+        // An ASCII DXF is text. Skipping it as a drawing would drop the
+        // TEXT/MTEXT strings, which are the only searchable content a drawing
+        // carries — the identical bytes under a .txt name still produce them.
+        const std::string dxf =
+            "  0\r\nSECTION\r\n  2\r\nENTITIES\r\n  0\r\nTEXT\r\n"
+            "  1\r\nDRAWING NO. M-204 REV C\r\n  0\r\nEOF\r\n";
+        auto path = write_tmp("dxf.zip", make_zip({{"plan.dxf", dxf}}));
+        auto rs = jdoc::convert_archive(path);
+        ASSERT(rs.size() == 1);
+        ASSERT(rs[0].ok());
+        ASSERT(rs[0].markdown.find("DRAWING NO. M-204 REV C") != std::string::npos);
+    TEST_END
+
+    TEST(text_opening_like_a_dwg_version_still_converts)
+        // "AC1032 …" is six bytes of the DWG signature followed by prose. The
+        // magic check runs before the extension and before the is-it-text
+        // heuristic, so a false hit here is unrecoverable — the member would
+        // vanish from the default output entirely.
+        auto path = write_tmp("acprose.zip", make_zip(
+            {{"notes.txt", "AC1032 cable was pulled from panel A to panel B.\n"}}));
+        auto rs = jdoc::convert_archive(path);
+        ASSERT(rs.size() == 1);
+        ASSERT(rs[0].ok());
+        ASSERT(rs[0].markdown.find("panel B") != std::string::npos);
     TEST_END
 
     TEST(non_archive_input_single_result)

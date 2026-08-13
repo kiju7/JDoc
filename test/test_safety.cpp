@@ -393,6 +393,43 @@ void test_pdf_reads_rotated_text() {
 // way it scales the geometry. A CAD sheet plotted at 1:2.8 sets `24 w` under a
 // 0.03 matrix — 0.72pt on the page. Recording the 24 raw drew it as a bar wide
 // enough to swallow the drawing when the page was composited to a raster.
+// Ruled tables assemble a cell through PageCharCache::get_text_in_rect, which
+// is a separate implementation from the borderless builder that the end-to-end
+// fixture happens to exercise. Drive it directly so a regression confined to
+// this one cannot hide.
+void test_pdf_cell_assembly_reading_order() {
+    using namespace jdoc::pdf_detail;
+
+    // "ECHO" drawn 180°-rotated: glyphs advance toward -x, one em apart, all
+    // on the same baseline — the shape a Tm of [-1 0 0 -1] produces.
+    auto glyph = [](uint32_t cp, double right, int16_t rot) {
+        TextChar t{};
+        t.x = right; t.y = 150;
+        t.left = right - 6; t.right = right;
+        t.top = 152; t.bot = 142;
+        t.font_size = 10;
+        t.unicode = cp;
+        t.rot = rot;
+        return t;
+    };
+    std::vector<TextChar> chars = {
+        glyph('E', 250, 12), glyph('C', 244, 12),
+        glyph('H', 238, 12), glyph('O', 232, 12),
+    };
+    PageCharCache cache;
+    cache.build(chars);
+    CHECK(cache.get_text_in_rect(200, 170, 300, 130) == "ECHO");
+
+    // Upright text is the identity case and must be untouched.
+    std::vector<TextChar> upright = {
+        glyph('A', 106, 0), glyph('B', 112, 0), glyph('C', 118, 0),
+    };
+    for (auto& t : upright) { t.left = t.x; t.right = t.x + 6; }
+    PageCharCache up;
+    up.build(upright);
+    CHECK(up.get_text_in_rect(100, 170, 200, 130) == "ABC");
+}
+
 void test_pdf_line_width_follows_ctm() {
     using namespace jdoc::pdf_detail;
     const std::string ops =
@@ -499,6 +536,7 @@ int main() {
     test_pdf_reads_rotated_text();
     test_pdf_table_cell_rotated_text();
     test_pdf_line_width_follows_ctm();
+    test_pdf_cell_assembly_reading_order();
     test_pdf_lists_attachments();
     test_pdf_name_tree_cycle_terminates();
     test_pdf_decodes_surrogate_pair();

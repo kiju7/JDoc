@@ -99,14 +99,21 @@ static FileFormat format_from_magic(const unsigned char* magic, size_t n) {
         magic[3] == 0x9A)
         return FileFormat::WMF;
     // CAD drawings. DWG names its version in six ASCII bytes ("AC1032" =
-    // AutoCAD 2018); the digits are checked so prose starting with "AC10"
-    // cannot claim the format. DWF is a zip behind a 12-byte ASCII banner —
-    // caught here so it is not walked as a plain archive and dumped as raw XML.
-    if (n >= 6 && memcmp(magic, "AC10", 4) == 0 &&
+    // AutoCAD 2018) followed by a NUL. The version digits alone are six bytes
+    // of the plain-text alphabet, and this runs ahead of both the extension
+    // and the is-it-text check, so a report opening "AC1032 cable was pulled…"
+    // would be claimed as a drawing and never recover. The NUL settles it:
+    // every DWG has one there, and no text file does.
+    if (n >= 7 && memcmp(magic, "AC10", 4) == 0 && magic[6] == 0x00 &&
         magic[4] >= '0' && magic[4] <= '9' && magic[5] >= '0' && magic[5] <= '9')
         return FileFormat::CAD;
+    // DWF is a zip behind a 12-byte ASCII banner — caught here so it is not
+    // walked as a plain archive and dumped as raw XML.
     if (n >= 6 && memcmp(magic, "(DWF V", 6) == 0)
         return FileFormat::CAD;
+    // Only the binary DXF flavour is a drawing as far as jdoc is concerned; an
+    // ASCII DXF is plain text and keeps going to TXT, where its TEXT/MTEXT
+    // strings are the one part of a drawing that does extract.
     if (n >= 18 && memcmp(magic, "AutoCAD Binary DXF", 18) == 0)
         return FileFormat::CAD;
     // Standalone raster images with strong, multi-byte signatures (jpeg/png/gif/
@@ -129,15 +136,19 @@ static FileFormat classify_zip(const ZipReader& zip) {
         zip.has_entry("Contents/content.hpf") ||
         zip.has_entry("META-INF/container.xml"))
         return FileFormat::HWPX;
-    // DWFx is an XPS package, so it carries [Content_Types].xml like an OOXML
-    // document and used to be handed to the office layer, which rejected it as
-    // an unsupported document. The drawing parts under dwf/ are what separate
-    // it from plain XPS.
-    if (zip.has_entry("FixedDocumentSequence.fdseq") &&
-        !zip.entries_with_prefix("dwf/").empty())
-        return FileFormat::CAD;
-    if (zip.has_entry("[Content_Types].xml"))
+    if (zip.has_entry("[Content_Types].xml")) {
+        // DWFx is an XPS package, so it reaches here like an OOXML document
+        // and used to be handed to the office layer, which rejected it as an
+        // unsupported document. The drawing parts under dwf/ are what separate
+        // it from plain XPS — the sequence part is not, since Autodesk names
+        // it FixedDocumentSequence.fdseq in 2D packages and
+        // DWFDocumentSequence.dwfseq in 3D ones. Requiring the OPC marker
+        // first keeps an ordinary zip that happens to hold a dwf/ folder from
+        // being mistaken for a drawing.
+        if (!zip.entries_with_prefix("dwf/").empty())
+            return FileFormat::CAD;
         return FileFormat::OFFICE;
+    }
     // ODF (odt/ods/odp): no [Content_Types].xml — instead a top-level mimetype
     // member plus META-INF/manifest.xml. The office layer splits the three
     // kinds by the mimetype string.
@@ -356,10 +367,11 @@ FileFormat format_from_extension(const std::string& name) {
         ext == ".html" || ext == ".htm" || ext == ".xlsb" ||
         ext == ".odt" || ext == ".ods" || ext == ".odp")
         return FileFormat::OFFICE;
-    // CAD drawings. An ASCII DXF is plain text and would otherwise fall through
-    // to TXT, dumping group codes; the extension is the only thing that names
-    // it, since only the binary flavour carries a signature.
-    if (ext == ".dwg" || ext == ".dxf" || ext == ".dwf" || ext == ".dwfx")
+    // CAD drawings. ".dxf" is deliberately absent: an ASCII DXF is plain text,
+    // and classifying it here would cost the TEXT/MTEXT strings that are the
+    // only searchable content a drawing carries. It stays on the TXT path,
+    // group-code noise and all; the binary flavour has a signature of its own.
+    if (ext == ".dwg" || ext == ".dwf" || ext == ".dwfx")
         return FileFormat::CAD;
     if (ext == ".zip") return FileFormat::ZIP;
     if (ext == ".gz" || ext == ".tgz") return FileFormat::GZIP;

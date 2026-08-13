@@ -171,6 +171,13 @@ inline void writing_axes(int16_t rot, double& c, double& s) {
 
 // Baseline index: larger reads earlier, the way page-space y does for upright
 // text (where this returns y unchanged).
+//
+// Known limitation: `rot` is quantized from the advance direction alone, so a
+// mirrored matrix (negative determinant, e.g. `-1 0 0 1 Tm`) is indistinguish-
+// able from a half turn even though its up-vector still points at +y. Such a
+// run reads its characters in the right order but stacks its lines bottom-up.
+// Telling the two apart needs a flag TextChar has no room for — it is exactly
+// 64 bytes with no padding left — and no corpus or CAD sample exercises it.
 inline double text_across(int16_t rot, double x, double y) {
     double c, s;
     writing_axes(rot, c, s);

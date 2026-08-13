@@ -48,7 +48,7 @@ static const char* image_from_magic(const unsigned char* b, size_t n) {
 static const char* cad_from_magic(const unsigned char* b, size_t n,
                                   const std::string& name) {
     if (b) {
-        if (n >= 6 && std::memcmp(b, "AC10", 4) == 0 &&
+        if (n >= 7 && std::memcmp(b, "AC10", 4) == 0 && b[6] == 0x00 &&
             b[4] >= '0' && b[4] <= '9' && b[5] >= '0' && b[5] <= '9')
             return "DWG";
         if (n >= 6 && std::memcmp(b, "(DWF V", 6) == 0) return "DWF";
