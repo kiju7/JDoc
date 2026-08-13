@@ -2,6 +2,7 @@
 // pdf_content.h — internal: content-stream parse vocabulary and line layout.
 #include "pdf_core.h"
 #include <array>
+#include <cmath>
 #include <cstring>
 #include <memory>
 #include <unordered_map>
@@ -136,12 +137,59 @@ struct TextLine {
     double x_right = 0;
 };
 
+// ── Reading order for rotated runs ──────────────────────
+// Glyphs are ordered along their own writing direction rather than along the
+// page: a 180° run advances toward -x, so comparing left-to-right spells it
+// backwards. CAD title blocks repeat the drawing number upside down along the
+// sheet's top edge, and that is the shape this exists for. Cell assembly lives
+// in two places (ruled tables in PageCharCache, borderless ones in
+// pdf_tables.cpp), so the projection is shared rather than written twice.
+//
+// `rot` is TextChar::rot: 15° steps, 0 = upright. The four axis-aligned cases
+// are spelled out because sin(180°) through <cmath> is 1.2e-16, not 0, and
+// that residue is enough to reorder glyphs that share a baseline.
+inline void writing_axes(int16_t rot, double& c, double& s) {
+    int q = ((rot % 24) + 24) % 24;
+    switch (q) {
+        case 0:  c =  1; s =  0; return;
+        case 6:  c =  0; s =  1; return;
+        case 12: c = -1; s =  0; return;
+        case 18: c =  0; s = -1; return;
+    }
+    double th = q * (15.0 * 3.14159265358979323846 / 180.0);
+    c = std::cos(th);
+    s = std::sin(th);
+}
+
+// Baseline index: larger reads earlier, the way page-space y does for upright
+// text (where this returns y unchanged).
+inline double text_across(int16_t rot, double x, double y) {
+    double c, s;
+    writing_axes(rot, c, s);
+    return y * c - x * s;
+}
+
+// Extent along the glyph advance. The glyph box is an axis-aligned page
+// rectangle, so project all four corners; upright text gets [left, right].
+inline void text_along_span(int16_t rot, double left, double right,
+                            double top, double bot, double& lo, double& hi) {
+    double c, s;
+    writing_axes(rot, c, s);
+    double v0 = left  * c + bot * s;
+    double v1 = left  * c + top * s;
+    double v2 = right * c + bot * s;
+    double v3 = right * c + top * s;
+    lo = std::min(std::min(v0, v1), std::min(v2, v3));
+    hi = std::max(std::max(v0, v1), std::max(v2, v3));
+}
+
 struct PageCharCache {
     struct CharInfo {
         double x, y;
         double left, right, top, bot;
         double font_size;
         unsigned int unicode;
+        int16_t rot;   // writing direction, as TextChar::rot
     };
     std::vector<CharInfo> chars;
     std::vector<size_t> y_sorted;
@@ -150,7 +198,7 @@ struct PageCharCache {
         chars.reserve(text_chars.size());
         for (auto& tc : text_chars) {
             if (tc.unicode == 0 || tc.unicode == '\r' || tc.unicode == '\n' || tc.unicode == 0xFFFD) continue;
-            chars.push_back({tc.x, tc.y, tc.left, tc.right, tc.top, tc.bot, tc.font_size, tc.unicode});
+            chars.push_back({tc.x, tc.y, tc.left, tc.right, tc.top, tc.bot, tc.font_size, tc.unicode, tc.rot});
         }
         y_sorted.resize(chars.size());
         for (size_t i = 0; i < chars.size(); i++) y_sorted[i] = i;
@@ -176,29 +224,47 @@ struct PageCharCache {
             if (cx >= left - 1.0 && cx < right + 1.0)
                 matches.push_back(*it);
         }
-        // Sort by reading order: top-to-bottom, then left-to-right.
-        // Single-row cells will fall through to a stable left-to-right order;
+        // Sort by reading order: top-to-bottom, then along the advance.
+        // Single-row cells will fall through to a stable advance-order sort;
         // multi-row cells (merged) read top-to-bottom.
+        //
+        // Direction is the primary key: projecting each glyph with its own
+        // angle would not be a strict weak ordering in a cell that mixes them.
         std::sort(matches.begin(), matches.end(), [this](size_t a, size_t b) {
             const auto& ca = chars[a];
             const auto& cb = chars[b];
+            if (ca.rot != cb.rot) return ca.rot < cb.rot;
             double y_tol = std::max(ca.font_size, cb.font_size) * 0.4;
             if (y_tol < 2.0) y_tol = 2.0;
-            if (std::abs(ca.y - cb.y) > y_tol) return ca.y > cb.y;
-            return ca.left < cb.left;
+            double aa = text_across(ca.rot, ca.x, ca.y);
+            double ab = text_across(cb.rot, cb.x, cb.y);
+            if (std::abs(aa - ab) > y_tol) return aa > ab;
+            double a_lo, a_hi, b_lo, b_hi;
+            text_along_span(ca.rot, ca.left, ca.right, ca.top, ca.bot, a_lo, a_hi);
+            text_along_span(cb.rot, cb.left, cb.right, cb.top, cb.bot, b_lo, b_hi);
+            return a_lo < b_lo;
         });
         std::string text;
-        double prev_right = -1e9;
-        double prev_y = 0.0;
+        double prev_hi = -1e9;
+        double prev_across = 0.0;
         double prev_fs = 12.0;
+        int16_t prev_rot = 0;
         bool first = true;
         for (size_t idx : matches) {
             auto& ch = chars[idx];
             double fs = ch.font_size > 1.0 ? ch.font_size : 12.0;
+            // Same frame the sort used, so row breaks and word gaps are
+            // measured along the run's baseline rather than the page's.
+            double lo, hi;
+            text_along_span(ch.rot, ch.left, ch.right, ch.top, ch.bot, lo, hi);
+            double acr = text_across(ch.rot, ch.x, ch.y);
             if (!first) {
                 double y_tol = std::max(prev_fs, fs) * 0.4;
                 if (y_tol < 2.0) y_tol = 2.0;
-                bool new_row = std::abs(ch.y - prev_y) > y_tol;
+                // A direction change always breaks the run: the two frames
+                // share no baseline to compare against.
+                bool new_row = ch.rot != prev_rot ||
+                               std::abs(acr - prev_across) > y_tol;
                 if (new_row) {
                     // A number wrapped across cell lines ("991225-" /
                     // "1234567") continues without a space; only the
@@ -213,7 +279,7 @@ struct PageCharCache {
                 } else {
                     // Insert a space when the positional gap exceeds the
                     // word-spacing threshold used by chars_to_lines.
-                    double gap = ch.left - prev_right;
+                    double gap = lo - prev_hi;
                     double word_gap = fs * 0.15;
                     if (word_gap < 1.0) word_gap = 1.0;
                     if (ch.unicode == ' ' || ch.unicode == 0xA0) {
@@ -225,9 +291,10 @@ struct PageCharCache {
             }
             if (ch.unicode != ' ' && ch.unicode != 0xA0)
                 util::append_utf8(text, ch.unicode);
-            prev_right = ch.right;
-            prev_y = ch.y;
+            prev_hi = hi;
+            prev_across = acr;
             prev_fs = fs;
+            prev_rot = ch.rot;
             first = false;
         }
         size_t s = text.find_first_not_of(" ");

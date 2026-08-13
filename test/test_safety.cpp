@@ -183,6 +183,42 @@ std::string rotated_text_pdf() {
     });
 }
 
+// A ruled 3x4 table whose middle cell holds a 180°-rotated label — the shape a
+// CAD title block makes when it repeats the drawing number upside down along
+// the sheet edge. Cell assembly is a separate path from line layout, so the
+// quarter-turn coverage above does not reach it.
+std::string rotated_table_pdf() {
+    const std::string content =
+        "q 0.6 w 0 G\n"
+        "30 210 m 280 210 l S\n30 170 m 280 170 l S\n30 130 m 280 130 l S\n"
+        "30 90 m 280 90 l S\n30 50 m 280 50 l S\n"
+        "30 50 m 30 210 l S\n120 50 m 120 210 l S\n"
+        "210 50 m 210 210 l S\n280 50 m 280 210 l S\nQ\n"
+        "BT /F1 10 Tf\n"
+        "1 0 0 1 36 184 Tm (ALPHA) Tj\n"
+        "1 0 0 1 126 184 Tm (BRAVO) Tj\n"
+        "1 0 0 1 216 184 Tm (CHARLIE) Tj\n"
+        "1 0 0 1 36 144 Tm (DELTA) Tj\n"
+        "1 0 0 1 216 144 Tm (FOXTROT) Tj\n"
+        "1 0 0 1 36 104 Tm (GOLF) Tj\n"
+        "1 0 0 1 126 104 Tm (HOTEL) Tj\n"
+        "1 0 0 1 216 104 Tm (INDIA) Tj\n"
+        "1 0 0 1 36 64 Tm (JULIET) Tj\n"
+        "1 0 0 1 126 64 Tm (KILO) Tj\n"
+        "1 0 0 1 216 64 Tm (LIMA) Tj\n"
+        // Advances toward -x, so the origin is the run's top-right corner.
+        "-1 0 0 -1 185 150 Tm (ECHO) Tj\n"
+        "ET";
+    return assemble_pdf({
+        "<< /Type /Catalog /Pages 2 0 R >>",
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 250] "
+        "/Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>",
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+        stream_object("", content),
+    });
+}
+
 // Two embedded files reached through a branching name tree. The first is
 // registered under two keys and carries a UTF-16BE name; the second declares
 // no /Params, so its size has to come from the stream length.
@@ -352,6 +388,19 @@ void test_pdf_reads_rotated_text() {
     CHECK(text.find("NRUTFLAH") == std::string::npos);
 }
 
+void test_pdf_table_cell_rotated_text() {
+    const std::string pdf = rotated_table_pdf();
+    const std::string text = jdoc::pdf_to_markdown_mem(
+        reinterpret_cast<const uint8_t*>(pdf.data()), pdf.size());
+    // Cell assembly ordered glyphs left to right in page space, which reversed
+    // the half-turn run the same way line layout used to.
+    CHECK(text.find("ECHO") != std::string::npos);
+    CHECK(text.find("OHCE") == std::string::npos);
+    // The upright cells are untouched by grouping runs per direction.
+    CHECK(text.find("CHARLIE") != std::string::npos);
+    CHECK(text.find("JULIET") != std::string::npos);
+}
+
 void test_pdf_lists_attachments() {
     const std::string pdf = attachment_pdf();
     const std::string text = jdoc::pdf_to_markdown_mem(
@@ -420,6 +469,7 @@ int main() {
     test_png_converts_cmyk();
     test_pdf_honors_images_option();
     test_pdf_reads_rotated_text();
+    test_pdf_table_cell_rotated_text();
     test_pdf_lists_attachments();
     test_pdf_name_tree_cycle_terminates();
     test_pdf_decodes_surrogate_pair();
