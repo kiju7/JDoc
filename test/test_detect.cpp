@@ -121,6 +121,59 @@ void test_document_magic() {
     TEST_END
 }
 
+// CAD drawings are recognized but never convertible: a DWG keeps its text in a
+// compressed object section, and DWF/DWFx would need a WHIP! opcode walker.
+// Naming them lets a caller route or skip instead of seeing a bare UNKNOWN.
+void test_cad_magic() {
+    std::cerr << "CAD drawings (detect-only, convertible=false):\n";
+
+    TEST("dwg")
+        std::string s = "AC1032";                    // AutoCAD 2018
+        std::vector<unsigned char> b(s.begin(), s.end());
+        b.resize(64, 0);
+        auto info = detect_bytes(b);
+        expect(info, "DWG", jdoc::FormatCategory::Image, false);
+        ASSERT(info.extension == ".dwg");
+        ASSERT(info.mime == "image/vnd.dwg");
+    TEST_END
+
+    TEST("dwg_version_digits_required")
+        // Prose opening with "AC10" must not be claimed as a drawing.
+        std::string s = "AC10 units of cable were pulled to the riser.\n";
+        std::vector<unsigned char> b(s.begin(), s.end());
+        auto info = detect_bytes(b, "notes.txt");
+        ASSERT(info.format != "DWG");
+    TEST_END
+
+    TEST("dwf")
+        std::string s = "(DWF V06.00)PK\x03\x04";
+        std::vector<unsigned char> b(s.begin(), s.end());
+        b.resize(64, 0);
+        expect(detect_bytes(b), "DWF", jdoc::FormatCategory::Image, false);
+    TEST_END
+
+    TEST("dxf_binary")
+        std::string s = "AutoCAD Binary DXF\r\n\x1a";
+        std::vector<unsigned char> b(s.begin(), s.end());
+        b.resize(64, 0);
+        expect(detect_bytes(b), "DXF", jdoc::FormatCategory::Image, false);
+    TEST_END
+
+    TEST("dxf_ascii_by_extension")
+        // An ASCII DXF is plain text; only the name says what it is. Without
+        // that it would land in TXT and dump group codes as prose.
+        std::string s = "  0\r\nSECTION\r\n  2\r\nHEADER\r\n";
+        std::vector<unsigned char> b(s.begin(), s.end());
+        auto info = detect_bytes(b, "plan.dxf");
+        expect(info, "DXF", jdoc::FormatCategory::Image, false);
+    TEST_END
+
+    TEST("dwfx_by_extension")
+        auto info = jdoc::detect("/no/such/drawing.dwfx");
+        expect(info, "DWFX", jdoc::FormatCategory::Image, false);
+    TEST_END
+}
+
 void test_real_files(const std::string& root) {
     std::cerr << "Real fixture files:\n";
 
@@ -170,6 +223,7 @@ int main(int argc, char** argv) {
     std::cerr << "\n=== jdoc::detect tests ===\n\n";
     test_image_magic();
     test_document_magic();
+    test_cad_magic();
     test_real_files(root);
 
     std::cerr << "\n" << tests_passed << " passed, " << tests_failed

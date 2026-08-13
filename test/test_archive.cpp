@@ -532,6 +532,34 @@ static void test_basic_zip() {
         ASSERT(blob && !blob->ok() && blob->error == "unsupported format");
     TEST_END
 
+    TEST(cad_member_skipped_but_named)
+        // A drawing is skipped before inflation — jdoc reads nothing out of
+        // one, and a sheet set runs to hundreds of megabytes. It still comes
+        // back named, so a caller can tell a drawing was in the archive rather
+        // than seeing a bare "something unsupported".
+        std::string dwg = "AC1032";
+        dwg.resize(4096, '\0');
+        auto zip = make_zip({{"plan.dwg", dwg},
+                             {"sheet.dxf", "  0\r\nSECTION\r\n"},
+                             {"model.dwf", "(DWF V06.00)PK\x03\x04"},
+                             {"ok.txt", "fine"}});
+        auto path = write_tmp("cad.zip", zip);
+
+        auto rs = jdoc::convert_archive(path);
+        ASSERT(rs.size() == 1 && rs[0].member_path == "ok.txt");
+
+        jdoc::ConvertOptions opts;
+        opts.archive.include_unsupported = true;
+        rs = jdoc::convert_archive(path, opts);
+        ASSERT(rs.size() == 4);
+        for (const char* name : {"plan.dwg", "sheet.dxf", "model.dwf"}) {
+            auto* m = find_member(rs, name);
+            ASSERT(m && !m->ok());
+            ASSERT(m->error_code == jdoc::MemberErrorCode::UNSUPPORTED);
+            ASSERT(m->format == "CAD");
+        }
+    TEST_END
+
     TEST(non_archive_input_single_result)
         auto path = write_tmp("plain.txt", "just text");
         auto rs = jdoc::convert_archive(path);

@@ -24,7 +24,8 @@ enum class FormatCategory {
     Archive,       // zip, gz, bz2, tar, 7z, alz, egg, rar
     Email,         // eml, msg
     Text,          // txt/csv/json/xml/source code …
-    Image,         // png, jpeg, gif, bmp, tiff, webp, ico, psd (detect-only)
+    Image,         // png, jpeg, gif, bmp, tiff, webp, ico, psd (detect-only),
+                   // emf/wmf metafiles, and dwg/dxf/dwf CAD drawings
     Unknown
 };
 

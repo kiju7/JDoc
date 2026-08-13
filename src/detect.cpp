@@ -38,6 +38,37 @@ static const char* image_from_magic(const unsigned char* b, size_t n) {
     return util::image_type(f);
 }
 
+// ── CAD drawings ────────────────────────────────────────
+// detect_format() lumps every drawing into FileFormat::CAD because that is all
+// the routing/skipping paths need. detect() reports the exact one, so the
+// signature is re-read here — the same split image_from_magic already makes.
+//
+// Only DWG, DWF and binary DXF are self-identifying; an ASCII DXF is plain
+// text whose extension is the only evidence.
+static const char* cad_from_magic(const unsigned char* b, size_t n,
+                                  const std::string& name) {
+    if (b) {
+        if (n >= 6 && std::memcmp(b, "AC10", 4) == 0 &&
+            b[4] >= '0' && b[4] <= '9' && b[5] >= '0' && b[5] <= '9')
+            return "DWG";
+        if (n >= 6 && std::memcmp(b, "(DWF V", 6) == 0) return "DWF";
+        if (n >= 18 && std::memcmp(b, "AutoCAD Binary DXF", 18) == 0) return "DXF";
+        // DWFx is an XPS zip; detect_format already opened the container.
+        if (n >= 4 && std::memcmp(b, "PK\x03\x04", 4) == 0) return "DWFX";
+    }
+    auto dot = name.rfind('.');
+    if (dot != std::string::npos) {
+        std::string ext = name.substr(dot);
+        for (auto& c : ext) c = static_cast<char>(std::tolower(
+            static_cast<unsigned char>(c)));
+        if (ext == ".dwg")  return "DWG";
+        if (ext == ".dxf")  return "DXF";
+        if (ext == ".dwfx") return "DWFX";
+        if (ext == ".dwf")  return "DWF";
+    }
+    return "CAD";
+}
+
 struct Entry {
     FormatCategory category;
     const char* extension;
@@ -60,6 +91,17 @@ static const Entry* lookup(const std::string& fmt) {
     // unlike raster images these are convertible.
     static const Entry EMF  {FormatCategory::Image, ".emf",  "image/emf", true};
     static const Entry WMF  {FormatCategory::Image, ".wmf",  "image/wmf", true};
+
+    // CAD drawings (detect-only). Grouped with the metafiles as vector
+    // pictures, but nothing is extracted: a DWG keeps its text inside a
+    // compressed object section, and a DWF/DWFx would need a WHIP! opcode
+    // walker. Recognizing them lets callers route or skip instead of
+    // decompressing a hundred-megabyte drawing only to discard it.
+    static const Entry DWG  {FormatCategory::Image, ".dwg",  "image/vnd.dwg", false};
+    static const Entry DXF  {FormatCategory::Image, ".dxf",  "image/vnd.dxf", false};
+    static const Entry DWF  {FormatCategory::Image, ".dwf",  "model/vnd.dwf", false};
+    static const Entry DWFX {FormatCategory::Image, ".dwfx", "model/vnd.dwfx+xps", false};
+    static const Entry CAD  {FormatCategory::Image, "", "", false};
 
     // Documents.
     static const Entry PDF  {FormatCategory::Document, ".pdf",  "application/pdf", true};
@@ -120,6 +162,11 @@ static const Entry* lookup(const std::string& fmt) {
     if (fmt == "PSD")  return &PSD;
     if (fmt == "EMF")  return &EMF;
     if (fmt == "WMF")  return &WMF;
+    if (fmt == "DWG")  return &DWG;
+    if (fmt == "DXF")  return &DXF;
+    if (fmt == "DWF")  return &DWF;
+    if (fmt == "DWFX") return &DWFX;
+    if (fmt == "CAD")  return &CAD;
     if (fmt == "PDF")  return &PDF;
     if (fmt == "HWP")  return &HWP;
     if (fmt == "HWPX") return &HWPX;
@@ -203,6 +250,8 @@ FormatInfo detect(const std::string& file_path) {
     FileFormat ff = detect_format(file_path);
     if (ff == FileFormat::OFFICE)
         return make_info(office_name(detect_office_format(file_path)));
+    if (ff == FileFormat::CAD)
+        return make_info(cad_from_magic(hdr, n, file_path));
     return make_info(file_format_name(ff));
 }
 
@@ -216,6 +265,8 @@ FormatInfo detect(const void* data, size_t size, const std::string& name_hint) {
     FileFormat ff = detect_format_mem(b, size, name_hint);
     if (ff == FileFormat::OFFICE)
         return make_info(office_name(detect_office_format_mem(b, size, name_hint)));
+    if (ff == FileFormat::CAD)
+        return make_info(cad_from_magic(b, size, name_hint));
     return make_info(file_format_name(ff));
 }
 

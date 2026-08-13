@@ -58,49 +58,6 @@ static bool is_likely_text(const std::string& path) {
                               static_cast<size_t>(f.gcount()));
 }
 
-// Extension → format, shared by path- and memory-based detection.
-// Returns UNKNOWN when the extension decides nothing.
-static FileFormat format_from_ext(const std::string& name) {
-    auto dot = name.rfind('.');
-    if (dot == std::string::npos) return FileFormat::UNKNOWN;
-    std::string ext = name.substr(dot);
-    for (auto& c : ext) c = std::tolower(static_cast<unsigned char>(c));
-
-    if (ext == ".pdf") return FileFormat::PDF;
-    if (ext == ".hwpx") return FileFormat::HWPX;
-    if (ext == ".hwp") return FileFormat::HWP;
-    if (ext == ".eml") return FileFormat::EML;
-    if (ext == ".emf") return FileFormat::EMF;
-    if (ext == ".wmf") return FileFormat::WMF;
-    if (ext == ".jpg" || ext == ".jpeg" || ext == ".png" || ext == ".gif" ||
-        ext == ".bmp" || ext == ".webp" || ext == ".tif" || ext == ".tiff")
-        return FileFormat::IMAGE;
-    if (ext == ".docx" || ext == ".xlsx" || ext == ".pptx" ||
-        ext == ".doc" || ext == ".xls" || ext == ".ppt" || ext == ".rtf" ||
-        ext == ".html" || ext == ".htm" || ext == ".xlsb" ||
-        ext == ".odt" || ext == ".ods" || ext == ".odp")
-        return FileFormat::OFFICE;
-    if (ext == ".zip") return FileFormat::ZIP;
-    if (ext == ".gz" || ext == ".tgz") return FileFormat::GZIP;
-    if (ext == ".bz2" || ext == ".tbz2") return FileFormat::BZIP2;
-    if (ext == ".tar") return FileFormat::TAR;
-    if (ext == ".7z") return FileFormat::SEVENZIP;
-    if (ext == ".alz") return FileFormat::ALZ;
-    if (ext == ".egg") return FileFormat::EGG;
-    if (ext == ".rar") return FileFormat::RAR;
-    if (ext == ".txt" || ext == ".text" || ext == ".log" || ext == ".csv" ||
-        ext == ".tsv" || ext == ".md" || ext == ".json" || ext == ".xml" ||
-        ext == ".yml" || ext == ".yaml" || ext == ".ini" || ext == ".cfg" ||
-        ext == ".conf" || ext == ".sh" || ext == ".bat" || ext == ".ps1" ||
-        ext == ".py" || ext == ".js" || ext == ".ts" || ext == ".cpp" ||
-        ext == ".c" || ext == ".h" || ext == ".hpp" || ext == ".java" ||
-        ext == ".rs" || ext == ".go" || ext == ".rb" || ext == ".php" ||
-        ext == ".sql" || ext == ".css" || ext == ".scss" || ext == ".less")
-        return FileFormat::TXT;
-
-    return FileFormat::UNKNOWN;
-}
-
 // Magic-byte checks that need no container probing.
 // probe must hold at least 8 bytes (or fewer at EOF); tar needs 262+.
 static FileFormat format_from_magic(const unsigned char* magic, size_t n) {
@@ -141,6 +98,17 @@ static FileFormat format_from_magic(const unsigned char* magic, size_t n) {
     if (n >= 4 && magic[0] == 0xD7 && magic[1] == 0xCD && magic[2] == 0xC6 &&
         magic[3] == 0x9A)
         return FileFormat::WMF;
+    // CAD drawings. DWG names its version in six ASCII bytes ("AC1032" =
+    // AutoCAD 2018); the digits are checked so prose starting with "AC10"
+    // cannot claim the format. DWF is a zip behind a 12-byte ASCII banner —
+    // caught here so it is not walked as a plain archive and dumped as raw XML.
+    if (n >= 6 && memcmp(magic, "AC10", 4) == 0 &&
+        magic[4] >= '0' && magic[4] <= '9' && magic[5] >= '0' && magic[5] <= '9')
+        return FileFormat::CAD;
+    if (n >= 6 && memcmp(magic, "(DWF V", 6) == 0)
+        return FileFormat::CAD;
+    if (n >= 18 && memcmp(magic, "AutoCAD Binary DXF", 18) == 0)
+        return FileFormat::CAD;
     // Standalone raster images with strong, multi-byte signatures (jpeg/png/gif/
     // webp). BMP has only a weak 2-byte "BM" magic that collides with text, so it
     // resolves by extension instead — kept out here to avoid misreading text.
@@ -161,6 +129,13 @@ static FileFormat classify_zip(const ZipReader& zip) {
         zip.has_entry("Contents/content.hpf") ||
         zip.has_entry("META-INF/container.xml"))
         return FileFormat::HWPX;
+    // DWFx is an XPS package, so it carries [Content_Types].xml like an OOXML
+    // document and used to be handed to the office layer, which rejected it as
+    // an unsupported document. The drawing parts under dwf/ are what separate
+    // it from plain XPS.
+    if (zip.has_entry("FixedDocumentSequence.fdseq") &&
+        !zip.entries_with_prefix("dwf/").empty())
+        return FileFormat::CAD;
     if (zip.has_entry("[Content_Types].xml"))
         return FileFormat::OFFICE;
     // ODF (odt/ods/odp): no [Content_Types].xml — instead a top-level mimetype
@@ -359,6 +334,54 @@ static PageChunk image_to_chunk(const uint8_t* data, size_t size,
 
 } // anonymous namespace
 
+// Extension → format, shared by path- and memory-based detection.
+// Returns UNKNOWN when the extension decides nothing.
+FileFormat format_from_extension(const std::string& name) {
+    auto dot = name.rfind('.');
+    if (dot == std::string::npos) return FileFormat::UNKNOWN;
+    std::string ext = name.substr(dot);
+    for (auto& c : ext) c = std::tolower(static_cast<unsigned char>(c));
+
+    if (ext == ".pdf") return FileFormat::PDF;
+    if (ext == ".hwpx") return FileFormat::HWPX;
+    if (ext == ".hwp") return FileFormat::HWP;
+    if (ext == ".eml") return FileFormat::EML;
+    if (ext == ".emf") return FileFormat::EMF;
+    if (ext == ".wmf") return FileFormat::WMF;
+    if (ext == ".jpg" || ext == ".jpeg" || ext == ".png" || ext == ".gif" ||
+        ext == ".bmp" || ext == ".webp" || ext == ".tif" || ext == ".tiff")
+        return FileFormat::IMAGE;
+    if (ext == ".docx" || ext == ".xlsx" || ext == ".pptx" ||
+        ext == ".doc" || ext == ".xls" || ext == ".ppt" || ext == ".rtf" ||
+        ext == ".html" || ext == ".htm" || ext == ".xlsb" ||
+        ext == ".odt" || ext == ".ods" || ext == ".odp")
+        return FileFormat::OFFICE;
+    // CAD drawings. An ASCII DXF is plain text and would otherwise fall through
+    // to TXT, dumping group codes; the extension is the only thing that names
+    // it, since only the binary flavour carries a signature.
+    if (ext == ".dwg" || ext == ".dxf" || ext == ".dwf" || ext == ".dwfx")
+        return FileFormat::CAD;
+    if (ext == ".zip") return FileFormat::ZIP;
+    if (ext == ".gz" || ext == ".tgz") return FileFormat::GZIP;
+    if (ext == ".bz2" || ext == ".tbz2") return FileFormat::BZIP2;
+    if (ext == ".tar") return FileFormat::TAR;
+    if (ext == ".7z") return FileFormat::SEVENZIP;
+    if (ext == ".alz") return FileFormat::ALZ;
+    if (ext == ".egg") return FileFormat::EGG;
+    if (ext == ".rar") return FileFormat::RAR;
+    if (ext == ".txt" || ext == ".text" || ext == ".log" || ext == ".csv" ||
+        ext == ".tsv" || ext == ".md" || ext == ".json" || ext == ".xml" ||
+        ext == ".yml" || ext == ".yaml" || ext == ".ini" || ext == ".cfg" ||
+        ext == ".conf" || ext == ".sh" || ext == ".bat" || ext == ".ps1" ||
+        ext == ".py" || ext == ".js" || ext == ".ts" || ext == ".cpp" ||
+        ext == ".c" || ext == ".h" || ext == ".hpp" || ext == ".java" ||
+        ext == ".rs" || ext == ".go" || ext == ".rb" || ext == ".php" ||
+        ext == ".sql" || ext == ".css" || ext == ".scss" || ext == ".less")
+        return FileFormat::TXT;
+
+    return FileFormat::UNKNOWN;
+}
+
 FileFormat detect_format(const std::string& path) {
     // Magic bytes first (262+ so the tar "ustar" field is visible)
     unsigned char magic[262] = {};
@@ -389,7 +412,7 @@ FileFormat detect_format(const std::string& path) {
     if (fmt != FileFormat::UNKNOWN) return fmt;
 
     // Extension — resolves ambiguous cases (e.g. .xml starts with '<' but is TXT)
-    fmt = format_from_ext(path);
+    fmt = format_from_extension(path);
     if (fmt != FileFormat::UNKNOWN) return fmt;
 
     // '<' fallback — extensionless HTML
@@ -424,7 +447,7 @@ FileFormat detect_format_mem(const uint8_t* data, size_t size,
     FileFormat fmt = format_from_magic(data, size);
     if (fmt != FileFormat::UNKNOWN) return fmt;
 
-    fmt = format_from_ext(name_hint);
+    fmt = format_from_extension(name_hint);
     if (fmt != FileFormat::UNKNOWN) return fmt;
 
     if (data[0] == '<')
@@ -447,6 +470,7 @@ const char* file_format_name(FileFormat fmt) {
         case FileFormat::EMF:      return "EMF";
         case FileFormat::WMF:      return "WMF";
         case FileFormat::IMAGE:    return "IMAGE";
+        case FileFormat::CAD:      return "CAD";
         case FileFormat::ZIP:      return "ZIP";
         case FileFormat::GZIP:     return "GZIP";
         case FileFormat::BZIP2:    return "BZIP2";
