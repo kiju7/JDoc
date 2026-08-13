@@ -513,6 +513,8 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
         if (first_error) std::rethrow_exception(first_error);
     }
 
+    collect_attachments(doc, root, result.attachments);
+
     // Extract bookmarks
     auto outlines = doc.resolve(root.get("Outlines"));
     if (outlines.is_dict()) {

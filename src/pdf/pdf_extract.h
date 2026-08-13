@@ -62,6 +62,17 @@ struct AnnotEntry {
     double y = 0;         // vertical position on page
 };
 
+// A file carried inside the PDF (/Names /EmbeddedFiles). jdoc does not parse
+// the payload — a CAD drawing or a spreadsheet attached to a document is not
+// something it converts — but listing it keeps the attachment from vanishing
+// silently from the output, which would leave callers indexing the PDF unaware
+// the file is even there.
+struct AttachmentEntry {
+    std::string name;   // /UF, else /F
+    std::string desc;   // /Desc, when the producer set one
+    uint64_t size = 0;  // uncompressed bytes; 0 when the PDF does not say
+};
+
 struct ExtractResult {
     std::vector<std::vector<TextLine>> all_lines;
     std::vector<std::vector<ImageData>> all_images;
@@ -73,6 +84,7 @@ struct ExtractResult {
     std::vector<double> page_widths;
     std::vector<double> page_heights;
     std::vector<BookmarkEntry> bookmarks;
+    std::vector<AttachmentEntry> attachments;
     FontStats stats;
     int total_pages = 0;
 };
@@ -102,6 +114,8 @@ ImageData render_page_composite(PdfDoc& doc, const PdfObj& page_obj,
                                 const std::string& output_dir);
 void collect_bookmarks(PdfDoc& doc, const PdfObj& node, int depth,
                        std::vector<BookmarkEntry>& out);
+void collect_attachments(PdfDoc& doc, const PdfObj& root,
+                         std::vector<AttachmentEntry>& out);
 std::vector<AnnotEntry> extract_annotations(PdfDoc& doc, const PdfObj& page_obj, double page_h,
                                             const double* view_ctm = nullptr);
 std::string result_to_markdown(ExtractResult& r, const ConvertOptions& opts);

@@ -17,6 +17,108 @@
 
 namespace jdoc { namespace pdf_detail {
 
+// A PDF text string is either UTF-16BE behind a byte-order mark or, failing
+// that, PDFDocEncoding — which agrees with Latin-1 over the range producers
+// actually use for titles and file names.
+static std::string decode_pdf_text(const std::string& raw) {
+    std::string out;
+    if (raw.size() >= 2 && static_cast<uint8_t>(raw[0]) == 0xFE &&
+        static_cast<uint8_t>(raw[1]) == 0xFF) {
+        for (size_t i = 2; i + 1 < raw.size(); i += 2) {
+            uint32_t cp = (static_cast<uint8_t>(raw[i]) << 8) |
+                           static_cast<uint8_t>(raw[i + 1]);
+            util::append_utf8(out, cp);
+        }
+    } else {
+        for (unsigned char c : raw)
+            util::append_utf8(out, static_cast<uint32_t>(c));
+    }
+    return out;
+}
+
+// ── Embedded file attachments ────────────────────────────
+
+// Read one file specification: the name it presents, and the size its embedded
+// stream declares. Returns false for a spec that names no file.
+static bool read_filespec(PdfDoc& doc, const PdfObj& fs_ref,
+                          AttachmentEntry& out) {
+    PdfObj fs = doc.resolve(fs_ref);
+    if (!fs.is_dict()) return false;
+
+    // /UF is the Unicode name and outranks the others; the platform-specific
+    // keys are what older producers wrote.
+    for (const char* key : {"UF", "F", "DOS", "Mac", "Unix"}) {
+        auto& v = fs.get(key);
+        if (v.is_str() && !v.str_val.empty()) {
+            out.name = decode_pdf_text(v.str_val);
+            break;
+        }
+    }
+    if (out.name.empty()) return false;
+
+    auto& desc = fs.get("Desc");
+    if (desc.is_str()) out.desc = decode_pdf_text(desc.str_val);
+
+    PdfObj ef = doc.resolve(fs.get("EF"));
+    if (ef.is_dict()) {
+        for (const char* key : {"UF", "F"}) {
+            PdfObj stream = doc.resolve(ef.get(key));
+            if (!stream.is_dict()) continue;
+            // /Params /Size is the uncompressed length; /Length is the encoded
+            // one, which is the closest stand-in when Params is missing.
+            PdfObj params = doc.resolve(stream.get("Params"));
+            int64_t size = params.is_dict() ? params.get("Size").as_int() : 0;
+            if (size <= 0) size = stream.get("Length").as_int();
+            if (size > 0) out.size = static_cast<uint64_t>(size);
+            break;
+        }
+    }
+    return true;
+}
+
+// Name trees hold their entries in /Names leaves and branch through /Kids.
+// `budget` bounds the total nodes visited, not just the depth: a /Kids array
+// whose entries point back at their own node fans out 2^depth times, so a
+// depth cap alone lets a malformed file spin for hours.
+static void walk_embedded_files(PdfDoc& doc, const PdfObj& node_ref, int depth,
+                                int& budget, std::vector<AttachmentEntry>& out) {
+    if (depth > 32 || budget <= 0 || out.size() >= 4096) return;
+    budget--;
+    PdfObj node = doc.resolve(node_ref);
+    if (!node.is_dict()) return;
+
+    PdfObj names = doc.resolve(node.get("Names"));
+    if (names.is_arr()) {
+        // Flat [key value key value ...]; the file specs are the odd slots.
+        for (size_t i = 1; i < names.arr.size(); i += 2) {
+            AttachmentEntry e;
+            if (read_filespec(doc, names.arr[i], e)) out.push_back(std::move(e));
+            if (out.size() >= 4096) return;
+        }
+    }
+
+    PdfObj kids = doc.resolve(node.get("Kids"));
+    if (kids.is_arr())
+        for (auto& kid : kids.arr)
+            walk_embedded_files(doc, kid, depth + 1, budget, out);
+}
+
+void collect_attachments(PdfDoc& doc, const PdfObj& root,
+                         std::vector<AttachmentEntry>& out) {
+    PdfObj names = doc.resolve(root.get("Names"));
+    if (!names.is_dict()) return;
+    int budget = 4096;
+    walk_embedded_files(doc, names.get("EmbeddedFiles"), 0, budget, out);
+
+    // The same file often appears under several tree keys; report each once.
+    std::unordered_set<std::string> seen;
+    std::vector<AttachmentEntry> unique;
+    unique.reserve(out.size());
+    for (auto& a : out)
+        if (seen.insert(a.name).second) unique.push_back(std::move(a));
+    out.swap(unique);
+}
+
 void collect_bookmarks(PdfDoc& doc, const PdfObj& node, int depth,
                         std::vector<BookmarkEntry>& out) {
     if (depth > 20) return;
@@ -34,24 +136,7 @@ void collect_bookmarks(PdfDoc& doc, const PdfObj& node, int depth,
         entry.level = depth;
 
         auto& title = child.get("Title");
-        if (title.is_str()) {
-            // Check for UTF-16BE BOM
-            if (title.str_val.size() >= 2 &&
-                static_cast<uint8_t>(title.str_val[0]) == 0xFE &&
-                static_cast<uint8_t>(title.str_val[1]) == 0xFF) {
-                // UTF-16BE
-                for (size_t i = 2; i + 1 < title.str_val.size(); i += 2) {
-                    uint32_t cp = (static_cast<uint8_t>(title.str_val[i]) << 8) |
-                                   static_cast<uint8_t>(title.str_val[i + 1]);
-                    util::append_utf8(entry.title, cp);
-                }
-            } else {
-                // PDFDocEncoding (similar to Latin-1)
-                for (unsigned char c : title.str_val) {
-                    util::append_utf8(entry.title, static_cast<uint32_t>(c));
-                }
-            }
-        }
+        if (title.is_str()) entry.title = decode_pdf_text(title.str_val);
 
         // Get destination page
         auto dest = doc.resolve(child.get("Dest"));
@@ -142,20 +227,17 @@ std::vector<AnnotEntry> extract_annotations(PdfDoc& doc, const PdfObj& page_obj,
 
         // Extract text content (Contents key)
         auto& contents = annot.get("Contents");
-        if (contents.is_str() && !contents.str_val.empty()) {
-            auto& s = contents.str_val;
-            // Detect UTF-16BE BOM
-            if (s.size() >= 2 &&
-                static_cast<uint8_t>(s[0]) == 0xFE &&
-                static_cast<uint8_t>(s[1]) == 0xFF) {
-                for (size_t i = 2; i + 1 < s.size(); i += 2) {
-                    uint32_t cp = (static_cast<uint8_t>(s[i]) << 8) |
-                                   static_cast<uint8_t>(s[i + 1]);
-                    util::append_utf8(entry.text, cp);
-                }
-            } else {
-                for (unsigned char c : s)
-                    util::append_utf8(entry.text, static_cast<uint32_t>(c));
+        if (contents.is_str() && !contents.str_val.empty())
+            entry.text = decode_pdf_text(contents.str_val);
+
+        // A paperclip annotation carries a file the page only gestures at. Its
+        // note, if any, describes the file without naming it, so the name goes
+        // in beside the note — otherwise the page reads as if nothing is there.
+        if (entry.subtype == "FileAttachment") {
+            AttachmentEntry att;
+            if (read_filespec(doc, annot.get("FS"), att)) {
+                if (!entry.text.empty()) entry.text += " ";
+                entry.text += "[" + att.name + "]";
             }
         }
 
@@ -563,6 +645,31 @@ std::string page_to_markdown(const std::vector<TextLine>& raw_lines,
 // ── Core Extraction Logic ────────────────────────────────
 
 
+// One line per attached file: its name, how big it is, and whatever the
+// producer said about it. The bytes themselves stay in the PDF — this is a
+// notice that they exist, not an extraction.
+static std::string format_attachments(
+    const std::vector<AttachmentEntry>& attachments) {
+    std::string out;
+    for (auto& a : attachments) {
+        out += "- " + a.name;
+        if (a.size > 0) {
+            char buf[64];
+            if (a.size >= 1024ull * 1024)
+                snprintf(buf, sizeof(buf), " (%.1f MB)", a.size / (1024.0 * 1024));
+            else if (a.size >= 1024)
+                snprintf(buf, sizeof(buf), " (%.1f KB)", a.size / 1024.0);
+            else
+                snprintf(buf, sizeof(buf), " (%llu B)",
+                         static_cast<unsigned long long>(a.size));
+            out += buf;
+        }
+        if (!a.desc.empty()) out += " — " + a.desc;
+        out += "\n";
+    }
+    return out;
+}
+
 static std::string format_bookmarks(const std::vector<BookmarkEntry>& bookmarks,
                                      bool plaintext) {
     if (bookmarks.empty()) return "";
@@ -602,6 +709,12 @@ std::string result_to_markdown(ExtractResult& r, const ConvertOptions& opts) {
     if (!r.bookmarks.empty()) {
         if (!plaintext) full_md += "## Table of Contents\n\n";
         full_md += format_bookmarks(r.bookmarks, plaintext);
+        full_md += "\n";
+    }
+
+    if (!r.attachments.empty()) {
+        if (!plaintext) full_md += "## Attachments\n\n";
+        full_md += format_attachments(r.attachments);
         full_md += "\n";
     }
 

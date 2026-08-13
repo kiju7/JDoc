@@ -136,6 +136,95 @@ std::string unicode_pdf() {
     return pdf;
 }
 
+// Assemble a PDF from object bodies numbered 1..n, with a matching xref.
+std::string assemble_pdf(const std::vector<std::string>& bodies) {
+    const size_t count = bodies.size();
+    std::string pdf = "%PDF-1.7\n";
+    std::vector<size_t> offsets(count + 1, 0);
+    for (size_t id = 1; id <= count; ++id) {
+        offsets[id] = pdf.size();
+        pdf += std::to_string(id) + " 0 obj\n" + bodies[id - 1] + "\nendobj\n";
+    }
+    const size_t xref = pdf.size();
+    pdf += "xref\n0 " + std::to_string(count + 1) + "\n0000000000 65535 f \n";
+    for (size_t id = 1; id <= count; ++id) {
+        std::ostringstream row;
+        row << std::setw(10) << std::setfill('0') << offsets[id] << " 00000 n \n";
+        pdf += row.str();
+    }
+    pdf += "trailer\n<< /Size " + std::to_string(count + 1) +
+           " /Root 1 0 R >>\nstartxref\n" + std::to_string(xref) + "\n%%EOF\n";
+    return pdf;
+}
+
+std::string stream_object(const std::string& dict_extra,
+                          const std::string& payload) {
+    return "<< " + dict_extra + " /Length " + std::to_string(payload.size()) +
+           " >>\nstream\n" + payload + "\nendstream";
+}
+
+// One label per quarter turn, the way a CAD export writes dimension text
+// around a drawing: upright, and rotated 90 / 180 / 270 degrees.
+std::string rotated_text_pdf() {
+    const std::string content =
+        "BT /F1 12 Tf\n"
+        "1 0 0 1 40 300 Tm (UPRIGHT) Tj\n"
+        "0 1 -1 0 40 100 Tm (QUARTER) Tj\n"
+        "-1 0 0 -1 170 300 Tm (HALFTURN) Tj\n"
+        "0 -1 1 0 200 100 Tm (THREEQTR) Tj\n"
+        "ET";
+    return assemble_pdf({
+        "<< /Type /Catalog /Pages 2 0 R >>",
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 400 400] "
+        "/Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>",
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+        stream_object("", content),
+    });
+}
+
+// Two embedded files reached through a branching name tree. The first is
+// registered under two keys and carries a UTF-16BE name; the second declares
+// no /Params, so its size has to come from the stream length.
+std::string attachment_pdf() {
+    const std::string payload = "AC1027 not really a drawing";
+    return assemble_pdf({
+        "<< /Type /Catalog /Pages 2 0 R "
+        "/Names << /EmbeddedFiles 6 0 R >> >>",
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] "
+        "/Resources << /Font << /F1 13 0 R >> >> /Contents 14 0 R "
+        "/Annots [10 0 R] >>",
+        "<< /Kids [7 0 R] >>",                       // unused filler slot 4
+        "<< /Type /Filespec /F (notes.txt) /EF << /F 9 0 R >> >>",
+        "<< /Kids [7 0 R 8 0 R] >>",                 // name tree root
+        // 도면.dwg in UTF-16BE, listed twice to exercise de-duplication.
+        "<< /Names [ (a) 11 0 R (b) 11 0 R ] >>",
+        "<< /Names [ (n) 5 0 R ] >>",
+        stream_object("/Type /EmbeddedFile", payload),
+        "<< /Type /Annot /Subtype /FileAttachment /Rect [10 10 30 30] "
+        "/FS 11 0 R /Contents (drawing attached) >>",
+        "<< /Type /Filespec "
+        "/UF <FEFFB3C4BA74002E006400770067> /F (drawing.dwg) "
+        "/EF << /F 12 0 R >> /Desc (site plan) >>",
+        stream_object("/Type /EmbeddedFile /Params << /Size 2097152 >>", payload),
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+        stream_object("", "BT /F1 12 Tf 20 150 Td (body text) Tj ET"),
+    });
+}
+
+// A name tree whose only node lists itself twice. Bounding the walk by depth
+// alone would fan this out 2^depth times.
+std::string cyclic_name_tree_pdf() {
+    return assemble_pdf({
+        "<< /Type /Catalog /Pages 2 0 R "
+        "/Names << /EmbeddedFiles 4 0 R >> >>",
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] >>",
+        "<< /Kids [4 0 R 4 0 R] >>",
+    });
+}
+
 void put_directory_entry(std::vector<uint8_t>& bytes, size_t index,
                          const char* name, uint8_t type) {
     const size_t offset = 1024 + index * 128;
@@ -249,6 +338,48 @@ void test_pdf_honors_images_option() {
     CHECK(markdown.find("![") != std::string::npos);
 }
 
+void test_pdf_reads_rotated_text() {
+    const std::string pdf = rotated_text_pdf();
+    const std::string text = jdoc::pdf_to_markdown_mem(
+        reinterpret_cast<const uint8_t*>(pdf.data()), pdf.size());
+    // Every quarter turn survives; the vertical ones used to be dropped.
+    CHECK(text.find("UPRIGHT") != std::string::npos);
+    CHECK(text.find("QUARTER") != std::string::npos);
+    CHECK(text.find("HALFTURN") != std::string::npos);
+    CHECK(text.find("THREEQTR") != std::string::npos);
+    // 180° text advances along -x. Sorting its row left to right without
+    // accounting for that spelled it backwards, one character per line.
+    CHECK(text.find("NRUTFLAH") == std::string::npos);
+}
+
+void test_pdf_lists_attachments() {
+    const std::string pdf = attachment_pdf();
+    const std::string text = jdoc::pdf_to_markdown_mem(
+        reinterpret_cast<const uint8_t*>(pdf.data()), pdf.size());
+    CHECK(jdoc::util::is_valid_utf8(text));
+    // UTF-16BE name, /Params /Size in preference to the stream length, and the
+    // description the producer attached.
+    const std::string listed = "- \xEB\x8F\x84\xEB\xA9\xB4.dwg (2.0 MB)";
+    const size_t first = text.find(listed);
+    CHECK(first != std::string::npos);
+    CHECK(text.find("site plan") != std::string::npos);
+    // Registered under two tree keys, listed once.
+    CHECK(text.find(listed, first + 1) == std::string::npos);
+    // The second file declares no /Params, so its size falls back to /Length.
+    CHECK(text.find("- notes.txt (27 B)") != std::string::npos);
+    // A paperclip annotation names the file it stands for, which is a separate
+    // mention from the document-level list.
+    CHECK(text.find("drawing attached [\xEB\x8F\x84\xEB\xA9\xB4.dwg]") !=
+          std::string::npos);
+}
+
+void test_pdf_name_tree_cycle_terminates() {
+    const std::string pdf = cyclic_name_tree_pdf();
+    const std::string text = jdoc::pdf_to_markdown_mem(
+        reinterpret_cast<const uint8_t*>(pdf.data()), pdf.size());
+    CHECK(text.find("## Attachments") == std::string::npos);
+}
+
 void test_pdf_decodes_surrogate_pair() {
     const std::string pdf = unicode_pdf();
     const std::string text = jdoc::pdf_to_markdown_mem(
@@ -288,6 +419,9 @@ int main() {
     test_png_rejects_short_pixels();
     test_png_converts_cmyk();
     test_pdf_honors_images_option();
+    test_pdf_reads_rotated_text();
+    test_pdf_lists_attachments();
+    test_pdf_name_tree_cycle_terminates();
     test_pdf_decodes_surrogate_pair();
     test_memory_streaming_supports_eml();
     std::cout << "Safety regression tests passed\n";
