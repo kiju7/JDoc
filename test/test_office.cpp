@@ -250,6 +250,33 @@ static std::string convert_pptx(const std::string& pptx) {
         reinterpret_cast<const uint8_t*>(pptx.data()), pptx.size(), "deck.pptx");
 }
 
+// An object inserted into a deck or document is kept as its own package part
+// under <ppt|word|xl>/embeddings/. jdoc does not open those payloads, so they
+// used to vanish without a trace.
+void test_ooxml_embedded_parts() {
+    std::cerr << "\nOOXML embedded object parts:\n";
+
+    TEST(embedded_parts_listed)
+        auto md = convert_pptx(make_pptx(
+            text_shape("sp", "slide body"),
+            {{"ppt/embeddings/Microsoft_Excel_Worksheet1.xlsx",
+              std::string(2048, 'x')},
+             {"ppt/embeddings/plan.dwg", "AC1032" + std::string(1024, '\0')}}));
+        ASSERT(md.find("## Attachments") != std::string::npos);
+        ASSERT(md.find("Microsoft_Excel_Worksheet1.xlsx (2.0 KB)") != std::string::npos);
+        ASSERT(md.find("plan.dwg (1.0 KB)") != std::string::npos);
+        // The slide's own text is untouched.
+        ASSERT(count_occurrences(md, "slide body") == 1);
+        // Only the leaf name is listed, not the package path.
+        ASSERT(md.find("ppt/embeddings/") == std::string::npos);
+    TEST_END
+
+    TEST(no_attachments_section_without_embeddings)
+        auto md = convert_pptx(make_pptx(text_shape("sp", "slide body")));
+        ASSERT(md.find("## Attachments") == std::string::npos);
+    TEST_END
+}
+
 void test_pptx_shape_tree() {
     std::cerr << "\nPPTX shape tree:\n";
 
@@ -1100,6 +1127,7 @@ int main() {
     test_zip_reader();
     test_ole_reader();
     test_rtf_parser();
+    test_ooxml_embedded_parts();
     test_pptx_shape_tree();
     test_pptx_master_layout();
     test_pptx_shared_media();

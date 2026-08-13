@@ -3,6 +3,7 @@
 
 #include "ooxml/xlsb_parser.h"
 #include "xml_utils.h"
+#include "ooxml/embedded_parts.h"
 #include "common/file_utils.h"
 #include <algorithm>
 #include <cmath>
@@ -594,7 +595,7 @@ std::string XlsbParser::to_markdown(const ConvertOptions& opts) {
         }
         out << format_sheet_as_table(sheet) << "\n";
     }
-    return out.str();
+    return out.str() + format_embedded_parts(zip_);
 }
 
 std::vector<PageChunk> XlsbParser::to_chunks(const ConvertOptions& opts) {

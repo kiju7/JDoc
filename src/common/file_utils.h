@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdint>
+#include <cstdio>
 #include <limits>
 #include <string>
 #include <utility>
@@ -51,6 +52,21 @@ inline std::string image_format_from_ext(const std::string& ext) {
 }
 
 // Trim leading/trailing whitespace.
+// Byte count for human eyes ("9.7 KB", "2.0 MB", "512 B"). Used wherever a
+// listing names a payload jdoc does not open, so the reader can judge whether
+// the thing that was left behind mattered.
+inline std::string human_bytes(uint64_t bytes) {
+    char buf[32];
+    if (bytes >= 1024ull * 1024)
+        snprintf(buf, sizeof buf, "%.1f MB", bytes / (1024.0 * 1024));
+    else if (bytes >= 1024)
+        snprintf(buf, sizeof buf, "%.1f KB", bytes / 1024.0);
+    else
+        snprintf(buf, sizeof buf, "%llu B",
+                 static_cast<unsigned long long>(bytes));
+    return buf;
+}
+
 inline std::string trim(const std::string& s) {
     auto start = s.find_first_not_of(" \t\r\n");
     if (start == std::string::npos) return "";

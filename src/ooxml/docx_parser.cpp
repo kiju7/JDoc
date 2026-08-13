@@ -3,6 +3,7 @@
 
 #include "ooxml/docx_parser.h"
 #include "xml_utils.h"
+#include "ooxml/embedded_parts.h"
 #include "common/file_utils.h"
 #include "common/image_utils.h"
 #include "common/png_encode.h"
@@ -776,6 +777,7 @@ std::string DocxParser::to_markdown(const ConvertOptions& opts) {
 
     std::string rendered = out.str();
     rendered += format_header_footer_block(rendered);
+    rendered += format_embedded_parts(zip_);
     return rendered;
 }
 

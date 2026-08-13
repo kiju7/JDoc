@@ -653,17 +653,7 @@ static std::string format_attachments(
     std::string out;
     for (auto& a : attachments) {
         out += "- " + a.name;
-        if (a.size > 0) {
-            char buf[64];
-            if (a.size >= 1024ull * 1024)
-                snprintf(buf, sizeof(buf), " (%.1f MB)", a.size / (1024.0 * 1024));
-            else if (a.size >= 1024)
-                snprintf(buf, sizeof(buf), " (%.1f KB)", a.size / 1024.0);
-            else
-                snprintf(buf, sizeof(buf), " (%llu B)",
-                         static_cast<unsigned long long>(a.size));
-            out += buf;
-        }
+        if (a.size > 0) out += " (" + util::human_bytes(a.size) + ")";
         if (!a.desc.empty()) out += " — " + a.desc;
         out += "\n";
     }

@@ -4,6 +4,7 @@
 #include "ooxml/xlsx_parser.h"
 #include "ooxml/xml_stream_scanner.h"
 #include "xml_utils.h"
+#include "ooxml/embedded_parts.h"
 #include "common/file_utils.h"
 #include "common/image_utils.h"
 #include "common/png_encode.h"
@@ -1549,6 +1550,7 @@ std::string XlsxParser::to_markdown(const ConvertOptions& opts) {
         out += ")\n\n";
     }
 
+    out += format_embedded_parts(zip_);
     return out;
 }
 
