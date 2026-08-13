@@ -494,6 +494,39 @@ void test_pdf_lists_attachments() {
     // mention from the document-level list.
     CHECK(text.find("drawing attached [\xEB\x8F\x84\xEB\xA9\xB4.dwg]") !=
           std::string::npos);
+
+    // Chunk consumers must see the same document-level attachment listing.
+    const auto chunks = jdoc::pdf_to_markdown_chunks_mem(
+        reinterpret_cast<const uint8_t*>(pdf.data()), pdf.size());
+    CHECK(!chunks.empty());
+    CHECK(chunks[0].text.find(listed) != std::string::npos);
+}
+
+// Object identity, rather than the display name, determines whether two name-
+// tree entries refer to the same attachment. Also exercise a supplementary
+// Unicode character encoded as a UTF-16 surrogate pair in /UF.
+void test_pdf_preserves_same_named_attachments() {
+    const std::string pdf = assemble_pdf({
+        "<< /Type /Catalog /Pages 2 0 R /Names << /EmbeddedFiles 5 0 R >> >>",
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] "
+        "/Resources << >> /Contents 4 0 R >>",
+        stream_object("", "BT ET"),
+        "<< /Names [ (a) 6 0 R (b) 7 0 R ] >>",
+        "<< /Type /Filespec /UF <FEFFD835DC00002E00620069006E> "
+        "/Desc (first payload) >>",
+        "<< /Type /Filespec /UF <FEFFD835DC00002E00620069006E> "
+        "/Desc (second payload) >>",
+    });
+    const std::string text = jdoc::pdf_to_markdown_mem(
+        reinterpret_cast<const uint8_t*>(pdf.data()), pdf.size());
+    const std::string name = "\xF0\x9D\x90\x80.bin";  // U+1D400
+    const size_t first = text.find(name);
+    CHECK(first != std::string::npos);
+    CHECK(text.find(name, first + name.size()) != std::string::npos);
+    CHECK(text.find("first payload") != std::string::npos);
+    CHECK(text.find("second payload") != std::string::npos);
+    CHECK(jdoc::util::is_valid_utf8(text));
 }
 
 // /UF, /F and /Desc are producer-supplied. A filespec carrying newlines would
@@ -604,6 +637,7 @@ int main() {
     test_pdf_line_width_follows_ctm();
     test_pdf_cell_assembly_reading_order();
     test_pdf_lists_attachments();
+    test_pdf_preserves_same_named_attachments();
     test_pdf_attachment_name_cannot_forge_structure();
     test_pdf_rotated_run_not_merged_into_body_line();
     test_pdf_name_tree_cycle_terminates();

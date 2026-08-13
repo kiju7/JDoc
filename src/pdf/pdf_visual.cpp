@@ -1168,16 +1168,28 @@ struct Canvas {
                     uint8_t r, g, b;
                     if (downscale) {
                         // Area sampling for downscale
-                        int sy0 = y * sh / dh, sy1 = (y + 1) * sh / dh;
-                        int sx0 = x * sw / dw, sx1 = (x + 1) * sw / dw;
+                        int sy0 = static_cast<int>(
+                            static_cast<int64_t>(y) * sh / dh);
+                        int sy1 = static_cast<int>(
+                            static_cast<int64_t>(y + 1) * sh / dh);
+                        int sx0 = static_cast<int>(
+                            static_cast<int64_t>(x) * sw / dw);
+                        int sx1 = static_cast<int>(
+                            static_cast<int64_t>(x + 1) * sw / dw);
                         if (sy1 <= sy0) sy1 = sy0 + 1;
                         if (sx1 <= sx0) sx1 = sx0 + 1;
                         if (sy1 > sh) sy1 = sh;
                         if (sx1 > sw) sx1 = sw;
-                        int sr = 0, sg = 0, sb = 0, sa = 0, cnt = 0;
+                        // A single destination pixel can cover millions of
+                        // source pixels. 32-bit sums overflow above ~8.4 Mpx;
+                        // use wide accumulators because image dimensions come
+                        // from the PDF, not from a trusted renderer.
+                        uint64_t sr = 0, sg = 0, sb = 0, sa = 0, cnt = 0;
                         for (int ry = sy0; ry < sy1; ry++)
                             for (int rx = sx0; rx < sx1; rx++) {
-                                const uint8_t* sp = src + (ry * sw + rx) * scomp;
+                                size_t src_idx =
+                                    (static_cast<size_t>(ry) * sw + rx) * scomp;
+                                const uint8_t* sp = src + src_idx;
                                 uint8_t pr, pg, pb;
                                 sample_rgb(sp, scomp, pr, pg, pb);
                                 sr += pr; sg += pg; sb += pb;
@@ -1198,9 +1210,15 @@ struct Canvas {
                         continue;
                     } else {
                         // Nearest-neighbor for upscale
-                        int sy = y * sh / dh; if (sy >= sh) sy = sh - 1;
-                        int sx = x * sw / dw; if (sx >= sw) sx = sw - 1;
-                        const uint8_t* sp = src + (sy * sw + sx) * scomp;
+                        int sy = static_cast<int>(
+                            static_cast<int64_t>(y) * sh / dh);
+                        if (sy >= sh) sy = sh - 1;
+                        int sx = static_cast<int>(
+                            static_cast<int64_t>(x) * sw / dw);
+                        if (sx >= sw) sx = sw - 1;
+                        size_t src_idx =
+                            (static_cast<size_t>(sy) * sw + sx) * scomp;
+                        const uint8_t* sp = src + src_idx;
                         sample_rgb(sp, scomp, r, g, b);
                         blend_pixel(dx + x, dy + y, r, g, b, alpha_at(sx, sy));
                         continue;
@@ -1249,7 +1267,9 @@ struct Canvas {
                     int sy = static_cast<int>((1 - iy) * (sh - 1));
                     if (sx < 0) sx = 0; if (sx >= sw) sx = sw - 1;
                     if (sy < 0) sy = 0; if (sy >= sh) sy = sh - 1;
-                    const uint8_t* sp = src + (sy * sw + sx) * scomp;
+                    size_t src_idx =
+                        (static_cast<size_t>(sy) * sw + sx) * scomp;
+                    const uint8_t* sp = src + src_idx;
                     uint8_t r, g, b;
                     sample_rgb(sp, scomp, r, g, b);
                     blend_pixel(dx, dy, r, g, b, alpha_at(sx, sy));

@@ -132,11 +132,42 @@ static FileFormat format_from_magic(const unsigned char* magic, size_t n) {
 // Classify an open zip container: OOXML/HWPX document package vs plain
 // archive of files.
 static FileFormat classify_zip(const ZipReader& zip) {
-    if (zip.has_entry("Contents/section0.xml") ||
-        zip.has_entry("Contents/content.hpf") ||
-        zip.has_entry("META-INF/container.xml"))
+    // Classification used to call has_entry() repeatedly (each call scans the
+    // whole central directory) and materialized a vector merely to ask whether
+    // a DWF prefix existed. Gather all markers in one allocation-free pass.
+    bool hwpx_root = false;
+    bool content_types = false;
+    bool office_root = false;
+    bool dwf_part = false;
+    bool mimetype = false;
+    bool odf_manifest = false;
+    static const char kDwfPrefix[] = "dwf/documents/";
+    for (const auto& e : zip.entries()) {
+        const std::string& name = e.name;
+        if (name == "Contents/section0.xml" ||
+            name == "Contents/content.hpf" ||
+            name == "META-INF/container.xml")
+            hwpx_root = true;
+        else if (name == "[Content_Types].xml")
+            content_types = true;
+        else if (name == "word/document.xml" ||
+                 name == "xl/workbook.xml" ||
+                 name == "xl/workbook.bin" ||
+                 name == "ppt/presentation.xml")
+            office_root = true;
+        else if (name == "mimetype")
+            mimetype = true;
+        else if (name == "META-INF/manifest.xml")
+            odf_manifest = true;
+
+        if (name.size() > sizeof(kDwfPrefix) - 1 &&
+            name.compare(0, sizeof(kDwfPrefix) - 1, kDwfPrefix) == 0)
+            dwf_part = true;
+    }
+
+    if (hwpx_root)
         return FileFormat::HWPX;
-    if (zip.has_entry("[Content_Types].xml")) {
+    if (content_types) {
         // DWFx is an XPS package, so it reaches here like an OOXML document
         // and used to be handed to the office layer, which rejected it as an
         // unsupported document. Its drawing parts live under dwf/documents/;
@@ -147,18 +178,14 @@ static FileFormat classify_zip(const ZipReader& zip) {
         // A real document is checked for first, so that a docx or xlsx which
         // happens to carry a dwf/ part stays convertible — misreading one as a
         // drawing would silently drop its whole body.
-        bool office_root = zip.has_entry("word/document.xml") ||
-                           zip.has_entry("xl/workbook.xml") ||
-                           zip.has_entry("xl/workbook.bin") ||
-                           zip.has_entry("ppt/presentation.xml");
-        if (!office_root && !zip.entries_with_prefix("dwf/documents/").empty())
+        if (!office_root && dwf_part)
             return FileFormat::CAD;
         return FileFormat::OFFICE;
     }
     // ODF (odt/ods/odp): no [Content_Types].xml — instead a top-level mimetype
     // member plus META-INF/manifest.xml. The office layer splits the three
     // kinds by the mimetype string.
-    if (zip.has_entry("mimetype") && zip.has_entry("META-INF/manifest.xml"))
+    if (mimetype && odf_manifest)
         return FileFormat::OFFICE;
     return FileFormat::ZIP;
 }

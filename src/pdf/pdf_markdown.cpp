@@ -27,6 +27,14 @@ static std::string decode_pdf_text(const std::string& raw) {
         for (size_t i = 2; i + 1 < raw.size(); i += 2) {
             uint32_t cp = (static_cast<uint8_t>(raw[i]) << 8) |
                            static_cast<uint8_t>(raw[i + 1]);
+            if (cp >= 0xD800 && cp <= 0xDBFF && i + 3 < raw.size()) {
+                uint32_t low = (static_cast<uint8_t>(raw[i + 2]) << 8) |
+                                static_cast<uint8_t>(raw[i + 3]);
+                if (low >= 0xDC00 && low <= 0xDFFF) {
+                    cp = 0x10000 + ((cp - 0xD800) << 10) + (low - 0xDC00);
+                    i += 2;
+                }
+            }
             util::append_utf8(out, cp);
         }
     } else {
@@ -80,9 +88,22 @@ static bool read_filespec(PdfDoc& doc, const PdfObj& fs_ref,
 // `budget` bounds the total nodes visited, not just the depth: a /Kids array
 // whose entries point back at their own node fans out 2^depth times, so a
 // depth cap alone lets a malformed file spin for hours.
-static void walk_embedded_files(PdfDoc& doc, const PdfObj& node_ref, int depth,
-                                int& budget, std::vector<AttachmentEntry>& out) {
+static uint64_t ref_key(const PdfObj& ref) {
+    return (static_cast<uint64_t>(static_cast<uint32_t>(ref.ref_num)) << 32) |
+           static_cast<uint32_t>(ref.ref_gen);
+}
+
+static void walk_embedded_files(
+    PdfDoc& doc, const PdfObj& node_ref, int depth, int& budget,
+    std::unordered_set<uint64_t>& visited_nodes,
+    std::unordered_set<uint64_t>& visited_specs,
+    std::vector<AttachmentEntry>& out) {
     if (depth > 32 || budget <= 0 || out.size() >= 4096) return;
+    // A malformed /Kids tree can point back to an ancestor or repeat a large
+    // subtree many times. Object identity makes that an O(unique nodes) walk;
+    // the budget remains as a bound for direct (non-reference) dictionaries.
+    if (node_ref.is_ref() && !visited_nodes.insert(ref_key(node_ref)).second)
+        return;
     budget--;
     PdfObj node = doc.resolve(node_ref);
     if (!node.is_dict()) return;
@@ -91,8 +112,14 @@ static void walk_embedded_files(PdfDoc& doc, const PdfObj& node_ref, int depth,
     if (names.is_arr()) {
         // Flat [key value key value ...]; the file specs are the odd slots.
         for (size_t i = 1; i < names.arr.size(); i += 2) {
+            const PdfObj& spec = names.arr[i];
+            // De-duplicate repeated registrations by object identity. Distinct
+            // attachments are allowed to share a leaf filename and must both
+            // remain visible to the caller.
+            if (spec.is_ref() && !visited_specs.insert(ref_key(spec)).second)
+                continue;
             AttachmentEntry e;
-            if (read_filespec(doc, names.arr[i], e)) out.push_back(std::move(e));
+            if (read_filespec(doc, spec, e)) out.push_back(std::move(e));
             if (out.size() >= 4096) return;
         }
     }
@@ -100,7 +127,8 @@ static void walk_embedded_files(PdfDoc& doc, const PdfObj& node_ref, int depth,
     PdfObj kids = doc.resolve(node.get("Kids"));
     if (kids.is_arr())
         for (auto& kid : kids.arr)
-            walk_embedded_files(doc, kid, depth + 1, budget, out);
+            walk_embedded_files(doc, kid, depth + 1, budget, visited_nodes,
+                                visited_specs, out);
 }
 
 void collect_attachments(PdfDoc& doc, const PdfObj& root,
@@ -108,15 +136,10 @@ void collect_attachments(PdfDoc& doc, const PdfObj& root,
     PdfObj names = doc.resolve(root.get("Names"));
     if (!names.is_dict()) return;
     int budget = 4096;
-    walk_embedded_files(doc, names.get("EmbeddedFiles"), 0, budget, out);
-
-    // The same file often appears under several tree keys; report each once.
-    std::unordered_set<std::string> seen;
-    std::vector<AttachmentEntry> unique;
-    unique.reserve(out.size());
-    for (auto& a : out)
-        if (seen.insert(a.name).second) unique.push_back(std::move(a));
-    out.swap(unique);
+    std::unordered_set<uint64_t> visited_nodes;
+    std::unordered_set<uint64_t> visited_specs;
+    walk_embedded_files(doc, names.get("EmbeddedFiles"), 0, budget,
+                        visited_nodes, visited_specs, out);
 }
 
 void collect_bookmarks(PdfDoc& doc, const PdfObj& node, int depth,
@@ -682,6 +705,16 @@ static std::string format_attachments(
     return out;
 }
 
+static std::string attachment_block(
+    const std::vector<AttachmentEntry>& attachments, bool plaintext) {
+    if (attachments.empty()) return "";
+    std::string out;
+    if (!plaintext) out = "## Attachments\n\n";
+    out += format_attachments(attachments);
+    out += "\n";
+    return out;
+}
+
 static std::string format_bookmarks(const std::vector<BookmarkEntry>& bookmarks,
                                      bool plaintext) {
     if (bookmarks.empty()) return "";
@@ -724,11 +757,7 @@ std::string result_to_markdown(ExtractResult& r, const ConvertOptions& opts) {
         full_md += "\n";
     }
 
-    if (!r.attachments.empty()) {
-        if (!plaintext) full_md += "## Attachments\n\n";
-        full_md += format_attachments(r.attachments);
-        full_md += "\n";
-    }
+    full_md += attachment_block(r.attachments, plaintext);
 
     for (int p : page_indices) {
         if (p < 0 || p >= r.total_pages) continue;
@@ -793,10 +822,19 @@ void stream_result_chunks(ExtractResult& r, const ConvertOptions& opts,
     }
 
     bool plaintext = (opts.format == OutputFormat::PLAINTEXT);
+    bool first_chunk = true;
 
     for (int p : page_indices) {
         if (p < 0 || p >= r.total_pages) continue;
         PageChunk chunk = build_page_chunk(r, opts, plaintext, p);
+        // Document-level attachments precede the first page in the whole-file
+        // API. Mirror them into the first emitted chunk so eager, streaming and
+        // whole-document consumers receive the same discoverability metadata.
+        if (first_chunk) {
+            std::string block = attachment_block(r.attachments, plaintext);
+            if (!block.empty()) chunk.text.insert(0, block);
+            first_chunk = false;
+        }
 
         if (release_per_page) {
             r.all_lines[p] = {};

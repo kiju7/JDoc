@@ -32,15 +32,25 @@ namespace {
 bool has_skippable_ext(const std::string& name, bool extracting_images) {
     auto dot = name.rfind('.');
     if (dot == std::string::npos) return false;
-    std::string ext = name.substr(dot + 1);
-    for (auto& c : ext) c = std::tolower(static_cast<unsigned char>(c));
+    // This runs for every archive member. Compare the suffix in place instead
+    // of allocating and lowercasing a temporary extension string.
+    auto ext_is = [&](const char* wanted) {
+        const size_t len = std::strlen(wanted);
+        if (name.size() - dot - 1 != len) return false;
+        for (size_t i = 0; i < len; ++i) {
+            unsigned char c = static_cast<unsigned char>(name[dot + 1 + i]);
+            if (std::tolower(c) != static_cast<unsigned char>(wanted[i]))
+                return false;
+        }
+        return true;
+    };
     // Raster images jdoc can save as-is: skipped only when image extraction is
     // off (nothing to do with them then); processed as IMAGE members when on.
     static const char* kImages[] = {
         "png", "jpg", "jpeg", "gif", "bmp", "tif", "tiff", "webp",
     };
     for (auto* s : kImages)
-        if (ext == s) return !extracting_images;
+        if (ext_is(s)) return !extracting_images;
     static const char* kSkip[] = {
         "ico",
         "mp3", "mp4", "avi", "mov", "mkv", "wav", "flac",
@@ -54,7 +64,7 @@ bool has_skippable_ext(const std::string& name, bool extracting_images) {
         "dwg", "dwf", "dwfx",
     };
     for (auto* s : kSkip)
-        if (ext == s) return true;
+        if (ext_is(s)) return true;
     return false;
 }
 
@@ -78,22 +88,26 @@ MemberResult skipped_member(const std::string& member_path, uint64_t size) {
 bool is_metadata_member(const std::string& name) {
     if (name.compare(0, 9, "__MACOSX/") == 0) return true;
     auto slash = name.rfind('/');
-    std::string base = slash == std::string::npos ? name : name.substr(slash + 1);
-    return base.compare(0, 2, "._") == 0 || base == ".DS_Store";
+    size_t base = slash == std::string::npos ? 0 : slash + 1;
+    size_t len = name.size() - base;
+    return (len >= 2 && name[base] == '.' && name[base + 1] == '_') ||
+           (len == 9 && name.compare(base, len, ".DS_Store") == 0);
 }
 
 // Convert both archive separator styles and discard traversal components so
 // the result is always a display-friendly relative path on every platform.
 std::string normalize_member_name(const std::string& name) {
     std::string out;
+    out.reserve(name.size());
     size_t pos = 0;
     while (pos < name.size()) {
         size_t slash = name.find_first_of("/\\", pos);
         size_t len = (slash == std::string::npos ? name.size() : slash) - pos;
-        std::string comp = name.substr(pos, len);
-        if (!comp.empty() && comp != "." && comp != "..") {
+        bool dot = len == 1 && name[pos] == '.';
+        bool dotdot = len == 2 && name[pos] == '.' && name[pos + 1] == '.';
+        if (len != 0 && !dot && !dotdot) {
             if (!out.empty()) out += '/';
-            out += comp;
+            out.append(name, pos, len);
         }
         pos = (slash == std::string::npos) ? name.size() : slash + 1;
     }
