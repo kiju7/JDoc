@@ -1174,21 +1174,27 @@ struct Canvas {
                         if (sx1 <= sx0) sx1 = sx0 + 1;
                         if (sy1 > sh) sy1 = sh;
                         if (sx1 > sw) sx1 = sw;
-                        int sr = 0, sg = 0, sb = 0, cnt = 0;
+                        int sr = 0, sg = 0, sb = 0, sa = 0, cnt = 0;
                         for (int ry = sy0; ry < sy1; ry++)
                             for (int rx = sx0; rx < sx1; rx++) {
                                 const uint8_t* sp = src + (ry * sw + rx) * scomp;
                                 uint8_t pr, pg, pb;
                                 sample_rgb(sp, scomp, pr, pg, pb);
                                 sr += pr; sg += pg; sb += pb;
+                                // Alpha has to be averaged over the same box as
+                                // the color. Rasterized-glyph strips carry a flat
+                                // RGB plane and keep the letter shapes entirely in
+                                // the soft mask, so point-sampling alpha here drops
+                                // half of every stroke when a 600 DPI strip lands
+                                // on a 300 DPI canvas — enough to turn 봉 into 농.
+                                sa += alpha_at(rx, ry);
                                 cnt++;
                             }
                         r = static_cast<uint8_t>(sr / cnt);
                         g = static_cast<uint8_t>(sg / cnt);
                         b = static_cast<uint8_t>(sb / cnt);
-                        int sy = y * sh / dh; if (sy >= sh) sy = sh - 1;
-                        int sx = x * sw / dw; if (sx >= sw) sx = sw - 1;
-                        blend_pixel(dx + x, dy + y, r, g, b, alpha_at(sx, sy));
+                        blend_pixel(dx + x, dy + y, r, g, b,
+                                    static_cast<uint8_t>(sa / cnt));
                         continue;
                     } else {
                         // Nearest-neighbor for upscale
