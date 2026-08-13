@@ -1375,8 +1375,19 @@ ImageData render_page_composite(PdfDoc& doc, const PdfObj& page_obj,
             if (std::min(x0, x1) < xmin_d) xmin_d = std::min(x0, x1);
             if (std::max(x0, x1) > xmax_d) xmax_d = std::max(x0, x1);
         }
-        int xmin = std::max(0, static_cast<int>(xmin_d) - 1);
-        int xmax = std::min(rw, static_cast<int>(xmax_d) + 2);
+        // Clamp before narrowing, not after. These bounds come from path
+        // coordinates the PDF supplies, and a degenerate one reaches ±1e11 —
+        // converting that to int is undefined, and in practice it saturated to
+        // INT_MIN, wrapped on the -1, and left xmin above xmax so the path was
+        // dropped instead of clipped to the canvas. The bound below is far
+        // outside any real raster (rw is a few thousand) so in-range geometry
+        // narrows exactly as before.
+        auto to_int = [](double v) {
+            constexpr double kGuard = 1e9;
+            return static_cast<int>(std::max(-kGuard, std::min(kGuard, v)));
+        };
+        int xmin = std::max(0, to_int(xmin_d) - 1);
+        int xmax = std::min(rw, to_int(xmax_d) + 2);
         int xspan = xmax - xmin;
         if (xspan <= 0) return;
 
@@ -1432,6 +1443,18 @@ ImageData render_page_composite(PdfDoc& doc, const PdfObj& page_obj,
             active.resize(write);
 
             auto add_span = [&](double fx0, double fx1) {
+                // Clamp the endpoints, not just the pixel indices they narrow
+                // to. They inherit the path's own coordinates, so a degenerate
+                // one reaches ±1e11: the casts below would be undefined, and
+                // the sub-pixel coverage terms — which stay in double until
+                // after the clamp in the original — would scale a partial
+                // pixel by 1e11 instead of by the fraction actually covered.
+                // A span that runs off the canvas covers its edge pixel
+                // fully, which is what clamping to [xmin, xmax] expresses.
+                fx0 = std::max(static_cast<double>(xmin),
+                               std::min(static_cast<double>(xmax), fx0));
+                fx1 = std::max(static_cast<double>(xmin),
+                               std::min(static_cast<double>(xmax), fx1));
                 int ix0 = std::max(xmin, static_cast<int>(fx0));
                 int ix1 = std::min(xmax - 1, static_cast<int>(fx1));
                 if (ix0 > ix1) return;
