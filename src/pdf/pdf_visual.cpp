@@ -1086,6 +1086,63 @@ std::vector<ExtractedImage> extract_page_images(PdfDoc& doc, const PdfObj& page_
 
 // ── Canvas / Image Compositing ───────────────────────────
 
+// PDF coordinates are untrusted doubles. Clip them to the actual raster before
+// narrowing: a saturating int conversion alone can still leave billion-pixel
+// loops for an image that only covers a few visible pixels.
+static bool visible_blit_span(double origin, double extent, int limit,
+                              int& begin, int& end) {
+    if (!std::isfinite(origin) || !std::isfinite(extent) || limit <= 0)
+        return false;
+    origin = std::trunc(origin);
+    extent = std::trunc(std::abs(extent));
+    if (extent <= 0 || origin >= limit) return false;
+
+    double stop;
+    if (origin < 0) {
+        if (extent <= -origin) return false;
+        stop = origin + extent;
+    } else {
+        stop = (extent >= static_cast<double>(limit) - origin)
+                   ? static_cast<double>(limit)
+                   : origin + extent;
+    }
+    double first = std::max(0.0, origin);
+    double last = std::min(static_cast<double>(limit), stop);
+    if (first >= last) return false;
+    begin = static_cast<int>(first);
+    end = static_cast<int>(last);
+    return begin < end;
+}
+
+// Which source pixel a destination offset samples. Both operands are integral
+// — they come from trunc() — so the mapping stays the integer division the
+// blit loops have always used. Doing it in floating point instead rounds
+// 7/10*90 to 62.99999999999999 and shifts the sample a whole pixel, which
+// resamples the image rather than merely clipping it.
+static int scaled_sample_bound(double position, int source_extent,
+                               double destination_extent) {
+    if (!(position > 0)) return 0;                       // also catches NaN
+    if (position >= destination_extent) return source_extent;
+    int64_t dest = static_cast<int64_t>(destination_extent);
+    if (dest <= 0) return 0;
+    int64_t mapped = static_cast<int64_t>(position) * source_extent / dest;
+    if (mapped <= 0) return 0;
+    if (mapped >= source_extent) return source_extent;
+    return static_cast<int>(mapped);
+}
+
+static bool inclusive_canvas_bounds(double min_v, double max_v, int limit,
+                                    int& first, int& last) {
+    if (!std::isfinite(min_v) || !std::isfinite(max_v) || limit <= 0 ||
+        max_v < 0 || min_v > limit - 1.0)
+        return false;
+    min_v = std::max(0.0, std::min(limit - 1.0, min_v));
+    max_v = std::max(0.0, std::min(limit - 1.0, max_v));
+    first = static_cast<int>(min_v);
+    last = std::min(limit - 1, static_cast<int>(max_v) + 1);
+    return first <= last;
+}
+
 struct Canvas {
     int width, height;
     size_t stride; // PNG row layout: 1 filter byte + width*3 samples
@@ -1156,26 +1213,27 @@ struct Canvas {
             double pw = ctm[0] * scale;
             double ph = ctm[3] * scale;
 
-            int dx = static_cast<int>(px);
-            int dy = static_cast<int>(py);
-            int dw = static_cast<int>(std::abs(pw));
-            int dh = static_cast<int>(std::abs(ph));
-            if (dw <= 0 || dh <= 0) return;
+            int dx0, dx1, dy0, dy1;
+            if (!visible_blit_span(px, pw, width, dx0, dx1) ||
+                !visible_blit_span(py, ph, height, dy0, dy1))
+                return;
+            double dst_x0 = std::trunc(px);
+            double dst_y0 = std::trunc(py);
+            double dw = std::trunc(std::abs(pw));
+            double dh = std::trunc(std::abs(ph));
 
             bool downscale = (dw < sw || dh < sh);
-            for (int y = 0; y < dh; y++) {
-                for (int x = 0; x < dw; x++) {
+            for (int dy = dy0; dy < dy1; dy++) {
+                double y = dy - dst_y0;
+                for (int dx = dx0; dx < dx1; dx++) {
+                    double x = dx - dst_x0;
                     uint8_t r, g, b;
                     if (downscale) {
                         // Area sampling for downscale
-                        int sy0 = static_cast<int>(
-                            static_cast<int64_t>(y) * sh / dh);
-                        int sy1 = static_cast<int>(
-                            static_cast<int64_t>(y + 1) * sh / dh);
-                        int sx0 = static_cast<int>(
-                            static_cast<int64_t>(x) * sw / dw);
-                        int sx1 = static_cast<int>(
-                            static_cast<int64_t>(x + 1) * sw / dw);
+                        int sy0 = scaled_sample_bound(y, sh, dh);
+                        int sy1 = scaled_sample_bound(y + 1, sh, dh);
+                        int sx0 = scaled_sample_bound(x, sw, dw);
+                        int sx1 = scaled_sample_bound(x + 1, sw, dw);
                         if (sy1 <= sy0) sy1 = sy0 + 1;
                         if (sx1 <= sx0) sx1 = sx0 + 1;
                         if (sy1 > sh) sy1 = sh;
@@ -1205,22 +1263,20 @@ struct Canvas {
                         r = static_cast<uint8_t>(sr / cnt);
                         g = static_cast<uint8_t>(sg / cnt);
                         b = static_cast<uint8_t>(sb / cnt);
-                        blend_pixel(dx + x, dy + y, r, g, b,
+                        blend_pixel(dx, dy, r, g, b,
                                     static_cast<uint8_t>(sa / cnt));
                         continue;
                     } else {
                         // Nearest-neighbor for upscale
-                        int sy = static_cast<int>(
-                            static_cast<int64_t>(y) * sh / dh);
+                        int sy = scaled_sample_bound(y, sh, dh);
                         if (sy >= sh) sy = sh - 1;
-                        int sx = static_cast<int>(
-                            static_cast<int64_t>(x) * sw / dw);
+                        int sx = scaled_sample_bound(x, sw, dw);
                         if (sx >= sw) sx = sw - 1;
                         size_t src_idx =
                             (static_cast<size_t>(sy) * sw + sx) * scomp;
                         const uint8_t* sp = src + src_idx;
                         sample_rgb(sp, scomp, r, g, b);
-                        blend_pixel(dx + x, dy + y, r, g, b, alpha_at(sx, sy));
+                        blend_pixel(dx, dy, r, g, b, alpha_at(sx, sy));
                         continue;
                     }
                 }
@@ -1229,7 +1285,7 @@ struct Canvas {
             // General case: inverse transform
             // For each destination pixel, find source pixel
             double inv_det = ctm[0]*ctm[3] - ctm[1]*ctm[2];
-            if (std::abs(inv_det) < 1e-10) return;
+            if (!std::isfinite(inv_det) || std::abs(inv_det) < 1e-10) return;
 
             // Bounding box in canvas space
             double corners[4][2];
@@ -1249,10 +1305,10 @@ struct Canvas {
                 if (c[1] > max_y) max_y = c[1];
             }
 
-            int x0 = std::max(0, static_cast<int>(min_x));
-            int x1 = std::min(width - 1, static_cast<int>(max_x) + 1);
-            int y0 = std::max(0, static_cast<int>(min_y));
-            int y1 = std::min(height - 1, static_cast<int>(max_y) + 1);
+            int x0, x1, y0, y1;
+            if (!inclusive_canvas_bounds(min_x, max_x, width, x0, x1) ||
+                !inclusive_canvas_bounds(min_y, max_y, height, y0, y1))
+                return;
 
             for (int dy = y0; dy <= y1; dy++) {
                 for (int dx = x0; dx <= x1; dx++) {
@@ -1333,16 +1389,33 @@ ImageData render_page_composite(PdfDoc& doc, const PdfObj& page_obj,
         }
         if (dpi > kMaxDPI) dpi = kMaxDPI;
     }
+    if (!std::isfinite(page_w) || !std::isfinite(page_h) ||
+        page_w <= 0 || page_h <= 0)
+        return {};
     double scale = dpi / kBase;
     // Bound total canvas pixels; a runaway page size must not exhaust memory.
     constexpr double kMaxPixels =
         static_cast<double>(limits::kMaxDecodedPixels);
-    if (page_w * scale * page_h * scale > kMaxPixels) {
-        scale *= std::sqrt(kMaxPixels / (page_w * scale * page_h * scale));
-        if (scale < kMinDPI / kBase / 8) scale = kMinDPI / kBase / 8;
+    long double pixel_count = static_cast<long double>(page_w) * scale *
+                              static_cast<long double>(page_h) * scale;
+    if (pixel_count > kMaxPixels) {
+        scale *= std::sqrt(kMaxPixels / pixel_count);
+        double min_scale = kMinDPI / kBase / 8;
+        if (scale < min_scale) {
+            long double min_pixels = static_cast<long double>(page_w) * min_scale *
+                                     static_cast<long double>(page_h) * min_scale;
+            if (min_pixels > kMaxPixels) return {};
+            scale = min_scale;
+        }
     }
-    int rw = static_cast<int>(page_w * scale);
-    int rh = static_cast<int>(page_h * scale);
+    long double raster_w = static_cast<long double>(page_w) * scale;
+    long double raster_h = static_cast<long double>(page_h) * scale;
+    if (!std::isfinite(scale) || raster_w > std::numeric_limits<int>::max() ||
+        raster_h > std::numeric_limits<int>::max() ||
+        raster_w * raster_h > kMaxPixels)
+        return {};
+    int rw = static_cast<int>(raster_w);
+    int rh = static_cast<int>(raster_h);
     if (rw <= 0 || rh <= 0) return {};
 
     Canvas canvas(rw, rh);
@@ -1517,6 +1590,43 @@ ImageData render_page_composite(PdfDoc& doc, const PdfObj& page_obj,
         }
     };
 
+    auto append_scan_edge = [&](double x0, double y0, double x1, double y1,
+                                int& ymin, int& ymax) {
+        if (!std::isfinite(x0) || !std::isfinite(y0) ||
+            !std::isfinite(x1) || !std::isfinite(y1) || y0 == y1)
+            return;
+
+        int dir = 1;
+        if (y0 > y1) {
+            std::swap(x0, x1);
+            std::swap(y0, y1);
+            dir = -1;
+        }
+        double iy0_d = std::round(y0 * AA_V);
+        double iy1_d = std::round(y1 * AA_V);
+        const double raster_bottom = static_cast<double>(rh) * AA_V;
+        if (!std::isfinite(iy0_d) || !std::isfinite(iy1_d) ||
+            iy1_d <= 0 || iy0_d >= raster_bottom)
+            return;
+
+        // Clip in floating point before narrowing. Besides avoiding UB, this
+        // keeps the scanline loop proportional to the canvas rather than to a
+        // malformed path coordinate.
+        iy0_d = std::max(0.0, iy0_d);
+        iy1_d = std::min(raster_bottom, iy1_d);
+        int iy0 = static_cast<int>(iy0_d);
+        int iy1 = static_cast<int>(iy1_d);
+        if (iy0 >= iy1) return;
+
+        double slope = (x1 - x0) / (y1 - y0);
+        double inv_slope = slope / AA_V;
+        double x_start = x0 + (iy0 / static_cast<double>(AA_V) - y0) * slope;
+        if (!std::isfinite(inv_slope) || !std::isfinite(x_start)) return;
+        edge_buf.push_back({x_start, inv_slope, iy0, iy1, dir});
+        if (iy0 < ymin) ymin = iy0;
+        if (iy1 > ymax) ymax = iy1;
+    };
+
     // Reusable buffers for path flattening
     std::vector<std::vector<std::pair<double,double>>> subpaths;
     std::vector<std::pair<double,double>> cur_sub;
@@ -1564,16 +1674,7 @@ ImageData render_page_composite(PdfDoc& doc, const PdfObj& page_obj,
                     double sy0 = (page_h - a.second) * scale;
                     double sx1 = b.first * scale;
                     double sy1 = (page_h - b.second) * scale;
-                    int iy0 = static_cast<int>(std::round(sy0 * AA_V));
-                    int iy1 = static_cast<int>(std::round(sy1 * AA_V));
-                    if (iy0 == iy1) continue;
-                    int dir = 1;
-                    if (iy0 > iy1) { std::swap(sx0, sx1); std::swap(sy0, sy1); std::swap(iy0, iy1); dir = -1; }
-                    double inv_slope = (sx1 - sx0) / (sy1 - sy0) / AA_V;
-                    double x_start = sx0 + (iy0 / (double)AA_V - sy0) * (sx1 - sx0) / (sy1 - sy0);
-                    edge_buf.push_back({x_start, inv_slope, iy0, iy1, dir});
-                    if (iy0 < ymin) ymin = iy0;
-                    if (iy1 > ymax) ymax = iy1;
+                    append_scan_edge(sx0, sy0, sx1, sy1, ymin, ymax);
                 }
             }
             uint8_t fr = static_cast<uint8_t>(std::min(255.0, std::max(0.0, rp.fill_r * 255)));
@@ -1597,7 +1698,7 @@ ImageData render_page_composite(PdfDoc& doc, const PdfObj& page_obj,
                     double sx1 = sp[i+1].first * scale;
                     double sy1 = (page_h - sp[i+1].second) * scale;
                     double dx = sx1 - sx0, dy = sy1 - sy0;
-                    double len = std::sqrt(dx*dx + dy*dy);
+                    double len = std::hypot(dx, dy);
                     if (len < 0.01) continue;
                     double nx = -dy / len * half;
                     double ny = dx / len * half;
@@ -1607,16 +1708,7 @@ ImageData render_page_composite(PdfDoc& doc, const PdfObj& page_obj,
                         int e2 = (e + 1) % 4;
                         double ey0 = qy[e], ey1 = qy[e2];
                         double ex0 = qx[e], ex1 = qx[e2];
-                        int iy0 = static_cast<int>(std::round(ey0 * AA_V));
-                        int iy1 = static_cast<int>(std::round(ey1 * AA_V));
-                        if (iy0 == iy1) continue;
-                        int dir = 1;
-                        if (iy0 > iy1) { std::swap(iy0, iy1); std::swap(ex0, ex1); std::swap(ey0, ey1); dir = -1; }
-                        double inv_s = (ex1 - ex0) / (ey1 - ey0) / AA_V;
-                        double x_s = ex0 + (iy0 / (double)AA_V - ey0) * (ex1 - ex0) / (ey1 - ey0);
-                        edge_buf.push_back({x_s, inv_s, iy0, iy1, dir});
-                        if (iy0 < ymin) ymin = iy0;
-                        if (iy1 > ymax) ymax = iy1;
+                        append_scan_edge(ex0, ey0, ex1, ey1, ymin, ymax);
                     }
                 }
             }
@@ -1857,7 +1949,7 @@ ImageData render_page_composite(PdfDoc& doc, const PdfObj& page_obj,
             // the mask wrong, so inverse-map each destination pixel instead.
             if (std::abs(ip.ctm[1]) >= 0.001 || std::abs(ip.ctm[2]) >= 0.001) {
                 double inv_det = ip.ctm[0]*ip.ctm[3] - ip.ctm[1]*ip.ctm[2];
-                if (std::abs(inv_det) < 1e-10) return;
+                if (!std::isfinite(inv_det) || std::abs(inv_det) < 1e-10) return;
                 double cmin_x = 1e18, cmax_x = -1e18, cmin_y = 1e18, cmax_y = -1e18;
                 for (int i = 0; i < 4; i++) {
                     double ix = (i & 1) ? 1.0 : 0.0;
@@ -1868,10 +1960,12 @@ ImageData render_page_composite(PdfDoc& doc, const PdfObj& page_obj,
                     cmin_x = std::min(cmin_x, cx2); cmax_x = std::max(cmax_x, cx2);
                     cmin_y = std::min(cmin_y, cy2); cmax_y = std::max(cmax_y, cy2);
                 }
-                int bx0 = std::max(0, static_cast<int>(cmin_x));
-                int bx1 = std::min(canvas.width - 1, static_cast<int>(cmax_x) + 1);
-                int by0 = std::max(0, static_cast<int>(cmin_y));
-                int by1 = std::min(canvas.height - 1, static_cast<int>(cmax_y) + 1);
+                int bx0, bx1, by0, by1;
+                if (!inclusive_canvas_bounds(cmin_x, cmax_x, canvas.width,
+                                             bx0, bx1) ||
+                    !inclusive_canvas_bounds(cmin_y, cmax_y, canvas.height,
+                                             by0, by1))
+                    return;
                 for (int cy2 = by0; cy2 <= by1; cy2++) {
                     for (int cx2 = bx0; cx2 <= bx1; cx2++) {
                         double gx = cx2 / scale;
@@ -1897,32 +1991,39 @@ ImageData render_page_composite(PdfDoc& doc, const PdfObj& page_obj,
             double py = (page_h - ip.ctm[5] - ip.ctm[3]) * scale;
             double pw = std::abs(ip.ctm[0] * scale);
             double ph = std::abs(ip.ctm[3] * scale);
-            int dx = static_cast<int>(px), dy = static_cast<int>(py);
-            int dw = static_cast<int>(pw), dh = static_cast<int>(ph);
-            if (dw <= 0 || dh <= 0) return;
+            int dx0, dx1, dy0, dy1;
+            if (!visible_blit_span(px, pw, canvas.width, dx0, dx1) ||
+                !visible_blit_span(py, ph, canvas.height, dy0, dy1))
+                return;
+            double dst_x0 = std::trunc(px);
+            double dst_y0 = std::trunc(py);
+            double dw = std::trunc(pw);
+            double dh = std::trunc(ph);
             // Area sampling for ImageMask: compute coverage ratio in source region
-            for (int y = 0; y < dh && dy + y >= 0 && dy + y < canvas.height; y++) {
-                int sy0 = y * h / dh;
-                int sy1 = (y + 1) * h / dh;
+            for (int dy = dy0; dy < dy1; dy++) {
+                double y = dy - dst_y0;
+                int sy0 = scaled_sample_bound(y, h, dh);
+                int sy1 = scaled_sample_bound(y + 1, h, dh);
                 if (sy1 <= sy0) sy1 = sy0 + 1;
                 if (sy1 > h) sy1 = h;
-                for (int x = 0; x < dw && dx + x < canvas.width; x++) {
-                    if (dx + x < 0) continue;
-                    int sx0 = x * w / dw;
-                    int sx1 = (x + 1) * w / dw;
+                for (int dx = dx0; dx < dx1; dx++) {
+                    double x = dx - dst_x0;
+                    int sx0 = scaled_sample_bound(x, w, dw);
+                    int sx1 = scaled_sample_bound(x + 1, w, dw);
                     if (sx1 <= sx0) sx1 = sx0 + 1;
                     if (sx1 > w) sx1 = w;
                     // Count set pixels in source region
-                    int total = (sy1 - sy0) * (sx1 - sx0);
+                    uint64_t total = static_cast<uint64_t>(sy1 - sy0) *
+                                     static_cast<uint64_t>(sx1 - sx0);
                     if (total <= 0) continue;
-                    int set = 0;
+                    uint64_t set = 0;
                     for (int ry = sy0; ry < sy1; ry++)
                         for (int rx = sx0; rx < sx1; rx++)
                             if (pixels[ry * w + rx] > 128) set++;
                     if (set > 0) {
                         uint8_t a = static_cast<uint8_t>(
                             set * 255 / total * ip_alpha / 255);
-                        canvas.blend_pixel(dx + x, dy + y, fr, fg, fb, a);
+                        canvas.blend_pixel(dx, dy, fr, fg, fb, a);
                     }
                 }
             }

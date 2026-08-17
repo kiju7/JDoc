@@ -2,6 +2,7 @@
 #include "common/png_encode.h"
 #include "common/string_utils.h"
 #include "pdf/pdf_content.h"
+#include "pdf/pdf_extract.h"
 #include "jdoc/jdoc.h"
 #include "jdoc/pdf.h"
 
@@ -11,6 +12,7 @@
 #include <cstring>
 #include <iostream>
 #include <iomanip>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 #include <vector>
@@ -379,6 +381,85 @@ void test_pdf_honors_images_option() {
     CHECK(markdown.find("![") != std::string::npos);
 }
 
+void test_pdf_composite_clips_extreme_coordinates_before_narrowing() {
+    using namespace jdoc::pdf_detail;
+
+    const uint8_t placeholder = 0;
+    PdfDoc doc(&placeholder, 1);
+
+    auto image = PdfObj::make_dict();
+    image.type = ObjType::STREAM;
+    image.dict.push_back({"Subtype", PdfObj::make_name("Image")});
+    image.dict.push_back({"Width", PdfObj::make_int(1)});
+    image.dict.push_back({"Height", PdfObj::make_int(1)});
+    image.dict.push_back({"BitsPerComponent", PdfObj::make_int(8)});
+    image.dict.push_back({"ColorSpace", PdfObj::make_name("DeviceRGB")});
+    image.stream_data = {255, 0, 0};
+
+    auto mask = PdfObj::make_dict();
+    mask.type = ObjType::STREAM;
+    mask.dict.push_back({"Subtype", PdfObj::make_name("Image")});
+    mask.dict.push_back({"Width", PdfObj::make_int(1)});
+    mask.dict.push_back({"Height", PdfObj::make_int(1)});
+    mask.dict.push_back({"BitsPerComponent", PdfObj::make_int(1)});
+    mask.dict.push_back({"ImageMask", PdfObj::make_bool(true)});
+    mask.stream_data = {0};
+
+    auto xobjects = PdfObj::make_dict();
+    xobjects.dict.push_back({"Im0", image});
+    xobjects.dict.push_back({"Mask0", mask});
+    auto resources = PdfObj::make_dict();
+    resources.dict.push_back({"XObject", xobjects});
+    auto page = PdfObj::make_dict();
+    page.dict.push_back({"Resources", resources});
+
+    ContentParseResult parsed;
+    RenderPath path{};
+    constexpr double kExtreme = 1e11;
+    path.points = {
+        {-kExtreme, -kExtreme, PathPoint::MOVE},
+        { kExtreme, -kExtreme, PathPoint::LINE},
+        { kExtreme,  kExtreme, PathPoint::LINE},
+        {-kExtreme,  kExtreme, PathPoint::LINE},
+        {0, 0, PathPoint::CLOSE},
+    };
+    path.fill_r = 0.2; path.fill_g = 0.3; path.fill_b = 0.4;
+    path.stroke_r = 0; path.stroke_g = 0; path.stroke_b = 0;
+    path.line_width = 1;
+    path.do_fill = true;
+    path.do_stroke = true;
+    parsed.paths.push_back(path);
+
+    auto placement = [](const char* name, const double (&ctm)[6], int seq) {
+        ImagePlacement ip{};
+        ip.xobj_name = name;
+        std::memcpy(ip.ctm, ctm, sizeof(ip.ctm));
+        ip.alpha = 1;
+        ip.seq = seq;
+        return ip;
+    };
+    // Both placements cross the page but have coordinates far outside int.
+    // The axis-aligned case also verifies that work is limited to visible
+    // pixels instead of iterating over the full 2e11-unit destination.
+    const double axis[6] =
+        {2 * kExtreme, 0, 0, 2 * kExtreme, -kExtreme, -kExtreme};
+    const double rotated[6] =
+        {0, 2 * kExtreme, -2 * kExtreme, 0, kExtreme, -kExtreme};
+    parsed.images.push_back(placement("Im0", axis, 1));
+    parsed.images.push_back(placement("Im0", rotated, 2));
+    parsed.images.push_back(placement("Mask0", axis, 3));
+    parsed.images.push_back(placement("Mask0", rotated, 4));
+
+    auto rendered = render_page_composite(doc, page, parsed, 0, 100, 100, "");
+    CHECK(rendered.width > 0);
+    CHECK(rendered.height > 0);
+    CHECK(!rendered.data.empty());
+
+    auto invalid = render_page_composite(
+        doc, page, {}, 0, std::numeric_limits<double>::infinity(), 100, "");
+    CHECK(invalid.data.empty());
+}
+
 void test_pdf_reads_rotated_text() {
     const std::string pdf = rotated_text_pdf();
     const std::string text = jdoc::pdf_to_markdown_mem(
@@ -632,6 +713,7 @@ int main() {
     test_png_rejects_short_pixels();
     test_png_converts_cmyk();
     test_pdf_honors_images_option();
+    test_pdf_composite_clips_extreme_coordinates_before_narrowing();
     test_pdf_reads_rotated_text();
     test_pdf_table_cell_rotated_text();
     test_pdf_line_width_follows_ctm();
