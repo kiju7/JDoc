@@ -364,14 +364,16 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
                 CompositeMemoryLease lease(composite_memory, memory_cost);
                 return render_page_composite(
                     doc, resources, parse_result, p, page_w, page_h, image_dir,
-                    &result.page_diags[p]);
+                    0, &result.page_diags[p]);
             };
 
             // Decide whether image XObjects are independent assets or drawing
-            // primitives that only make sense after page-level composition.
-            // This intentionally uses their role in the page instead of a
-            // large magic object count: some print drivers split text into
-            // only two or three masked strips, while others create dozens.
+            // primitives that only make sense composited. Fragmented rasters
+            // (print-driver strips, scanner tiles, layered stamp+photo pairs)
+            // arrive as placements that abut or overlap in device space, so
+            // the placements are clustered by bbox adjacency and each cluster
+            // composites once — into a cropped region on text-bearing pages,
+            // whose text the compositor cannot draw and must never lose.
             constexpr size_t kVectorTextMinPaths = 50;
             // An OCR text layer drawn with Tr 3 (invisible) must not count as
             // page text: the page is visually a scan and composites like one.
@@ -380,18 +382,18 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
             bool vector_text_page = no_text &&
                                     parse_result.paths.size() >= kVectorTextMinPaths;
 
-            int broad_bands = 0;
-            int thin_fragments = 0;
-            int masked_thin_fragments = 0;
-            double broad_band_height = 0;
-            bool has_regular_image = false;
-            bool has_stencil_image = false;
-
+            struct PlacementInfo {
+                size_t idx;             // index into parse_result.images
+                double x0, y0, x1, y1;  // device bbox, viewing coords
+                int obj_num;            // resolved ref; -1 for name/inline
+            };
+            std::vector<PlacementInfo> infos;
             auto xobjects = doc.resolve(resources.get("XObject"));
-            for (auto& ip : parse_result.images) {
+            for (size_t i = 0; i < parse_result.images.size(); i++) {
+                auto& ip = parse_result.images[i];
                 PdfObj xobj_res;
                 if (ip.inline_img) {
-                    // GDI drivers emit inline strips; they classify like any
+                    // GDI drivers emit inline strips; they cluster like any
                     // other placement.
                 } else if (ip.xobj_ref >= 0) {
                     xobj_res = doc.get_obj(ip.xobj_ref);
@@ -400,44 +402,145 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
                 }
                 const PdfObj& xobj = ip.inline_img ? *ip.inline_img : xobj_res;
                 if (!xobj.is_stream()) continue;
+                auto& st = xobj.get("Subtype");
+                if (!ip.inline_img &&
+                    (!st.is_name() || st.str_val != "Image")) continue;
 
-                bool stencil = xobj.get("ImageMask").bool_val;
-                bool one_bit_layer = xobj.get("BitsPerComponent").as_int() == 1;
-                if (stencil || one_bit_layer) has_stencil_image = true;
-                else has_regular_image = true;
-
-                // Bounding-box dimensions work for both normal and /Rotate
-                // pages. A quarter-turn swaps the CTM axes but does not stop
-                // the placement from being recognized as a thin fragment.
-                double drawn_w = std::abs(ip.ctm[0]) + std::abs(ip.ctm[2]);
-                double drawn_h = std::abs(ip.ctm[1]) + std::abs(ip.ctm[3]);
-                if (drawn_w >= page_w * 0.5 && drawn_h < page_h * 0.5) {
-                    broad_bands++;
-                    broad_band_height += drawn_h;
-                }
-
-                bool thin = drawn_h <= page_h * 0.04 &&
-                            drawn_w >= drawn_h * 2.0;
-                if (!thin) continue;
-                thin_fragments++;
-
-                // Rasterized glyph strips commonly store a solid RGB image
-                // plus a soft mask containing the actual glyphs. /Mask and
-                // ImageMask carry the same compositing semantics.
-                bool mask_backed = stencil || !xobj.get("SMask").is_none() ||
-                                   !xobj.get("Mask").is_none();
-                if (mask_backed) masked_thin_fragments++;
+                // Exact device bbox: the unit square's corners through the
+                // CTM, correct for rotated placements too.
+                const double* m = ip.ctm;
+                double xs[4] = {m[4], m[4] + m[0], m[4] + m[2],
+                                m[4] + m[0] + m[2]};
+                double ys[4] = {m[5], m[5] + m[1], m[5] + m[3],
+                                m[5] + m[1] + m[3]};
+                double bx0 = std::min({xs[0], xs[1], xs[2], xs[3]});
+                double bx1 = std::max({xs[0], xs[1], xs[2], xs[3]});
+                double by0 = std::min({ys[0], ys[1], ys[2], ys[3]});
+                double by1 = std::max({ys[0], ys[1], ys[2], ys[3]});
+                if (!std::isfinite(bx0) || !std::isfinite(bx1) ||
+                    !std::isfinite(by0) || !std::isfinite(by1))
+                    continue;
+                if (bx1 - bx0 < 0.1 || by1 - by0 < 0.1) continue;
+                if (bx1 < 0 || bx0 > page_w || by1 < 0 || by0 > page_h)
+                    continue;
+                infos.push_back({i, bx0, by0, bx1, by1, ip.xobj_ref});
             }
 
-            bool banded_scan_page = broad_bands >= 2 &&
-                                    broad_band_height >= page_h * 0.4;
-            bool fragmented_raster_page = masked_thin_fragments >= 2 ||
-                                          (no_text && thin_fragments >= 2);
-            bool layered_image_page = has_regular_image && has_stencil_image;
+            const size_t n_inf = infos.size();
+            std::vector<size_t> parent(n_inf);
+            for (size_t i = 0; i < n_inf; i++) parent[i] = i;
+            auto find = [&](size_t a) {
+                while (parent[a] != a) {
+                    parent[a] = parent[parent[a]];
+                    a = parent[a];
+                }
+                return a;
+            };
+
+            // Print-driver strips abut within sub-point rounding; distinct
+            // assets sit tens of points apart in real layouts.
+            const double eps = std::max(2.0, 0.003 * std::max(page_w, page_h));
+            if (n_inf > 2000) {
+                // Thousands of placements on one page IS a shredded raster;
+                // pairwise adjacency adds nothing at that count.
+                for (size_t i = 1; i < n_inf; i++) parent[i] = 0;
+            } else {
+                for (size_t a = 0; a < n_inf; a++) {
+                    // Same object drawn again at the same spot (producer
+                    // quirk): weld so it cannot form a phantom layered pair.
+                    for (size_t b = a + 1; b < n_inf; b++) {
+                        double gx = std::max(infos[a].x0, infos[b].x0) -
+                                    std::min(infos[a].x1, infos[b].x1);
+                        double gy = std::max(infos[a].y0, infos[b].y0) -
+                                    std::min(infos[a].y1, infos[b].y1);
+                        double eps_y = eps;
+                        // Page-wide bands tolerate a bigger vertical gap
+                        // (blank rows a driver skipped), gated on real x
+                        // overlap so a nearby logo does not merge sideways.
+                        double wa = infos[a].x1 - infos[a].x0;
+                        double wb = infos[b].x1 - infos[b].x0;
+                        if (std::min(wa, wb) >= 0.30 * page_w) {
+                            double xov = std::min(infos[a].x1, infos[b].x1) -
+                                         std::max(infos[a].x0, infos[b].x0);
+                            if (xov >= 0.5 * std::min(wa, wb))
+                                eps_y = std::max(eps, 0.02 * page_h);
+                        }
+                        if (gx <= eps && gy <= eps_y) {
+                            size_t ra = find(a), rb = find(b);
+                            if (ra != rb) parent[rb] = ra;
+                        }
+                    }
+                }
+            }
+
+            struct Cluster {
+                std::vector<size_t> members; // indices into infos
+                double x0 = 1e300, y0 = 1e300, x1 = -1e300, y1 = -1e300;
+                double area_sum = 0;
+            };
+            std::vector<Cluster> clusters;
+            {
+                std::unordered_map<size_t, size_t> root_to_cluster;
+                for (size_t i = 0; i < n_inf; i++) {
+                    size_t r = find(i);
+                    auto [it, fresh] =
+                        root_to_cluster.try_emplace(r, clusters.size());
+                    if (fresh) clusters.emplace_back();
+                    auto& c = clusters[it->second];
+                    c.members.push_back(i);
+                    c.x0 = std::min(c.x0, infos[i].x0);
+                    c.y0 = std::min(c.y0, infos[i].y0);
+                    c.x1 = std::max(c.x1, infos[i].x1);
+                    c.y1 = std::max(c.y1, infos[i].y1);
+                    c.area_sum += (infos[i].x1 - infos[i].x0) *
+                                  (infos[i].y1 - infos[i].y0);
+                }
+            }
+
+            auto qualifies = [&](const Cluster& c) {
+                size_t n = c.members.size();
+                if (n < 2) return false;
+                double ua = (c.x1 - c.x0) * (c.y1 - c.y0);
+                if (ua <= 0) return false;
+                // Three or more images butted to sub-3pt gaps are fragments;
+                // the coverage floor rejects sparse corner-to-corner chains.
+                if (n >= 3) return c.area_sum / ua >= 0.4;
+                const auto& A = infos[c.members[0]];
+                const auto& B = infos[c.members[1]];
+                double xov = std::min(A.x1, B.x1) - std::max(A.x0, B.x0);
+                double yov = std::min(A.y1, B.y1) - std::max(A.y0, B.y0);
+                double area_a = (A.x1 - A.x0) * (A.y1 - A.y0);
+                double area_b = (B.x1 - B.x0) * (B.y1 - B.y0);
+                // Layered pair: a stencil stamped over its base image. A
+                // photo here and a signature there stay separate assets.
+                if (xov > 0 && yov > 0 &&
+                    xov * yov >= 0.3 * std::min(area_a, area_b))
+                    return true;
+                // Stacked pair: two halves of one raster, butted along one
+                // axis with the perpendicular extents mostly aligned.
+                if (-yov <= eps &&
+                    xov >= 0.7 * std::min(A.x1 - A.x0, B.x1 - B.x0))
+                    return true;
+                if (-xov <= eps &&
+                    yov >= 0.7 * std::min(A.y1 - A.y0, B.y1 - B.y0))
+                    return true;
+                return false;
+            };
+
+            double frag_area = 0;
+            for (auto& c : clusters) {
+                if (!qualifies(c)) continue;
+                double cx0 = std::max(0.0, c.x0), cy0 = std::max(0.0, c.y0);
+                double cx1 = std::min(page_w, c.x1);
+                double cy1 = std::min(page_h, c.y1);
+                if (cx1 > cx0 && cy1 > cy0)
+                    frag_area += (cx1 - cx0) * (cy1 - cy0);
+            }
+            bool shredded_page =
+                no_text && frag_area >= 0.5 * page_w * page_h;
 
             bool composited = false;
-            if (vector_text_page || banded_scan_page || fragmented_raster_page ||
-                layered_image_page) {
+            if (vector_text_page || shredded_page) {
                 auto rendered = render_composite();
                 if (!rendered.data.empty() || !rendered.pixels.empty() || !rendered.saved_path.empty()) {
                     result.all_images[p].push_back(std::move(rendered));
@@ -449,19 +552,60 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
             if (!composited) {
                 // The diag records the attempt that produced the page's final
                 // images; a failed composite re-attempts everything below, so
-                // its counts must not double up with the extraction pass.
+                // its counts must not double up with the passes here.
                 result.page_diags[p] = {};
-                auto extracted = extract_page_images(doc, resources, parse_result,
-                                                     p, image_dir,
-                                                     opts.min_image_size,
-                                                     &result.page_diags[p]);
-                for (auto& ei : extracted) {
-                    // ctm[5] is the Y translation in PDF coordinates (origin bottom-left)
-                    // ctm[3] is vertical scale; y_top = ctm[5] + abs(ctm[3])
-                    double y_top = ei.ctm[5] + std::abs(ei.ctm[3]);
-                    result.all_image_y[p].push_back(y_top);
-                    result.all_image_x[p].push_back(ei.ctm[4]); // X position
-                    result.all_images[p].push_back(std::move(ei.img));
+                int img_idx = 0;
+                std::vector<char> handled(parse_result.images.size(), 0);
+                for (auto& c : clusters) {
+                    if (!qualifies(c)) continue;
+                    double rgn[4] = {std::max(0.0, c.x0), std::max(0.0, c.y0),
+                                     std::min(page_w, c.x1),
+                                     std::min(page_h, c.y1)};
+                    if (rgn[2] - rgn[0] < 1.0 || rgn[3] - rgn[1] < 1.0)
+                        continue;
+                    std::vector<size_t> members;
+                    members.reserve(c.members.size());
+                    for (size_t mi : c.members)
+                        members.push_back(infos[mi].idx);
+                    std::sort(members.begin(), members.end());
+                    ImageData rendered;
+                    {
+                        CompositeMemoryLease lease(
+                            composite_memory,
+                            composite_memory_cost(rgn[2] - rgn[0],
+                                                  rgn[3] - rgn[1]));
+                        rendered = render_region_composite(
+                            doc, resources, parse_result, members, p, rgn,
+                            image_dir, img_idx, &result.page_diags[p]);
+                    }
+                    if (rendered.data.empty() && rendered.pixels.empty() &&
+                        rendered.saved_path.empty())
+                        continue; // members fall back to individual export
+                    for (size_t mi : members) handled[mi] = 1;
+                    result.all_images[p].push_back(std::move(rendered));
+                    // Cluster top/left keeps the markdown insert in reading
+                    // order; only whole-page composites pin to top-of-page.
+                    result.all_image_y[p].push_back(rgn[3]);
+                    result.all_image_x[p].push_back(rgn[0]);
+                    img_idx++;
+                }
+
+                std::vector<size_t> remaining;
+                for (size_t i = 0; i < parse_result.images.size(); i++)
+                    if (!handled[i]) remaining.push_back(i);
+                if (!remaining.empty()) {
+                    auto extracted = extract_page_images(
+                        doc, resources, parse_result, p, image_dir,
+                        opts.min_image_size, &result.page_diags[p],
+                        &remaining, img_idx);
+                    for (auto& ei : extracted) {
+                        // ctm[5] is the Y translation in PDF coordinates (origin bottom-left)
+                        // ctm[3] is vertical scale; y_top = ctm[5] + abs(ctm[3])
+                        double y_top = ei.ctm[5] + std::abs(ei.ctm[3]);
+                        result.all_image_y[p].push_back(y_top);
+                        result.all_image_x[p].push_back(ei.ctm[4]); // X position
+                        result.all_images[p].push_back(std::move(ei.img));
+                    }
                 }
 
                 // Fallback: render page for scanned/vector-only pages

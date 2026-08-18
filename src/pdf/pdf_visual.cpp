@@ -647,15 +647,26 @@ std::vector<ExtractedImage> extract_page_images(PdfDoc& doc, const PdfObj& resou
                                                  int page_num,
                                                  const std::string& output_dir,
                                                  unsigned min_image_size,
-                                                 PageRenderDiag* diag) {
+                                                 PageRenderDiag* diag,
+                                                 const std::vector<size_t>* only,
+                                                 int name_base) {
     std::vector<ExtractedImage> images;
-    int img_idx = 0;
+    int img_idx = name_base;
     int considered = 0;   // image placements this call attempted
-    int policy_skips = 0; // min_image_size drops: deliberate, not failures
+    int policy_skips = 0; // dedup and min_image_size: deliberate, not failures
 
     const PdfObj& res = resources;
 
-    for (auto& ip : parse_result.images) {
+    // One file per distinct source image: a logo or rule stamped N times
+    // across the page used to write N identical files.
+    std::unordered_set<int> seen_refs;
+    std::unordered_set<std::string> seen_names;
+
+    const size_t total = only ? only->size() : parse_result.images.size();
+    for (size_t oi = 0; oi < total; oi++) {
+        const size_t pi_idx = only ? (*only)[oi] : oi;
+        if (pi_idx >= parse_result.images.size()) continue;
+        auto& ip = parse_result.images[pi_idx];
         PdfObj xobj_res;
         if (ip.inline_img) {
             // Inline image: synthesized stream, no /Subtype to check.
@@ -676,6 +687,17 @@ std::vector<ExtractedImage> extract_page_images(PdfDoc& doc, const PdfObj& resou
 
         considered++;
         if (diag) diag->images_total++;
+
+        if (!ip.inline_img) {
+            bool dup = ip.xobj_ref >= 0
+                ? !seen_refs.insert(ip.xobj_ref).second
+                : (!ip.xobj_name.empty() &&
+                   !seen_names.insert(ip.xobj_name).second);
+            if (dup) {
+                policy_skips++;
+                continue;
+            }
+        }
 
         int w = xobj.get("Width").as_int();
         int h = xobj.get("Height").as_int();
@@ -867,6 +889,9 @@ std::vector<ExtractedImage> extract_page_images(PdfDoc& doc, const PdfObj& resou
                         components = static_cast<int>(names_arr.arr.size());
                 }
             }
+            // A stencil has no ColorSpace at all; without this it keeps the
+            // RGB default and its 1-bit unpack below never runs.
+            if (xobj.get("ImageMask").bool_val) components = 1;
 
             const size_t width = static_cast<size_t>(w);
             const size_t height = static_cast<size_t>(h);
@@ -1410,6 +1435,7 @@ ImageData render_page_composite(PdfDoc& doc, const PdfObj& resources,
                                  const ContentParseResult& parse_result,
                                  int page_num, double page_w, double page_h,
                                  const std::string& output_dir,
+                                 int img_idx,
                                  PageRenderDiag* diag) {
     constexpr double kMinDPI = 150.0;
     constexpr double kMaxDPI = 300.0;
@@ -2134,7 +2160,8 @@ ImageData render_page_composite(PdfDoc& doc, const PdfObj& resources,
 
     ImageData img;
     img.page_number = page_num;
-    img.name = "page" + std::to_string(page_num + 1) + "_img0";
+    img.name = "page" + std::to_string(page_num + 1) + "_img" +
+               std::to_string(img_idx);
     img.format = "raw";
     img.width = rw;
     img.height = rh;
@@ -2157,6 +2184,67 @@ ImageData render_page_composite(PdfDoc& doc, const PdfObj& resources,
         }
     }
     return img;
+}
+
+ImageData render_region_composite(PdfDoc& doc, const PdfObj& resources,
+                                  const ContentParseResult& parse_result,
+                                  const std::vector<size_t>& members,
+                                  int page_num, const double region[4],
+                                  const std::string& output_dir,
+                                  int img_idx,
+                                  PageRenderDiag* diag) {
+    const double x0 = region[0], y0 = region[1];
+    const double rgn_w = region[2] - region[0];
+    const double rgn_h = region[3] - region[1];
+    if (!std::isfinite(rgn_w) || !std::isfinite(rgn_h) ||
+        rgn_w < 1.0 || rgn_h < 1.0)
+        return {};
+
+    // Translate the members and every intersecting path into region-local
+    // coordinates; with page dims set to the region size, the page compositor
+    // renders exactly the cropped window (its canvas math is origin-based).
+    ContentParseResult sub;
+    sub.images.reserve(members.size());
+    for (size_t idx : members) {
+        if (idx >= parse_result.images.size()) continue;
+        ImagePlacement ip = parse_result.images[idx];
+        ip.ctm[4] -= x0;
+        ip.ctm[5] -= y0;
+        sub.images.push_back(std::move(ip));
+    }
+    if (sub.images.empty()) return {};
+
+    for (const auto& rp : parse_result.paths) {
+        double bx0, by0, bx1, by1;
+        bx0 = by0 = 1e300;
+        bx1 = by1 = -1e300;
+        for (const auto& pt : rp.points) {
+            if (pt.type == PathPoint::CLOSE) continue;
+            bx0 = std::min(bx0, pt.x); bx1 = std::max(bx1, pt.x);
+            by0 = std::min(by0, pt.y); by1 = std::max(by1, pt.y);
+            if (pt.type == PathPoint::CURVE) {
+                bx0 = std::min({bx0, pt.cx1, pt.cx2});
+                bx1 = std::max({bx1, pt.cx1, pt.cx2});
+                by0 = std::min({by0, pt.cy1, pt.cy2});
+                by1 = std::max({by1, pt.cy1, pt.cy2});
+            }
+        }
+        if (bx0 > bx1) continue;
+        double pad = rp.do_stroke ? rp.line_width * 0.5 : 0.0;
+        if (bx1 + pad < region[0] || bx0 - pad > region[2] ||
+            by1 + pad < region[1] || by0 - pad > region[3])
+            continue;
+        RenderPath sp = rp;
+        for (auto& pt : sp.points) {
+            pt.x -= x0; pt.y -= y0;
+            pt.cx1 -= x0; pt.cy1 -= y0;
+            pt.cx2 -= x0; pt.cy2 -= y0;
+        }
+        sub.paths.push_back(std::move(sp));
+    }
+
+    return render_page_composite(doc, resources, sub, page_num, rgn_w, rgn_h,
+                                 output_dir, img_idx, diag);
 }
 
 // ── Bookmark Extraction ──────────────────────────────────

@@ -122,12 +122,26 @@ std::vector<ExtractedImage> extract_page_images(PdfDoc& doc, const PdfObj& resou
                                                 int page_num,
                                                 const std::string& output_dir,
                                                 unsigned min_image_size = 0,
-                                                PageRenderDiag* diag = nullptr);
+                                                PageRenderDiag* diag = nullptr,
+                                                const std::vector<size_t>* only = nullptr,
+                                                int name_base = 0);
 ImageData render_page_composite(PdfDoc& doc, const PdfObj& resources,
                                 const ContentParseResult& parse_result,
                                 int page_num, double page_w, double page_h,
                                 const std::string& output_dir,
+                                int img_idx = 0,
                                 PageRenderDiag* diag = nullptr);
+// Render only the given placements (indices into parse_result.images), plus
+// every path intersecting the region, into a canvas cropped to region
+// [x0,y0,x1,y1] in viewing coordinates. Used to composite one fragment
+// cluster without losing the rest of the page.
+ImageData render_region_composite(PdfDoc& doc, const PdfObj& resources,
+                                  const ContentParseResult& parse_result,
+                                  const std::vector<size_t>& members,
+                                  int page_num, const double region[4],
+                                  const std::string& output_dir,
+                                  int img_idx,
+                                  PageRenderDiag* diag = nullptr);
 void collect_bookmarks(PdfDoc& doc, const PdfObj& node, int depth,
                        std::vector<BookmarkEntry>& out);
 void collect_attachments(PdfDoc& doc, const PdfObj& root,

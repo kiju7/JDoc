@@ -111,6 +111,146 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    // Test 6: Fragment clustering. Abutting placements (tiles, strips —
+    // horizontal or vertical, above or below min_image_size, on pages with
+    // or without text) composite into one region image; scattered assets
+    // stay individual; repeated stamps deduplicate; an invisible-text (Tr 3)
+    // OCR layer does not stop a shredded scan from compositing.
+    std::cout << "[6] Testing fragment clustering fixtures...\n";
+    {
+        struct Case {
+            const char* fixture;
+            size_t want_images;
+            const char* want_text; // must appear in the markdown, or nullptr
+        };
+        const Case cases[] = {
+            {"test/fixtures/pdf/tile_grid.pdf", 1, nullptr},
+            {"test/fixtures/pdf/vstrip.pdf", 1, nullptr},
+            {"test/fixtures/pdf/strip_text.pdf", 1, "The quick brown fox"},
+            {"test/fixtures/pdf/tiny_frags.pdf", 1, "Heading line"},
+            {"test/fixtures/pdf/photo_stencil.pdf", 2, "Body text line"},
+            {"test/fixtures/pdf/dedup_logo.pdf", 1, "Some report text"},
+            {"test/fixtures/pdf/tr3_scan.pdf", 1, "Invisible ocr line"},
+        };
+        for (auto& c : cases) {
+            std::ifstream f(c.fixture);
+            if (!f.good()) {
+                std::cout << "    SKIP: " << c.fixture << "\n";
+                continue;
+            }
+            f.close();
+            try {
+                auto chunks = jdoc::pdf_to_markdown_chunks(c.fixture);
+                assert(chunks.size() == 1);
+                size_t refs = 0;
+                const std::string& md = chunks[0].text;
+                for (size_t i = md.find("!["); i != std::string::npos;
+                     i = md.find("![", i + 2))
+                    refs++;
+                std::cout << "    " << c.fixture << ": "
+                          << chunks[0].images.size() << " images, " << refs
+                          << " refs (expected " << c.want_images << ")\n";
+                assert(chunks[0].images.size() == c.want_images);
+                assert(refs == c.want_images);
+                assert(!c.want_text ||
+                       md.find(c.want_text) != std::string::npos);
+            } catch (const std::exception& e) {
+                std::cerr << "    FAIL: " << c.fixture << ": " << e.what()
+                          << "\n";
+                return 1;
+            }
+        }
+    }
+
+    // Test 7: Region composites keep reading order. strip_text's strip block
+    // sits below its six text lines, so the image ref must follow the text —
+    // the old behavior pinned composites to the top of the page.
+    std::cout << "[7] Testing region composite reading order...\n";
+    {
+        const char* fixture = "test/fixtures/pdf/strip_text.pdf";
+        std::ifstream f(fixture);
+        if (!f.good()) {
+            std::cout << "    SKIP: fixture not found\n";
+        } else {
+            f.close();
+            std::string md = jdoc::pdf_to_markdown(fixture);
+            size_t last_text = md.rfind("quick brown fox");
+            size_t ref = md.find("![");
+            assert(last_text != std::string::npos);
+            assert(ref != std::string::npos);
+            std::cout << "    text@" << last_text << " ref@" << ref << "\n";
+            assert(ref > last_text);
+        }
+    }
+
+    // Test 8: Inline images (BI/ID/EI). The payload must never leak into the
+    // operator loop: inline_corrupt's samples spell "(LEAKED) Tj", which
+    // would show up as text if the lexer read them as tokens.
+    std::cout << "[8] Testing inline images...\n";
+    {
+        const char* basic = "test/fixtures/pdf/inline_basic.pdf";
+        std::ifstream f(basic);
+        if (!f.good()) {
+            std::cout << "    SKIP: fixture not found\n";
+        } else {
+            f.close();
+            auto chunks = jdoc::pdf_to_markdown_chunks(basic);
+            assert(chunks.size() == 1);
+            assert(chunks[0].images.size() == 1);
+
+            std::string md =
+                jdoc::pdf_to_markdown("test/fixtures/pdf/inline_corrupt.pdf");
+            assert(md.find("MARKER_TEXT_LINE_A") != std::string::npos);
+            assert(md.find("MARKER_TEXT_LINE_C") != std::string::npos);
+            assert(md.find("LEAKED") == std::string::npos);
+
+            auto ahx = jdoc::pdf_to_markdown_chunks(
+                "test/fixtures/pdf/inline_ahx.pdf");
+            assert(ahx.size() == 1 && ahx[0].images.size() == 1);
+            std::cout << "    inline basic/corrupt/ahx OK\n";
+        }
+    }
+
+    // Test 9: RunLengthDecode images decode; an unknown filter surfaces as
+    // degraded_images plus a markdown comment instead of vanishing.
+    std::cout << "[9] Testing RunLength and decode diagnostics...\n";
+    {
+        std::ifstream f("test/fixtures/pdf/rl_image.pdf");
+        if (!f.good()) {
+            std::cout << "    SKIP: fixture not found\n";
+        } else {
+            f.close();
+            auto rl = jdoc::pdf_to_markdown_chunks(
+                "test/fixtures/pdf/rl_image.pdf");
+            assert(rl.size() == 1 && rl[0].images.size() == 1);
+
+            auto bad = jdoc::pdf_to_markdown_chunks(
+                "test/fixtures/pdf/bad_filter.pdf");
+            assert(bad.size() == 1);
+            assert(bad[0].images.empty());
+            assert(bad[0].degraded_images == 1);
+            assert(bad[0].text.find("failed to decode") != std::string::npos);
+            std::cout << "    rl_image 1 image, bad_filter degraded=1 OK\n";
+        }
+    }
+
+    // Test 10: /Resources inherited from an ancestor Pages node two levels up
+    // used to yield zero images from both extraction and compositing.
+    std::cout << "[10] Testing inherited /Resources...\n";
+    {
+        std::ifstream f("test/fixtures/pdf/inherited_res.pdf");
+        if (!f.good()) {
+            std::cout << "    SKIP: fixture not found\n";
+        } else {
+            f.close();
+            auto chunks = jdoc::pdf_to_markdown_chunks(
+                "test/fixtures/pdf/inherited_res.pdf");
+            assert(chunks.size() == 1);
+            assert(chunks[0].images.size() == 1);
+            std::cout << "    1 image extracted OK\n";
+        }
+    }
+
     std::cout << "\n=== All tests passed ===\n";
     return 0;
 }
