@@ -541,16 +541,30 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
             };
 
             double frag_area = 0;
+            size_t frag_members = 0, frag_clusters = 0;
             for (auto& c : clusters) {
                 if (!qualifies(c)) continue;
+                frag_clusters++;
+                frag_members += c.members.size();
                 double cx0 = std::max(0.0, c.x0), cy0 = std::max(0.0, c.y0);
                 double cx1 = std::min(page_w, c.x1);
                 double cy1 = std::min(page_h, c.y1);
                 if (cx1 > cx0 && cy1 > cy0)
                     frag_area += (cx1 - cx0) * (cy1 - cy0);
             }
+            // A page with no visible text loses nothing in a whole-page
+            // composite. Area alone under-detects rastered text: secure
+            // documents strip their body line by line, and inter-line gaps
+            // keep coverage well below half a page — several fragment
+            // clusters or a dozen fragments read as one shredded page.
+            // Pages where raster fragments far outnumber the extractable
+            // lines are the same document style with a stray caption or two;
+            // per-block crops would still shred them.
             bool shredded_page =
-                no_text && frag_area >= 0.5 * page_w * page_h;
+                (no_text && (frag_area >= 0.5 * page_w * page_h ||
+                             frag_clusters >= 3 || frag_members >= 12)) ||
+                (frag_members >= 12 &&
+                 frag_members >= 2 * result.all_lines[p].size());
 
             bool composited = false;
             if (vector_text_page || shredded_page) {
