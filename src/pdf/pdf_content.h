@@ -383,6 +383,11 @@ struct ContentParseOptions {
 };
 
 // Cross-translation-unit declarations.
+// Resolve a colorspace object into its render vocabulary (tint ramps and
+// palettes precomputed to RGB); shared with the compositor so Separation
+// image samples map through the same tint transform as fill colors.
+std::shared_ptr<const CsInfo> load_colorspace(PdfDoc& doc,
+                                              const PdfObj& cs_ref);
 // inherit_gs: graphics state a Form XObject inherits from its caller (colors,
 // /ca alpha, clip). initial_ctm still overrides the CTM after the copy.
 ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>& stream,

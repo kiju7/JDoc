@@ -204,8 +204,8 @@ static int colorspace_component_count(PdfDoc& doc, const PdfObj& cs_resolved) {
     return 3;
 }
 
-static std::shared_ptr<const CsInfo> load_colorspace(PdfDoc& doc,
-                                                     const PdfObj& cs_ref) {
+std::shared_ptr<const CsInfo> load_colorspace(PdfDoc& doc,
+                                              const PdfObj& cs_ref) {
     auto cs = doc.resolve(cs_ref);
     auto info = std::make_shared<CsInfo>();
 

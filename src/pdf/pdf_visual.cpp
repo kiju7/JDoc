@@ -642,6 +642,60 @@ static bool decode_stencil_mask(PdfDoc& doc, const PdfObj& xobj,
     return true;
 }
 
+// CIE Lab samples (D50 white, the PDF default) to sRGB in place. L is stored
+// 0..255 for 0..100; a and b are byte-mapped over /Range (default ±100).
+static void lab_pixels_to_srgb(std::vector<uint8_t>& px, size_t count,
+                               double amin, double amax,
+                               double bmin, double bmax) {
+    auto finv = [](double t) {
+        constexpr double d = 6.0 / 29.0;
+        return t > d ? t * t * t : 3.0 * d * d * (t - 4.0 / 29.0);
+    };
+    auto gam = [](double v) {
+        v = std::max(0.0, std::min(1.0, v));
+        return v <= 0.0031308 ? 12.92 * v
+                              : 1.055 * std::pow(v, 1.0 / 2.4) - 0.055;
+    };
+    for (size_t i = 0; i + 1 < count * 3; i += 3) {
+        double L = px[i] * 100.0 / 255.0;
+        double a = amin + px[i + 1] * (amax - amin) / 255.0;
+        double b = bmin + px[i + 2] * (bmax - bmin) / 255.0;
+        double fy = (L + 16.0) / 116.0;
+        double fx = fy + a / 500.0;
+        double fz = fy - b / 200.0;
+        double X = 0.9642 * finv(fx);
+        double Y = finv(fy);
+        double Z = 0.8249 * finv(fz);
+        // XYZ (D50) → linear sRGB, Bradford-adapted matrix.
+        double R = 3.1338561 * X - 1.6168667 * Y - 0.4906146 * Z;
+        double G = -0.9787684 * X + 1.9161415 * Y + 0.0334540 * Z;
+        double B = 0.0719453 * X - 0.2289914 * Y + 1.4052427 * Z;
+        px[i] = static_cast<uint8_t>(gam(R) * 255.0 + 0.5);
+        px[i + 1] = static_cast<uint8_t>(gam(G) * 255.0 + 0.5);
+        px[i + 2] = static_cast<uint8_t>(gam(B) * 255.0 + 0.5);
+    }
+}
+
+// /Range for a [/Lab <<…>>] colorspace; defaults per spec.
+static void lab_range(PdfDoc& doc, const PdfObj& cs_obj, double range[4]) {
+    range[0] = -100;
+    range[1] = 100;
+    range[2] = -100;
+    range[3] = 100;
+    if (!cs_obj.is_arr() || cs_obj.arr.size() < 2) return;
+    auto params = doc.resolve(cs_obj.arr[1]);
+    auto rng = doc.resolve(params.get("Range"));
+    if (rng.is_arr() && rng.arr.size() >= 4)
+        for (int i = 0; i < 4; i++) range[i] = rng.arr[i].as_num();
+}
+
+// 16-bit samples fold to their high bytes; downstream reads bytes, and
+// leaving both bytes in place shears the sample grid.
+static void fold_16bpc(std::vector<uint8_t>& samples) {
+    for (size_t i = 0; i * 2 < samples.size(); i++) samples[i] = samples[i * 2];
+    samples.resize(samples.size() / 2);
+}
+
 std::vector<ExtractedImage> extract_page_images(PdfDoc& doc, const PdfObj& resources,
                                                  const ContentParseResult& parse_result,
                                                  int page_num,
@@ -822,6 +876,10 @@ std::vector<ExtractedImage> extract_page_images(PdfDoc& doc, const PdfObj& resou
 
             int bpc = xobj.get("BitsPerComponent").as_int();
             if (bpc <= 0) bpc = 8;
+            if (bpc == 16) {
+                fold_16bpc(decoded);
+                bpc = 8;
+            }
 
             auto cs_obj = doc.resolve(xobj.get("ColorSpace"));
             std::string cs_name;
@@ -971,6 +1029,31 @@ std::vector<ExtractedImage> extract_page_images(PdfDoc& doc, const PdfObj& resou
 
             if (!is_indexed && bpc == 8)
                 apply_decode_array(doc, xobj, decoded, components);
+
+            // Ink-tint samples (Separation, single-ink DeviceN) expand to RGB
+            // through the shared tint ramp — a raw tint byte read as gray has
+            // its ink sense inverted. Lab converts to sRGB in place.
+            if ((cs_name == "Separation" || cs_name == "DeviceN") &&
+                components == 1) {
+                auto csi = load_colorspace(doc, cs_obj);
+                if (csi && csi->kind == CsInfo::TINT && !csi->lut.empty()) {
+                    std::vector<uint8_t> rgb(pixel_count * 3);
+                    for (size_t pi = 0;
+                         pi < pixel_count && pi < decoded.size(); pi++) {
+                        const auto& e = csi->lut[decoded[pi]];
+                        rgb[pi * 3] = e[0];
+                        rgb[pi * 3 + 1] = e[1];
+                        rgb[pi * 3 + 2] = e[2];
+                    }
+                    decoded = std::move(rgb);
+                    components = 3;
+                }
+            } else if (cs_name == "Lab") {
+                double range[4];
+                lab_range(doc, cs_obj, range);
+                lab_pixels_to_srgb(decoded, decoded.size() / 3,
+                                   range[0], range[1], range[2], range[3]);
+            }
 
             img.format = "raw";
             img.components = components;
@@ -1299,9 +1382,14 @@ struct Canvas {
 
     // 1/3-component sources are gray/RGB; 4-component is CMYK ink
     // (Adobe-inverted JPEGs are normalized before reaching the canvas).
+    // tint_lut (256 RGB entries) maps 1-component ink tints instead.
     static void sample_rgb(const uint8_t* sp, int scomp,
-                           uint8_t& r, uint8_t& g, uint8_t& b) {
-        if (scomp == 4) {
+                           uint8_t& r, uint8_t& g, uint8_t& b,
+                           const std::array<uint8_t, 3>* tint_lut = nullptr) {
+        if (tint_lut && scomp == 1) {
+            const auto& px = tint_lut[sp[0]];
+            r = px[0]; g = px[1]; b = px[2];
+        } else if (scomp == 4) {
             util::cmyk_to_rgb(sp[0] / 255.0, sp[1] / 255.0,
                               sp[2] / 255.0, sp[3] / 255.0, r, g, b);
         } else if (scomp >= 3) {
@@ -1314,7 +1402,8 @@ struct Canvas {
     void blit_image(const uint8_t* src, int sw, int sh, int scomp,
                      const double ctm[6], double page_h, double scale,
                      const uint8_t* amask = nullptr, int amw = 0, int amh = 0,
-                     int base_alpha = 255, const int* clip_px = nullptr) {
+                     int base_alpha = 255, const int* clip_px = nullptr,
+                     const std::array<uint8_t, 3>* tint_lut = nullptr) {
         // CTM maps image space [0,1]×[0,1] to page space
         // Scale converts page space to canvas space
         bool axis_aligned = (std::abs(ctm[1]) < 0.001 && std::abs(ctm[2]) < 0.001);
@@ -1365,7 +1454,7 @@ struct Canvas {
                                     (static_cast<size_t>(ry) * sw + rx) * scomp;
                                 const uint8_t* sp = src + src_idx;
                                 uint8_t pr, pg, pb;
-                                sample_rgb(sp, scomp, pr, pg, pb);
+                                sample_rgb(sp, scomp, pr, pg, pb, tint_lut);
                                 sr += pr; sg += pg; sb += pb;
                                 // Alpha has to be averaged over the same box as
                                 // the color. Rasterized-glyph strips carry a flat
@@ -1389,7 +1478,7 @@ struct Canvas {
                     size_t src_idx =
                         (static_cast<size_t>(sy) * sw + sx) * scomp;
                     const uint8_t* sp = src + src_idx;
-                    sample_rgb(sp, scomp, r, g, b);
+                    sample_rgb(sp, scomp, r, g, b, tint_lut);
                     blend_pixel(dx, dy, r, g, b, alpha_at(sx, sy));
                 }
             }
@@ -1407,30 +1496,88 @@ struct Canvas {
                 image_map.y.end = std::min(image_map.y.end, clip_px[3]);
             }
 
+            // Bilinear 4-tap sampling; nearest-neighbour aliased rotated
+            // scans badly while the axis-aligned path box-filtered.
+            auto bilinear = [&](double image_x, double image_y, double& r,
+                                double& g, double& b, double& a) {
+                double fx = image_x * (sw - 1);
+                double fy = (1 - image_y) * (sh - 1);
+                int sx0 = static_cast<int>(fx);
+                int sy0 = static_cast<int>(fy);
+                int sx1 = std::min(sx0 + 1, sw - 1);
+                int sy1 = std::min(sy0 + 1, sh - 1);
+                double tx = fx - sx0, ty = fy - sy0;
+                const int xs[2] = {sx0, sx1}, ys[2] = {sy0, sy1};
+                const double wx[2] = {1 - tx, tx}, wy[2] = {1 - ty, ty};
+                r = g = b = a = 0;
+                for (int j = 0; j < 2; j++)
+                    for (int i = 0; i < 2; i++) {
+                        double wgt = wx[i] * wy[j];
+                        if (wgt <= 0) continue;
+                        const uint8_t* sp =
+                            src + (static_cast<size_t>(ys[j]) * sw + xs[i]) *
+                                      scomp;
+                        uint8_t pr, pg, pb;
+                        sample_rgb(sp, scomp, pr, pg, pb, tint_lut);
+                        r += wgt * pr;
+                        g += wgt * pg;
+                        b += wgt * pb;
+                        a += wgt * alpha_at(xs[i], ys[j]);
+                    }
+            };
+            // When the source is denser than the destination, one bilinear
+            // tap skips texels; a 2×2 sub-pixel average keeps thin scan
+            // strokes from stippling.
+            const bool minify =
+                sw > (image_map.x.end - image_map.x.begin) ||
+                sh > (image_map.y.end - image_map.y.begin);
+
             for (int canvas_y = image_map.y.begin;
                  canvas_y < image_map.y.end; canvas_y++) {
                 for (int canvas_x = image_map.x.begin;
                      canvas_x < image_map.x.end; canvas_x++) {
-                    double page_x = canvas_x / scale;
-                    double page_y = page_h - canvas_y / scale;
-                    double local_x = page_x - ctm[4];
-                    double local_y = page_y - ctm[5];
-                    double image_x = (ctm[3] * local_x - ctm[2] * local_y) /
-                                     image_map.determinant;
-                    double image_y = (-ctm[1] * local_x + ctm[0] * local_y) /
-                                     image_map.determinant;
-                    if (!std::isfinite(image_x) || !std::isfinite(image_y) ||
-                        image_x < 0 || image_x > 1 ||
-                        image_y < 0 || image_y > 1)
-                        continue;
-                    int sx = static_cast<int>(image_x * (sw - 1));
-                    int sy = static_cast<int>((1 - image_y) * (sh - 1));
-                    size_t src_idx =
-                        (static_cast<size_t>(sy) * sw + sx) * scomp;
-                    const uint8_t* sp = src + src_idx;
-                    uint8_t r, g, b;
-                    sample_rgb(sp, scomp, r, g, b);
-                    blend_pixel(canvas_x, canvas_y, r, g, b, alpha_at(sx, sy));
+                    double racc = 0, gacc = 0, bacc = 0, aacc = 0, wacc = 0;
+                    const double subs[2] = {0.25, 0.75};
+                    const int taps = minify ? 2 : 1;
+                    for (int jy = 0; jy < taps; jy++) {
+                        for (int jx = 0; jx < taps; jx++) {
+                            double cxs = canvas_x +
+                                         (minify ? subs[jx] : 0.5);
+                            double cys = canvas_y +
+                                         (minify ? subs[jy] : 0.5);
+                            double page_x = cxs / scale;
+                            double page_y = page_h - cys / scale;
+                            double local_x = page_x - ctm[4];
+                            double local_y = page_y - ctm[5];
+                            double image_x =
+                                (ctm[3] * local_x - ctm[2] * local_y) /
+                                image_map.determinant;
+                            double image_y =
+                                (-ctm[1] * local_x + ctm[0] * local_y) /
+                                image_map.determinant;
+                            if (!std::isfinite(image_x) ||
+                                !std::isfinite(image_y) || image_x < 0 ||
+                                image_x > 1 || image_y < 0 || image_y > 1)
+                                continue;
+                            double r, g, b, a;
+                            bilinear(image_x, image_y, r, g, b, a);
+                            racc += r;
+                            gacc += g;
+                            bacc += b;
+                            aacc += a;
+                            wacc += 1;
+                        }
+                    }
+                    if (wacc <= 0) continue;
+                    // Partially-covered edge pixels keep their full sampled
+                    // alpha over the covered fraction only.
+                    double cov = wacc / (taps * taps);
+                    blend_pixel(canvas_x, canvas_y,
+                                static_cast<uint8_t>(racc / wacc + 0.5),
+                                static_cast<uint8_t>(gacc / wacc + 0.5),
+                                static_cast<uint8_t>(bacc / wacc + 0.5),
+                                static_cast<uint8_t>(aacc / wacc * cov +
+                                                     0.5));
                 }
             }
         }
@@ -1895,6 +2042,9 @@ ImageData render_page_composite(PdfDoc& doc, const PdfObj& resources,
         // Decode image to RGB pixels for compositing
         std::vector<uint8_t> pixels;
         int components = 3;
+        // Separation/DeviceN samples are ink tints, not luminance; they map
+        // through the same tint→RGB ramp the fill colors use.
+        std::shared_ptr<const CsInfo> tint_cs;
         {
             // Determine last filter to decide decode strategy
             auto filter_obj = doc.resolve(xobj.get("Filter"));
@@ -1991,6 +2141,10 @@ ImageData render_page_composite(PdfDoc& doc, const PdfObj& resources,
                     if (jr.inverted_cmyk)
                         for (auto& v : pixels) v = 255 - v;
                 } else {
+                    {
+                        int bpc16 = xobj.get("BitsPerComponent").as_int();
+                        if (bpc16 == 16 && !is_image_mask) fold_16bpc(decoded);
+                    }
                     auto cs_obj = doc.resolve(xobj.get("ColorSpace"));
                     std::string cs_name;
                     if (cs_obj.is_name()) cs_name = cs_obj.str_val;
@@ -2043,6 +2197,33 @@ ImageData render_page_composite(PdfDoc& doc, const PdfObj& resources,
                         }
                     } else if (cs_name == "Separation") {
                         components = 1;
+                        auto csi = load_colorspace(doc, cs_obj);
+                        if (csi && csi->kind == CsInfo::TINT &&
+                            !csi->lut.empty())
+                            tint_cs = csi;
+                    } else if (cs_name == "DeviceN") {
+                        if (cs_obj.is_arr() && cs_obj.arr.size() >= 2) {
+                            auto names_arr = doc.resolve(cs_obj.arr[1]);
+                            if (names_arr.is_arr())
+                                components =
+                                    static_cast<int>(names_arr.arr.size());
+                        }
+                        // N-in tint transforms don't fit a 1-D ramp; N>=2
+                        // reads through the alternate-space interpretation
+                        // (4=CMYK, 3=RGB) below.
+                        if (components == 1) {
+                            auto csi = load_colorspace(doc, cs_obj);
+                            if (csi && csi->kind == CsInfo::TINT &&
+                                !csi->lut.empty())
+                                tint_cs = csi;
+                        }
+                    } else if (cs_name == "Lab") {
+                        components = 3;
+                        double range[4];
+                        lab_range(doc, cs_obj, range);
+                        lab_pixels_to_srgb(decoded, decoded.size() / 3,
+                                           range[0], range[1],
+                                           range[2], range[3]);
                     }
                     if (is_image_mask) components = 1;
                     // Unpack 1-bit rows to bytes; CCITT masks arrive unpacked
@@ -2141,11 +2322,29 @@ ImageData render_page_composite(PdfDoc& doc, const PdfObj& resources,
                             !std::isfinite(image_y) || image_x < 0 ||
                             image_x > 1 || image_y < 0 || image_y > 1)
                             continue;
-                        int sx = static_cast<int>(image_x * (w - 1));
-                        int sy = static_cast<int>((1 - image_y) * (h - 1));
-                        if (pixels[static_cast<size_t>(sy) * w + sx] > 128)
+                        // Fractional coverage instead of a >128 threshold:
+                        // rotated stencil edges anti-alias like the
+                        // axis-aligned branch's area sampling.
+                        double fx = image_x * (w - 1);
+                        double fy = (1 - image_y) * (h - 1);
+                        int sx0 = static_cast<int>(fx);
+                        int sy0 = static_cast<int>(fy);
+                        int sx1 = std::min(sx0 + 1, w - 1);
+                        int sy1 = std::min(sy0 + 1, h - 1);
+                        double tx = fx - sx0, ty = fy - sy0;
+                        double cov =
+                            (1 - tx) * (1 - ty) *
+                                pixels[static_cast<size_t>(sy0) * w + sx0] +
+                            tx * (1 - ty) *
+                                pixels[static_cast<size_t>(sy0) * w + sx1] +
+                            (1 - tx) * ty *
+                                pixels[static_cast<size_t>(sy1) * w + sx0] +
+                            tx * ty *
+                                pixels[static_cast<size_t>(sy1) * w + sx1];
+                        int a = static_cast<int>(cov / 255.0 * ip_alpha + 0.5);
+                        if (a > 0)
                             canvas.blend_pixel(canvas_x, canvas_y, fr, fg, fb,
-                                               static_cast<uint8_t>(ip_alpha));
+                                               static_cast<uint8_t>(a));
                     }
                 }
                 return;
@@ -2188,7 +2387,8 @@ ImageData render_page_composite(PdfDoc& doc, const PdfObj& resources,
                 decode_stencil_mask(doc, xobj, smask, smw, smh);
             canvas.blit_image(pixels.data(), w, h, components, ip.ctm, page_h, scale,
                               smask.empty() ? nullptr : smask.data(), smw, smh,
-                              ip_alpha, clip_px);
+                              ip_alpha, clip_px,
+                              tint_cs ? tint_cs->lut.data() : nullptr);
         }
     };
 
