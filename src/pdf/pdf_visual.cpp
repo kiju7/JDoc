@@ -1086,61 +1086,136 @@ std::vector<ExtractedImage> extract_page_images(PdfDoc& doc, const PdfObj& page_
 
 // ── Canvas / Image Compositing ───────────────────────────
 
+struct BlitAxis {
+    int begin = 0;
+    int end = 0;  // exclusive canvas coordinate
+    double origin = 0;
+    double length = 0;
+
+    int source_edge(int canvas_edge, int source_length) const {
+        long double position = static_cast<long double>(canvas_edge) - origin;
+        if (!(position > 0)) return 0;  // also catches NaN
+        if (position >= length) return source_length;
+
+        // Preserve the old integer mapping where multiplication cannot
+        // overflow. Extreme PDF coordinates use long double only after their
+        // destination loop has already been clipped to the canvas.
+        constexpr long double kInt64Max =
+            std::numeric_limits<int64_t>::max();
+        if (length < kInt64Max &&
+            position <= kInt64Max / source_length) {
+            auto numerator = static_cast<int64_t>(position) * source_length;
+            return static_cast<int>(
+                numerator / static_cast<int64_t>(length));
+        }
+        long double mapped = position * source_length / length;
+        if (mapped <= 0) return 0;
+        if (mapped >= source_length) return source_length;
+        return static_cast<int>(mapped);
+    }
+
+    int source_pixel(int canvas_pixel, int source_length) const {
+        return std::min(source_length - 1,
+                        source_edge(canvas_pixel, source_length));
+    }
+
+    std::pair<int, int> source_interval(int canvas_pixel,
+                                        int source_length) const {
+        int first = source_pixel(canvas_pixel, source_length);
+        int last = source_edge(canvas_pixel + 1, source_length);
+        if (last <= first) last = first + 1;
+        if (last > source_length) last = source_length;
+        return {first, last};
+    }
+};
+
 // PDF coordinates are untrusted doubles. Clip them to the actual raster before
 // narrowing: a saturating int conversion alone can still leave billion-pixel
 // loops for an image that only covers a few visible pixels.
-static bool visible_blit_span(double origin, double extent, int limit,
-                              int& begin, int& end) {
-    if (!std::isfinite(origin) || !std::isfinite(extent) || limit <= 0)
+static bool clip_blit_axis(double origin, double length, int canvas_length,
+                           BlitAxis& out) {
+    if (!std::isfinite(origin) || !std::isfinite(length) || canvas_length <= 0)
         return false;
     origin = std::trunc(origin);
-    extent = std::trunc(std::abs(extent));
-    if (extent <= 0 || origin >= limit) return false;
+    length = std::trunc(std::abs(length));
+    if (length <= 0 || origin >= canvas_length) return false;
 
     double stop;
     if (origin < 0) {
-        if (extent <= -origin) return false;
-        stop = origin + extent;
+        if (length <= -origin) return false;
+        stop = origin + length;
     } else {
-        stop = (extent >= static_cast<double>(limit) - origin)
-                   ? static_cast<double>(limit)
-                   : origin + extent;
+        stop = (length >= static_cast<double>(canvas_length) - origin)
+                   ? static_cast<double>(canvas_length)
+                   : origin + length;
     }
     double first = std::max(0.0, origin);
-    double last = std::min(static_cast<double>(limit), stop);
+    double last = std::min(static_cast<double>(canvas_length), stop);
     if (first >= last) return false;
-    begin = static_cast<int>(first);
-    end = static_cast<int>(last);
-    return begin < end;
+    out = {static_cast<int>(first), static_cast<int>(last), origin, length};
+    return out.begin < out.end;
 }
 
-// Which source pixel a destination offset samples. Both operands are integral
-// — they come from trunc() — so the mapping stays the integer division the
-// blit loops have always used. Doing it in floating point instead rounds
-// 7/10*90 to 62.99999999999999 and shifts the sample a whole pixel, which
-// resamples the image rather than merely clipping it.
-static int scaled_sample_bound(double position, int source_extent,
-                               double destination_extent) {
-    if (!(position > 0)) return 0;                       // also catches NaN
-    if (position >= destination_extent) return source_extent;
-    int64_t dest = static_cast<int64_t>(destination_extent);
-    if (dest <= 0) return 0;
-    int64_t mapped = static_cast<int64_t>(position) * source_extent / dest;
-    if (mapped <= 0) return 0;
-    if (mapped >= source_extent) return source_extent;
-    return static_cast<int>(mapped);
-}
+struct PixelRange {
+    int begin = 0;
+    int end = 0;  // exclusive
+};
 
-static bool inclusive_canvas_bounds(double min_v, double max_v, int limit,
-                                    int& first, int& last) {
-    if (!std::isfinite(min_v) || !std::isfinite(max_v) || limit <= 0 ||
-        max_v < 0 || min_v > limit - 1.0)
+static bool clip_pixel_range(double min_value, double max_value,
+                             int canvas_length, PixelRange& out) {
+    if (!std::isfinite(min_value) || !std::isfinite(max_value) ||
+        canvas_length <= 0 || max_value < 0 ||
+        min_value > canvas_length - 1.0)
         return false;
-    min_v = std::max(0.0, std::min(limit - 1.0, min_v));
-    max_v = std::max(0.0, std::min(limit - 1.0, max_v));
-    first = static_cast<int>(min_v);
-    last = std::min(limit - 1, static_cast<int>(max_v) + 1);
-    return first <= last;
+    min_value = std::max(0.0, std::min(canvas_length - 1.0, min_value));
+    max_value = std::max(0.0, std::min(canvas_length - 1.0, max_value));
+    out.begin = static_cast<int>(min_value);
+    out.end = std::min(canvas_length, static_cast<int>(max_value) + 2);
+    return out.begin < out.end;
+}
+
+static bool clip_axis_aligned_image(const double ctm[6], double page_height,
+                                    double scale, int canvas_width,
+                                    int canvas_height, BlitAxis& x_axis,
+                                    BlitAxis& y_axis) {
+    double left = ctm[4] * scale;
+    double top = (page_height - ctm[5] - ctm[3]) * scale;
+    return clip_blit_axis(left, ctm[0] * scale, canvas_width, x_axis) &&
+           clip_blit_axis(top, ctm[3] * scale, canvas_height, y_axis);
+}
+
+struct InverseImageMap {
+    double determinant = 0;
+    PixelRange x;
+    PixelRange y;
+};
+
+static bool make_inverse_image_map(const double ctm[6], double page_height,
+                                   double scale, int canvas_width,
+                                   int canvas_height, InverseImageMap& out) {
+    out.determinant = ctm[0] * ctm[3] - ctm[1] * ctm[2];
+    if (!std::isfinite(out.determinant) ||
+        std::abs(out.determinant) < 1e-10)
+        return false;
+
+    double min_x = std::numeric_limits<double>::infinity();
+    double max_x = -min_x;
+    double min_y = min_x;
+    double max_y = -min_x;
+    for (int corner = 0; corner < 4; corner++) {
+        double image_x = (corner & 1) ? 1.0 : 0.0;
+        double image_y = (corner & 2) ? 1.0 : 0.0;
+        double page_x = ctm[0] * image_x + ctm[2] * image_y + ctm[4];
+        double page_y = ctm[1] * image_x + ctm[3] * image_y + ctm[5];
+        double canvas_x = page_x * scale;
+        double canvas_y = (page_height - page_y) * scale;
+        min_x = std::min(min_x, canvas_x);
+        max_x = std::max(max_x, canvas_x);
+        min_y = std::min(min_y, canvas_y);
+        max_y = std::max(max_y, canvas_y);
+    }
+    return clip_pixel_range(min_x, max_x, canvas_width, out.x) &&
+           clip_pixel_range(min_y, max_y, canvas_height, out.y);
 }
 
 struct Canvas {
@@ -1208,36 +1283,19 @@ struct Canvas {
 
         if (axis_aligned) {
             // Fast path: direct pixel copy
-            double px = ctm[4] * scale;
-            double py = (page_h - ctm[5] - ctm[3]) * scale;
-            double pw = ctm[0] * scale;
-            double ph = ctm[3] * scale;
-
-            int dx0, dx1, dy0, dy1;
-            if (!visible_blit_span(px, pw, width, dx0, dx1) ||
-                !visible_blit_span(py, ph, height, dy0, dy1))
+            BlitAxis x_axis, y_axis;
+            if (!clip_axis_aligned_image(ctm, page_h, scale, width, height,
+                                         x_axis, y_axis))
                 return;
-            double dst_x0 = std::trunc(px);
-            double dst_y0 = std::trunc(py);
-            double dw = std::trunc(std::abs(pw));
-            double dh = std::trunc(std::abs(ph));
 
-            bool downscale = (dw < sw || dh < sh);
-            for (int dy = dy0; dy < dy1; dy++) {
-                double y = dy - dst_y0;
-                for (int dx = dx0; dx < dx1; dx++) {
-                    double x = dx - dst_x0;
+            bool downscale = (x_axis.length < sw || y_axis.length < sh);
+            for (int dy = y_axis.begin; dy < y_axis.end; dy++) {
+                for (int dx = x_axis.begin; dx < x_axis.end; dx++) {
                     uint8_t r, g, b;
                     if (downscale) {
                         // Area sampling for downscale
-                        int sy0 = scaled_sample_bound(y, sh, dh);
-                        int sy1 = scaled_sample_bound(y + 1, sh, dh);
-                        int sx0 = scaled_sample_bound(x, sw, dw);
-                        int sx1 = scaled_sample_bound(x + 1, sw, dw);
-                        if (sy1 <= sy0) sy1 = sy0 + 1;
-                        if (sx1 <= sx0) sx1 = sx0 + 1;
-                        if (sy1 > sh) sy1 = sh;
-                        if (sx1 > sw) sx1 = sw;
+                        auto [sy0, sy1] = y_axis.source_interval(dy, sh);
+                        auto [sx0, sx1] = x_axis.source_interval(dx, sw);
                         // A single destination pixel can cover millions of
                         // source pixels. 32-bit sums overflow above ~8.4 Mpx;
                         // use wide accumulators because image dimensions come
@@ -1266,69 +1324,49 @@ struct Canvas {
                         blend_pixel(dx, dy, r, g, b,
                                     static_cast<uint8_t>(sa / cnt));
                         continue;
-                    } else {
-                        // Nearest-neighbor for upscale
-                        int sy = scaled_sample_bound(y, sh, dh);
-                        if (sy >= sh) sy = sh - 1;
-                        int sx = scaled_sample_bound(x, sw, dw);
-                        if (sx >= sw) sx = sw - 1;
-                        size_t src_idx =
-                            (static_cast<size_t>(sy) * sw + sx) * scomp;
-                        const uint8_t* sp = src + src_idx;
-                        sample_rgb(sp, scomp, r, g, b);
-                        blend_pixel(dx, dy, r, g, b, alpha_at(sx, sy));
-                        continue;
                     }
+                    // Nearest-neighbor for upscale
+                    int sy = y_axis.source_pixel(dy, sh);
+                    int sx = x_axis.source_pixel(dx, sw);
+                    size_t src_idx =
+                        (static_cast<size_t>(sy) * sw + sx) * scomp;
+                    const uint8_t* sp = src + src_idx;
+                    sample_rgb(sp, scomp, r, g, b);
+                    blend_pixel(dx, dy, r, g, b, alpha_at(sx, sy));
                 }
             }
         } else {
             // General case: inverse transform
             // For each destination pixel, find source pixel
-            double inv_det = ctm[0]*ctm[3] - ctm[1]*ctm[2];
-            if (!std::isfinite(inv_det) || std::abs(inv_det) < 1e-10) return;
-
-            // Bounding box in canvas space
-            double corners[4][2];
-            for (int i = 0; i < 4; i++) {
-                double ix = (i & 1) ? 1.0 : 0.0;
-                double iy = (i & 2) ? 1.0 : 0.0;
-                double pgx = ctm[0]*ix + ctm[2]*iy + ctm[4];
-                double pgy = ctm[1]*ix + ctm[3]*iy + ctm[5];
-                corners[i][0] = pgx * scale;
-                corners[i][1] = (page_h - pgy) * scale;
-            }
-            double min_x = 1e9, max_x = -1e9, min_y = 1e9, max_y = -1e9;
-            for (auto& c : corners) {
-                if (c[0] < min_x) min_x = c[0];
-                if (c[0] > max_x) max_x = c[0];
-                if (c[1] < min_y) min_y = c[1];
-                if (c[1] > max_y) max_y = c[1];
-            }
-
-            int x0, x1, y0, y1;
-            if (!inclusive_canvas_bounds(min_x, max_x, width, x0, x1) ||
-                !inclusive_canvas_bounds(min_y, max_y, height, y0, y1))
+            InverseImageMap image_map;
+            if (!make_inverse_image_map(ctm, page_h, scale, width, height,
+                                        image_map))
                 return;
 
-            for (int dy = y0; dy <= y1; dy++) {
-                for (int dx = x0; dx <= x1; dx++) {
-                    double pgx = dx / scale;
-                    double pgy = page_h - dy / scale;
-                    double lx = pgx - ctm[4];
-                    double ly = pgy - ctm[5];
-                    double ix = (ctm[3]*lx - ctm[2]*ly) / inv_det;
-                    double iy = (-ctm[1]*lx + ctm[0]*ly) / inv_det;
-                    if (ix < 0 || ix > 1 || iy < 0 || iy > 1) continue;
-                    int sx = static_cast<int>(ix * (sw - 1));
-                    int sy = static_cast<int>((1 - iy) * (sh - 1));
-                    if (sx < 0) sx = 0; if (sx >= sw) sx = sw - 1;
-                    if (sy < 0) sy = 0; if (sy >= sh) sy = sh - 1;
+            for (int canvas_y = image_map.y.begin;
+                 canvas_y < image_map.y.end; canvas_y++) {
+                for (int canvas_x = image_map.x.begin;
+                     canvas_x < image_map.x.end; canvas_x++) {
+                    double page_x = canvas_x / scale;
+                    double page_y = page_h - canvas_y / scale;
+                    double local_x = page_x - ctm[4];
+                    double local_y = page_y - ctm[5];
+                    double image_x = (ctm[3] * local_x - ctm[2] * local_y) /
+                                     image_map.determinant;
+                    double image_y = (-ctm[1] * local_x + ctm[0] * local_y) /
+                                     image_map.determinant;
+                    if (!std::isfinite(image_x) || !std::isfinite(image_y) ||
+                        image_x < 0 || image_x > 1 ||
+                        image_y < 0 || image_y > 1)
+                        continue;
+                    int sx = static_cast<int>(image_x * (sw - 1));
+                    int sy = static_cast<int>((1 - image_y) * (sh - 1));
                     size_t src_idx =
                         (static_cast<size_t>(sy) * sw + sx) * scomp;
                     const uint8_t* sp = src + src_idx;
                     uint8_t r, g, b;
                     sample_rgb(sp, scomp, r, g, b);
-                    blend_pixel(dx, dy, r, g, b, alpha_at(sx, sy));
+                    blend_pixel(canvas_x, canvas_y, r, g, b, alpha_at(sx, sy));
                 }
             }
         }
@@ -1937,10 +1975,7 @@ ImageData render_page_composite(PdfDoc& doc, const PdfObj& page_obj,
         int ip_alpha = static_cast<int>(
             std::min(1.0, std::max(0.0, ip.alpha)) * 255 + 0.5);
         if (is_image_mask && components == 1) {
-            // ImageMask: painted where mask bit is SET (pixel==0 means bit was 1 in decoder)
-            // In our grayscale: 0=black(bit was set), 255=white(bit was clear)
-            // Paint fill color (black) where bit was set (pixel==0),
-            // transparent where bit was clear (pixel==255)
+            // Composite mask coverage using the current fill color.
             uint8_t fr = static_cast<uint8_t>(std::min(255.0, std::max(0.0, ip.fill_r * 255)));
             uint8_t fg = static_cast<uint8_t>(std::min(255.0, std::max(0.0, ip.fill_g * 255)));
             uint8_t fb = static_cast<uint8_t>(std::min(255.0, std::max(0.0, ip.fill_b * 255)));
@@ -1948,70 +1983,48 @@ ImageData render_page_composite(PdfDoc& doc, const PdfObj& page_obj,
             // coordinates): the axis-aligned coverage loop below would place
             // the mask wrong, so inverse-map each destination pixel instead.
             if (std::abs(ip.ctm[1]) >= 0.001 || std::abs(ip.ctm[2]) >= 0.001) {
-                double inv_det = ip.ctm[0]*ip.ctm[3] - ip.ctm[1]*ip.ctm[2];
-                if (!std::isfinite(inv_det) || std::abs(inv_det) < 1e-10) return;
-                double cmin_x = 1e18, cmax_x = -1e18, cmin_y = 1e18, cmax_y = -1e18;
-                for (int i = 0; i < 4; i++) {
-                    double ix = (i & 1) ? 1.0 : 0.0;
-                    double iy = (i & 2) ? 1.0 : 0.0;
-                    double gx = ip.ctm[0]*ix + ip.ctm[2]*iy + ip.ctm[4];
-                    double gy = ip.ctm[1]*ix + ip.ctm[3]*iy + ip.ctm[5];
-                    double cx2 = gx * scale, cy2 = (page_h - gy) * scale;
-                    cmin_x = std::min(cmin_x, cx2); cmax_x = std::max(cmax_x, cx2);
-                    cmin_y = std::min(cmin_y, cy2); cmax_y = std::max(cmax_y, cy2);
-                }
-                int bx0, bx1, by0, by1;
-                if (!inclusive_canvas_bounds(cmin_x, cmax_x, canvas.width,
-                                             bx0, bx1) ||
-                    !inclusive_canvas_bounds(cmin_y, cmax_y, canvas.height,
-                                             by0, by1))
+                InverseImageMap image_map;
+                if (!make_inverse_image_map(ip.ctm, page_h, scale,
+                                            canvas.width, canvas.height,
+                                            image_map))
                     return;
-                for (int cy2 = by0; cy2 <= by1; cy2++) {
-                    for (int cx2 = bx0; cx2 <= bx1; cx2++) {
-                        double gx = cx2 / scale;
-                        double gy = page_h - cy2 / scale;
-                        double lx = gx - ip.ctm[4];
-                        double ly = gy - ip.ctm[5];
-                        double ix = (ip.ctm[3]*lx - ip.ctm[2]*ly) / inv_det;
-                        double iy = (-ip.ctm[1]*lx + ip.ctm[0]*ly) / inv_det;
-                        if (ix < 0 || ix > 1 || iy < 0 || iy > 1) continue;
-                        int sx = static_cast<int>(ix * (w - 1));
-                        int sy = static_cast<int>((1 - iy) * (h - 1));
-                        if (sx < 0) sx = 0; if (sx >= w) sx = w - 1;
-                        if (sy < 0) sy = 0; if (sy >= h) sy = h - 1;
+                for (int canvas_y = image_map.y.begin;
+                     canvas_y < image_map.y.end; canvas_y++) {
+                    for (int canvas_x = image_map.x.begin;
+                         canvas_x < image_map.x.end; canvas_x++) {
+                        double page_x = canvas_x / scale;
+                        double page_y = page_h - canvas_y / scale;
+                        double local_x = page_x - ip.ctm[4];
+                        double local_y = page_y - ip.ctm[5];
+                        double image_x =
+                            (ip.ctm[3] * local_x - ip.ctm[2] * local_y) /
+                            image_map.determinant;
+                        double image_y =
+                            (-ip.ctm[1] * local_x + ip.ctm[0] * local_y) /
+                            image_map.determinant;
+                        if (!std::isfinite(image_x) ||
+                            !std::isfinite(image_y) || image_x < 0 ||
+                            image_x > 1 || image_y < 0 || image_y > 1)
+                            continue;
+                        int sx = static_cast<int>(image_x * (w - 1));
+                        int sy = static_cast<int>((1 - image_y) * (h - 1));
                         if (pixels[static_cast<size_t>(sy) * w + sx] > 128)
-                            canvas.blend_pixel(cx2, cy2, fr, fg, fb,
+                            canvas.blend_pixel(canvas_x, canvas_y, fr, fg, fb,
                                                static_cast<uint8_t>(ip_alpha));
                     }
                 }
                 return;
             }
             // Blit with alpha — use Canvas blit for proper CTM handling
-            double px = ip.ctm[4] * scale;
-            double py = (page_h - ip.ctm[5] - ip.ctm[3]) * scale;
-            double pw = std::abs(ip.ctm[0] * scale);
-            double ph = std::abs(ip.ctm[3] * scale);
-            int dx0, dx1, dy0, dy1;
-            if (!visible_blit_span(px, pw, canvas.width, dx0, dx1) ||
-                !visible_blit_span(py, ph, canvas.height, dy0, dy1))
+            BlitAxis x_axis, y_axis;
+            if (!clip_axis_aligned_image(ip.ctm, page_h, scale, canvas.width,
+                                         canvas.height, x_axis, y_axis))
                 return;
-            double dst_x0 = std::trunc(px);
-            double dst_y0 = std::trunc(py);
-            double dw = std::trunc(pw);
-            double dh = std::trunc(ph);
             // Area sampling for ImageMask: compute coverage ratio in source region
-            for (int dy = dy0; dy < dy1; dy++) {
-                double y = dy - dst_y0;
-                int sy0 = scaled_sample_bound(y, h, dh);
-                int sy1 = scaled_sample_bound(y + 1, h, dh);
-                if (sy1 <= sy0) sy1 = sy0 + 1;
-                if (sy1 > h) sy1 = h;
-                for (int dx = dx0; dx < dx1; dx++) {
-                    double x = dx - dst_x0;
-                    int sx0 = scaled_sample_bound(x, w, dw);
-                    int sx1 = scaled_sample_bound(x + 1, w, dw);
-                    if (sx1 <= sx0) sx1 = sx0 + 1;
-                    if (sx1 > w) sx1 = w;
+            for (int dy = y_axis.begin; dy < y_axis.end; dy++) {
+                auto [sy0, sy1] = y_axis.source_interval(dy, h);
+                for (int dx = x_axis.begin; dx < x_axis.end; dx++) {
+                    auto [sx0, sx1] = x_axis.source_interval(dx, w);
                     // Count set pixels in source region
                     uint64_t total = static_cast<uint64_t>(sy1 - sy0) *
                                      static_cast<uint64_t>(sx1 - sx0);
