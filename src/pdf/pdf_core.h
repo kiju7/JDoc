@@ -533,6 +533,10 @@ struct PdfFont {
 
 // Cross-translation-unit declarations.
 std::vector<uint8_t> decode_flate(const uint8_t* src, size_t src_len);
+// Locate the exact end of one complete zlib stream. Unlike decode_flate(),
+// this rejects truncated input instead of returning recoverable partial data.
+bool flate_encoded_size(const uint8_t* src, size_t src_len,
+                        size_t& encoded_size);
 PdfFont load_font(PdfDoc& doc, const PdfObj& font_ref);
 
 }} // namespace jdoc::pdf_detail

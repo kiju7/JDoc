@@ -29,6 +29,34 @@ namespace jdoc { namespace pdf_detail {
 
 namespace {
 
+class DisjointSet {
+public:
+    explicit DisjointSet(size_t count) : parent_(count), rank_(count, 0) {
+        std::iota(parent_.begin(), parent_.end(), size_t{0});
+    }
+
+    size_t find(size_t node) {
+        while (parent_[node] != node) {
+            parent_[node] = parent_[parent_[node]];
+            node = parent_[node];
+        }
+        return node;
+    }
+
+    void unite(size_t a, size_t b) {
+        a = find(a);
+        b = find(b);
+        if (a == b) return;
+        if (rank_[a] < rank_[b]) std::swap(a, b);
+        parent_[b] = a;
+        if (rank_[a] == rank_[b]) rank_[a]++;
+    }
+
+private:
+    std::vector<size_t> parent_;
+    std::vector<unsigned char> rank_;
+};
+
 // Limit simultaneous page-composite working sets process-wide. An A4 RGB
 // canvas at 300 DPI is about 26 MiB, while compression and decoded source
 // rasters add further transient allocations. Text-only pages do not take a
@@ -448,15 +476,7 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
             }
 
             const size_t n_inf = infos.size();
-            std::vector<size_t> parent(n_inf);
-            for (size_t i = 0; i < n_inf; i++) parent[i] = i;
-            auto find = [&](size_t a) {
-                while (parent[a] != a) {
-                    parent[a] = parent[parent[a]];
-                    a = parent[a];
-                }
-                return a;
-            };
+            DisjointSet image_sets(n_inf);
 
             // Print-driver strips abut within sub-point rounding; distinct
             // assets sit tens of points apart in real layouts.
@@ -464,7 +484,7 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
             if (n_inf > 2000) {
                 // Thousands of placements on one page IS a shredded raster;
                 // pairwise adjacency adds nothing at that count.
-                for (size_t i = 1; i < n_inf; i++) parent[i] = 0;
+                for (size_t i = 1; i < n_inf; i++) image_sets.unite(0, i);
             } else {
                 for (size_t a = 0; a < n_inf; a++) {
                     // Same object drawn again at the same spot (producer
@@ -487,8 +507,7 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
                                 eps_y = std::max(eps, 0.02 * page_h);
                         }
                         if (gx <= eps && gy <= eps_y) {
-                            size_t ra = find(a), rb = find(b);
-                            if (ra != rb) parent[rb] = ra;
+                            image_sets.unite(a, b);
                         }
                     }
                 }
@@ -503,7 +522,7 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
             {
                 std::unordered_map<size_t, size_t> root_to_cluster;
                 for (size_t i = 0; i < n_inf; i++) {
-                    size_t r = find(i);
+                    size_t r = image_sets.find(i);
                     auto [it, fresh] =
                         root_to_cluster.try_emplace(r, clusters.size());
                     if (fresh) clusters.emplace_back();
@@ -675,15 +694,7 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
                     }
 
                     const size_t np = pb.size();
-                    std::vector<size_t> fparent(np);
-                    for (size_t i = 0; i < np; i++) fparent[i] = i;
-                    auto ffind = [&](size_t a) {
-                        while (fparent[a] != a) {
-                            fparent[a] = fparent[fparent[a]];
-                            a = fparent[a];
-                        }
-                        return a;
-                    };
+                    DisjointSet figure_sets(np);
                     for (size_t a = 0; a < np; a++)
                         for (size_t b = a + 1; b < np; b++) {
                             double gx = std::max(pb[a].x0, pb[b].x0) -
@@ -691,8 +702,7 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
                             double gy = std::max(pb[a].y0, pb[b].y0) -
                                         std::min(pb[a].y1, pb[b].y1);
                             if (gx <= eps && gy <= eps) {
-                                size_t ra = ffind(a), rb = ffind(b);
-                                if (ra != rb) fparent[rb] = ra;
+                                figure_sets.unite(a, b);
                             }
                         }
 
@@ -706,7 +716,7 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
                         std::unordered_map<size_t, size_t> root_to_fig;
                         for (size_t i = 0; i < np; i++) {
                             auto [it, fresh] = root_to_fig.try_emplace(
-                                ffind(i), figs.size());
+                                figure_sets.find(i), figs.size());
                             if (fresh) figs.emplace_back();
                             auto& fc = figs[it->second];
                             fc.n++;

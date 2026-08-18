@@ -1391,6 +1391,7 @@ struct Canvas {
     int width, height;
     size_t stride; // PNG row layout: 1 filter byte + width*3 samples
     std::vector<uint8_t> pixels;
+    bool painted = false; // at least one in-bounds sample had nonzero coverage
 
     // Rows carry their PNG filter byte (0 = none) so the finished canvas
     // deflates in place, skipping a full-page copy at encode time.
@@ -1403,11 +1404,13 @@ struct Canvas {
     void blend_pixel(int x, int y, uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
         if (static_cast<unsigned>(x) >= static_cast<unsigned>(width) ||
             static_cast<unsigned>(y) >= static_cast<unsigned>(height)) return;
+        if (a == 0) return;
+        painted = true;
         uint8_t* p = pixels.data() + static_cast<size_t>(y) * stride + 1 +
                      static_cast<size_t>(x) * 3;
         if (a >= 255) {
             p[0] = r; p[1] = g; p[2] = b;
-        } else if (a > 0) {
+        } else {
             // Alpha blend onto opaque white background (no dst alpha needed)
             unsigned inv = 255 - a;
             p[0] = static_cast<uint8_t>((r * a + p[0] * inv + 127) >> 8);
@@ -1628,12 +1631,25 @@ struct Canvas {
 
 // ── Page Rendering ───────────────────────────────────────
 
-ImageData render_page_composite(PdfDoc& doc, const PdfObj& resources,
-                                 const ContentParseResult& parse_result,
-                                 int page_num, double page_w, double page_h,
-                                 const std::string& output_dir,
-                                 int img_idx,
-                                 PageRenderDiag* diag) {
+static ImageData render_composite_view(
+        PdfDoc& doc, const PdfObj& resources,
+        const ContentParseResult& parse_result,
+        const std::vector<size_t>* image_indices,
+        const std::vector<size_t>* path_indices,
+        double origin_x, double origin_y,
+        int page_num, double page_w, double page_h,
+        const std::string& output_dir, int img_idx,
+        PageRenderDiag* diag) {
+    const size_t image_count = image_indices ? image_indices->size()
+                                             : parse_result.images.size();
+    const size_t path_count = path_indices ? path_indices->size()
+                                           : parse_result.paths.size();
+    auto image_at = [&](size_t pos) -> const ImagePlacement& {
+        return parse_result.images[image_indices ? (*image_indices)[pos] : pos];
+    };
+    auto path_at = [&](size_t pos) -> const RenderPath& {
+        return parse_result.paths[path_indices ? (*path_indices)[pos] : pos];
+    };
     constexpr double kMinDPI = 150.0;
     constexpr double kMaxDPI = 300.0;
     constexpr double kBase = 72.0;
@@ -1643,7 +1659,8 @@ ImageData render_page_composite(PdfDoc& doc, const PdfObj& resources,
     double dpi = kMinDPI;
     {
         const PdfObj& pre_res = resources;
-        for (auto& ip : parse_result.images) {
+        for (size_t image_pos = 0; image_pos < image_count; image_pos++) {
+            const auto& ip = image_at(image_pos);
             PdfObj xobj_res;
             if (ip.inline_img) {
                 // Inline strips carry their own dims and filter.
@@ -1749,10 +1766,10 @@ ImageData render_page_composite(PdfDoc& doc, const PdfObj& resources,
             v = std::max(0.0, std::min(static_cast<double>(hi), v));
             return static_cast<int>(std::ceil(v));
         };
-        out[0] = clamp_floor(clip[0] * scale, rw);
-        out[2] = clamp_ceil(clip[2] * scale, rw);
-        out[1] = clamp_floor((page_h - clip[3]) * scale, rh);
-        out[3] = clamp_ceil((page_h - clip[1]) * scale, rh);
+        out[0] = clamp_floor((clip[0] - origin_x) * scale, rw);
+        out[2] = clamp_ceil((clip[2] - origin_x) * scale, rw);
+        out[1] = clamp_floor((page_h - (clip[3] - origin_y)) * scale, rh);
+        out[3] = clamp_ceil((page_h - (clip[1] - origin_y)) * scale, rh);
         return out[0] < out[2] && out[1] < out[3];
     };
 
@@ -1983,14 +2000,18 @@ ImageData render_page_composite(PdfDoc& doc, const PdfObj& resources,
                 case PathPoint::MOVE:
                     if (!cur_sub.empty()) subpaths.push_back(std::move(cur_sub));
                     cur_sub.clear();
-                    cur_sub.push_back({pt.x, pt.y});
-                    px = pt.x; py = pt.y; break;
+                    cur_sub.push_back({pt.x - origin_x, pt.y - origin_y});
+                    px = pt.x - origin_x; py = pt.y - origin_y; break;
                 case PathPoint::LINE:
-                    cur_sub.push_back({pt.x, pt.y});
-                    px = pt.x; py = pt.y; break;
+                    cur_sub.push_back({pt.x - origin_x, pt.y - origin_y});
+                    px = pt.x - origin_x; py = pt.y - origin_y; break;
                 case PathPoint::CURVE:
-                    flatten_bezier(px, py, pt.cx1, pt.cy1, pt.cx2, pt.cy2, pt.x, pt.y, cur_sub, 0.25);
-                    px = pt.x; py = pt.y; break;
+                    flatten_bezier(px, py,
+                                   pt.cx1 - origin_x, pt.cy1 - origin_y,
+                                   pt.cx2 - origin_x, pt.cy2 - origin_y,
+                                   pt.x - origin_x, pt.y - origin_y,
+                                   cur_sub, 0.25);
+                    px = pt.x - origin_x; py = pt.y - origin_y; break;
                 case PathPoint::CLOSE:
                     if (!cur_sub.empty()) { cur_sub.push_back(cur_sub[0]); px = cur_sub[0].first; py = cur_sub[0].second; }
                     break;
@@ -2068,8 +2089,11 @@ ImageData render_page_composite(PdfDoc& doc, const PdfObj& resources,
 
     const PdfObj& res = resources;
 
-    int images_drawn = 0;
     auto draw_image = [&](const ImagePlacement& ip) {
+        double image_ctm[6];
+        std::memcpy(image_ctm, ip.ctm, sizeof(image_ctm));
+        image_ctm[4] -= origin_x;
+        image_ctm[5] -= origin_y;
         PdfObj xobj_res;
         if (ip.inline_img) {
             // Inline image: the synthesized stream carries dict and payload.
@@ -2341,8 +2365,6 @@ ImageData render_page_composite(PdfDoc& doc, const PdfObj& resources,
             if (diag) { diag->images_failed++; diag->decode_size_mismatch++; }
             return;
         }
-        images_drawn++;
-
         int ip_alpha = static_cast<int>(
             std::min(1.0, std::max(0.0, ip.alpha)) * 255 + 0.5);
         if (is_image_mask && components == 1) {
@@ -2353,9 +2375,10 @@ ImageData render_page_composite(PdfDoc& doc, const PdfObj& resources,
             // Rotated placement (e.g. a /Rotate page normalized into viewing
             // coordinates): the axis-aligned coverage loop below would place
             // the mask wrong, so inverse-map each destination pixel instead.
-            if (std::abs(ip.ctm[1]) >= 0.001 || std::abs(ip.ctm[2]) >= 0.001) {
+            if (std::abs(image_ctm[1]) >= 0.001 ||
+                std::abs(image_ctm[2]) >= 0.001) {
                 InverseImageMap image_map;
-                if (!make_inverse_image_map(ip.ctm, page_h, scale,
+                if (!make_inverse_image_map(image_ctm, page_h, scale,
                                             canvas.width, canvas.height,
                                             image_map))
                     return;
@@ -2369,13 +2392,15 @@ ImageData render_page_composite(PdfDoc& doc, const PdfObj& resources,
                          canvas_x < image_map.x.end; canvas_x++) {
                         double page_x = canvas_x / scale;
                         double page_y = page_h - canvas_y / scale;
-                        double local_x = page_x - ip.ctm[4];
-                        double local_y = page_y - ip.ctm[5];
+                        double local_x = page_x - image_ctm[4];
+                        double local_y = page_y - image_ctm[5];
                         double image_x =
-                            (ip.ctm[3] * local_x - ip.ctm[2] * local_y) /
+                            (image_ctm[3] * local_x -
+                             image_ctm[2] * local_y) /
                             image_map.determinant;
                         double image_y =
-                            (-ip.ctm[1] * local_x + ip.ctm[0] * local_y) /
+                            (-image_ctm[1] * local_x +
+                             image_ctm[0] * local_y) /
                             image_map.determinant;
                         if (!std::isfinite(image_x) ||
                             !std::isfinite(image_y) || image_x < 0 ||
@@ -2410,7 +2435,7 @@ ImageData render_page_composite(PdfDoc& doc, const PdfObj& resources,
             }
             // Blit with alpha — use Canvas blit for proper CTM handling
             BlitAxis x_axis, y_axis;
-            if (!clip_axis_aligned_image(ip.ctm, page_h, scale, canvas.width,
+            if (!clip_axis_aligned_image(image_ctm, page_h, scale, canvas.width,
                                          canvas.height, x_axis, y_axis))
                 return;
             x_axis.begin = std::max(x_axis.begin, clip_px[0]);
@@ -2444,7 +2469,8 @@ ImageData render_page_composite(PdfDoc& doc, const PdfObj& resources,
             int smw = 0, smh = 0;
             if (!decode_smask(doc, xobj, smask, smw, smh))
                 decode_stencil_mask(doc, xobj, smask, smw, smh);
-            canvas.blit_image(pixels.data(), w, h, components, ip.ctm, page_h, scale,
+            canvas.blit_image(pixels.data(), w, h, components, image_ctm,
+                              page_h, scale,
                               smask.empty() ? nullptr : smask.data(), smw, smh,
                               ip_alpha, clip_px,
                               tint_cs ? tint_cs->lut.data() : nullptr);
@@ -2457,21 +2483,20 @@ ImageData render_page_composite(PdfDoc& doc, const PdfObj& resources,
     // of GDI print-to-PDF pages.
     {
         size_t pi = 0, ii = 0;
-        while (pi < parse_result.paths.size() || ii < parse_result.images.size()) {
+        while (pi < path_count || ii < image_count) {
             bool take_path =
-                ii >= parse_result.images.size() ||
-                (pi < parse_result.paths.size() &&
-                 parse_result.paths[pi].seq <= parse_result.images[ii].seq);
-            if (take_path) draw_path(parse_result.paths[pi++]);
-            else draw_image(parse_result.images[ii++]);
+                ii >= image_count ||
+                (pi < path_count && path_at(pi).seq <= image_at(ii).seq);
+            if (take_path) draw_path(path_at(pi++));
+            else draw_image(image_at(ii++));
         }
     }
 
-    // Every image placement failed to draw and no vector path was recorded:
-    // the canvas is blank white, and shipping it would read as success.
-    // Returning empty hands control back to the caller's extraction fallback.
-    if (images_drawn == 0 && parse_result.paths.empty() &&
-        !parse_result.images.empty())
+    // Decoding is not painting: a fully transparent mask, zero-alpha image,
+    // or completely clipped operation can decode successfully while leaving
+    // the canvas untouched. Do not ship that white canvas as a successful
+    // page image; the caller may retry individual extraction or omit it.
+    if (!canvas.painted && (path_count != 0 || image_count != 0))
         return {};
 
     ImageData img;
@@ -2502,6 +2527,17 @@ ImageData render_page_composite(PdfDoc& doc, const PdfObj& resources,
     return img;
 }
 
+ImageData render_page_composite(PdfDoc& doc, const PdfObj& resources,
+                                const ContentParseResult& parse_result,
+                                int page_num, double page_w, double page_h,
+                                const std::string& output_dir,
+                                int img_idx,
+                                PageRenderDiag* diag) {
+    return render_composite_view(doc, resources, parse_result, nullptr, nullptr,
+                                 0, 0, page_num, page_w, page_h, output_dir,
+                                 img_idx, diag);
+}
+
 ImageData render_region_composite(PdfDoc& doc, const PdfObj& resources,
                                   const ContentParseResult& parse_result,
                                   const std::vector<size_t>& members,
@@ -2516,24 +2552,24 @@ ImageData render_region_composite(PdfDoc& doc, const PdfObj& resources,
         rgn_w < 1.0 || rgn_h < 1.0)
         return {};
 
-    // Translate the members and every intersecting path into region-local
-    // coordinates; with page dims set to the region size, the page compositor
-    // renders exactly the cropped window (its canvas math is origin-based).
-    ContentParseResult sub;
-    sub.images.reserve(members.size());
-    for (size_t idx : members) {
-        if (idx >= parse_result.images.size()) continue;
-        ImagePlacement ip = parse_result.images[idx];
-        ip.ctm[4] -= x0;
-        ip.ctm[5] -= y0;
-        ip.clip[0] -= static_cast<float>(x0);
-        ip.clip[2] -= static_cast<float>(x0);
-        ip.clip[1] -= static_cast<float>(y0);
-        ip.clip[3] -= static_cast<float>(y0);
-        sub.images.push_back(std::move(ip));
+    // Keep source geometry in place. The compositor applies the region origin
+    // while flattening/drawing, so cropped figures do not duplicate every
+    // RenderPath and its PathPoint allocation.
+    const std::vector<size_t>* selected_images = &members;
+    std::vector<size_t> valid_images;
+    if (std::any_of(members.begin(), members.end(), [&](size_t idx) {
+            return idx >= parse_result.images.size();
+        })) {
+        valid_images.reserve(members.size());
+        for (size_t idx : members)
+            if (idx < parse_result.images.size()) valid_images.push_back(idx);
+        selected_images = &valid_images;
     }
 
-    for (const auto& rp : parse_result.paths) {
+    std::vector<size_t> selected_paths;
+    selected_paths.reserve(parse_result.paths.size());
+    for (size_t path_idx = 0; path_idx < parse_result.paths.size(); path_idx++) {
+        const auto& rp = parse_result.paths[path_idx];
         double bx0, by0, bx1, by1;
         bx0 = by0 = 1e300;
         bx1 = by1 = -1e300;
@@ -2553,24 +2589,15 @@ ImageData render_region_composite(PdfDoc& doc, const PdfObj& resources,
         if (bx1 + pad < region[0] || bx0 - pad > region[2] ||
             by1 + pad < region[1] || by0 - pad > region[3])
             continue;
-        RenderPath sp = rp;
-        for (auto& pt : sp.points) {
-            pt.x -= x0; pt.y -= y0;
-            pt.cx1 -= x0; pt.cy1 -= y0;
-            pt.cx2 -= x0; pt.cy2 -= y0;
-        }
-        sp.clip[0] -= static_cast<float>(x0);
-        sp.clip[2] -= static_cast<float>(x0);
-        sp.clip[1] -= static_cast<float>(y0);
-        sp.clip[3] -= static_cast<float>(y0);
-        sub.paths.push_back(std::move(sp));
+        selected_paths.push_back(path_idx);
     }
     // Vector-figure regions legitimately hold paths only; a region with
     // neither is nothing to draw.
-    if (sub.images.empty() && sub.paths.empty()) return {};
+    if (selected_images->empty() && selected_paths.empty()) return {};
 
-    return render_page_composite(doc, resources, sub, page_num, rgn_w, rgn_h,
-                                 output_dir, img_idx, diag);
+    return render_composite_view(doc, resources, parse_result, selected_images,
+                                 &selected_paths, x0, y0, page_num, rgn_w,
+                                 rgn_h, output_dir, img_idx, diag);
 }
 
 // ── Bookmark Extraction ──────────────────────────────────

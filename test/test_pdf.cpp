@@ -3,8 +3,16 @@
 
 #include <iostream>
 #include <fstream>
-#include <cassert>
 #include <chrono>
+
+#define CHECK(condition) \
+    do { \
+        if (!(condition)) { \
+            std::cerr << "FAIL " << __FILE__ << ":" << __LINE__ \
+                      << ": " #condition "\n"; \
+            return 1; \
+        } \
+    } while (false)
 
 int main(int argc, char* argv[]) {
     const char* test_pdf = (argc > 1) ? argv[1] : "test/fixtures/pdf/sample.pdf";
@@ -29,7 +37,7 @@ int main(int argc, char* argv[]) {
 
         std::cout << "    Time: " << elapsed << "s\n";
         std::cout << "    Output length: " << md.size() << " bytes\n";
-        assert(!md.empty());
+        CHECK(!md.empty());
     } catch (const std::exception& e) {
         std::cerr << "    FAIL: " << e.what() << "\n";
         return 1;
@@ -40,7 +48,7 @@ int main(int argc, char* argv[]) {
     try {
         auto chunks = jdoc::pdf_to_markdown_chunks(test_pdf);
         std::cout << "    Pages: " << chunks.size() << "\n";
-        assert(!chunks.empty());
+        CHECK(!chunks.empty());
         for (auto& c : chunks) {
             std::cout << "    Page " << c.page_number
                       << ": " << c.text.size() << " bytes"
@@ -59,7 +67,7 @@ int main(int argc, char* argv[]) {
         opts.pages = {0};
         std::string md = jdoc::pdf_to_markdown(test_pdf, opts);
         std::cout << "    Page 0 only: " << md.size() << " bytes\n";
-        assert(!md.empty());
+        CHECK(!md.empty());
     } catch (const std::exception& e) {
         std::cerr << "    FAIL: " << e.what() << "\n";
         return 1;
@@ -72,7 +80,7 @@ int main(int argc, char* argv[]) {
         opts.tables = false;
         std::string md = jdoc::pdf_to_markdown(test_pdf, opts);
         std::cout << "    No tables: " << md.size() << " bytes\n";
-        assert(!md.empty());
+        CHECK(!md.empty());
     } catch (const std::exception& e) {
         std::cerr << "    FAIL: " << e.what() << "\n";
         return 1;
@@ -92,9 +100,9 @@ int main(int argc, char* argv[]) {
             f.close();
             try {
                 auto chunks = jdoc::pdf_to_markdown_chunks(fixture);
-                assert(chunks.size() == 1);
-                assert(chunks[0].images.size() == 1);
-                assert(chunks[0].images[0].format == "png");
+                CHECK(chunks.size() == 1);
+                CHECK(chunks[0].images.size() == 1);
+                CHECK(chunks[0].images[0].format == "png");
 
                 const std::string& md = chunks[0].text;
                 size_t refs = 0;
@@ -103,7 +111,7 @@ int main(int argc, char* argv[]) {
                     refs++;
                 std::cout << "    Chunk images: " << chunks[0].images.size()
                           << ", image refs: " << refs << " (expected 1 each)\n";
-                assert(refs == 1);
+                CHECK(refs == 1);
             } catch (const std::exception& e) {
                 std::cerr << "    FAIL: " << e.what() << "\n";
                 return 1;
@@ -141,7 +149,7 @@ int main(int argc, char* argv[]) {
             f.close();
             try {
                 auto chunks = jdoc::pdf_to_markdown_chunks(c.fixture);
-                assert(chunks.size() == 1);
+                CHECK(chunks.size() == 1);
                 size_t refs = 0;
                 const std::string& md = chunks[0].text;
                 for (size_t i = md.find("!["); i != std::string::npos;
@@ -150,10 +158,10 @@ int main(int argc, char* argv[]) {
                 std::cout << "    " << c.fixture << ": "
                           << chunks[0].images.size() << " images, " << refs
                           << " refs (expected " << c.want_images << ")\n";
-                assert(chunks[0].images.size() == c.want_images);
-                assert(refs == c.want_images);
-                assert(!c.want_text ||
-                       md.find(c.want_text) != std::string::npos);
+                CHECK(chunks[0].images.size() == c.want_images);
+                CHECK(refs == c.want_images);
+                CHECK(!c.want_text ||
+                      md.find(c.want_text) != std::string::npos);
             } catch (const std::exception& e) {
                 std::cerr << "    FAIL: " << c.fixture << ": " << e.what()
                           << "\n";
@@ -179,10 +187,10 @@ int main(int argc, char* argv[]) {
                  i = md.find("![", i + 2))
                 refs++;
             std::cout << "    refs=" << refs << "\n";
-            assert(refs == 1);
+            CHECK(refs == 1);
             for (int i = 0; i < 6; i++)
-                assert(md.find("The quick brown fox " + std::to_string(i)) !=
-                       std::string::npos);
+                CHECK(md.find("The quick brown fox " + std::to_string(i)) !=
+                      std::string::npos);
         }
     }
 
@@ -198,18 +206,18 @@ int main(int argc, char* argv[]) {
         } else {
             f.close();
             auto chunks = jdoc::pdf_to_markdown_chunks(basic);
-            assert(chunks.size() == 1);
-            assert(chunks[0].images.size() == 1);
+            CHECK(chunks.size() == 1);
+            CHECK(chunks[0].images.size() == 1);
 
             std::string md =
                 jdoc::pdf_to_markdown("test/fixtures/pdf/inline_corrupt.pdf");
-            assert(md.find("MARKER_TEXT_LINE_A") != std::string::npos);
-            assert(md.find("MARKER_TEXT_LINE_C") != std::string::npos);
-            assert(md.find("LEAKED") == std::string::npos);
+            CHECK(md.find("MARKER_TEXT_LINE_A") != std::string::npos);
+            CHECK(md.find("MARKER_TEXT_LINE_C") != std::string::npos);
+            CHECK(md.find("LEAKED") == std::string::npos);
 
             auto ahx = jdoc::pdf_to_markdown_chunks(
                 "test/fixtures/pdf/inline_ahx.pdf");
-            assert(ahx.size() == 1 && ahx[0].images.size() == 1);
+            CHECK(ahx.size() == 1 && ahx[0].images.size() == 1);
             std::cout << "    inline basic/corrupt/ahx OK\n";
         }
     }
@@ -225,14 +233,14 @@ int main(int argc, char* argv[]) {
             f.close();
             auto rl = jdoc::pdf_to_markdown_chunks(
                 "test/fixtures/pdf/rl_image.pdf");
-            assert(rl.size() == 1 && rl[0].images.size() == 1);
+            CHECK(rl.size() == 1 && rl[0].images.size() == 1);
 
             auto bad = jdoc::pdf_to_markdown_chunks(
                 "test/fixtures/pdf/bad_filter.pdf");
-            assert(bad.size() == 1);
-            assert(bad[0].images.empty());
-            assert(bad[0].degraded_images == 1);
-            assert(bad[0].text.find("failed to decode") != std::string::npos);
+            CHECK(bad.size() == 1);
+            CHECK(bad[0].images.empty());
+            CHECK(bad[0].degraded_images == 1);
+            CHECK(bad[0].text.find("failed to decode") != std::string::npos);
             std::cout << "    rl_image 1 image, bad_filter degraded=1 OK\n";
         }
     }
@@ -248,8 +256,8 @@ int main(int argc, char* argv[]) {
             f.close();
             auto chunks = jdoc::pdf_to_markdown_chunks(
                 "test/fixtures/pdf/inherited_res.pdf");
-            assert(chunks.size() == 1);
-            assert(chunks[0].images.size() == 1);
+            CHECK(chunks.size() == 1);
+            CHECK(chunks[0].images.size() == 1);
             std::cout << "    1 image extracted OK\n";
         }
     }
@@ -265,11 +273,11 @@ int main(int argc, char* argv[]) {
             f.close();
             auto chunks = jdoc::pdf_to_markdown_chunks(
                 "test/fixtures/pdf/jbig2_symtext.pdf");
-            assert(chunks.size() == 1);
-            assert(chunks[0].images.size() == 1);
-            assert(chunks[0].degraded_images == 0);
-            assert(chunks[0].images[0].width == 400);
-            assert(chunks[0].images[0].height == 120);
+            CHECK(chunks.size() == 1);
+            CHECK(chunks[0].images.size() == 1);
+            CHECK(chunks[0].degraded_images == 0);
+            CHECK(chunks[0].images[0].width == 400);
+            CHECK(chunks[0].images[0].height == 120);
             std::cout << "    400x120 symbol-text image extracted OK\n";
         }
     }

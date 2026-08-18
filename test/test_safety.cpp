@@ -459,6 +459,82 @@ void test_pdf_composite_clips_extreme_coordinates_before_narrowing() {
     CHECK(invalid.data.empty());
 }
 
+void test_pdf_region_composite_matches_translated_geometry() {
+    using namespace jdoc::pdf_detail;
+
+    const uint8_t placeholder = 0;
+    PdfDoc doc(&placeholder, 1);
+    auto image = PdfObj::make_dict();
+    image.type = ObjType::STREAM;
+    image.dict.push_back({"Subtype", PdfObj::make_name("Image")});
+    image.dict.push_back({"Width", PdfObj::make_int(1)});
+    image.dict.push_back({"Height", PdfObj::make_int(1)});
+    image.dict.push_back({"BitsPerComponent", PdfObj::make_int(8)});
+    image.dict.push_back({"ColorSpace", PdfObj::make_name("DeviceRGB")});
+    image.stream_data = {220, 30, 20};
+    auto xobjects = PdfObj::make_dict();
+    xobjects.dict.push_back({"Im0", std::move(image)});
+    auto resources = PdfObj::make_dict();
+    resources.dict.push_back({"XObject", std::move(xobjects)});
+
+    ContentParseResult source;
+    RenderPath path{};
+    path.points = {{30, 30, PathPoint::MOVE},
+                   {70, 30, PathPoint::LINE},
+                   {70, 70, PathPoint::LINE},
+                   {30, 70, PathPoint::LINE},
+                   {0, 0, PathPoint::CLOSE}};
+    path.fill_r = 0.1; path.fill_g = 0.2; path.fill_b = 0.8;
+    path.stroke_r = path.stroke_g = path.stroke_b = 0;
+    path.line_width = 0;
+    path.do_fill = true;
+    path.do_stroke = false;
+    path.clip[0] = 25; path.clip[1] = 25;
+    path.clip[2] = 75; path.clip[3] = 75;
+    path.seq = 0;
+    source.paths.push_back(path);
+
+    ImagePlacement placement{};
+    placement.xobj_name = "Im0";
+    const double ctm[6] = {15, 0, 0, 15, 50, 50};
+    std::memcpy(placement.ctm, ctm, sizeof(ctm));
+    placement.clip[0] = 20; placement.clip[1] = 20;
+    placement.clip[2] = 80; placement.clip[3] = 80;
+    placement.alpha = 1;
+    placement.seq = 1;
+    source.images.push_back(placement);
+
+    const double region[4] = {20, 20, 80, 80};
+    const std::vector<size_t> members = {0};
+    auto actual = render_region_composite(doc, resources, source, members, 0,
+                                          region, "", 0, nullptr);
+
+    // Reproduce the former copy-and-translate implementation as the oracle.
+    ContentParseResult translated = source;
+    for (auto& pt : translated.paths[0].points) {
+        pt.x -= region[0]; pt.y -= region[1];
+        pt.cx1 -= region[0]; pt.cy1 -= region[1];
+        pt.cx2 -= region[0]; pt.cy2 -= region[1];
+    }
+    translated.paths[0].clip[0] -= static_cast<float>(region[0]);
+    translated.paths[0].clip[1] -= static_cast<float>(region[1]);
+    translated.paths[0].clip[2] -= static_cast<float>(region[0]);
+    translated.paths[0].clip[3] -= static_cast<float>(region[1]);
+    translated.images[0].ctm[4] -= region[0];
+    translated.images[0].ctm[5] -= region[1];
+    translated.images[0].clip[0] -= static_cast<float>(region[0]);
+    translated.images[0].clip[1] -= static_cast<float>(region[1]);
+    translated.images[0].clip[2] -= static_cast<float>(region[0]);
+    translated.images[0].clip[3] -= static_cast<float>(region[1]);
+    auto expected = render_page_composite(doc, resources, translated, 0, 60,
+                                          60, "", 0, nullptr);
+
+    CHECK(!actual.data.empty());
+    CHECK(actual.width == expected.width);
+    CHECK(actual.height == expected.height);
+    CHECK(actual.data == expected.data);
+}
+
 // Composite PNGs carry filter byte 0 on every row (Canvas keeps rows in PNG
 // layout and prefiltered_to_png preserves that), so tests can inflate the
 // IDAT with zlib and probe raw samples directly.
@@ -503,6 +579,219 @@ uint8_t png_sample0(const DecodedPng& p, unsigned x, unsigned y) {
     size_t stride = 1 + static_cast<size_t>(p.w) * p.comps;
     CHECK(p.rows[y * stride] == 0); // filter byte
     return p.rows[y * stride + 1 + static_cast<size_t>(x) * p.comps];
+}
+
+// A valid Flate payload may itself contain whitespace+EI. The inline scanner
+// must use the zlib end marker, not partial decompression of each EI candidate.
+void test_pdf_inline_flate_ignores_embedded_ei() {
+    using namespace jdoc::pdf_detail;
+
+    std::vector<uint8_t> samples(256, 37);
+    samples[100] = '\n';
+    samples[101] = 'E';
+    samples[102] = 'I';
+    samples[103] = ' ';
+    uLongf compressed_len = compressBound(samples.size());
+    std::vector<uint8_t> compressed(compressed_len);
+    CHECK(compress2(compressed.data(), &compressed_len, samples.data(),
+                    samples.size(), Z_NO_COMPRESSION) == Z_OK);
+    compressed.resize(compressed_len);
+    CHECK(std::search(compressed.begin(), compressed.end(),
+                      samples.begin() + 100, samples.begin() + 104) !=
+          compressed.end());
+
+    const std::string prefix =
+        "BI /W 256 /H 1 /BPC 8 /CS /G /F /Fl ID\n";
+    const std::string suffix = "\nEI\n10 10 m 20 20 l S\n";
+    std::vector<uint8_t> content(prefix.begin(), prefix.end());
+    content.insert(content.end(), compressed.begin(), compressed.end());
+    content.insert(content.end(), suffix.begin(), suffix.end());
+
+    const uint8_t placeholder = 0;
+    PdfDoc doc(&placeholder, 1);
+    ContentParseOptions options;
+    options.graphics = GraphicsCollection::RenderPaths;
+    auto parsed = parse_content_stream(doc, content, PdfObj::make_dict(), 100,
+                                       nullptr, options);
+    CHECK(parsed.inline_images == 1);
+    CHECK(parsed.inline_scan_bailouts == 0);
+    CHECK(parsed.images.size() == 1);
+    CHECK(parsed.paths.size() == 1); // content after the real EI survived
+    CHECK(parsed.images[0].inline_img != nullptr);
+    auto decoded = doc.decode_stream(*parsed.images[0].inline_img);
+    CHECK(decoded == samples);
+}
+
+static jdoc::pdf_detail::PdfObj number_array(
+    std::initializer_list<double> values) {
+    using jdoc::pdf_detail::PdfObj;
+    auto out = PdfObj::make_arr();
+    for (double value : values) out.arr.push_back(PdfObj::make_real(value));
+    return out;
+}
+
+static jdoc::pdf_detail::PdfObj gradient_function() {
+    using jdoc::pdf_detail::PdfObj;
+    auto fn = PdfObj::make_dict();
+    fn.dict.push_back({"FunctionType", PdfObj::make_int(2)});
+    fn.dict.push_back({"Domain", number_array({0, 1})});
+    fn.dict.push_back({"C0", number_array({1, 0, 0})});
+    fn.dict.push_back({"C1", number_array({0, 0, 1})});
+    fn.dict.push_back({"N", PdfObj::make_int(1)});
+    return fn;
+}
+
+// Pattern shading is only lowered to bbox-clipped strips for a real
+// axis-aligned rectangle. A triangle must retain its own path boundary.
+void test_pdf_pattern_shading_does_not_fill_triangle_bbox() {
+    using namespace jdoc::pdf_detail;
+
+    auto shading = PdfObj::make_dict();
+    shading.dict.push_back({"ShadingType", PdfObj::make_int(2)});
+    shading.dict.push_back({"ColorSpace", PdfObj::make_name("DeviceRGB")});
+    shading.dict.push_back({"Coords", number_array({20, 20, 80, 20})});
+    shading.dict.push_back({"Function", gradient_function()});
+    auto extend = PdfObj::make_arr();
+    extend.arr.push_back(PdfObj::make_bool(true));
+    extend.arr.push_back(PdfObj::make_bool(true));
+    shading.dict.push_back({"Extend", std::move(extend)});
+
+    auto pattern = PdfObj::make_dict();
+    pattern.dict.push_back({"PatternType", PdfObj::make_int(2)});
+    pattern.dict.push_back({"Shading", std::move(shading)});
+    auto patterns = PdfObj::make_dict();
+    patterns.dict.push_back({"P1", std::move(pattern)});
+    auto resources = PdfObj::make_dict();
+    resources.dict.push_back({"Pattern", std::move(patterns)});
+
+    const std::string stream =
+        "/Pattern cs /P1 scn 20 20 m 80 20 l 50 80 l h f";
+    const uint8_t placeholder = 0;
+    PdfDoc doc(&placeholder, 1);
+    ContentParseOptions options;
+    options.graphics = GraphicsCollection::RenderPaths;
+    options.page_width = 100;
+    auto parsed = parse_content_stream(
+        doc, std::vector<uint8_t>(stream.begin(), stream.end()), resources,
+        100, nullptr, options);
+    CHECK(parsed.shading_paths == 0);
+    CHECK(parsed.paths.size() == 1);
+
+    auto rendered = render_page_composite(doc, resources, parsed, 0, 100, 100,
+                                          "");
+    CHECK(!rendered.data.empty());
+    auto png = decode_test_png(rendered.data);
+    auto sample = [&](double x, double y) {
+        unsigned px = std::min(png.w - 1,
+                               static_cast<unsigned>(x * png.w / 100));
+        unsigned py = std::min(png.h - 1, static_cast<unsigned>(
+            (100 - y) * png.h / 100));
+        return png_sample0(png, px, py);
+    };
+    CHECK(sample(22, 75) == 255); // outside triangle, inside its bbox
+    CHECK(sample(50, 40) < 32);   // inside triangle: flat-color fallback
+}
+
+// With neither radial endpoint extended, a nonzero start circle leaves its
+// interior untouched. The gradient occupies only the annulus r0..r1.
+void test_pdf_radial_shading_preserves_unextended_center() {
+    using namespace jdoc::pdf_detail;
+
+    auto shading = PdfObj::make_dict();
+    shading.dict.push_back({"ShadingType", PdfObj::make_int(3)});
+    shading.dict.push_back({"ColorSpace", PdfObj::make_name("DeviceRGB")});
+    shading.dict.push_back({"Coords", number_array({50, 50, 20, 50, 50, 40})});
+    shading.dict.push_back({"Function", gradient_function()});
+    auto extend = PdfObj::make_arr();
+    extend.arr.push_back(PdfObj::make_bool(false));
+    extend.arr.push_back(PdfObj::make_bool(false));
+    shading.dict.push_back({"Extend", std::move(extend)});
+    auto shadings = PdfObj::make_dict();
+    shadings.dict.push_back({"Sh1", std::move(shading)});
+    auto resources = PdfObj::make_dict();
+    resources.dict.push_back({"Shading", std::move(shadings)});
+
+    const std::string stream = "/Sh1 sh";
+    const uint8_t placeholder = 0;
+    PdfDoc doc(&placeholder, 1);
+    ContentParseOptions options;
+    options.graphics = GraphicsCollection::RenderPaths;
+    options.page_width = 100;
+    auto parsed = parse_content_stream(
+        doc, std::vector<uint8_t>(stream.begin(), stream.end()), resources,
+        100, nullptr, options);
+    auto rendered = render_page_composite(doc, resources, parsed, 0, 100, 100,
+                                          "");
+    CHECK(!rendered.data.empty());
+    auto png = decode_test_png(rendered.data);
+    auto sample = [&](double x, double y) {
+        unsigned px = std::min(png.w - 1,
+                               static_cast<unsigned>(x * png.w / 100));
+        unsigned py = std::min(png.h - 1, static_cast<unsigned>(
+            (100 - y) * png.h / 100));
+        return png_sample0(png, px, py);
+    };
+    CHECK(sample(50, 50) == 255); // r < 20 remains white
+    CHECK(sample(80, 50) < 240);  // r = 30 lies in the gradient
+
+    // Extending the outer endpoint must color only outside r1; it must not
+    // leak through the unextended start-circle hole.
+    auto& shading_obj = resources.dict[0].second.dict[0].second;
+    for (auto& entry : shading_obj.dict)
+        if (entry.first == "Extend") entry.second.arr[1].bool_val = true;
+    auto extended = parse_content_stream(
+        doc, std::vector<uint8_t>(stream.begin(), stream.end()), resources,
+        100, nullptr, options);
+    auto extended_render = render_page_composite(
+        doc, resources, extended, 0, 100, 100, "");
+    CHECK(!extended_render.data.empty());
+    auto extended_png = decode_test_png(extended_render.data);
+    auto extended_sample = [&](double x, double y) {
+        unsigned px = std::min(extended_png.w - 1,
+            static_cast<unsigned>(x * extended_png.w / 100));
+        unsigned py = std::min(extended_png.h - 1, static_cast<unsigned>(
+            (100 - y) * extended_png.h / 100));
+        return png_sample0(extended_png, px, py);
+    };
+    CHECK(extended_sample(50, 50) == 255);
+    CHECK(extended_sample(95, 50) < 32);
+}
+
+// Successfully decoded ImageMasks may still have zero coverage. They must not
+// turn a fragment-classified page into a blank white composite image.
+void test_pdf_composite_skips_fully_transparent_masks() {
+    using namespace jdoc::pdf_detail;
+
+    const uint8_t placeholder = 0;
+    PdfDoc doc(&placeholder, 1);
+    auto mask = PdfObj::make_dict();
+    mask.type = ObjType::STREAM;
+    mask.dict.push_back({"Subtype", PdfObj::make_name("Image")});
+    mask.dict.push_back({"Width", PdfObj::make_int(8)});
+    mask.dict.push_back({"Height", PdfObj::make_int(1)});
+    mask.dict.push_back({"BitsPerComponent", PdfObj::make_int(1)});
+    mask.dict.push_back({"ImageMask", PdfObj::make_bool(true)});
+    mask.stream_data = {0xFF}; // default Decode [0 1]: no painted samples
+    auto xobjects = PdfObj::make_dict();
+    xobjects.dict.push_back({"M1", mask});
+    xobjects.dict.push_back({"M2", mask});
+    auto resources = PdfObj::make_dict();
+    resources.dict.push_back({"XObject", std::move(xobjects)});
+
+    ContentParseResult parsed;
+    auto placement = [](const char* name, double x, double y) {
+        ImagePlacement ip{};
+        ip.xobj_name = name;
+        const double ctm[6] = {40, 0, 0, 2, x, y};
+        std::memcpy(ip.ctm, ctm, sizeof(ctm));
+        ip.alpha = 1;
+        return ip;
+    };
+    parsed.images.push_back(placement("M1", 5, 20));
+    parsed.images.push_back(placement("M2", 55, 70));
+    auto rendered = render_page_composite(doc, resources, parsed, 0, 100, 100,
+                                          "");
+    CHECK(rendered.data.empty());
 }
 
 // A W n clip rect must confine an image to its window: the uncovered part of
@@ -840,6 +1129,11 @@ int main() {
     test_png_converts_cmyk();
     test_pdf_honors_images_option();
     test_pdf_composite_clips_extreme_coordinates_before_narrowing();
+    test_pdf_region_composite_matches_translated_geometry();
+    test_pdf_inline_flate_ignores_embedded_ei();
+    test_pdf_pattern_shading_does_not_fill_triangle_bbox();
+    test_pdf_radial_shading_preserves_unextended_center();
+    test_pdf_composite_skips_fully_transparent_masks();
     test_pdf_composite_applies_clip_rect();
     test_pdf_composite_renders_axial_shading();
     test_pdf_reads_rotated_text();

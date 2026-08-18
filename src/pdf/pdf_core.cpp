@@ -194,6 +194,47 @@ std::vector<uint8_t> decode_flate(const uint8_t* src, size_t src_len) {
     return out;
 }
 
+bool flate_encoded_size(const uint8_t* src, size_t src_len,
+                        size_t& encoded_size) {
+    encoded_size = 0;
+    if (!src || src_len == 0) return false;
+
+    z_stream zs = {};
+    if (inflateInit(&zs) != Z_OK) return false;
+
+    size_t fed = 0;
+    uint64_t produced = 0;
+    uint8_t out[8192];
+    bool complete = false;
+    while (true) {
+        if (zs.avail_in == 0 && fed < src_len) {
+            size_t chunk = std::min(
+                src_len - fed,
+                static_cast<size_t>(std::numeric_limits<uInt>::max()));
+            zs.next_in = const_cast<Bytef*>(src + fed);
+            zs.avail_in = static_cast<uInt>(chunk);
+            fed += chunk;
+        }
+
+        zs.next_out = out;
+        zs.avail_out = sizeof(out);
+        uInt before_in = zs.avail_in;
+        int ret = inflate(&zs, Z_NO_FLUSH);
+        produced += sizeof(out) - zs.avail_out;
+        if (produced > limits::kMaxDecodedSamples) break;
+        if (ret == Z_STREAM_END) {
+            encoded_size = fed - zs.avail_in;
+            complete = true;
+            break;
+        }
+        if (ret != Z_OK && ret != Z_BUF_ERROR) break;
+        if (zs.avail_in == before_in && zs.avail_out == sizeof(out)) break;
+        if (zs.avail_in == 0 && fed == src_len && zs.avail_out != 0) break;
+    }
+    inflateEnd(&zs);
+    return complete;
+}
+
 std::vector<uint8_t> decode_ascii85(const uint8_t* src, size_t len) {
     std::vector<uint8_t> out;
     out.reserve(len);

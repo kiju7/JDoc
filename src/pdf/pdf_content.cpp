@@ -348,6 +348,37 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
         }
     };
 
+    auto axis_aligned_rect_bbox = [&](const std::vector<PathPoint>& pts,
+                                      double& x0, double& y0,
+                                      double& x1, double& y1) {
+        if (pts.size() != 5 || pts[0].type != PathPoint::MOVE ||
+            pts[1].type != PathPoint::LINE ||
+            pts[2].type != PathPoint::LINE ||
+            pts[3].type != PathPoint::LINE ||
+            pts[4].type != PathPoint::CLOSE)
+            return false;
+        path_bbox(pts, x0, y0, x1, y1);
+        if (!(x0 < x1 && y0 < y1)) return false;
+        const double eps = 1e-6 * std::max({1.0, x1 - x0, y1 - y0});
+        bool corners[4] = {false, false, false, false};
+        for (size_t i = 0; i < 4; i++) {
+            const auto& p = pts[i];
+            bool left = std::abs(p.x - x0) <= eps;
+            bool right = std::abs(p.x - x1) <= eps;
+            bool bottom = std::abs(p.y - y0) <= eps;
+            bool top = std::abs(p.y - y1) <= eps;
+            if ((!left && !right) || (!bottom && !top)) return false;
+            size_t corner = (right ? 1u : 0u) | (top ? 2u : 0u);
+            if (corners[corner]) return false;
+            corners[corner] = true;
+            const auto& next = pts[(i + 1) % 4];
+            if (std::abs(p.x - next.x) > eps &&
+                std::abs(p.y - next.y) > eps)
+                return false;
+        }
+        return true;
+    };
+
     auto commit_pending_clip = [&](GfxState& g) {
         if (has_pending_clip) {
             // Rect tier: fold the clip's bbox into the running intersection.
@@ -411,17 +442,18 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
 
     // Emit gradient geometry for one shading dict, restricted to `region`
     // (viewing coords, x0 y0 x1 y1 — already intersected with the clip).
-    auto emit_shading_paths = [&](const PdfObj& sh, const double region[4]) {
+    auto emit_shading_paths = [&](const PdfObj& sh,
+                                  const double region[4]) -> bool {
         int stype = doc.resolve(sh.get("ShadingType")).as_int();
         if (stype != 2 && stype != 3) {
             result.shading_unsupported++;
-            return;
+            return false;
         }
         auto coords = doc.resolve(sh.get("Coords"));
         size_t need = stype == 2 ? 4 : 6;
         if (!coords.is_arr() || coords.arr.size() < need) {
             result.shading_unsupported++;
-            return;
+            return false;
         }
         double t0 = 0, t1 = 1;
         {
@@ -446,26 +478,21 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
         auto& fn = sh.get("Function");
         if (fn.is_none()) {
             result.shading_unsupported++;
-            return;
+            return false;
         }
         for (int v = 0; v < 256; v++) {
             double t = t0 + (t1 - t0) * (v / 255.0);
             auto comps = eval_shading_fn(fn, t);
             if (comps.empty()) {
                 result.shading_unsupported++;
-                return;
+                return false;
             }
             alt_components_to_rgb(comps, ramp[v]);
         }
-        auto push_quad = [&](double ax, double ay, double bx, double by,
-                             double cx, double cy, double dx, double dy,
-                             const std::array<uint8_t, 3>& col) {
+        auto make_shading_path = [&](const std::array<uint8_t, 3>& col,
+                                     size_t point_capacity) {
             RenderPath rp;
-            rp.points = {{ax, ay, PathPoint::MOVE},
-                         {bx, by, PathPoint::LINE},
-                         {cx, cy, PathPoint::LINE},
-                         {dx, dy, PathPoint::LINE},
-                         {0, 0, PathPoint::CLOSE}};
+            rp.points.reserve(point_capacity);
             rp.fill_r = col[0] / 255.0;
             rp.fill_g = col[1] / 255.0;
             rp.fill_b = col[2] / 255.0;
@@ -479,13 +506,27 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
             rp.clip[2] = static_cast<float>(region[2]);
             rp.clip[3] = static_cast<float>(region[3]);
             rp.synthetic = true;
+            return rp;
+        };
+        auto emit_shading_path = [&](RenderPath&& rp) {
             rp.seq = draw_seq++;
             result.shading_paths++;
             result.paths.push_back(std::move(rp));
         };
+        auto push_quad = [&](double ax, double ay, double bx, double by,
+                             double cx, double cy, double dx, double dy,
+                             const std::array<uint8_t, 3>& col) {
+            auto rp = make_shading_path(col, 5);
+            rp.points.push_back({ax, ay, PathPoint::MOVE});
+            rp.points.push_back({bx, by, PathPoint::LINE});
+            rp.points.push_back({cx, cy, PathPoint::LINE});
+            rp.points.push_back({dx, dy, PathPoint::LINE});
+            rp.points.push_back({0, 0, PathPoint::CLOSE});
+            emit_shading_path(std::move(rp));
+        };
         const double diag = std::hypot(region[2] - region[0],
                                        region[3] - region[1]);
-        if (diag <= 0) return;
+        if (diag <= 0) return true;
 
         if (stype == 2) {
             double p0x, p0y, p1x, p1y;
@@ -500,7 +541,7 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
                 push_quad(region[0], region[1], region[2], region[1],
                           region[2], region[3], region[0], region[3],
                           ramp[128]);
-                return;
+                return true;
             }
             // Project region corners onto the axis (s: 0 at p0, 1 at p1).
             double smin = 1e300, smax = -1e300;
@@ -513,7 +554,7 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
             }
             if (!ext0) smin = std::max(smin, 0.0);
             if (!ext1) smax = std::min(smax, 1.0);
-            if (smin >= smax) return;
+            if (smin >= smax) return true;
             double len = std::sqrt(len2) * (smax - smin);
             int K = std::max(16, std::min(128, static_cast<int>(len)));
             // Perpendicular half-width big enough to cross the region.
@@ -532,11 +573,12 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
                 push_quad(ax + nx, ay + ny, bx + nx, by + ny,
                           bx - nx, by - ny, ax - nx, ay - ny, col);
             }
-            return;
+            return true;
         }
 
-        // Radial: concentric disks, outermost first; each smaller disk
-        // overdraws toward the inner color. Circles approximate ellipses
+        // Radial: approximate consecutive parameter bands as even-odd rings.
+        // Unlike overpainting filled disks, rings preserve an unextended
+        // nonzero start/end circle as a hole. Circles approximate ellipses
         // under a non-uniform CTM by the average axis scale.
         double c0x, c0y, c1x, c1y;
         transform_point(gs.ctm, coords.arr[0].as_num(),
@@ -546,52 +588,85 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
         double rscale = ctm_pen_scale(gs.ctm);
         double r0 = std::abs(coords.arr[2].as_num()) * rscale;
         double r1 = std::abs(coords.arr[5].as_num()) * rscale;
+        auto append_circle = [](std::vector<PathPoint>& points,
+                                double cx, double cy, double r) {
+            constexpr double kKappa = 0.5522847498;
+            double h = r * kKappa;
+            points.push_back({cx + r, cy, PathPoint::MOVE});
+            points.push_back({cx, cy + r, PathPoint::CURVE,
+                              cx + r, cy + h, cx + h, cy + r});
+            points.push_back({cx - r, cy, PathPoint::CURVE,
+                              cx - h, cy + r, cx - r, cy + h});
+            points.push_back({cx, cy - r, PathPoint::CURVE,
+                              cx - r, cy - h, cx - h, cy - r});
+            points.push_back({cx + r, cy, PathPoint::CURVE,
+                              cx + h, cy - r, cx + r, cy - h});
+            points.push_back({0, 0, PathPoint::CLOSE});
+        };
         auto push_disk = [&](double cx, double cy, double r,
                              const std::array<uint8_t, 3>& col) {
             if (r <= 0) return;
-            constexpr double kKappa = 0.5522847498;
-            RenderPath rp;
-            double h = r * kKappa;
-            rp.points.push_back({cx + r, cy, PathPoint::MOVE});
-            rp.points.push_back({cx, cy + r, PathPoint::CURVE,
-                                 cx + r, cy + h, cx + h, cy + r});
-            rp.points.push_back({cx - r, cy, PathPoint::CURVE,
-                                 cx - h, cy + r, cx - r, cy + h});
-            rp.points.push_back({cx, cy - r, PathPoint::CURVE,
-                                 cx - r, cy - h, cx - h, cy - r});
-            rp.points.push_back({cx + r, cy, PathPoint::CURVE,
-                                 cx + h, cy - r, cx + r, cy - h});
-            rp.points.push_back({0, 0, PathPoint::CLOSE});
-            rp.fill_r = col[0] / 255.0;
-            rp.fill_g = col[1] / 255.0;
-            rp.fill_b = col[2] / 255.0;
-            rp.stroke_r = rp.stroke_g = rp.stroke_b = 0;
-            rp.fill_alpha = gs.fill_alpha;
-            rp.line_width = 0;
-            rp.do_fill = true;
-            rp.do_stroke = false;
-            rp.clip[0] = static_cast<float>(region[0]);
-            rp.clip[1] = static_cast<float>(region[1]);
-            rp.clip[2] = static_cast<float>(region[2]);
-            rp.clip[3] = static_cast<float>(region[3]);
-            rp.synthetic = true;
-            rp.seq = draw_seq++;
-            result.shading_paths++;
-            result.paths.push_back(std::move(rp));
+            auto rp = make_shading_path(col, 6);
+            append_circle(rp.points, cx, cy, r);
+            emit_shading_path(std::move(rp));
         };
-        if (ext1 && r1 >= r0) {
-            // Outer extend: the region beyond the end circle keeps t1.
-            push_quad(region[0], region[1], region[2], region[1],
-                      region[2], region[3], region[0], region[3], ramp[255]);
+        auto push_band = [&](double acx, double acy, double ar,
+                             double bcx, double bcy, double br,
+                             const std::array<uint8_t, 3>& col) {
+            if (ar <= 0 && br <= 0) return;
+            auto rp = make_shading_path(col, (ar > 0 ? 6 : 0) +
+                                             (br > 0 ? 6 : 0));
+            if (ar > 0) append_circle(rp.points, acx, acy, ar);
+            if (br > 0) append_circle(rp.points, bcx, bcy, br);
+            rp.even_odd = ar > 0 && br > 0;
+            emit_shading_path(std::move(rp));
+        };
+        auto push_outside = [&](double cx, double cy, double r,
+                                const std::array<uint8_t, 3>& col) {
+            if (r <= 0) {
+                push_quad(region[0], region[1], region[2], region[1],
+                          region[2], region[3], region[0], region[3], col);
+                return;
+            }
+            auto rp = make_shading_path(col, 11);
+            rp.points.push_back({region[0], region[1], PathPoint::MOVE});
+            rp.points.push_back({region[2], region[1], PathPoint::LINE});
+            rp.points.push_back({region[2], region[3], PathPoint::LINE});
+            rp.points.push_back({region[0], region[3], PathPoint::LINE});
+            rp.points.push_back({0, 0, PathPoint::CLOSE});
+            append_circle(rp.points, cx, cy, r);
+            rp.even_odd = true;
+            emit_shading_path(std::move(rp));
+        };
+
+        const bool grows = r1 >= r0;
+        if (grows && ext1)
+            push_outside(c1x, c1y, r1, ramp[255]);
+        else if (!grows && ext0)
+            push_outside(c0x, c0y, r0, ramp[0]);
+        int K = std::max(16, std::min(128, static_cast<int>(
+            std::max({r0, r1, std::hypot(c1x - c0x, c1y - c0y)}))));
+        for (int k = 0; k < K; k++) {
+            double fa = static_cast<double>(k) / K;
+            double fb = static_cast<double>(k + 1) / K;
+            double acx = c0x + (c1x - c0x) * fa;
+            double acy = c0y + (c1y - c0y) * fa;
+            double ar = r0 + (r1 - r0) * fa;
+            double bcx = c0x + (c1x - c0x) * fb;
+            double bcy = c0y + (c1y - c0y) * fb;
+            double br = r0 + (r1 - r0) * fb;
+            double fm = (fa + fb) * 0.5;
+            const auto& col = ramp[static_cast<int>(fm * 255.0 + 0.5)];
+            if (ar >= br)
+                push_band(acx, acy, ar, bcx, bcy, br, col);
+            else
+                push_band(bcx, bcy, br, acx, acy, ar, col);
         }
-        int K = std::max(16, std::min(128,
-            static_cast<int>(std::max(r0, r1))));
-        for (int k = K; k >= 0; k--) {
-            double f = static_cast<double>(k) / K;
-            auto& col = ramp[static_cast<int>(f * 255.0 + 0.5)];
-            push_disk(c0x + (c1x - c0x) * f, c0y + (c1y - c0y) * f,
-                      r0 + (r1 - r0) * f, col);
-        }
+        if (grows && ext0)
+            push_disk(c0x, c0y, r0, ramp[0]);
+        else if (!grows && ext1)
+            push_disk(c1x, c1y, r1, ramp[255]);
+        return true;
     };
 
     // Viewing-coord region for a shading: current clip ∩ page box.
@@ -834,19 +909,20 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
             // Shading-pattern fill: a rect-ish path becomes gradient strips
             // clipped to its box (exact for the title-bar idiom); other
             // shapes keep the flat backstop color set at scn time.
-            if (do_fill && gs.fill_shading && current_path.size() <= 6) {
-                double bx0, by0, bx1, by1;
-                path_bbox(current_path, bx0, by0, bx1, by1);
+            double bx0, by0, bx1, by1;
+            if (do_fill && gs.fill_shading &&
+                axis_aligned_rect_bbox(current_path, bx0, by0, bx1, by1)) {
                 double region[4] = {
                     std::max(bx0, gs.clip_x0), std::max(by0, gs.clip_y0),
                     std::min(bx1, gs.clip_x1), std::min(by1, gs.clip_y1)};
                 if (region[0] < region[2] && region[1] < region[3]) {
-                    emit_shading_paths(*gs.fill_shading, region);
-                    if (!do_stroke) {
-                        current_path.clear();
-                        return;
+                    if (emit_shading_paths(*gs.fill_shading, region)) {
+                        if (!do_stroke) {
+                            current_path.clear();
+                            return;
+                        }
+                        do_fill = false;
                     }
-                    do_fill = false;
                 }
             }
             RenderPath rp;
@@ -1209,12 +1285,12 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
             return q >= lex.len || PdfLexer::is_ws(lex.data[q]) ||
                    PdfLexer::is_delim(lex.data[q]);
         };
-        // Payload candidate [data_start, end): valid when at most a little
-        // whitespace and then EI at a token boundary follows.
+        // Payload candidate [data_start, end): valid when whitespace and then
+        // EI at a token boundary follows. Producers may emit more than one
+        // separator byte, especially after a length-delimited payload.
         auto valid_end = [&](size_t end, size_t& after) -> bool {
             size_t p = end;
-            for (int ws = 0; ws < 4 && p < lex.len &&
-                             PdfLexer::is_ws(lex.data[p]); ws++)
+            while (p < lex.len && PdfLexer::is_ws(lex.data[p]))
                 p++;
             if (!ei_at(p)) return false;
             after = p + 2;
@@ -1264,15 +1340,38 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
             }
         }
 
-        // 3. Scan for ws+EI at a token boundary. 'E','I' are ordinary data
-        //    bytes, so validate cheap-to-check codecs before accepting.
+        // 3. A single Flate stream has an unambiguous compressed-stream end.
+        //    Locate that first: decode_flate intentionally returns partial
+        //    output for truncated data and therefore cannot validate an EI
+        //    candidate embedded inside the compressed bytes.
+        const bool single_flate =
+            flist.size() == 1 && flist[0] == "FlateDecode";
+        if (payload_end == SIZE_MAX && single_flate) {
+            constexpr size_t kMaxInlineScan = 8u << 20;
+            const size_t limit = std::min(lex.len, data_start + kMaxInlineScan);
+            size_t encoded = 0;
+            if (flate_encoded_size(lex.data + data_start, limit - data_start,
+                                   encoded)) {
+                size_t after;
+                if (valid_end(data_start + encoded, after)) {
+                    payload_end = data_start + encoded;
+                    resume = after;
+                }
+            }
+        }
+
+        // 4. Scan for ws+EI at a token boundary. 'E','I' are ordinary data
+        //    bytes, so validate cheap-to-check codecs before accepting. A
+        //    failed single-Flate probe must not fall back to partial decoding.
         if (payload_end == SIZE_MAX) {
             constexpr size_t kMaxInlineScan = 8u << 20;
             const size_t limit = std::min(lex.len, data_start + kMaxInlineScan);
             const bool dct = !flist.empty() && flist.back() == "DCTDecode";
-            const bool flate = !flist.empty() && flist.back() == "FlateDecode";
+            const bool flate = !single_flate && !flist.empty() &&
+                               flist.back() == "FlateDecode";
             int probes = 0;
-            for (size_t p = data_start; p + 2 < limit; p++) {
+            for (size_t p = data_start;
+                 !single_flate && p + 2 < limit; p++) {
                 if (!PdfLexer::is_ws(lex.data[p]) || !ei_at(p + 1)) continue;
                 const size_t cand_len = p - data_start;
                 if (dct) {
