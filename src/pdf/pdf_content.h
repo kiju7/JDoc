@@ -132,6 +132,7 @@ struct ContentParseResult {
     std::vector<ImagePlacement> images;
     std::vector<RenderPath> paths; // for vector rendering
     int draw_ops = 0; // total paths+images recorded (seq offset for nested forms)
+    int visible_text_chars = 0; // chars emitted outside Tr 3/7 (invisible text)
 };
 
 struct TextLine {

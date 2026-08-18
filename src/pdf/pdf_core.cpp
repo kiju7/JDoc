@@ -1,5 +1,6 @@
 #include "pdf_core.h"
 #include "jbig2.h"
+#include "pdf_limits.h"
 #include "common/string_utils.h"
 #include "common/file_utils.h"
 #include "common/inflate.h"
@@ -839,6 +840,33 @@ std::vector<uint8_t> PdfDoc::decode_stream(const PdfObj& obj, int obj_num, int g
                 if (hi < 0) { hi = nibble; } else { out.push_back(static_cast<uint8_t>((hi << 4) | nibble)); hi = -1; }
             }
             if (hi >= 0) out.push_back(static_cast<uint8_t>(hi << 4));
+            result = std::move(out);
+        } else if (fname == "RunLengthDecode") {
+            // 7.4.5: length byte n < 128 copies n+1 literals; n > 128 repeats
+            // the next byte 257-n times; 128 is EOD. Runs expand up to 128×,
+            // so cap the output like every other attacker-reachable decode.
+            std::vector<uint8_t> out;
+            size_t i = 0;
+            const size_t n = result.size();
+            while (i < n) {
+                uint8_t len = result[i++];
+                if (len == 128) break;
+                if (len < 128) {
+                    size_t count = static_cast<size_t>(len) + 1;
+                    if (count > n - i) count = n - i;
+                    out.insert(out.end(), result.begin() + i,
+                               result.begin() + i + count);
+                    i += count;
+                } else {
+                    if (i >= n) break;
+                    out.insert(out.end(), 257 - static_cast<size_t>(len),
+                               result[i++]);
+                }
+                if (out.size() > limits::kMaxDecodedSamples) {
+                    out.clear();
+                    break;
+                }
+            }
             result = std::move(out);
         } else if (fname == "JBIG2Decode") {
             std::vector<uint8_t> globals;

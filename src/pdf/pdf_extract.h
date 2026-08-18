@@ -44,6 +44,19 @@ struct ExtractedImage {
     double ctm[6];
 };
 
+// Per-page record of image decodes that produced no output. Failures used to
+// vanish silently, leaving a blank composite indistinguishable from a clean
+// one; callers and tests need the counts to detect degraded pages.
+struct PageRenderDiag {
+    int images_total = 0;        // image placements attempted
+    int images_failed = 0;       // placements that produced no output
+    int unsupported_filter = 0;  // JBIG2/JPX variant or unknown filter rejected
+    int decode_size_mismatch = 0;
+    int inline_images = 0;
+    int inline_scan_bailouts = 0;
+    int shading_unsupported = 0;
+};
+
 inline void discard_image_payload(ImageData& image) {
     decltype(image.data){}.swap(image.data);
     decltype(image.pixels){}.swap(image.pixels);
@@ -83,6 +96,7 @@ struct ExtractResult {
     std::vector<std::vector<AnnotEntry>> all_annots;
     std::vector<double> page_widths;
     std::vector<double> page_heights;
+    std::vector<PageRenderDiag> page_diags;
     std::vector<BookmarkEntry> bookmarks;
     std::vector<AttachmentEntry> attachments;
     FontStats stats;
@@ -103,15 +117,17 @@ std::vector<TableData> detect_text_tables(const PageCharCache& cache,
                                           double page_width, double page_height,
                                           double col_boundary = 0.0);
 std::string format_table(const TableData& table);
-std::vector<ExtractedImage> extract_page_images(PdfDoc& doc, const PdfObj& page_obj,
+std::vector<ExtractedImage> extract_page_images(PdfDoc& doc, const PdfObj& resources,
                                                 const ContentParseResult& parse_result,
                                                 int page_num,
                                                 const std::string& output_dir,
-                                                unsigned min_image_size = 0);
-ImageData render_page_composite(PdfDoc& doc, const PdfObj& page_obj,
+                                                unsigned min_image_size = 0,
+                                                PageRenderDiag* diag = nullptr);
+ImageData render_page_composite(PdfDoc& doc, const PdfObj& resources,
                                 const ContentParseResult& parse_result,
                                 int page_num, double page_w, double page_h,
-                                const std::string& output_dir);
+                                const std::string& output_dir,
+                                PageRenderDiag* diag = nullptr);
 void collect_bookmarks(PdfDoc& doc, const PdfObj& node, int depth,
                        std::vector<BookmarkEntry>& out);
 void collect_attachments(PdfDoc& doc, const PdfObj& root,

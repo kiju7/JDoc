@@ -773,6 +773,11 @@ std::string result_to_markdown(ExtractResult& r, const ConvertOptions& opts) {
             full_md += util::strip_markdown(page_md);
         else
             full_md += page_md;
+        if (p < (int)r.page_diags.size() && r.page_diags[p].images_failed > 0 &&
+            !plaintext)
+            full_md += "<!-- jdoc: " +
+                       std::to_string(r.page_diags[p].images_failed) +
+                       " image(s) failed to decode on this page -->\n";
     }
     return full_md;
 }
@@ -794,6 +799,13 @@ static PageChunk build_page_chunk(ExtractResult& r, const ConvertOptions& opts,
                                             r.col_boundaries[p],
                                             opts.image_ref_prefix);
     chunk.text = plaintext ? util::strip_markdown(page_md) : page_md;
+    if (p < (int)r.page_diags.size() && r.page_diags[p].images_failed > 0) {
+        chunk.degraded_images = r.page_diags[p].images_failed;
+        if (!plaintext)
+            chunk.text += "<!-- jdoc: " +
+                          std::to_string(chunk.degraded_images) +
+                          " image(s) failed to decode on this page -->\n";
+    }
 
     // Rendering above already consumed the tables, so move the rows out rather
     // than copying them into the chunk.

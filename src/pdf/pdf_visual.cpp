@@ -642,15 +642,18 @@ static bool decode_stencil_mask(PdfDoc& doc, const PdfObj& xobj,
     return true;
 }
 
-std::vector<ExtractedImage> extract_page_images(PdfDoc& doc, const PdfObj& page_obj,
+std::vector<ExtractedImage> extract_page_images(PdfDoc& doc, const PdfObj& resources,
                                                  const ContentParseResult& parse_result,
                                                  int page_num,
                                                  const std::string& output_dir,
-                                                 unsigned min_image_size) {
+                                                 unsigned min_image_size,
+                                                 PageRenderDiag* diag) {
     std::vector<ExtractedImage> images;
     int img_idx = 0;
+    int considered = 0;   // image placements this call attempted
+    int policy_skips = 0; // min_image_size drops: deliberate, not failures
 
-    auto res = doc.resolve(page_obj.get("Resources"));
+    const PdfObj& res = resources;
 
     for (auto& ip : parse_result.images) {
         PdfObj xobj;
@@ -667,13 +670,18 @@ std::vector<ExtractedImage> extract_page_images(PdfDoc& doc, const PdfObj& page_
         auto& subtype = xobj.get("Subtype");
         if (!subtype.is_name() || subtype.str_val != "Image") continue;
 
+        considered++;
+        if (diag) diag->images_total++;
+
         int w = xobj.get("Width").as_int();
         int h = xobj.get("Height").as_int();
         if (w <= 0 || h <= 0) continue;
         if (min_image_size > 0 &&
             (static_cast<unsigned>(w) < min_image_size ||
-             static_cast<unsigned>(h) < min_image_size))
+             static_cast<unsigned>(h) < min_image_size)) {
+            policy_skips++;
             continue;
+        }
 
         ImageData img;
         img.page_number = page_num;
@@ -743,6 +751,7 @@ std::vector<ExtractedImage> extract_page_images(PdfDoc& doc, const PdfObj& page_
                 img.data.assign(reinterpret_cast<const char*>(decoded.data()),
                                 reinterpret_cast<const char*>(decoded.data()) + decoded.size());
             } else {
+                if (diag) diag->unsupported_filter++;
                 continue;
             }
         } else if (last_filter == "CCITTFaxDecode") {
@@ -779,7 +788,11 @@ std::vector<ExtractedImage> extract_page_images(PdfDoc& doc, const PdfObj& page_
         } else {
             // FlateDecode or other — decode to raw pixels
             auto decoded = doc.decode_stream(xobj);
-            if (decoded.empty()) continue;
+            if (decoded.empty()) {
+                // JBIG2 variant reject, or an unknown filter left nothing.
+                if (diag) diag->unsupported_filter++;
+                continue;
+            }
 
             int bpc = xobj.get("BitsPerComponent").as_int();
             if (bpc <= 0) bpc = 8;
@@ -1052,6 +1065,7 @@ std::vector<ExtractedImage> extract_page_images(PdfDoc& doc, const PdfObj& page_
                     // Unsupported component layout or truncated sample data.
                     // Never expose a "raw" image whose declared dimensions
                     // exceed its backing buffer.
+                    if (diag) diag->decode_size_mismatch++;
                     continue;
                 }
             }
@@ -1081,6 +1095,13 @@ std::vector<ExtractedImage> extract_page_images(PdfDoc& doc, const PdfObj& page_
         }
     }
 
+    // Anything considered that neither hit a policy skip nor produced an
+    // image was lost to a decode failure, whichever branch dropped it.
+    if (diag) {
+        int failed = considered - policy_skips -
+                     static_cast<int>(images.size());
+        if (failed > 0) diag->images_failed += failed;
+    }
     return images;
 }
 
@@ -1381,10 +1402,11 @@ struct Canvas {
 
 // ── Page Rendering ───────────────────────────────────────
 
-ImageData render_page_composite(PdfDoc& doc, const PdfObj& page_obj,
+ImageData render_page_composite(PdfDoc& doc, const PdfObj& resources,
                                  const ContentParseResult& parse_result,
                                  int page_num, double page_w, double page_h,
-                                 const std::string& output_dir) {
+                                 const std::string& output_dir,
+                                 PageRenderDiag* diag) {
     constexpr double kMinDPI = 150.0;
     constexpr double kMaxDPI = 300.0;
     constexpr double kBase = 72.0;
@@ -1393,7 +1415,7 @@ ImageData render_page_composite(PdfDoc& doc, const PdfObj& page_obj,
     // the densest embedded image's effective resolution, within bounds.
     double dpi = kMinDPI;
     {
-        auto pre_res = doc.resolve(page_obj.get("Resources"));
+        const PdfObj& pre_res = resources;
         for (auto& ip : parse_result.images) {
             PdfObj xobj;
             if (ip.xobj_ref >= 0) {
@@ -1758,8 +1780,9 @@ ImageData render_page_composite(PdfDoc& doc, const PdfObj& page_obj,
         }
     };
 
-    auto res = doc.resolve(page_obj.get("Resources"));
+    const PdfObj& res = resources;
 
+    int images_drawn = 0;
     auto draw_image = [&](const ImagePlacement& ip) {
         PdfObj xobj;
         if (ip.xobj_ref >= 0) {
@@ -1769,12 +1792,19 @@ ImageData render_page_composite(PdfDoc& doc, const PdfObj& page_obj,
             auto xd = doc.resolve(xobjects);
             if (xd.is_dict()) xobj = doc.resolve(xd.get(ip.xobj_name));
         }
+        if (!xobj.is_stream()) return;
 
         auto& subtype = xobj.get("Subtype");
+        if (subtype.is_name() && subtype.str_val != "Image") return;
+
+        if (diag) diag->images_total++;
 
         int w = xobj.get("Width").as_int();
         int h = xobj.get("Height").as_int();
-        if (w <= 0 || h <= 0) return;
+        if (w <= 0 || h <= 0) {
+            if (diag) diag->images_failed++;
+            return;
+        }
 
         // Check if this is an ImageMask (1-bit stencil)
         bool is_image_mask = xobj.get("ImageMask").bool_val;
@@ -1809,7 +1839,10 @@ ImageData render_page_composite(PdfDoc& doc, const PdfObj& page_obj,
                 // Get raw stream data and apply pre-filters manually
                 const uint8_t* src = xobj.raw_stream_data();
                 size_t src_len = xobj.raw_stream_size();
-                if (!src || src_len == 0) return;
+                if (!src || src_len == 0) {
+                    if (diag) diag->images_failed++;
+                    return;
+                }
 
                 // Apply preceding filters (e.g. FlateDecode before CCITTFax)
                 std::vector<uint8_t> pre_decoded;
@@ -1827,7 +1860,10 @@ ImageData render_page_composite(PdfDoc& doc, const PdfObj& page_obj,
                 auto ccitt_data = decode_ccitt(src, src_len, k, cols, black_is_1);
                 int row_bytes = (cols + 7) / 8;
                 int rows = ccitt_data.empty() ? 0 : (int)ccitt_data.size() / row_bytes;
-                if (rows <= 0) return;
+                if (rows <= 0) {
+                    if (diag) { diag->images_failed++; diag->unsupported_filter++; }
+                    return;
+                }
 
                 // Convert 1-bit to grayscale
                 pixels.resize(static_cast<size_t>(cols) * rows);
@@ -1847,10 +1883,18 @@ ImageData render_page_composite(PdfDoc& doc, const PdfObj& page_obj,
             } else {
                 // Use decode_stream for everything else (handles filter chains)
                 auto decoded = doc.decode_stream(xobj);
+                if (decoded.empty() && last_filter == "JBIG2Decode") {
+                    // Variant outside the in-tree subset (MMR, symbol dicts…).
+                    if (diag) { diag->images_failed++; diag->unsupported_filter++; }
+                    return;
+                }
 
                 if (last_filter == "JPXDecode") {
                     auto jr = jpx_decode(decoded.data(), decoded.size());
-                    if (jr.pixels.empty()) return;
+                    if (jr.pixels.empty()) {
+                        if (diag) { diag->images_failed++; diag->unsupported_filter++; }
+                        return;
+                    }
                     pixels = std::move(jr.pixels);
                     w = jr.width;
                     h = jr.height;
@@ -1970,7 +2014,11 @@ ImageData render_page_composite(PdfDoc& doc, const PdfObj& page_obj,
         }
 
         size_t expected = static_cast<size_t>(w) * h * components;
-        if (pixels.size() < expected) return;
+        if (pixels.size() < expected) {
+            if (diag) { diag->images_failed++; diag->decode_size_mismatch++; }
+            return;
+        }
+        images_drawn++;
 
         int ip_alpha = static_cast<int>(
             std::min(1.0, std::max(0.0, ip.alpha)) * 255 + 0.5);
@@ -2066,6 +2114,13 @@ ImageData render_page_composite(PdfDoc& doc, const PdfObj& page_obj,
             else draw_image(parse_result.images[ii++]);
         }
     }
+
+    // Every image placement failed to draw and no vector path was recorded:
+    // the canvas is blank white, and shipping it would read as success.
+    // Returning empty hands control back to the caller's extraction fallback.
+    if (images_drawn == 0 && parse_result.paths.empty() &&
+        !parse_result.images.empty())
+        return {};
 
     ImageData img;
     img.page_number = page_num;

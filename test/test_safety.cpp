@@ -410,8 +410,6 @@ void test_pdf_composite_clips_extreme_coordinates_before_narrowing() {
     xobjects.dict.push_back({"Mask0", mask});
     auto resources = PdfObj::make_dict();
     resources.dict.push_back({"XObject", xobjects});
-    auto page = PdfObj::make_dict();
-    page.dict.push_back({"Resources", resources});
 
     ContentParseResult parsed;
     RenderPath path{};
@@ -450,13 +448,13 @@ void test_pdf_composite_clips_extreme_coordinates_before_narrowing() {
     parsed.images.push_back(placement("Mask0", axis, 3));
     parsed.images.push_back(placement("Mask0", rotated, 4));
 
-    auto rendered = render_page_composite(doc, page, parsed, 0, 100, 100, "");
+    auto rendered = render_page_composite(doc, resources, parsed, 0, 100, 100, "");
     CHECK(rendered.width > 0);
     CHECK(rendered.height > 0);
     CHECK(!rendered.data.empty());
 
     auto invalid = render_page_composite(
-        doc, page, {}, 0, std::numeric_limits<double>::infinity(), 100, "");
+        doc, resources, {}, 0, std::numeric_limits<double>::infinity(), 100, "");
     CHECK(invalid.data.empty());
 }
 

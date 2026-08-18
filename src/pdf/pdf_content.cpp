@@ -810,6 +810,11 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
             tc.is_bold = (gs.font && gs.font->is_bold) ||
                          gs.render_mode == 2 || gs.render_mode == 6;
             tc.is_italic = gs.font ? gs.font->is_italic : false;
+            // Tr 3/7 draw nothing: an OCR text layer over a scanned page is
+            // all invisible, and the composite classifier must not mistake it
+            // for visible body text.
+            if (gs.render_mode != 3 && gs.render_mode != 7)
+                result.visible_text_chars++;
             result.chars.push_back(tc);
         }
     };
@@ -1262,6 +1267,8 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
                                 result.chars.insert(result.chars.end(),
                                     std::make_move_iterator(sub.chars.begin()),
                                     std::make_move_iterator(sub.chars.end()));
+                                result.visible_text_chars +=
+                                    sub.visible_text_chars;
                                 result.segments.insert(result.segments.end(),
                                     std::make_move_iterator(sub.segments.begin()),
                                     std::make_move_iterator(sub.segments.end()));

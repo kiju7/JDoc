@@ -211,6 +211,7 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
     result.col_boundaries.resize(tp, 0);
     result.all_tables.resize(tp);
     result.all_annots.resize(tp);
+    result.page_diags.resize(tp);
     result.page_widths.resize(tp, 0);
     result.page_heights.resize(tp, 0);
 
@@ -252,10 +253,12 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
         double page_w = 612, page_h = 792; // default letter
         double mb_llx = 0, mb_lly = 0;
         int page_rotate = 0;
+        PdfObj resources; // /Resources is inheritable like MediaBox and /Rotate
         {
-            bool have_box = false, have_rot = false;
+            bool have_box = false, have_rot = false, have_res = false;
             PdfObj node = page_obj;
-            for (int hop = 0; hop < 64 && (!have_box || !have_rot); hop++) {
+            for (int hop = 0; hop < 64 && (!have_box || !have_rot || !have_res);
+                 hop++) {
                 if (!have_box) {
                     auto mediabox = doc.resolve(node.get("MediaBox"));
                     if (mediabox.is_arr() && mediabox.arr.size() >= 4) {
@@ -272,6 +275,13 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
                         page_rotate = ((rot.as_int() % 360) + 360) % 360;
                         page_rotate -= page_rotate % 90;
                         have_rot = true;
+                    }
+                }
+                if (!have_res) {
+                    auto r = doc.resolve(node.get("Resources"));
+                    if (r.is_dict()) {
+                        resources = std::move(r);
+                        have_res = true;
                     }
                 }
                 auto parent = doc.resolve(node.get("Parent"));
@@ -293,13 +303,6 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
             std::swap(page_w, page_h);
         result.page_widths[p] = page_w;
         result.page_heights[p] = page_h;
-
-        // Get resources (inherit from parent)
-        auto resources = doc.resolve(page_obj.get("Resources"));
-        if (!resources.is_dict()) {
-            auto parent = doc.resolve(page_obj.get("Parent"));
-            if (parent.is_dict()) resources = doc.resolve(parent.get("Resources"));
-        }
 
         // Quick check: skip pages with no fonts and no extractable images
         bool has_fonts = false;
@@ -360,7 +363,8 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
                 const size_t memory_cost = composite_memory_cost(page_w, page_h);
                 CompositeMemoryLease lease(composite_memory, memory_cost);
                 return render_page_composite(
-                    doc, page_obj, parse_result, p, page_w, page_h, image_dir);
+                    doc, resources, parse_result, p, page_w, page_h, image_dir,
+                    &result.page_diags[p]);
             };
 
             // Decide whether image XObjects are independent assets or drawing
@@ -369,7 +373,10 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
             // large magic object count: some print drivers split text into
             // only two or three masked strips, while others create dozens.
             constexpr size_t kVectorTextMinPaths = 50;
-            bool no_text = result.all_lines[p].size() <= 2;
+            // An OCR text layer drawn with Tr 3 (invisible) must not count as
+            // page text: the page is visually a scan and composites like one.
+            bool no_text = result.all_lines[p].size() <= 2 ||
+                           parse_result.visible_text_chars == 0;
             bool vector_text_page = no_text &&
                                     parse_result.paths.size() >= kVectorTextMinPaths;
 
@@ -434,9 +441,14 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
                 }
             }
             if (!composited) {
-                auto extracted = extract_page_images(doc, page_obj, parse_result,
+                // The diag records the attempt that produced the page's final
+                // images; a failed composite re-attempts everything below, so
+                // its counts must not double up with the extraction pass.
+                result.page_diags[p] = {};
+                auto extracted = extract_page_images(doc, resources, parse_result,
                                                      p, image_dir,
-                                                     opts.min_image_size);
+                                                     opts.min_image_size,
+                                                     &result.page_diags[p]);
                 for (auto& ei : extracted) {
                     // ctm[5] is the Y translation in PDF coordinates (origin bottom-left)
                     // ctm[3] is vertical scale; y_top = ctm[5] + abs(ctm[3])
@@ -449,6 +461,7 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
                 // Fallback: render page for scanned/vector-only pages
                 if (result.all_images[p].empty() && result.all_lines[p].empty()) {
                     if (!parse_result.images.empty() || !parse_result.segments.empty()) {
+                        result.page_diags[p] = {};
                         auto rendered = render_composite();
                         if (!rendered.data.empty() || !rendered.pixels.empty() || !rendered.saved_path.empty()) {
                             result.all_images[p].push_back(std::move(rendered));
