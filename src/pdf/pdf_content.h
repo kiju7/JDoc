@@ -38,6 +38,11 @@ struct CsInfo {
     std::vector<std::array<uint8_t, 3>> lut;
 };
 
+// "No clip" sentinel for the axis-aligned clip rect carried through the
+// graphics state and onto recorded paths/placements. Real page coordinates
+// never approach it.
+inline constexpr double kClipUnbounded = 1e30;
+
 struct GfxState {
     double ctm[6] = {1, 0, 0, 1, 0, 0};  // a b c d e f
     double text_mat[6] = {1, 0, 0, 1, 0, 0};
@@ -57,9 +62,13 @@ struct GfxState {
     double fill_alpha = 1, stroke_alpha = 1; // ExtGState /ca and /CA
     std::shared_ptr<const CsInfo> fill_cs, stroke_cs; // active cs/CS for sc/scn
     // Last clip path set by W/W*. Fills whose bbox fully covers the clip are
-    // replaced by it (the "clip to shape, paint a rect" idiom); a real clip
-    // intersection stack is not modeled.
+    // replaced by it (the "clip to shape, paint a rect" idiom); shape-exact
+    // clipping is not modeled, but the running axis-aligned intersection of
+    // every committed clip's bbox is (clip_* below) — exact for rectangular
+    // clips, a conservative superset for shaped ones. q/Q scope it by copy.
     std::shared_ptr<const std::vector<PathPoint>> clip_path;
+    double clip_x0 = -kClipUnbounded, clip_y0 = -kClipUnbounded;
+    double clip_x1 = kClipUnbounded, clip_y1 = kClipUnbounded;
     double line_width = 1;
     int line_cap = 0, line_join = 0;
     double miter_limit = 10;
@@ -114,6 +123,9 @@ struct ImagePlacement {
     double ctm[6];
     double fill_r = 0, fill_g = 0, fill_b = 0; // fill color for ImageMask
     double alpha = 1; // ExtGState /ca in force at the Do (watermark fades)
+    // Clip rect in force at the Do (page space, x0 y0 x1 y1); the compositor
+    // narrows its destination ranges to it.
+    float clip[4] = {-1e30f, -1e30f, 1e30f, 1e30f};
     int seq = 0; // draw order shared with RenderPath (z-order for compositing)
 };
 
@@ -125,6 +137,7 @@ struct RenderPath {
     double line_width;
     bool do_fill, do_stroke;
     bool even_odd = false; // f*/B*/b*: even-odd fill rule (default nonzero)
+    float clip[4] = {-1e30f, -1e30f, 1e30f, 1e30f}; // page-space clip rect
     int seq = 0; // draw order shared with ImagePlacement
 };
 

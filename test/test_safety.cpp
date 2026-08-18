@@ -458,6 +458,102 @@ void test_pdf_composite_clips_extreme_coordinates_before_narrowing() {
     CHECK(invalid.data.empty());
 }
 
+// Composite PNGs carry filter byte 0 on every row (Canvas keeps rows in PNG
+// layout and prefiltered_to_png preserves that), so tests can inflate the
+// IDAT with zlib and probe raw samples directly.
+struct DecodedPng {
+    unsigned w = 0, h = 0;
+    int comps = 0;
+    std::vector<uint8_t> rows; // per row: 1 filter byte + samples
+};
+
+DecodedPng decode_test_png(const std::vector<char>& png) {
+    DecodedPng out;
+    CHECK(png.size() > 33);
+    const uint8_t* d = reinterpret_cast<const uint8_t*>(png.data());
+    auto be32 = [&](size_t off) {
+        return (static_cast<uint32_t>(d[off]) << 24) |
+               (static_cast<uint32_t>(d[off + 1]) << 16) |
+               (static_cast<uint32_t>(d[off + 2]) << 8) |
+               static_cast<uint32_t>(d[off + 3]);
+    };
+    out.w = be32(16);
+    out.h = be32(20);
+    int ctype = d[25];
+    out.comps = ctype == 2 ? 3 : ctype == 6 ? 4 : 1;
+    std::vector<uint8_t> idat;
+    size_t pos = 8;
+    while (pos + 12 <= png.size()) {
+        uint32_t len = be32(pos);
+        if (len > png.size() - pos - 12) break;
+        if (std::memcmp(d + pos + 4, "IDAT", 4) == 0)
+            idat.insert(idat.end(), d + pos + 8, d + pos + 8 + len);
+        pos += 12 + len;
+    }
+    uLongf dst_len = static_cast<uLongf>(out.h) *
+                     (1 + static_cast<size_t>(out.w) * out.comps);
+    out.rows.resize(dst_len);
+    CHECK(uncompress(out.rows.data(), &dst_len, idat.data(),
+                     static_cast<uLong>(idat.size())) == Z_OK);
+    return out;
+}
+
+uint8_t png_sample0(const DecodedPng& p, unsigned x, unsigned y) {
+    size_t stride = 1 + static_cast<size_t>(p.w) * p.comps;
+    CHECK(p.rows[y * stride] == 0); // filter byte
+    return p.rows[y * stride + 1 + static_cast<size_t>(x) * p.comps];
+}
+
+// A W n clip rect must confine an image to its window: the uncovered part of
+// the canvas stays white. Before the rect clip tier, the whole 100×100-pt
+// placement painted regardless of the 40×40-pt window.
+void test_pdf_composite_applies_clip_rect() {
+    using namespace jdoc::pdf_detail;
+
+    const uint8_t placeholder = 0;
+    PdfDoc doc(&placeholder, 1);
+
+    auto image = PdfObj::make_dict();
+    image.type = ObjType::STREAM;
+    image.dict.push_back({"Subtype", PdfObj::make_name("Image")});
+    image.dict.push_back({"Width", PdfObj::make_int(2)});
+    image.dict.push_back({"Height", PdfObj::make_int(2)});
+    image.dict.push_back({"BitsPerComponent", PdfObj::make_int(8)});
+    image.dict.push_back({"ColorSpace", PdfObj::make_name("DeviceGray")});
+    image.stream_data = {100, 100, 100, 100};
+
+    auto xobjects = PdfObj::make_dict();
+    xobjects.dict.push_back({"Im0", image});
+    auto resources = PdfObj::make_dict();
+    resources.dict.push_back({"XObject", xobjects});
+
+    ContentParseResult parsed;
+    ImagePlacement ip{};
+    ip.xobj_name = "Im0";
+    const double ctm[6] = {100, 0, 0, 100, 0, 0}; // covers the whole page
+    std::memcpy(ip.ctm, ctm, sizeof(ctm));
+    ip.alpha = 1;
+    ip.clip[0] = 30; ip.clip[1] = 30; ip.clip[2] = 70; ip.clip[3] = 70;
+    ip.seq = 1;
+    parsed.images.push_back(ip);
+
+    auto rendered = render_page_composite(doc, resources, parsed, 0, 100, 100, "");
+    CHECK(!rendered.data.empty());
+    auto png = decode_test_png(
+        std::vector<char>(rendered.data.begin(), rendered.data.end()));
+    CHECK(png.w > 0 && png.h > 0);
+    double sx = png.w / 100.0, sy = png.h / 100.0;
+    auto px = [&](double page_x, double page_y) {
+        unsigned cx = static_cast<unsigned>(page_x * sx);
+        unsigned cy = static_cast<unsigned>((100.0 - page_y) * sy);
+        return png_sample0(png, cx, cy);
+    };
+    CHECK(px(50, 50) == 100);  // inside the window
+    CHECK(px(10, 50) == 255);  // left of it: white
+    CHECK(px(50, 90) == 255);  // above it: white
+    CHECK(px(90, 10) == 255);  // opposite corner: white
+}
+
 void test_pdf_reads_rotated_text() {
     const std::string pdf = rotated_text_pdf();
     const std::string text = jdoc::pdf_to_markdown_mem(
@@ -712,6 +808,7 @@ int main() {
     test_png_converts_cmyk();
     test_pdf_honors_images_option();
     test_pdf_composite_clips_extreme_coordinates_before_narrowing();
+    test_pdf_composite_applies_clip_rect();
     test_pdf_reads_rotated_text();
     test_pdf_table_cell_rotated_text();
     test_pdf_line_width_follows_ctm();

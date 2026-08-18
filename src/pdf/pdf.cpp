@@ -420,6 +420,12 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
                 if (!std::isfinite(bx0) || !std::isfinite(bx1) ||
                     !std::isfinite(by0) || !std::isfinite(by1))
                     continue;
+                // The visual extent is the placement clipped by W/W*: a big
+                // image behind a small window must cluster by the window.
+                bx0 = std::max(bx0, static_cast<double>(ip.clip[0]));
+                by0 = std::max(by0, static_cast<double>(ip.clip[1]));
+                bx1 = std::min(bx1, static_cast<double>(ip.clip[2]));
+                by1 = std::min(by1, static_cast<double>(ip.clip[3]));
                 if (bx1 - bx0 < 0.1 || by1 - by0 < 0.1) continue;
                 if (bx1 < 0 || bx0 > page_w || by1 < 0 || by0 > page_h)
                     continue;

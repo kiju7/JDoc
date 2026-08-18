@@ -350,11 +350,29 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
 
     auto commit_pending_clip = [&](GfxState& g) {
         if (has_pending_clip) {
+            // Rect tier: fold the clip's bbox into the running intersection.
+            // Exact for rectangular clips (the overwhelming case: viewports,
+            // table cells, form windows); a conservative superset for shapes.
+            double cx0, cy0, cx1, cy1;
+            path_bbox(pending_clip, cx0, cy0, cx1, cy1);
+            if (cx0 <= cx1 && cy0 <= cy1) {
+                g.clip_x0 = std::max(g.clip_x0, cx0);
+                g.clip_y0 = std::max(g.clip_y0, cy0);
+                g.clip_x1 = std::min(g.clip_x1, cx1);
+                g.clip_y1 = std::min(g.clip_y1, cy1);
+            }
             g.clip_path = std::make_shared<const std::vector<PathPoint>>(
                 std::move(pending_clip));
             pending_clip.clear();
             has_pending_clip = false;
         }
+    };
+
+    auto copy_clip = [](const GfxState& g, float out[4]) {
+        out[0] = static_cast<float>(g.clip_x0);
+        out[1] = static_cast<float>(g.clip_y0);
+        out[2] = static_cast<float>(g.clip_x1);
+        out[3] = static_cast<float>(g.clip_y1);
     };
 
     // "Clip to the shape, then paint a covering rect" draws the clip shape;
@@ -609,6 +627,7 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
             rp.line_width = gs.line_width * ctm_pen_scale(gs.ctm);
             rp.do_fill = do_fill; rp.do_stroke = do_stroke;
             rp.even_odd = even_odd;
+            copy_clip(gs, rp.clip);
             rp.seq = draw_seq++;
             result.paths.push_back(std::move(rp));
         }
@@ -1063,6 +1082,7 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
             ip.fill_g = gs.fill_g;
             ip.fill_b = gs.fill_b;
             ip.alpha = gs.fill_alpha;
+            copy_clip(gs, ip.clip);
             ip.seq = draw_seq++;
             result.images.push_back(std::move(ip));
         }
@@ -1512,11 +1532,38 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
                                 }
                                 auto& form_res = xobj.get("Resources");
                                 const PdfObj& sub_res = form_res.is_none() ? res : form_res;
+                                // /BBox is a required clip (8.10.1): content
+                                // outside it must not paint. Intersect its
+                                // transformed AABB into the inherited state.
+                                GfxState form_gs = gs;
+                                auto bbox = doc.resolve(xobj.get("BBox"));
+                                if (bbox.is_arr() && bbox.arr.size() >= 4) {
+                                    double b0 = bbox.arr[0].as_num();
+                                    double b1 = bbox.arr[1].as_num();
+                                    double b2 = bbox.arr[2].as_num();
+                                    double b3 = bbox.arr[3].as_num();
+                                    double cx[4], cy[4];
+                                    transform_point(form_ctm, b0, b1, cx[0], cy[0]);
+                                    transform_point(form_ctm, b2, b1, cx[1], cy[1]);
+                                    transform_point(form_ctm, b0, b3, cx[2], cy[2]);
+                                    transform_point(form_ctm, b2, b3, cx[3], cy[3]);
+                                    double fx0 = std::min({cx[0], cx[1], cx[2], cx[3]});
+                                    double fx1 = std::max({cx[0], cx[1], cx[2], cx[3]});
+                                    double fy0 = std::min({cy[0], cy[1], cy[2], cy[3]});
+                                    double fy1 = std::max({cy[0], cy[1], cy[2], cy[3]});
+                                    if (std::isfinite(fx0) && std::isfinite(fx1) &&
+                                        std::isfinite(fy0) && std::isfinite(fy1)) {
+                                        form_gs.clip_x0 = std::max(form_gs.clip_x0, fx0);
+                                        form_gs.clip_y0 = std::max(form_gs.clip_y0, fy0);
+                                        form_gs.clip_x1 = std::min(form_gs.clip_x1, fx1);
+                                        form_gs.clip_y1 = std::min(form_gs.clip_y1, fy1);
+                                    }
+                                }
                                 auto sub = parse_content_stream(
                                     doc, form_stream, sub_res, page_height,
                                     font_cache, options,
                                     form_ctm, depth + 1,
-                                    &gs);
+                                    &form_gs);
                                 // sub is a temporary discarded right after — move
                                 // its elements into the parent instead of copying.
                                 result.chars.insert(result.chars.end(),
@@ -1554,6 +1601,7 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
                             ip.fill_g = gs.fill_g;
                             ip.fill_b = gs.fill_b;
                             ip.alpha = gs.fill_alpha;
+                            copy_clip(gs, ip.clip);
                             ip.seq = draw_seq++;
                             result.images.push_back(ip);
                         }

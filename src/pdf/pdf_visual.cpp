@@ -1314,7 +1314,7 @@ struct Canvas {
     void blit_image(const uint8_t* src, int sw, int sh, int scomp,
                      const double ctm[6], double page_h, double scale,
                      const uint8_t* amask = nullptr, int amw = 0, int amh = 0,
-                     int base_alpha = 255) {
+                     int base_alpha = 255, const int* clip_px = nullptr) {
         // CTM maps image space [0,1]×[0,1] to page space
         // Scale converts page space to canvas space
         bool axis_aligned = (std::abs(ctm[1]) < 0.001 && std::abs(ctm[2]) < 0.001);
@@ -1337,6 +1337,14 @@ struct Canvas {
             if (!clip_axis_aligned_image(ctm, page_h, scale, width, height,
                                          x_axis, y_axis))
                 return;
+            if (clip_px) {
+                x_axis.begin = std::max(x_axis.begin, clip_px[0]);
+                x_axis.end = std::min(x_axis.end, clip_px[2]);
+                y_axis.begin = std::max(y_axis.begin, clip_px[1]);
+                y_axis.end = std::min(y_axis.end, clip_px[3]);
+                if (x_axis.begin >= x_axis.end || y_axis.begin >= y_axis.end)
+                    return;
+            }
 
             bool downscale = (x_axis.length < sw || y_axis.length < sh);
             for (int dy = y_axis.begin; dy < y_axis.end; dy++) {
@@ -1392,6 +1400,12 @@ struct Canvas {
             if (!make_inverse_image_map(ctm, page_h, scale, width, height,
                                         image_map))
                 return;
+            if (clip_px) {
+                image_map.x.begin = std::max(image_map.x.begin, clip_px[0]);
+                image_map.x.end = std::min(image_map.x.end, clip_px[2]);
+                image_map.y.begin = std::max(image_map.y.begin, clip_px[1]);
+                image_map.y.end = std::min(image_map.y.end, clip_px[3]);
+            }
 
             for (int canvas_y = image_map.y.begin;
                  canvas_y < image_map.y.end; canvas_y++) {
@@ -1513,6 +1527,25 @@ ImageData render_page_composite(PdfDoc& doc, const PdfObj& resources,
 
     Canvas canvas(rw, rh);
 
+    // Canvas-space clip rect (pixels, end-exclusive) from a recorded page-
+    // space clip. Returns false when the op is clipped away entirely; the
+    // sentinel bounds clamp to the full canvas at no cost.
+    auto canvas_clip = [&](const float clip[4], int out[4]) -> bool {
+        auto clamp_floor = [](double v, int hi) {
+            v = std::max(0.0, std::min(static_cast<double>(hi), v));
+            return static_cast<int>(std::floor(v));
+        };
+        auto clamp_ceil = [](double v, int hi) {
+            v = std::max(0.0, std::min(static_cast<double>(hi), v));
+            return static_cast<int>(std::ceil(v));
+        };
+        out[0] = clamp_floor(clip[0] * scale, rw);
+        out[2] = clamp_ceil(clip[2] * scale, rw);
+        out[1] = clamp_floor((page_h - clip[3]) * scale, rh);
+        out[3] = clamp_ceil((page_h - clip[1]) * scale, rh);
+        return out[0] < out[2] && out[1] < out[3];
+    };
+
     // ── Rasterize vector paths (8× vertical AA + analytic horizontal coverage) ──
     constexpr int AA_V = 8;
 
@@ -1527,7 +1560,9 @@ ImageData render_page_composite(PdfDoc& doc, const PdfObj& resources,
     // glyphs cancel under even-odd, punching white holes at every joint.
     auto rasterize_edges = [&](std::vector<ScanEdge>& edges, int ymin, int ymax,
                                uint8_t cr, uint8_t cg, uint8_t cb,
-                               bool nonzero = false, int alpha255 = 255) {
+                               bool nonzero = false, int alpha255 = 255,
+                               int clip_x0 = 0,
+                               int clip_x1 = std::numeric_limits<int>::max()) {
         if (edges.empty()) return;
         ymin = std::max(0, ymin);
         ymax = std::min(rh * AA_V, ymax);
@@ -1552,8 +1587,8 @@ ImageData render_page_composite(PdfDoc& doc, const PdfObj& resources,
             constexpr double kGuard = 1e9;
             return static_cast<int>(std::max(-kGuard, std::min(kGuard, v)));
         };
-        int xmin = std::max(0, to_int(xmin_d) - 1);
-        int xmax = std::min(rw, to_int(xmax_d) + 2);
+        int xmin = std::max({0, to_int(xmin_d) - 1, clip_x0});
+        int xmax = std::min({rw, to_int(xmax_d) + 2, clip_x1});
         int xspan = xmax - xmin;
         if (xspan <= 0) return;
 
@@ -1726,6 +1761,8 @@ ImageData render_page_composite(PdfDoc& doc, const PdfObj& resources,
 
     auto draw_path = [&](const RenderPath& rp) {
         if (rp.points.empty()) return;
+        int clip_px[4];
+        if (!canvas_clip(rp.clip, clip_px)) return;
 
         // Flatten path to line segments
         subpaths.clear();
@@ -1774,7 +1811,10 @@ ImageData render_page_composite(PdfDoc& doc, const PdfObj& resources,
             uint8_t fg = static_cast<uint8_t>(std::min(255.0, std::max(0.0, rp.fill_g * 255)));
             uint8_t fb = static_cast<uint8_t>(std::min(255.0, std::max(0.0, rp.fill_b * 255)));
             int fa = static_cast<int>(std::min(1.0, std::max(0.0, rp.fill_alpha)) * 255 + 0.5);
-            rasterize_edges(edge_buf, ymin, ymax, fr, fg, fb, !rp.even_odd, fa);
+            ymin = std::max(ymin, clip_px[1] * AA_V);
+            ymax = std::min(ymax, clip_px[3] * AA_V);
+            rasterize_edges(edge_buf, ymin, ymax, fr, fg, fb, !rp.even_odd, fa,
+                            clip_px[0], clip_px[2]);
         }
 
         // Stroke
@@ -1809,7 +1849,10 @@ ImageData render_page_composite(PdfDoc& doc, const PdfObj& resources,
             uint8_t sg = static_cast<uint8_t>(std::min(255.0, std::max(0.0, rp.stroke_g * 255)));
             uint8_t sb = static_cast<uint8_t>(std::min(255.0, std::max(0.0, rp.stroke_b * 255)));
             int sa = static_cast<int>(std::min(1.0, std::max(0.0, rp.stroke_alpha)) * 255 + 0.5);
-            rasterize_edges(edge_buf, ymin, ymax, sr, sg, sb, true, sa);
+            ymin = std::max(ymin, clip_px[1] * AA_V);
+            ymax = std::min(ymax, clip_px[3] * AA_V);
+            rasterize_edges(edge_buf, ymin, ymax, sr, sg, sb, true, sa,
+                            clip_px[0], clip_px[2]);
         }
     };
 
@@ -1841,6 +1884,10 @@ ImageData render_page_composite(PdfDoc& doc, const PdfObj& resources,
             if (diag) diag->images_failed++;
             return;
         }
+
+        // Spec-clipped away entirely: not a failure, and no decode needed.
+        int clip_px[4];
+        if (!canvas_clip(ip.clip, clip_px)) return;
 
         // Check if this is an ImageMask (1-bit stencil)
         bool is_image_mask = xobj.get("ImageMask").bool_val;
@@ -2072,6 +2119,10 @@ ImageData render_page_composite(PdfDoc& doc, const PdfObj& resources,
                                             canvas.width, canvas.height,
                                             image_map))
                     return;
+                image_map.x.begin = std::max(image_map.x.begin, clip_px[0]);
+                image_map.x.end = std::min(image_map.x.end, clip_px[2]);
+                image_map.y.begin = std::max(image_map.y.begin, clip_px[1]);
+                image_map.y.end = std::min(image_map.y.end, clip_px[3]);
                 for (int canvas_y = image_map.y.begin;
                      canvas_y < image_map.y.end; canvas_y++) {
                     for (int canvas_x = image_map.x.begin;
@@ -2104,6 +2155,12 @@ ImageData render_page_composite(PdfDoc& doc, const PdfObj& resources,
             if (!clip_axis_aligned_image(ip.ctm, page_h, scale, canvas.width,
                                          canvas.height, x_axis, y_axis))
                 return;
+            x_axis.begin = std::max(x_axis.begin, clip_px[0]);
+            x_axis.end = std::min(x_axis.end, clip_px[2]);
+            y_axis.begin = std::max(y_axis.begin, clip_px[1]);
+            y_axis.end = std::min(y_axis.end, clip_px[3]);
+            if (x_axis.begin >= x_axis.end || y_axis.begin >= y_axis.end)
+                return;
             // Area sampling for ImageMask: compute coverage ratio in source region
             for (int dy = y_axis.begin; dy < y_axis.end; dy++) {
                 auto [sy0, sy1] = y_axis.source_interval(dy, h);
@@ -2131,7 +2188,7 @@ ImageData render_page_composite(PdfDoc& doc, const PdfObj& resources,
                 decode_stencil_mask(doc, xobj, smask, smw, smh);
             canvas.blit_image(pixels.data(), w, h, components, ip.ctm, page_h, scale,
                               smask.empty() ? nullptr : smask.data(), smw, smh,
-                              ip_alpha);
+                              ip_alpha, clip_px);
         }
     };
 
@@ -2210,6 +2267,10 @@ ImageData render_region_composite(PdfDoc& doc, const PdfObj& resources,
         ImagePlacement ip = parse_result.images[idx];
         ip.ctm[4] -= x0;
         ip.ctm[5] -= y0;
+        ip.clip[0] -= static_cast<float>(x0);
+        ip.clip[2] -= static_cast<float>(x0);
+        ip.clip[1] -= static_cast<float>(y0);
+        ip.clip[3] -= static_cast<float>(y0);
         sub.images.push_back(std::move(ip));
     }
     if (sub.images.empty()) return {};
@@ -2240,6 +2301,10 @@ ImageData render_region_composite(PdfDoc& doc, const PdfObj& resources,
             pt.cx1 -= x0; pt.cy1 -= y0;
             pt.cx2 -= x0; pt.cy2 -= y0;
         }
+        sp.clip[0] -= static_cast<float>(x0);
+        sp.clip[2] -= static_cast<float>(x0);
+        sp.clip[1] -= static_cast<float>(y0);
+        sp.clip[3] -= static_cast<float>(y0);
         sub.paths.push_back(std::move(sp));
     }
 
