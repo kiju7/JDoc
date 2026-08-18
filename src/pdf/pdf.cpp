@@ -579,30 +579,15 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
 
             bool composited = false;
             if (vector_text_page || fragment_page) {
+                // The composite draws every placement, standalone images
+                // included; exporting those separately would store the same
+                // content twice, so a composited page emits exactly one file.
                 auto rendered = render_composite();
                 if (!rendered.data.empty() || !rendered.pixels.empty() || !rendered.saved_path.empty()) {
                     result.all_images[p].push_back(std::move(rendered));
                     result.all_image_y[p].push_back(page_h);
                     result.all_image_x[p].push_back(0);
                     composited = true;
-
-                    // Standalone assets still come out as originals; the
-                    // fragments live only inside the composite.
-                    std::vector<size_t> assets;
-                    for (size_t i = 0; i < parse_result.images.size(); i++)
-                        if (!is_fragment[i]) assets.push_back(i);
-                    if (!assets.empty()) {
-                        auto extracted = extract_page_images(
-                            doc, resources, parse_result, p, image_dir,
-                            opts.min_image_size, &result.page_diags[p],
-                            &assets, 1);
-                        for (auto& ei : extracted) {
-                            double y_top = ei.ctm[5] + std::abs(ei.ctm[3]);
-                            result.all_image_y[p].push_back(y_top);
-                            result.all_image_x[p].push_back(ei.ctm[4]);
-                            result.all_images[p].push_back(std::move(ei.img));
-                        }
-                    }
                 }
             }
             if (!composited) {
