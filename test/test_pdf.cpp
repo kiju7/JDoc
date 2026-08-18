@@ -162,10 +162,10 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    // Test 7: Region composites keep reading order. strip_text's strip block
-    // sits below its six text lines, so the image ref must follow the text —
-    // the old behavior pinned composites to the top of the page.
-    std::cout << "[7] Testing region composite reading order...\n";
+    // Test 7: A fragment page composites whole without losing its text —
+    // the strips fold into one page image while every text line stays in
+    // the markdown.
+    std::cout << "[7] Testing fragment page keeps text...\n";
     {
         const char* fixture = "test/fixtures/pdf/strip_text.pdf";
         std::ifstream f(fixture);
@@ -174,12 +174,15 @@ int main(int argc, char* argv[]) {
         } else {
             f.close();
             std::string md = jdoc::pdf_to_markdown(fixture);
-            size_t last_text = md.rfind("quick brown fox");
-            size_t ref = md.find("![");
-            assert(last_text != std::string::npos);
-            assert(ref != std::string::npos);
-            std::cout << "    text@" << last_text << " ref@" << ref << "\n";
-            assert(ref > last_text);
+            size_t refs = 0;
+            for (size_t i = md.find("!["); i != std::string::npos;
+                 i = md.find("![", i + 2))
+                refs++;
+            std::cout << "    refs=" << refs << "\n";
+            assert(refs == 1);
+            for (int i = 0; i < 6; i++)
+                assert(md.find("The quick brown fox " + std::to_string(i)) !=
+                       std::string::npos);
         }
     }
 

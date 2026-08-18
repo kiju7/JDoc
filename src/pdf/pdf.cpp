@@ -393,6 +393,7 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
                 size_t idx;             // index into parse_result.images
                 double x0, y0, x1, y1;  // device bbox, viewing coords
                 int obj_num;            // resolved ref; -1 for name/inline
+                bool masked;            // stencil/1-bit or /SMask//Mask-backed
             };
             std::vector<PlacementInfo> infos;
             auto xobjects = doc.resolve(resources.get("XObject"));
@@ -436,7 +437,14 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
                 if (bx1 - bx0 < 0.1 || by1 - by0 < 0.1) continue;
                 if (bx1 < 0 || bx0 > page_w || by1 < 0 || by0 > page_h)
                     continue;
-                infos.push_back({i, bx0, by0, bx1, by1, ip.xobj_ref});
+                // Rasterized glyph strips commonly store a solid RGB image
+                // plus a soft mask holding the actual glyphs; /Mask,
+                // ImageMask and 1-bit layers carry the same role.
+                bool masked = xobj.get("ImageMask").bool_val ||
+                              xobj.get("BitsPerComponent").as_int() == 1 ||
+                              !xobj.get("SMask").is_none() ||
+                              !xobj.get("Mask").is_none();
+                infos.push_back({i, bx0, by0, bx1, by1, ip.xobj_ref, masked});
             }
 
             const size_t n_inf = infos.size();
@@ -540,40 +548,61 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
                 return false;
             };
 
-            double frag_area = 0;
-            size_t frag_members = 0, frag_clusters = 0;
+            // ── Fragment classification ─────────────────────────
+            // A fragment is a drawing primitive that only makes sense
+            // composited: a member of an abutting/overlapping cluster
+            // (strips, tiles, layered stamp pairs), or a thin glyph strip
+            // (mask-backed on any page; bare rasters count once the page has
+            // no visible text). Any two fragments turn the page into one
+            // whole-page composite; standalone images (photos, logos,
+            // scans) always export as original assets besides it.
+            std::vector<char> is_fragment(parse_result.images.size(), 0);
+            size_t fragment_count = 0;
             for (auto& c : clusters) {
                 if (!qualifies(c)) continue;
-                frag_clusters++;
-                frag_members += c.members.size();
-                double cx0 = std::max(0.0, c.x0), cy0 = std::max(0.0, c.y0);
-                double cx1 = std::min(page_w, c.x1);
-                double cy1 = std::min(page_h, c.y1);
-                if (cx1 > cx0 && cy1 > cy0)
-                    frag_area += (cx1 - cx0) * (cy1 - cy0);
+                for (size_t mi : c.members)
+                    if (!is_fragment[infos[mi].idx]) {
+                        is_fragment[infos[mi].idx] = 1;
+                        fragment_count++;
+                    }
             }
-            // A page with no visible text loses nothing in a whole-page
-            // composite. Area alone under-detects rastered text: secure
-            // documents strip their body line by line, and inter-line gaps
-            // keep coverage well below half a page — several fragment
-            // clusters or a dozen fragments read as one shredded page.
-            // Pages where raster fragments far outnumber the extractable
-            // lines are the same document style with a stray caption or two;
-            // per-block crops would still shred them.
-            bool shredded_page =
-                (no_text && (frag_area >= 0.5 * page_w * page_h ||
-                             frag_clusters >= 3 || frag_members >= 12)) ||
-                (frag_members >= 12 &&
-                 frag_members >= 2 * result.all_lines[p].size());
+            for (auto& info : infos) {
+                if (is_fragment[info.idx]) continue;
+                double w = info.x1 - info.x0, h = info.y1 - info.y0;
+                bool thin = h <= 0.04 * page_h && w >= 2.0 * h;
+                if (thin && (info.masked || no_text)) {
+                    is_fragment[info.idx] = 1;
+                    fragment_count++;
+                }
+            }
+            bool fragment_page = fragment_count >= 2;
 
             bool composited = false;
-            if (vector_text_page || shredded_page) {
+            if (vector_text_page || fragment_page) {
                 auto rendered = render_composite();
                 if (!rendered.data.empty() || !rendered.pixels.empty() || !rendered.saved_path.empty()) {
                     result.all_images[p].push_back(std::move(rendered));
                     result.all_image_y[p].push_back(page_h);
                     result.all_image_x[p].push_back(0);
                     composited = true;
+
+                    // Standalone assets still come out as originals; the
+                    // fragments live only inside the composite.
+                    std::vector<size_t> assets;
+                    for (size_t i = 0; i < parse_result.images.size(); i++)
+                        if (!is_fragment[i]) assets.push_back(i);
+                    if (!assets.empty()) {
+                        auto extracted = extract_page_images(
+                            doc, resources, parse_result, p, image_dir,
+                            opts.min_image_size, &result.page_diags[p],
+                            &assets, 1);
+                        for (auto& ei : extracted) {
+                            double y_top = ei.ctm[5] + std::abs(ei.ctm[3]);
+                            result.all_image_y[p].push_back(y_top);
+                            result.all_image_x[p].push_back(ei.ctm[4]);
+                            result.all_images[p].push_back(std::move(ei.img));
+                        }
+                    }
                 }
             }
             if (!composited) {
@@ -584,40 +613,6 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
                 int img_idx = 0;
                 std::vector<char> handled(parse_result.images.size(), 0);
                 std::vector<std::array<double, 4>> done_regions;
-                for (auto& c : clusters) {
-                    if (!qualifies(c)) continue;
-                    double rgn[4] = {std::max(0.0, c.x0), std::max(0.0, c.y0),
-                                     std::min(page_w, c.x1),
-                                     std::min(page_h, c.y1)};
-                    if (rgn[2] - rgn[0] < 1.0 || rgn[3] - rgn[1] < 1.0)
-                        continue;
-                    std::vector<size_t> members;
-                    members.reserve(c.members.size());
-                    for (size_t mi : c.members)
-                        members.push_back(infos[mi].idx);
-                    std::sort(members.begin(), members.end());
-                    ImageData rendered;
-                    {
-                        CompositeMemoryLease lease(
-                            composite_memory,
-                            composite_memory_cost(rgn[2] - rgn[0],
-                                                  rgn[3] - rgn[1]));
-                        rendered = render_region_composite(
-                            doc, resources, parse_result, members, p, rgn,
-                            image_dir, img_idx, &result.page_diags[p]);
-                    }
-                    if (rendered.data.empty() && rendered.pixels.empty() &&
-                        rendered.saved_path.empty())
-                        continue; // members fall back to individual export
-                    for (size_t mi : members) handled[mi] = 1;
-                    result.all_images[p].push_back(std::move(rendered));
-                    // Cluster top/left keeps the markdown insert in reading
-                    // order; only whole-page composites pin to top-of-page.
-                    result.all_image_y[p].push_back(rgn[3]);
-                    result.all_image_x[p].push_back(rgn[0]);
-                    done_regions.push_back({rgn[0], rgn[1], rgn[2], rgn[3]});
-                    img_idx++;
-                }
 
                 // ── Vector figures ──────────────────────────────
                 // A schematic or chart drawn as paths (often with a few small
