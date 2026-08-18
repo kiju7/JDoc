@@ -788,7 +788,18 @@ std::vector<ExtractedImage> extract_page_images(PdfDoc& doc, const PdfObj& resou
         }
 
         if (last_filter == "DCTDecode") {
-            if (single_filter) {
+            if (single_filter && doc.crypt.active) {
+                // Encrypted document: the raw stream bytes are ciphertext.
+                // decode_stream decrypts and leaves the JPEG payload intact.
+                auto decoded = doc.decode_stream(xobj);
+                if (decoded.size() < 2 || decoded[0] != 0xFF ||
+                    decoded[1] != 0xD8)
+                    continue;
+                img.format = "jpeg";
+                img.data.assign(reinterpret_cast<const char*>(decoded.data()),
+                                reinterpret_cast<const char*>(decoded.data()) +
+                                    decoded.size());
+            } else if (single_filter) {
                 // JPEG passthrough — raw bytes are valid JPEG
                 if (!xobj.raw_stream_data() || xobj.raw_stream_size() == 0) continue;
                 img.format = "jpeg";
@@ -842,8 +853,16 @@ std::vector<ExtractedImage> extract_page_images(PdfDoc& doc, const PdfObj& resou
             if (cols <= 0) cols = w;
             bool black_is_1 = parms.get("BlackIs1").bool_val;
 
-            auto decoded = decode_ccitt(xobj.raw_stream_data(), xobj.raw_stream_size(),
-                                         k, cols, black_is_1);
+            const uint8_t* csrc = xobj.raw_stream_data();
+            size_t clen = xobj.raw_stream_size();
+            std::vector<uint8_t> dec_buf;
+            if (doc.crypt.active) {
+                // decode_stream decrypts and leaves the CCITT payload raw.
+                dec_buf = doc.decode_stream(xobj);
+                csrc = dec_buf.data();
+                clen = dec_buf.size();
+            }
+            auto decoded = decode_ccitt(csrc, clen, k, cols, black_is_1);
             // Convert 1-bit to grayscale
             int row_bytes = (cols + 7) / 8;
             int expected_rows = (int)decoded.size() / row_bytes;
@@ -1660,13 +1679,22 @@ ImageData render_page_composite(PdfDoc& doc, const PdfObj& resources,
                               (pre_filter.is_arr() &&
                                pre_filter.arr.size() == 1);
                 if (!single || !xobj.raw_stream_data()) continue;
+                const uint8_t* jb = xobj.raw_stream_data();
+                size_t jb_len = xobj.raw_stream_size();
+                std::vector<uint8_t> jb_buf;
+                if (doc.crypt.active) {
+                    // Probe on plaintext; the raw bytes are ciphertext here.
+                    jb_buf.assign(jb, jb + jb_len);
+                    doc.crypt.decrypt_data(jb_buf, xobj.src_num,
+                                           xobj.src_gen);
+                    jb = jb_buf.data();
+                    jb_len = jb_buf.size();
+                }
                 std::vector<uint8_t> gl;
                 auto parms = doc.resolve(xobj.get("DecodeParms"));
                 auto g = doc.resolve(parms.get("JBIG2Globals"));
                 if (g.is_stream()) gl = doc.decode_stream(g);
-                if (!jbig2_supported(xobj.raw_stream_data(),
-                                     xobj.raw_stream_size(),
-                                     gl.data(), gl.size()))
+                if (!jbig2_supported(jb, jb_len, gl.data(), gl.size()))
                     continue;
             }
             int iw = xobj.get("Width").as_int();
@@ -2104,25 +2132,21 @@ ImageData render_page_composite(PdfDoc& doc, const PdfObj& resources,
                 if (cols <= 0) cols = w;
                 bool black_is_1 = ccitt_parms.get("BlackIs1").bool_val;
 
-                // Get raw stream data and apply pre-filters manually
+                // Get the CCITT payload. decode_stream decrypts and applies
+                // any preceding filters (Flate/LZW/ASCII), leaving CCITT raw
+                // for the caller; the plain raw path stays zero-copy.
                 const uint8_t* src = xobj.raw_stream_data();
                 size_t src_len = xobj.raw_stream_size();
+                std::vector<uint8_t> pre_decoded;
+                if (doc.crypt.active ||
+                    (filter_obj.is_arr() && filter_obj.arr.size() > 1)) {
+                    pre_decoded = doc.decode_stream(xobj);
+                    src = pre_decoded.data();
+                    src_len = pre_decoded.size();
+                }
                 if (!src || src_len == 0) {
                     if (diag) diag->images_failed++;
                     return;
-                }
-
-                // Apply preceding filters (e.g. FlateDecode before CCITTFax)
-                std::vector<uint8_t> pre_decoded;
-                if (filter_obj.is_arr() && filter_obj.arr.size() > 1) {
-                    pre_decoded.assign(src, src + src_len);
-                    for (size_t fi = 0; fi + 1 < filter_obj.arr.size(); fi++) {
-                        auto fname = doc.resolve(filter_obj.arr[fi]);
-                        if (fname.str_val == "FlateDecode")
-                            pre_decoded = decode_flate(pre_decoded.data(), pre_decoded.size());
-                    }
-                    src = pre_decoded.data();
-                    src_len = pre_decoded.size();
                 }
 
                 auto ccitt_data = decode_ccitt(src, src_len, k, cols, black_is_1);
