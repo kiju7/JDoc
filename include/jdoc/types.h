@@ -38,6 +38,9 @@ struct PageChunk {
     double body_font_size = 0;
     std::vector<std::vector<std::vector<std::string>>> tables;
     std::vector<ImageData> images;
+    // Images on this page whose sample data could not be decoded (unsupported
+    // codec variant, truncated stream). The page's other content is intact.
+    int degraded_images = 0;
 };
 
 // Streaming sink for per-page conversion. The core produces one PageChunk at a

@@ -15,6 +15,10 @@ enum class FileFormat {
     EMF, WMF,   // metafiles — vector records carrying text (+ images)
     IMAGE,      // standalone raster image (jpeg/png/gif/bmp/webp) — no text,
                 // saved as-is when image extraction is on
+    CAD,        // dwg/dwf/dwfx drawing (and binary dxf) — recognized so callers
+                // can route or skip it, but jdoc extracts nothing from it.
+                // An ASCII DXF is TXT instead: it is text, and dropping it
+                // would lose the TEXT records a drawing does carry.
     ZIP, GZIP, BZIP2, TAR, SEVENZIP, ALZ, EGG, RAR,
     UNKNOWN
 };
@@ -22,6 +26,9 @@ enum class FileFormat {
 FileFormat detect_format(const std::string& path);
 FileFormat detect_format_mem(const uint8_t* data, size_t size,
                              const std::string& name_hint);
+// Format implied by a name's extension alone, with no bytes to look at. The
+// archive walker uses it to name the members it skips without inflating.
+FileFormat format_from_extension(const std::string& name);
 const char* file_format_name(FileFormat fmt);
 
 inline bool is_archive_format(FileFormat f) {

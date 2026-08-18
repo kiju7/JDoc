@@ -1,5 +1,6 @@
 #include "pdf_core.h"
 #include "jbig2.h"
+#include "pdf_limits.h"
 #include "common/string_utils.h"
 #include "common/file_utils.h"
 #include "common/inflate.h"
@@ -191,6 +192,47 @@ std::vector<uint8_t> decode_flate(const uint8_t* src, size_t src_len) {
     } while (true);
     inflateEnd(&zs);
     return out;
+}
+
+bool flate_encoded_size(const uint8_t* src, size_t src_len,
+                        size_t& encoded_size) {
+    encoded_size = 0;
+    if (!src || src_len == 0) return false;
+
+    z_stream zs = {};
+    if (inflateInit(&zs) != Z_OK) return false;
+
+    size_t fed = 0;
+    uint64_t produced = 0;
+    uint8_t out[8192];
+    bool complete = false;
+    while (true) {
+        if (zs.avail_in == 0 && fed < src_len) {
+            size_t chunk = std::min(
+                src_len - fed,
+                static_cast<size_t>(std::numeric_limits<uInt>::max()));
+            zs.next_in = const_cast<Bytef*>(src + fed);
+            zs.avail_in = static_cast<uInt>(chunk);
+            fed += chunk;
+        }
+
+        zs.next_out = out;
+        zs.avail_out = sizeof(out);
+        uInt before_in = zs.avail_in;
+        int ret = inflate(&zs, Z_NO_FLUSH);
+        produced += sizeof(out) - zs.avail_out;
+        if (produced > limits::kMaxDecodedSamples) break;
+        if (ret == Z_STREAM_END) {
+            encoded_size = fed - zs.avail_in;
+            complete = true;
+            break;
+        }
+        if (ret != Z_OK && ret != Z_BUF_ERROR) break;
+        if (zs.avail_in == before_in && zs.avail_out == sizeof(out)) break;
+        if (zs.avail_in == 0 && fed == src_len && zs.avail_out != 0) break;
+    }
+    inflateEnd(&zs);
+    return complete;
 }
 
 std::vector<uint8_t> decode_ascii85(const uint8_t* src, size_t len) {
@@ -839,6 +881,33 @@ std::vector<uint8_t> PdfDoc::decode_stream(const PdfObj& obj, int obj_num, int g
                 if (hi < 0) { hi = nibble; } else { out.push_back(static_cast<uint8_t>((hi << 4) | nibble)); hi = -1; }
             }
             if (hi >= 0) out.push_back(static_cast<uint8_t>(hi << 4));
+            result = std::move(out);
+        } else if (fname == "RunLengthDecode") {
+            // 7.4.5: length byte n < 128 copies n+1 literals; n > 128 repeats
+            // the next byte 257-n times; 128 is EOD. Runs expand up to 128×,
+            // so cap the output like every other attacker-reachable decode.
+            std::vector<uint8_t> out;
+            size_t i = 0;
+            const size_t n = result.size();
+            while (i < n) {
+                uint8_t len = result[i++];
+                if (len == 128) break;
+                if (len < 128) {
+                    size_t count = static_cast<size_t>(len) + 1;
+                    if (count > n - i) count = n - i;
+                    out.insert(out.end(), result.begin() + i,
+                               result.begin() + i + count);
+                    i += count;
+                } else {
+                    if (i >= n) break;
+                    out.insert(out.end(), 257 - static_cast<size_t>(len),
+                               result[i++]);
+                }
+                if (out.size() > limits::kMaxDecodedSamples) {
+                    out.clear();
+                    break;
+                }
+            }
             result = std::move(out);
         } else if (fname == "JBIG2Decode") {
             std::vector<uint8_t> globals;

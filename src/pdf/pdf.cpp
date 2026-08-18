@@ -7,6 +7,7 @@
 #include "common/mapped_file.h"
 #include <fstream>
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cassert>
 #include <cmath>
@@ -27,6 +28,34 @@
 namespace jdoc { namespace pdf_detail {
 
 namespace {
+
+class DisjointSet {
+public:
+    explicit DisjointSet(size_t count) : parent_(count), rank_(count, 0) {
+        std::iota(parent_.begin(), parent_.end(), size_t{0});
+    }
+
+    size_t find(size_t node) {
+        while (parent_[node] != node) {
+            parent_[node] = parent_[parent_[node]];
+            node = parent_[node];
+        }
+        return node;
+    }
+
+    void unite(size_t a, size_t b) {
+        a = find(a);
+        b = find(b);
+        if (a == b) return;
+        if (rank_[a] < rank_[b]) std::swap(a, b);
+        parent_[b] = a;
+        if (rank_[a] == rank_[b]) rank_[a]++;
+    }
+
+private:
+    std::vector<size_t> parent_;
+    std::vector<unsigned char> rank_;
+};
 
 // Limit simultaneous page-composite working sets process-wide. An A4 RGB
 // canvas at 300 DPI is about 26 MiB, while compression and decoded source
@@ -211,6 +240,7 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
     result.col_boundaries.resize(tp, 0);
     result.all_tables.resize(tp);
     result.all_annots.resize(tp);
+    result.page_diags.resize(tp);
     result.page_widths.resize(tp, 0);
     result.page_heights.resize(tp, 0);
 
@@ -252,10 +282,12 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
         double page_w = 612, page_h = 792; // default letter
         double mb_llx = 0, mb_lly = 0;
         int page_rotate = 0;
+        PdfObj resources; // /Resources is inheritable like MediaBox and /Rotate
         {
-            bool have_box = false, have_rot = false;
+            bool have_box = false, have_rot = false, have_res = false;
             PdfObj node = page_obj;
-            for (int hop = 0; hop < 64 && (!have_box || !have_rot); hop++) {
+            for (int hop = 0; hop < 64 && (!have_box || !have_rot || !have_res);
+                 hop++) {
                 if (!have_box) {
                     auto mediabox = doc.resolve(node.get("MediaBox"));
                     if (mediabox.is_arr() && mediabox.arr.size() >= 4) {
@@ -272,6 +304,13 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
                         page_rotate = ((rot.as_int() % 360) + 360) % 360;
                         page_rotate -= page_rotate % 90;
                         have_rot = true;
+                    }
+                }
+                if (!have_res) {
+                    auto r = doc.resolve(node.get("Resources"));
+                    if (r.is_dict()) {
+                        resources = std::move(r);
+                        have_res = true;
                     }
                 }
                 auto parent = doc.resolve(node.get("Parent"));
@@ -293,13 +332,6 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
             std::swap(page_w, page_h);
         result.page_widths[p] = page_w;
         result.page_heights[p] = page_h;
-
-        // Get resources (inherit from parent)
-        auto resources = doc.resolve(page_obj.get("Resources"));
-        if (!resources.is_dict()) {
-            auto parent = doc.resolve(page_obj.get("Parent"));
-            if (parent.is_dict()) resources = doc.resolve(parent.get("Resources"));
-        }
 
         // Quick check: skip pages with no fonts and no extractable images
         bool has_fonts = false;
@@ -329,6 +361,7 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
         } else {
             parse_options.graphics = GraphicsCollection::TableGeometry;
         }
+        parse_options.page_width = page_w;
         auto parse_result = parse_content_stream(
             doc, content_data, resources, page_h, &font_cache, parse_options,
             initial_ctm);
@@ -360,71 +393,214 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
                 const size_t memory_cost = composite_memory_cost(page_w, page_h);
                 CompositeMemoryLease lease(composite_memory, memory_cost);
                 return render_page_composite(
-                    doc, page_obj, parse_result, p, page_w, page_h, image_dir);
+                    doc, resources, parse_result, p, page_w, page_h, image_dir,
+                    0, &result.page_diags[p]);
             };
 
             // Decide whether image XObjects are independent assets or drawing
-            // primitives that only make sense after page-level composition.
-            // This intentionally uses their role in the page instead of a
-            // large magic object count: some print drivers split text into
-            // only two or three masked strips, while others create dozens.
+            // primitives that only make sense composited. Fragmented rasters
+            // (print-driver strips, scanner tiles, layered stamp+photo pairs)
+            // arrive as placements that abut or overlap in device space, so
+            // the placements are clustered by bbox adjacency and each cluster
+            // composites once — into a cropped region on text-bearing pages,
+            // whose text the compositor cannot draw and must never lose.
             constexpr size_t kVectorTextMinPaths = 50;
-            bool no_text = result.all_lines[p].size() <= 2;
+            // An OCR text layer drawn with Tr 3 (invisible) must not count as
+            // page text: the page is visually a scan and composites like one.
+            bool no_text = result.all_lines[p].size() <= 2 ||
+                           parse_result.visible_text_chars == 0;
+            // Gradient strips are synthesized geometry, not evidence of
+            // vectorized glyphs — a page with one shaded banner must not
+            // count as a vector-text page.
+            size_t drawn_paths = parse_result.paths.size() -
+                                 static_cast<size_t>(parse_result.shading_paths);
             bool vector_text_page = no_text &&
-                                    parse_result.paths.size() >= kVectorTextMinPaths;
+                                    drawn_paths >= kVectorTextMinPaths;
 
-            int broad_bands = 0;
-            int thin_fragments = 0;
-            int masked_thin_fragments = 0;
-            double broad_band_height = 0;
-            bool has_regular_image = false;
-            bool has_stencil_image = false;
-
+            struct PlacementInfo {
+                size_t idx;             // index into parse_result.images
+                double x0, y0, x1, y1;  // device bbox, viewing coords
+                int obj_num;            // resolved ref; -1 for name/inline
+                bool masked;            // stencil/1-bit or /SMask//Mask-backed
+            };
+            std::vector<PlacementInfo> infos;
             auto xobjects = doc.resolve(resources.get("XObject"));
-            for (auto& ip : parse_result.images) {
-                PdfObj xobj;
-                if (ip.xobj_ref >= 0) xobj = doc.get_obj(ip.xobj_ref);
-                else if (xobjects.is_dict() && !ip.xobj_name.empty())
-                    xobj = doc.resolve(xobjects.get(ip.xobj_name));
-                if (!xobj.is_stream()) continue;
-
-                bool stencil = xobj.get("ImageMask").bool_val;
-                bool one_bit_layer = xobj.get("BitsPerComponent").as_int() == 1;
-                if (stencil || one_bit_layer) has_stencil_image = true;
-                else has_regular_image = true;
-
-                // Bounding-box dimensions work for both normal and /Rotate
-                // pages. A quarter-turn swaps the CTM axes but does not stop
-                // the placement from being recognized as a thin fragment.
-                double drawn_w = std::abs(ip.ctm[0]) + std::abs(ip.ctm[2]);
-                double drawn_h = std::abs(ip.ctm[1]) + std::abs(ip.ctm[3]);
-                if (drawn_w >= page_w * 0.5 && drawn_h < page_h * 0.5) {
-                    broad_bands++;
-                    broad_band_height += drawn_h;
+            for (size_t i = 0; i < parse_result.images.size(); i++) {
+                auto& ip = parse_result.images[i];
+                PdfObj xobj_res;
+                if (ip.inline_img) {
+                    // GDI drivers emit inline strips; they cluster like any
+                    // other placement.
+                } else if (ip.xobj_ref >= 0) {
+                    xobj_res = doc.get_obj(ip.xobj_ref);
+                } else if (xobjects.is_dict() && !ip.xobj_name.empty()) {
+                    xobj_res = doc.resolve(xobjects.get(ip.xobj_name));
                 }
+                const PdfObj& xobj = ip.inline_img ? *ip.inline_img : xobj_res;
+                if (!xobj.is_stream()) continue;
+                auto& st = xobj.get("Subtype");
+                if (!ip.inline_img &&
+                    (!st.is_name() || st.str_val != "Image")) continue;
 
-                bool thin = drawn_h <= page_h * 0.04 &&
-                            drawn_w >= drawn_h * 2.0;
-                if (!thin) continue;
-                thin_fragments++;
-
+                // Exact device bbox: the unit square's corners through the
+                // CTM, correct for rotated placements too.
+                const double* m = ip.ctm;
+                double xs[4] = {m[4], m[4] + m[0], m[4] + m[2],
+                                m[4] + m[0] + m[2]};
+                double ys[4] = {m[5], m[5] + m[1], m[5] + m[3],
+                                m[5] + m[1] + m[3]};
+                double bx0 = std::min({xs[0], xs[1], xs[2], xs[3]});
+                double bx1 = std::max({xs[0], xs[1], xs[2], xs[3]});
+                double by0 = std::min({ys[0], ys[1], ys[2], ys[3]});
+                double by1 = std::max({ys[0], ys[1], ys[2], ys[3]});
+                if (!std::isfinite(bx0) || !std::isfinite(bx1) ||
+                    !std::isfinite(by0) || !std::isfinite(by1))
+                    continue;
+                // The visual extent is the placement clipped by W/W*: a big
+                // image behind a small window must cluster by the window.
+                bx0 = std::max(bx0, static_cast<double>(ip.clip[0]));
+                by0 = std::max(by0, static_cast<double>(ip.clip[1]));
+                bx1 = std::min(bx1, static_cast<double>(ip.clip[2]));
+                by1 = std::min(by1, static_cast<double>(ip.clip[3]));
+                if (bx1 - bx0 < 0.1 || by1 - by0 < 0.1) continue;
+                if (bx1 < 0 || bx0 > page_w || by1 < 0 || by0 > page_h)
+                    continue;
                 // Rasterized glyph strips commonly store a solid RGB image
-                // plus a soft mask containing the actual glyphs. /Mask and
-                // ImageMask carry the same compositing semantics.
-                bool mask_backed = stencil || !xobj.get("SMask").is_none() ||
-                                   !xobj.get("Mask").is_none();
-                if (mask_backed) masked_thin_fragments++;
+                // plus a soft mask holding the actual glyphs; /Mask,
+                // ImageMask and 1-bit layers carry the same role.
+                bool masked = xobj.get("ImageMask").bool_val ||
+                              xobj.get("BitsPerComponent").as_int() == 1 ||
+                              !xobj.get("SMask").is_none() ||
+                              !xobj.get("Mask").is_none();
+                infos.push_back({i, bx0, by0, bx1, by1, ip.xobj_ref, masked});
             }
 
-            bool banded_scan_page = broad_bands >= 2 &&
-                                    broad_band_height >= page_h * 0.4;
-            bool fragmented_raster_page = masked_thin_fragments >= 2 ||
-                                          (no_text && thin_fragments >= 2);
-            bool layered_image_page = has_regular_image && has_stencil_image;
+            const size_t n_inf = infos.size();
+            DisjointSet image_sets(n_inf);
+
+            // Print-driver strips abut within sub-point rounding; distinct
+            // assets sit tens of points apart in real layouts.
+            const double eps = std::max(2.0, 0.003 * std::max(page_w, page_h));
+            if (n_inf > 2000) {
+                // Thousands of placements on one page IS a shredded raster;
+                // pairwise adjacency adds nothing at that count.
+                for (size_t i = 1; i < n_inf; i++) image_sets.unite(0, i);
+            } else {
+                for (size_t a = 0; a < n_inf; a++) {
+                    // Same object drawn again at the same spot (producer
+                    // quirk): weld so it cannot form a phantom layered pair.
+                    for (size_t b = a + 1; b < n_inf; b++) {
+                        double gx = std::max(infos[a].x0, infos[b].x0) -
+                                    std::min(infos[a].x1, infos[b].x1);
+                        double gy = std::max(infos[a].y0, infos[b].y0) -
+                                    std::min(infos[a].y1, infos[b].y1);
+                        double eps_y = eps;
+                        // Page-wide bands tolerate a bigger vertical gap
+                        // (blank rows a driver skipped), gated on real x
+                        // overlap so a nearby logo does not merge sideways.
+                        double wa = infos[a].x1 - infos[a].x0;
+                        double wb = infos[b].x1 - infos[b].x0;
+                        if (std::min(wa, wb) >= 0.30 * page_w) {
+                            double xov = std::min(infos[a].x1, infos[b].x1) -
+                                         std::max(infos[a].x0, infos[b].x0);
+                            if (xov >= 0.5 * std::min(wa, wb))
+                                eps_y = std::max(eps, 0.02 * page_h);
+                        }
+                        if (gx <= eps && gy <= eps_y) {
+                            image_sets.unite(a, b);
+                        }
+                    }
+                }
+            }
+
+            struct Cluster {
+                std::vector<size_t> members; // indices into infos
+                double x0 = 1e300, y0 = 1e300, x1 = -1e300, y1 = -1e300;
+                double area_sum = 0;
+            };
+            std::vector<Cluster> clusters;
+            {
+                std::unordered_map<size_t, size_t> root_to_cluster;
+                for (size_t i = 0; i < n_inf; i++) {
+                    size_t r = image_sets.find(i);
+                    auto [it, fresh] =
+                        root_to_cluster.try_emplace(r, clusters.size());
+                    if (fresh) clusters.emplace_back();
+                    auto& c = clusters[it->second];
+                    c.members.push_back(i);
+                    c.x0 = std::min(c.x0, infos[i].x0);
+                    c.y0 = std::min(c.y0, infos[i].y0);
+                    c.x1 = std::max(c.x1, infos[i].x1);
+                    c.y1 = std::max(c.y1, infos[i].y1);
+                    c.area_sum += (infos[i].x1 - infos[i].x0) *
+                                  (infos[i].y1 - infos[i].y0);
+                }
+            }
+
+            auto qualifies = [&](const Cluster& c) {
+                size_t n = c.members.size();
+                if (n < 2) return false;
+                double ua = (c.x1 - c.x0) * (c.y1 - c.y0);
+                if (ua <= 0) return false;
+                // Three or more images butted to sub-3pt gaps are fragments;
+                // the coverage floor rejects sparse corner-to-corner chains.
+                if (n >= 3) return c.area_sum / ua >= 0.4;
+                const auto& A = infos[c.members[0]];
+                const auto& B = infos[c.members[1]];
+                double xov = std::min(A.x1, B.x1) - std::max(A.x0, B.x0);
+                double yov = std::min(A.y1, B.y1) - std::max(A.y0, B.y0);
+                double area_a = (A.x1 - A.x0) * (A.y1 - A.y0);
+                double area_b = (B.x1 - B.x0) * (B.y1 - B.y0);
+                // Layered pair: a stencil stamped over its base image. A
+                // photo here and a signature there stay separate assets.
+                if (xov > 0 && yov > 0 &&
+                    xov * yov >= 0.3 * std::min(area_a, area_b))
+                    return true;
+                // Stacked pair: two halves of one raster, butted along one
+                // axis with the perpendicular extents mostly aligned.
+                if (-yov <= eps &&
+                    xov >= 0.7 * std::min(A.x1 - A.x0, B.x1 - B.x0))
+                    return true;
+                if (-xov <= eps &&
+                    yov >= 0.7 * std::min(A.y1 - A.y0, B.y1 - B.y0))
+                    return true;
+                return false;
+            };
+
+            // ── Fragment classification ─────────────────────────
+            // A fragment is a drawing primitive that only makes sense
+            // composited: a member of an abutting/overlapping cluster
+            // (strips, tiles, layered stamp pairs), or a thin glyph strip
+            // (mask-backed on any page; bare rasters count once the page has
+            // no visible text). Any two fragments turn the page into one
+            // whole-page composite; standalone images (photos, logos,
+            // scans) always export as original assets besides it.
+            std::vector<char> is_fragment(parse_result.images.size(), 0);
+            size_t fragment_count = 0;
+            for (auto& c : clusters) {
+                if (!qualifies(c)) continue;
+                for (size_t mi : c.members)
+                    if (!is_fragment[infos[mi].idx]) {
+                        is_fragment[infos[mi].idx] = 1;
+                        fragment_count++;
+                    }
+            }
+            for (auto& info : infos) {
+                if (is_fragment[info.idx]) continue;
+                double w = info.x1 - info.x0, h = info.y1 - info.y0;
+                bool thin = h <= 0.04 * page_h && w >= 2.0 * h;
+                if (thin && (info.masked || no_text)) {
+                    is_fragment[info.idx] = 1;
+                    fragment_count++;
+                }
+            }
+            bool fragment_page = fragment_count >= 2;
 
             bool composited = false;
-            if (vector_text_page || banded_scan_page || fragmented_raster_page ||
-                layered_image_page) {
+            if (vector_text_page || fragment_page) {
+                // The composite draws every placement, standalone images
+                // included; exporting those separately would store the same
+                // content twice, so a composited page emits exactly one file.
                 auto rendered = render_composite();
                 if (!rendered.data.empty() || !rendered.pixels.empty() || !rendered.saved_path.empty()) {
                     result.all_images[p].push_back(std::move(rendered));
@@ -434,21 +610,277 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
                 }
             }
             if (!composited) {
-                auto extracted = extract_page_images(doc, page_obj, parse_result,
-                                                     p, image_dir,
-                                                     opts.min_image_size);
-                for (auto& ei : extracted) {
-                    // ctm[5] is the Y translation in PDF coordinates (origin bottom-left)
-                    // ctm[3] is vertical scale; y_top = ctm[5] + abs(ctm[3])
-                    double y_top = ei.ctm[5] + std::abs(ei.ctm[3]);
-                    result.all_image_y[p].push_back(y_top);
-                    result.all_image_x[p].push_back(ei.ctm[4]); // X position
-                    result.all_images[p].push_back(std::move(ei.img));
+                // The diag records the attempt that produced the page's final
+                // images; a failed composite re-attempts everything below, so
+                // its counts must not double up with the passes here.
+                result.page_diags[p] = {};
+                int img_idx = 0;
+                std::vector<char> handled(parse_result.images.size(), 0);
+                std::vector<std::array<double, 4>> done_regions;
+
+                // ── Vector figures ──────────────────────────────
+                // A schematic or chart drawn as paths (often with a few small
+                // glyph images sprinkled in) has no representation at all
+                // outside a whole-page composite. Cluster author-drawn path
+                // bboxes the same way and composite dense regions that are
+                // not tables and hold no body text.
+                constexpr size_t kFigureMinPaths = 10;
+                constexpr size_t kFigureMaxPaths = 1500;
+                const size_t author_paths =
+                    parse_result.paths.size() -
+                    static_cast<size_t>(parse_result.shading_paths);
+                if (author_paths >= kFigureMinPaths &&
+                    author_paths <= kFigureMaxPaths) {
+                    struct PathBox {
+                        double x0, y0, x1, y1;
+                        bool dark;
+                    };
+                    std::vector<PathBox> pb;
+                    pb.reserve(author_paths);
+                    for (auto& rp : parse_result.paths) {
+                        if (rp.synthetic) continue;
+                        // Real figures carry ink; a cluster of nothing but
+                        // pastel fills is a decorated text background.
+                        auto lum = [](double r, double g, double b) {
+                            return 0.299 * r + 0.587 * g + 0.114 * b;
+                        };
+                        bool dark =
+                            (rp.do_stroke &&
+                             lum(rp.stroke_r, rp.stroke_g, rp.stroke_b) <
+                                 0.7) ||
+                            (rp.do_fill &&
+                             lum(rp.fill_r, rp.fill_g, rp.fill_b) < 0.7);
+                        double bx0 = 1e300, by0 = 1e300;
+                        double bx1 = -1e300, by1 = -1e300;
+                        for (auto& pt : rp.points) {
+                            if (pt.type == PathPoint::CLOSE) continue;
+                            bx0 = std::min(bx0, pt.x);
+                            bx1 = std::max(bx1, pt.x);
+                            by0 = std::min(by0, pt.y);
+                            by1 = std::max(by1, pt.y);
+                            if (pt.type == PathPoint::CURVE) {
+                                bx0 = std::min({bx0, pt.cx1, pt.cx2});
+                                bx1 = std::max({bx1, pt.cx1, pt.cx2});
+                                by0 = std::min({by0, pt.cy1, pt.cy2});
+                                by1 = std::max({by1, pt.cy1, pt.cy2});
+                            }
+                        }
+                        if (bx0 > bx1 || !std::isfinite(bx0) ||
+                            !std::isfinite(bx1) || !std::isfinite(by0) ||
+                            !std::isfinite(by1))
+                            continue;
+                        if (rp.do_stroke) {
+                            double pad = rp.line_width * 0.5;
+                            bx0 -= pad; by0 -= pad;
+                            bx1 += pad; by1 += pad;
+                        }
+                        bx0 = std::max(bx0, static_cast<double>(rp.clip[0]));
+                        by0 = std::max(by0, static_cast<double>(rp.clip[1]));
+                        bx1 = std::min(bx1, static_cast<double>(rp.clip[2]));
+                        by1 = std::min(by1, static_cast<double>(rp.clip[3]));
+                        double w = bx1 - bx0, h = by1 - by0;
+                        if (w < 0.5 && h < 0.5) continue;
+                        if (bx1 < 0 || bx0 > page_w || by1 < 0 || by0 > page_h)
+                            continue;
+                        // Page borders/backgrounds join everything and mean
+                        // nothing; long rules are separators, not figures.
+                        if (w > 0.7 * page_w && h > 0.7 * page_h) continue;
+                        double longd = std::max(w, h);
+                        double shortd = std::max(std::min(w, h), 0.04);
+                        if (longd > 25.0 * shortd &&
+                            longd > 0.3 * std::max(page_w, page_h))
+                            continue;
+                        pb.push_back({bx0, by0, bx1, by1, dark});
+                    }
+
+                    const size_t np = pb.size();
+                    DisjointSet figure_sets(np);
+                    for (size_t a = 0; a < np; a++)
+                        for (size_t b = a + 1; b < np; b++) {
+                            double gx = std::max(pb[a].x0, pb[b].x0) -
+                                        std::min(pb[a].x1, pb[b].x1);
+                            double gy = std::max(pb[a].y0, pb[b].y0) -
+                                        std::min(pb[a].y1, pb[b].y1);
+                            if (gx <= eps && gy <= eps) {
+                                figure_sets.unite(a, b);
+                            }
+                        }
+
+                    struct FigCluster {
+                        size_t n = 0, dark = 0;
+                        double x0 = 1e300, y0 = 1e300;
+                        double x1 = -1e300, y1 = -1e300;
+                    };
+                    std::vector<FigCluster> figs;
+                    {
+                        std::unordered_map<size_t, size_t> root_to_fig;
+                        for (size_t i = 0; i < np; i++) {
+                            auto [it, fresh] = root_to_fig.try_emplace(
+                                figure_sets.find(i), figs.size());
+                            if (fresh) figs.emplace_back();
+                            auto& fc = figs[it->second];
+                            fc.n++;
+                            if (pb[i].dark) fc.dark++;
+                            fc.x0 = std::min(fc.x0, pb[i].x0);
+                            fc.y0 = std::min(fc.y0, pb[i].y0);
+                            fc.x1 = std::max(fc.x1, pb[i].x1);
+                            fc.y1 = std::max(fc.y1, pb[i].y1);
+                        }
+                    }
+                    // Two clusters can interleave — union boxes overlapping
+                    // while no member pair touches (a wire bus crossing a
+                    // component row). Merge until the boxes are disjoint.
+                    for (bool merged = true; merged;) {
+                        merged = false;
+                        for (size_t a = 0; a < figs.size() && !merged; a++)
+                            for (size_t b = a + 1; b < figs.size(); b++) {
+                                if (std::max(figs[a].x0, figs[b].x0) -
+                                        std::min(figs[a].x1, figs[b].x1) >
+                                    eps)
+                                    continue;
+                                if (std::max(figs[a].y0, figs[b].y0) -
+                                        std::min(figs[a].y1, figs[b].y1) >
+                                    eps)
+                                    continue;
+                                figs[a].n += figs[b].n;
+                                figs[a].dark += figs[b].dark;
+                                figs[a].x0 = std::min(figs[a].x0, figs[b].x0);
+                                figs[a].y0 = std::min(figs[a].y0, figs[b].y0);
+                                figs[a].x1 = std::max(figs[a].x1, figs[b].x1);
+                                figs[a].y1 = std::max(figs[a].y1, figs[b].y1);
+                                figs.erase(figs.begin() + b);
+                                merged = true;
+                                break;
+                            }
+                    }
+
+                    for (auto& fc : figs) {
+                        if (fc.n < kFigureMinPaths) continue;
+                        if (fc.dark < 2) continue;
+                        double rgn[4] = {std::max(0.0, fc.x0),
+                                         std::max(0.0, fc.y0),
+                                         std::min(page_w, fc.x1),
+                                         std::min(page_h, fc.y1)};
+                        double fw = rgn[2] - rgn[0], fh = rgn[3] - rgn[1];
+                        if (fw < 1.0 || fh < 1.0) continue;
+                        double farea = fw * fh;
+                        double parea = page_w * page_h;
+                        if (farea < 0.006 * parea || farea > 0.65 * parea)
+                            continue;
+                        auto overlap = [&](double x0, double y0, double x1,
+                                           double y1) {
+                            double ox = std::min(rgn[2], x1) -
+                                        std::max(rgn[0], x0);
+                            double oy = std::min(rgn[3], y1) -
+                                        std::max(rgn[1], y0);
+                            return ox > 0 && oy > 0 ? ox * oy : 0.0;
+                        };
+                        // Ruled/shaded tables cluster densely too, and text
+                        // blocks carry decorations; both must stay text.
+                        int veto_code = 0;
+                        for (auto& t : result.all_tables[p]) {
+                            // Text-detected tables own no drawn geometry;
+                            // paths under them are a figure, not the table.
+                            if (t.kind == TableData::TEXT) continue;
+                            if (overlap(t.x0, t.y0, t.x1, t.y1) >
+                                0.3 * farea) {
+                                veto_code = 1;
+                                break;
+                            }
+                        }
+                        if (!veto_code) {
+                            // Body text vetoes; a figure's own short labels
+                            // (pin names, axis ticks) do not — the region is
+                            // still a drawing, and the label characters stay
+                            // in the markdown text either way.
+                            int body_lines = 0;
+                            for (auto& ln : result.all_lines[p]) {
+                                if (ln.y_center < rgn[1] ||
+                                    ln.y_center > rgn[3])
+                                    continue;
+                                double lw = ln.x_right - ln.x_left;
+                                if (lw <= std::max(0.5 * fw, 60.0)) continue;
+                                // Sparse label rows (pin names merged onto
+                                // one baseline) span width with few glyphs;
+                                // body lines carry real character mass.
+                                if (ln.text.size() < 30) continue;
+                                if (std::min(static_cast<double>(ln.x_right),
+                                             rgn[2]) >
+                                    std::max(static_cast<double>(ln.x_left),
+                                             rgn[0]))
+                                    body_lines++;
+                            }
+                            if (body_lines >= 2) veto_code = 2;
+                        }
+                        bool veto = veto_code != 0;
+                        if (!veto)
+                            for (auto& dr : done_regions)
+                                if (overlap(dr[0], dr[1], dr[2], dr[3]) >
+                                    0.3 * farea) {
+                                    veto = true;
+                                    break;
+                                }
+                        if (veto) continue;
+
+                        // Glyph images inside the figure render with it.
+                        std::vector<size_t> members;
+                        for (auto& info : infos)
+                            if (!handled[info.idx] &&
+                                overlap(info.x0, info.y0, info.x1, info.y1) >
+                                    0)
+                                members.push_back(info.idx);
+                        std::sort(members.begin(), members.end());
+                        ImageData rendered;
+                        {
+                            CompositeMemoryLease lease(
+                                composite_memory,
+                                composite_memory_cost(fw, fh));
+                            rendered = render_region_composite(
+                                doc, resources, parse_result, members, p,
+                                rgn, image_dir, img_idx,
+                                &result.page_diags[p]);
+                        }
+                        if (rendered.data.empty() &&
+                            rendered.pixels.empty() &&
+                            rendered.saved_path.empty())
+                            continue;
+                        for (size_t mi : members) handled[mi] = 1;
+                        result.all_images[p].push_back(std::move(rendered));
+                        result.all_image_y[p].push_back(rgn[3]);
+                        result.all_image_x[p].push_back(rgn[0]);
+                        done_regions.push_back(
+                            {rgn[0], rgn[1], rgn[2], rgn[3]});
+                        img_idx++;
+                    }
                 }
 
-                // Fallback: render page for scanned/vector-only pages
+                std::vector<size_t> remaining;
+                for (size_t i = 0; i < parse_result.images.size(); i++)
+                    if (!handled[i]) remaining.push_back(i);
+                if (!remaining.empty()) {
+                    auto extracted = extract_page_images(
+                        doc, resources, parse_result, p, image_dir,
+                        opts.min_image_size, &result.page_diags[p],
+                        &remaining, img_idx);
+                    for (auto& ei : extracted) {
+                        // ctm[5] is the Y translation in PDF coordinates (origin bottom-left)
+                        // ctm[3] is vertical scale; y_top = ctm[5] + abs(ctm[3])
+                        double y_top = ei.ctm[5] + std::abs(ei.ctm[3]);
+                        result.all_image_y[p].push_back(y_top);
+                        result.all_image_x[p].push_back(ei.ctm[4]); // X position
+                        result.all_images[p].push_back(std::move(ei.img));
+                    }
+                }
+
+                // Fallback: render page for scanned/vector-only pages.
+                // Paths count too: gradient strips and curved vector art
+                // never produce segments, and such a page has no other
+                // representation than a composite.
                 if (result.all_images[p].empty() && result.all_lines[p].empty()) {
-                    if (!parse_result.images.empty() || !parse_result.segments.empty()) {
+                    if (!parse_result.images.empty() ||
+                        !parse_result.segments.empty() ||
+                        !parse_result.paths.empty()) {
+                        result.page_diags[p] = {};
                         auto rendered = render_composite();
                         if (!rendered.data.empty() || !rendered.pixels.empty() || !rendered.saved_path.empty()) {
                             result.all_images[p].push_back(std::move(rendered));
@@ -470,6 +902,14 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
                 }
             }
         }
+
+        // Set after the image pipeline: the per-attempt diag resets above must
+        // not wipe the parse-time counters.
+        result.page_diags[p].inline_images = parse_result.inline_images;
+        result.page_diags[p].inline_scan_bailouts =
+            parse_result.inline_scan_bailouts;
+        result.page_diags[p].shading_unsupported =
+            parse_result.shading_unsupported;
     };
 
     // Each worker owns one pre-sized result slot. Shared object/font caches
@@ -512,6 +952,8 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
         for (auto& w : workers) w.join();
         if (first_error) std::rethrow_exception(first_error);
     }
+
+    collect_attachments(doc, root, result.attachments);
 
     // Extract bookmarks
     auto outlines = doc.resolve(root.get("Outlines"));

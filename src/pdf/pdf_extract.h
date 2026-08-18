@@ -9,6 +9,10 @@ struct TableData {
     std::string title;  // full-width title row extracted from top of table
     double x0, y0, x1, y1;
     int page = 0;
+    // What the detection keyed on. Ruled/shading tables are drawn geometry
+    // (their paths must not be mistaken for a vector figure); text tables
+    // are alignment-only and own no paths.
+    enum Kind { RULED, SHADING, TEXT } kind = RULED;
 };
 
 struct FontStats {
@@ -44,6 +48,19 @@ struct ExtractedImage {
     double ctm[6];
 };
 
+// Per-page record of image decodes that produced no output. Failures used to
+// vanish silently, leaving a blank composite indistinguishable from a clean
+// one; callers and tests need the counts to detect degraded pages.
+struct PageRenderDiag {
+    int images_total = 0;        // image placements attempted
+    int images_failed = 0;       // placements that produced no output
+    int unsupported_filter = 0;  // JBIG2/JPX variant or unknown filter rejected
+    int decode_size_mismatch = 0;
+    int inline_images = 0;
+    int inline_scan_bailouts = 0;
+    int shading_unsupported = 0;
+};
+
 inline void discard_image_payload(ImageData& image) {
     decltype(image.data){}.swap(image.data);
     decltype(image.pixels){}.swap(image.pixels);
@@ -62,6 +79,17 @@ struct AnnotEntry {
     double y = 0;         // vertical position on page
 };
 
+// A file carried inside the PDF (/Names /EmbeddedFiles). jdoc does not parse
+// the payload — a CAD drawing or a spreadsheet attached to a document is not
+// something it converts — but listing it keeps the attachment from vanishing
+// silently from the output, which would leave callers indexing the PDF unaware
+// the file is even there.
+struct AttachmentEntry {
+    std::string name;   // /UF, else /F
+    std::string desc;   // /Desc, when the producer set one
+    uint64_t size = 0;  // uncompressed bytes; 0 when the PDF does not say
+};
+
 struct ExtractResult {
     std::vector<std::vector<TextLine>> all_lines;
     std::vector<std::vector<ImageData>> all_images;
@@ -72,7 +100,9 @@ struct ExtractResult {
     std::vector<std::vector<AnnotEntry>> all_annots;
     std::vector<double> page_widths;
     std::vector<double> page_heights;
+    std::vector<PageRenderDiag> page_diags;
     std::vector<BookmarkEntry> bookmarks;
+    std::vector<AttachmentEntry> attachments;
     FontStats stats;
     int total_pages = 0;
 };
@@ -91,17 +121,35 @@ std::vector<TableData> detect_text_tables(const PageCharCache& cache,
                                           double page_width, double page_height,
                                           double col_boundary = 0.0);
 std::string format_table(const TableData& table);
-std::vector<ExtractedImage> extract_page_images(PdfDoc& doc, const PdfObj& page_obj,
+std::vector<ExtractedImage> extract_page_images(PdfDoc& doc, const PdfObj& resources,
                                                 const ContentParseResult& parse_result,
                                                 int page_num,
                                                 const std::string& output_dir,
-                                                unsigned min_image_size = 0);
-ImageData render_page_composite(PdfDoc& doc, const PdfObj& page_obj,
+                                                unsigned min_image_size = 0,
+                                                PageRenderDiag* diag = nullptr,
+                                                const std::vector<size_t>* only = nullptr,
+                                                int name_base = 0);
+ImageData render_page_composite(PdfDoc& doc, const PdfObj& resources,
                                 const ContentParseResult& parse_result,
                                 int page_num, double page_w, double page_h,
-                                const std::string& output_dir);
+                                const std::string& output_dir,
+                                int img_idx = 0,
+                                PageRenderDiag* diag = nullptr);
+// Render only the given placements (indices into parse_result.images), plus
+// every path intersecting the region, into a canvas cropped to region
+// [x0,y0,x1,y1] in viewing coordinates. Used to composite one fragment
+// cluster without losing the rest of the page.
+ImageData render_region_composite(PdfDoc& doc, const PdfObj& resources,
+                                  const ContentParseResult& parse_result,
+                                  const std::vector<size_t>& members,
+                                  int page_num, const double region[4],
+                                  const std::string& output_dir,
+                                  int img_idx,
+                                  PageRenderDiag* diag = nullptr);
 void collect_bookmarks(PdfDoc& doc, const PdfObj& node, int depth,
                        std::vector<BookmarkEntry>& out);
+void collect_attachments(PdfDoc& doc, const PdfObj& root,
+                         std::vector<AttachmentEntry>& out);
 std::vector<AnnotEntry> extract_annotations(PdfDoc& doc, const PdfObj& page_obj, double page_h,
                                             const double* view_ctm = nullptr);
 std::string result_to_markdown(ExtractResult& r, const ConvertOptions& opts);

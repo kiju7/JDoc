@@ -204,8 +204,8 @@ static int colorspace_component_count(PdfDoc& doc, const PdfObj& cs_resolved) {
     return 3;
 }
 
-static std::shared_ptr<const CsInfo> load_colorspace(PdfDoc& doc,
-                                                     const PdfObj& cs_ref) {
+std::shared_ptr<const CsInfo> load_colorspace(PdfDoc& doc,
+                                              const PdfObj& cs_ref) {
     auto cs = doc.resolve(cs_ref);
     auto info = std::make_shared<CsInfo>();
 
@@ -348,13 +348,62 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
         }
     };
 
+    auto axis_aligned_rect_bbox = [&](const std::vector<PathPoint>& pts,
+                                      double& x0, double& y0,
+                                      double& x1, double& y1) {
+        if (pts.size() != 5 || pts[0].type != PathPoint::MOVE ||
+            pts[1].type != PathPoint::LINE ||
+            pts[2].type != PathPoint::LINE ||
+            pts[3].type != PathPoint::LINE ||
+            pts[4].type != PathPoint::CLOSE)
+            return false;
+        path_bbox(pts, x0, y0, x1, y1);
+        if (!(x0 < x1 && y0 < y1)) return false;
+        const double eps = 1e-6 * std::max({1.0, x1 - x0, y1 - y0});
+        bool corners[4] = {false, false, false, false};
+        for (size_t i = 0; i < 4; i++) {
+            const auto& p = pts[i];
+            bool left = std::abs(p.x - x0) <= eps;
+            bool right = std::abs(p.x - x1) <= eps;
+            bool bottom = std::abs(p.y - y0) <= eps;
+            bool top = std::abs(p.y - y1) <= eps;
+            if ((!left && !right) || (!bottom && !top)) return false;
+            size_t corner = (right ? 1u : 0u) | (top ? 2u : 0u);
+            if (corners[corner]) return false;
+            corners[corner] = true;
+            const auto& next = pts[(i + 1) % 4];
+            if (std::abs(p.x - next.x) > eps &&
+                std::abs(p.y - next.y) > eps)
+                return false;
+        }
+        return true;
+    };
+
     auto commit_pending_clip = [&](GfxState& g) {
         if (has_pending_clip) {
+            // Rect tier: fold the clip's bbox into the running intersection.
+            // Exact for rectangular clips (the overwhelming case: viewports,
+            // table cells, form windows); a conservative superset for shapes.
+            double cx0, cy0, cx1, cy1;
+            path_bbox(pending_clip, cx0, cy0, cx1, cy1);
+            if (cx0 <= cx1 && cy0 <= cy1) {
+                g.clip_x0 = std::max(g.clip_x0, cx0);
+                g.clip_y0 = std::max(g.clip_y0, cy0);
+                g.clip_x1 = std::min(g.clip_x1, cx1);
+                g.clip_y1 = std::min(g.clip_y1, cy1);
+            }
             g.clip_path = std::make_shared<const std::vector<PathPoint>>(
                 std::move(pending_clip));
             pending_clip.clear();
             has_pending_clip = false;
         }
+    };
+
+    auto copy_clip = [](const GfxState& g, float out[4]) {
+        out[0] = static_cast<float>(g.clip_x0);
+        out[1] = static_cast<float>(g.clip_y0);
+        out[2] = static_cast<float>(g.clip_x1);
+        out[3] = static_cast<float>(g.clip_y1);
     };
 
     // "Clip to the shape, then paint a covering rect" draws the clip shape;
@@ -369,6 +418,268 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
             (fx1 - fx0) * (fy1 - fy0) > (cx1 - cx0) * (cy1 - cy0) + 0.01)
             current_path = *g.clip_path;
     };
+
+    // ── Shading (sh + PatternType 2 fills) ────────────────
+    // Axial (type 2) and radial (type 3) shadings decompose at parse time
+    // into flat-fill strips/disks. That reuses the whole raster pipeline —
+    // z-order via draw_seq and the rect clip trim the strips for free — so
+    // the compositor needs no gradient machinery of its own.
+    // A 1-in function may be an array of 1-out functions, one per component.
+    auto eval_shading_fn = [&](const PdfObj& fn_ref,
+                               double t) -> std::vector<double> {
+        auto fn = doc.resolve(fn_ref);
+        if (fn.is_arr()) {
+            std::vector<double> comps;
+            for (auto& e : fn.arr) {
+                auto v = eval_function_1d(doc, e, t);
+                if (v.empty()) return {};
+                comps.insert(comps.end(), v.begin(), v.end());
+            }
+            return comps;
+        }
+        return eval_function_1d(doc, fn_ref, t);
+    };
+
+    // Emit gradient geometry for one shading dict, restricted to `region`
+    // (viewing coords, x0 y0 x1 y1 — already intersected with the clip).
+    auto emit_shading_paths = [&](const PdfObj& sh,
+                                  const double region[4]) -> bool {
+        int stype = doc.resolve(sh.get("ShadingType")).as_int();
+        if (stype != 2 && stype != 3) {
+            result.shading_unsupported++;
+            return false;
+        }
+        auto coords = doc.resolve(sh.get("Coords"));
+        size_t need = stype == 2 ? 4 : 6;
+        if (!coords.is_arr() || coords.arr.size() < need) {
+            result.shading_unsupported++;
+            return false;
+        }
+        double t0 = 0, t1 = 1;
+        {
+            auto dom = doc.resolve(sh.get("Domain"));
+            if (dom.is_arr() && dom.arr.size() >= 2) {
+                t0 = dom.arr[0].as_num();
+                t1 = dom.arr[1].as_num();
+            }
+        }
+        bool ext0 = false, ext1 = false;
+        {
+            auto ext = doc.resolve(sh.get("Extend"));
+            if (ext.is_arr() && ext.arr.size() >= 2) {
+                ext0 = ext.arr[0].bool_val;
+                ext1 = ext.arr[1].bool_val;
+            }
+        }
+        // 256-entry RGB ramp over the domain. Components map through the
+        // alternate-space conversion; exotic shading colorspaces (Separation
+        // ramps) come out as gray, which still reads correctly in tone.
+        std::array<std::array<uint8_t, 3>, 256> ramp;
+        auto& fn = sh.get("Function");
+        if (fn.is_none()) {
+            result.shading_unsupported++;
+            return false;
+        }
+        for (int v = 0; v < 256; v++) {
+            double t = t0 + (t1 - t0) * (v / 255.0);
+            auto comps = eval_shading_fn(fn, t);
+            if (comps.empty()) {
+                result.shading_unsupported++;
+                return false;
+            }
+            alt_components_to_rgb(comps, ramp[v]);
+        }
+        auto make_shading_path = [&](const std::array<uint8_t, 3>& col,
+                                     size_t point_capacity) {
+            RenderPath rp;
+            rp.points.reserve(point_capacity);
+            rp.fill_r = col[0] / 255.0;
+            rp.fill_g = col[1] / 255.0;
+            rp.fill_b = col[2] / 255.0;
+            rp.stroke_r = rp.stroke_g = rp.stroke_b = 0;
+            rp.fill_alpha = gs.fill_alpha;
+            rp.line_width = 0;
+            rp.do_fill = true;
+            rp.do_stroke = false;
+            rp.clip[0] = static_cast<float>(region[0]);
+            rp.clip[1] = static_cast<float>(region[1]);
+            rp.clip[2] = static_cast<float>(region[2]);
+            rp.clip[3] = static_cast<float>(region[3]);
+            rp.synthetic = true;
+            return rp;
+        };
+        auto emit_shading_path = [&](RenderPath&& rp) {
+            rp.seq = draw_seq++;
+            result.shading_paths++;
+            result.paths.push_back(std::move(rp));
+        };
+        auto push_quad = [&](double ax, double ay, double bx, double by,
+                             double cx, double cy, double dx, double dy,
+                             const std::array<uint8_t, 3>& col) {
+            auto rp = make_shading_path(col, 5);
+            rp.points.push_back({ax, ay, PathPoint::MOVE});
+            rp.points.push_back({bx, by, PathPoint::LINE});
+            rp.points.push_back({cx, cy, PathPoint::LINE});
+            rp.points.push_back({dx, dy, PathPoint::LINE});
+            rp.points.push_back({0, 0, PathPoint::CLOSE});
+            emit_shading_path(std::move(rp));
+        };
+        const double diag = std::hypot(region[2] - region[0],
+                                       region[3] - region[1]);
+        if (diag <= 0) return true;
+
+        if (stype == 2) {
+            double p0x, p0y, p1x, p1y;
+            transform_point(gs.ctm, coords.arr[0].as_num(),
+                            coords.arr[1].as_num(), p0x, p0y);
+            transform_point(gs.ctm, coords.arr[2].as_num(),
+                            coords.arr[3].as_num(), p1x, p1y);
+            double dx = p1x - p0x, dy = p1y - p0y;
+            double len2 = dx * dx + dy * dy;
+            if (!(len2 > 1e-9)) {
+                // Degenerate axis: single flat fill of the region.
+                push_quad(region[0], region[1], region[2], region[1],
+                          region[2], region[3], region[0], region[3],
+                          ramp[128]);
+                return true;
+            }
+            // Project region corners onto the axis (s: 0 at p0, 1 at p1).
+            double smin = 1e300, smax = -1e300;
+            for (int c = 0; c < 4; c++) {
+                double px = (c & 1) ? region[2] : region[0];
+                double py = (c & 2) ? region[3] : region[1];
+                double s = ((px - p0x) * dx + (py - p0y) * dy) / len2;
+                smin = std::min(smin, s);
+                smax = std::max(smax, s);
+            }
+            if (!ext0) smin = std::max(smin, 0.0);
+            if (!ext1) smax = std::min(smax, 1.0);
+            if (smin >= smax) return true;
+            double len = std::sqrt(len2) * (smax - smin);
+            int K = std::max(16, std::min(128, static_cast<int>(len)));
+            // Perpendicular half-width big enough to cross the region.
+            double nx = -dy, ny = dx;
+            double nl = std::hypot(nx, ny);
+            nx = nx / nl * diag;
+            ny = ny / nl * diag;
+            for (int k = 0; k < K; k++) {
+                double sa = smin + (smax - smin) * k / K;
+                // Slight overlap avoids AA seams between strips.
+                double sb = smin + (smax - smin) * (k + 1.3) / K;
+                double sm = std::min(1.0, std::max(0.0, (sa + sb) / 2));
+                auto& col = ramp[static_cast<int>(sm * 255.0 + 0.5)];
+                double ax = p0x + sa * dx, ay = p0y + sa * dy;
+                double bx = p0x + sb * dx, by = p0y + sb * dy;
+                push_quad(ax + nx, ay + ny, bx + nx, by + ny,
+                          bx - nx, by - ny, ax - nx, ay - ny, col);
+            }
+            return true;
+        }
+
+        // Radial: approximate consecutive parameter bands as even-odd rings.
+        // Unlike overpainting filled disks, rings preserve an unextended
+        // nonzero start/end circle as a hole. Circles approximate ellipses
+        // under a non-uniform CTM by the average axis scale.
+        double c0x, c0y, c1x, c1y;
+        transform_point(gs.ctm, coords.arr[0].as_num(),
+                        coords.arr[1].as_num(), c0x, c0y);
+        transform_point(gs.ctm, coords.arr[3].as_num(),
+                        coords.arr[4].as_num(), c1x, c1y);
+        double rscale = ctm_pen_scale(gs.ctm);
+        double r0 = std::abs(coords.arr[2].as_num()) * rscale;
+        double r1 = std::abs(coords.arr[5].as_num()) * rscale;
+        auto append_circle = [](std::vector<PathPoint>& points,
+                                double cx, double cy, double r) {
+            constexpr double kKappa = 0.5522847498;
+            double h = r * kKappa;
+            points.push_back({cx + r, cy, PathPoint::MOVE});
+            points.push_back({cx, cy + r, PathPoint::CURVE,
+                              cx + r, cy + h, cx + h, cy + r});
+            points.push_back({cx - r, cy, PathPoint::CURVE,
+                              cx - h, cy + r, cx - r, cy + h});
+            points.push_back({cx, cy - r, PathPoint::CURVE,
+                              cx - r, cy - h, cx - h, cy - r});
+            points.push_back({cx + r, cy, PathPoint::CURVE,
+                              cx + h, cy - r, cx + r, cy - h});
+            points.push_back({0, 0, PathPoint::CLOSE});
+        };
+        auto push_disk = [&](double cx, double cy, double r,
+                             const std::array<uint8_t, 3>& col) {
+            if (r <= 0) return;
+            auto rp = make_shading_path(col, 6);
+            append_circle(rp.points, cx, cy, r);
+            emit_shading_path(std::move(rp));
+        };
+        auto push_band = [&](double acx, double acy, double ar,
+                             double bcx, double bcy, double br,
+                             const std::array<uint8_t, 3>& col) {
+            if (ar <= 0 && br <= 0) return;
+            auto rp = make_shading_path(col, (ar > 0 ? 6 : 0) +
+                                             (br > 0 ? 6 : 0));
+            if (ar > 0) append_circle(rp.points, acx, acy, ar);
+            if (br > 0) append_circle(rp.points, bcx, bcy, br);
+            rp.even_odd = ar > 0 && br > 0;
+            emit_shading_path(std::move(rp));
+        };
+        auto push_outside = [&](double cx, double cy, double r,
+                                const std::array<uint8_t, 3>& col) {
+            if (r <= 0) {
+                push_quad(region[0], region[1], region[2], region[1],
+                          region[2], region[3], region[0], region[3], col);
+                return;
+            }
+            auto rp = make_shading_path(col, 11);
+            rp.points.push_back({region[0], region[1], PathPoint::MOVE});
+            rp.points.push_back({region[2], region[1], PathPoint::LINE});
+            rp.points.push_back({region[2], region[3], PathPoint::LINE});
+            rp.points.push_back({region[0], region[3], PathPoint::LINE});
+            rp.points.push_back({0, 0, PathPoint::CLOSE});
+            append_circle(rp.points, cx, cy, r);
+            rp.even_odd = true;
+            emit_shading_path(std::move(rp));
+        };
+
+        const bool grows = r1 >= r0;
+        if (grows && ext1)
+            push_outside(c1x, c1y, r1, ramp[255]);
+        else if (!grows && ext0)
+            push_outside(c0x, c0y, r0, ramp[0]);
+        int K = std::max(16, std::min(128, static_cast<int>(
+            std::max({r0, r1, std::hypot(c1x - c0x, c1y - c0y)}))));
+        for (int k = 0; k < K; k++) {
+            double fa = static_cast<double>(k) / K;
+            double fb = static_cast<double>(k + 1) / K;
+            double acx = c0x + (c1x - c0x) * fa;
+            double acy = c0y + (c1y - c0y) * fa;
+            double ar = r0 + (r1 - r0) * fa;
+            double bcx = c0x + (c1x - c0x) * fb;
+            double bcy = c0y + (c1y - c0y) * fb;
+            double br = r0 + (r1 - r0) * fb;
+            double fm = (fa + fb) * 0.5;
+            const auto& col = ramp[static_cast<int>(fm * 255.0 + 0.5)];
+            if (ar >= br)
+                push_band(acx, acy, ar, bcx, bcy, br, col);
+            else
+                push_band(bcx, bcy, br, acx, acy, ar, col);
+        }
+        if (grows && ext0)
+            push_disk(c0x, c0y, r0, ramp[0]);
+        else if (!grows && ext1)
+            push_disk(c1x, c1y, r1, ramp[255]);
+        return true;
+    };
+
+    // Viewing-coord region for a shading: current clip ∩ page box.
+    auto shading_region = [&](double region[4]) -> bool {
+        double pw = options.page_width > 0 ? options.page_width
+                                           : page_height * 1.5;
+        region[0] = std::max(gs.clip_x0, 0.0);
+        region[1] = std::max(gs.clip_y0, 0.0);
+        region[2] = std::min(gs.clip_x1, pw);
+        region[3] = std::min(gs.clip_y1, page_height);
+        return region[0] < region[2] && region[1] < region[3];
+    };
+
 
     std::unordered_map<std::string, std::shared_ptr<const CsInfo>> cs_cache;
     auto lookup_colorspace =
@@ -595,15 +906,40 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
     auto record_render_path = [&](bool do_fill, bool do_stroke,
                                   bool even_odd = false) {
         if (collect_render_paths) {
+            // Shading-pattern fill: a rect-ish path becomes gradient strips
+            // clipped to its box (exact for the title-bar idiom); other
+            // shapes keep the flat backstop color set at scn time.
+            double bx0, by0, bx1, by1;
+            if (do_fill && gs.fill_shading &&
+                axis_aligned_rect_bbox(current_path, bx0, by0, bx1, by1)) {
+                double region[4] = {
+                    std::max(bx0, gs.clip_x0), std::max(by0, gs.clip_y0),
+                    std::min(bx1, gs.clip_x1), std::min(by1, gs.clip_y1)};
+                if (region[0] < region[2] && region[1] < region[3]) {
+                    if (emit_shading_paths(*gs.fill_shading, region)) {
+                        if (!do_stroke) {
+                            current_path.clear();
+                            return;
+                        }
+                        do_fill = false;
+                    }
+                }
+            }
             RenderPath rp;
             rp.points = std::move(current_path);
             rp.fill_r = gs.fill_r; rp.fill_g = gs.fill_g; rp.fill_b = gs.fill_b;
             rp.stroke_r = gs.stroke_r; rp.stroke_g = gs.stroke_g;
             rp.stroke_b = gs.stroke_b;
             rp.fill_alpha = gs.fill_alpha; rp.stroke_alpha = gs.stroke_alpha;
-            rp.line_width = gs.line_width;
+            // Line width is a user-space quantity — the CTM scales the pen
+            // along with the geometry, and these points are already in page
+            // space. Leaving it raw drew a CAD sheet's hairlines, set to 24
+            // units under a 1:2.8 plot matrix, as 50-pixel bars instead of
+            // 0.72pt lines.
+            rp.line_width = gs.line_width * ctm_pen_scale(gs.ctm);
             rp.do_fill = do_fill; rp.do_stroke = do_stroke;
             rp.even_odd = even_odd;
+            copy_clip(gs, rp.clip);
             rp.seq = draw_seq++;
             result.paths.push_back(std::move(rp));
         }
@@ -654,7 +990,10 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
         mat_multiply(trm, scale_mat, gs.text_mat);
         mat_multiply(final_mat, trm, gs.ctm);
         mat_multiply(M, gs.font->font_matrix, final_mat);
-        double lw_scale = (std::hypot(M[0], M[1]) + std::hypot(M[2], M[3])) / 2.0;
+        // The glyph program was parsed with an identity CTM, so its widths
+        // carry only whatever `cm` the charproc set itself; this adds the
+        // show-time chain on top.
+        double lw_scale = ctm_pen_scale(M);
 
         for (auto rp : it->second) {
             for (auto& pt : rp.points) {
@@ -734,11 +1073,16 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
             double advance = char_w_ts + gs.char_spacing;
             if (unicode == ' ') advance += gs.word_spacing;
 
-            // Skip rotated text (vertical direction dominates) but still advance.
-            if (std::abs(final_mat[1]) > std::abs(final_mat[0]) * 2) {
-                gs.text_mat[4] += advance * gs.text_mat[0];
-                gs.text_mat[5] += advance * gs.text_mat[1];
-                continue;
+            // Writing direction, quantized to 15° buckets. Upright text lands
+            // on 0 even when b is rounding noise rather than a true tilt, and
+            // takes the no-trig path — every glyph of ordinary prose runs
+            // through here, and almost none of them are rotated.
+            int16_t rot = 0;
+            if (final_mat[1] != 0 || final_mat[0] < 0) {
+                double deg = std::atan2(final_mat[1], final_mat[0]) *
+                             (180.0 / 3.14159265358979323846);
+                int q = static_cast<int>(std::lround(deg / 15.0));
+                rot = static_cast<int16_t>((q % 24 + 24) % 24);
             }
 
             double gx, gy;
@@ -759,17 +1103,325 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
             TextChar tc;
             tc.x = gx;
             tc.y = gy;
-            tc.left = gx;
-            tc.right = next_gx;
-            tc.top = gy + char_h * 0.8;
-            tc.bot = gy - char_h * 0.2;
-            tc.font_size = char_h;
+            tc.rot = rot;
+            if (rot == 0) {
+                tc.left = gx;
+                tc.right = next_gx;
+                tc.top = gy + char_h * 0.8;
+                tc.bot = gy - char_h * 0.2;
+                tc.font_size = char_h;
+            } else {
+                // A rotated glyph's baseline does not run along +x, so the box
+                // has to be built from the transformed axes: the baseline from
+                // this origin to the next, raised by the ascender and dropped
+                // by the descender along the "up" vector. Its em height is that
+                // vector's length, which for upright text is the |d| read above.
+                double ux = final_mat[2], uy = final_mat[3];
+                double up_len = std::hypot(ux, uy);
+                if (up_len < 1) {
+                    // Degenerate up vector: size from the baseline instead and
+                    // stand the ascender perpendicular to it.
+                    up_len = std::hypot(final_mat[0], final_mat[1]);
+                    double bx = -final_mat[1], by = final_mat[0];
+                    double bl = std::hypot(bx, by);
+                    if (bl > 0) { ux = bx / bl * up_len; uy = by / bl * up_len; }
+                    else { ux = 0; uy = up_len; }
+                }
+                double ax = ux * 0.8, ay = uy * 0.8;
+                double dxx = ux * -0.2, dyy = uy * -0.2;
+                double cx[4] = {gx + ax, gx + dxx, next_gx + ax, next_gx + dxx};
+                double cy[4] = {gy + ay, gy + dyy, next_gy + ay, next_gy + dyy};
+                tc.left = *std::min_element(cx, cx + 4);
+                tc.right = *std::max_element(cx, cx + 4);
+                tc.top = *std::max_element(cy, cy + 4);
+                tc.bot = *std::min_element(cy, cy + 4);
+                tc.font_size = up_len;
+            }
             tc.unicode = unicode;
             tc.is_bold = (gs.font && gs.font->is_bold) ||
                          gs.render_mode == 2 || gs.render_mode == 6;
             tc.is_italic = gs.font ? gs.font->is_italic : false;
+            // Tr 3/7 draw nothing: an OCR text layer over a scanned page is
+            // all invisible, and the composite classifier must not mistake it
+            // for visible body text.
+            if (gs.render_mode != 3 && gs.render_mode != 7)
+                result.visible_text_chars++;
             result.chars.push_back(tc);
         }
+    };
+
+    // ── Inline images (BI … ID … EI) ──────────────────────
+    // The payload after ID is raw binary. It must be consumed in every parse
+    // mode — left in place, the operator loop reads sample bytes as tokens,
+    // and a stray 'q'/'cm'/'(' corrupts the graphics state (or swallows the
+    // stream) for everything after the image.
+    auto parse_inline_image = [&]() {
+        auto full_key = [](const std::string& k) -> const char* {
+            if (k == "W") return "Width";
+            if (k == "H") return "Height";
+            if (k == "BPC") return "BitsPerComponent";
+            if (k == "CS") return "ColorSpace";
+            if (k == "F") return "Filter";
+            if (k == "DP") return "DecodeParms";
+            if (k == "D") return "Decode";
+            if (k == "IM") return "ImageMask";
+            if (k == "I") return "Interpolate";
+            if (k == "L") return "Length";
+            return nullptr;
+        };
+        auto full_cs = [](const std::string& n) -> const char* {
+            if (n == "G") return "DeviceGray";
+            if (n == "RGB") return "DeviceRGB";
+            if (n == "CMYK") return "DeviceCMYK";
+            if (n == "I") return "Indexed";
+            return nullptr;
+        };
+        auto full_filter = [](const std::string& n) -> const char* {
+            if (n == "AHx") return "ASCIIHexDecode";
+            if (n == "A85") return "ASCII85Decode";
+            if (n == "LZW") return "LZWDecode";
+            if (n == "Fl") return "FlateDecode";
+            if (n == "RL") return "RunLengthDecode";
+            if (n == "CCF") return "CCITTFaxDecode";
+            if (n == "DCT") return "DCTDecode";
+            return nullptr;
+        };
+
+        PdfObj img = PdfObj::make_dict();
+        bool have_id = false;
+        while (lex.pos < lex.len) {
+            lex.skip_ws();
+            if (lex.pos >= lex.len) break;
+            uint8_t c = lex.data[lex.pos];
+            if (c == '/') {
+                PdfObj key = lex.parse_object();
+                PdfObj val = lex.parse_object();
+                if (!key.is_name()) continue;
+                std::string k = key.str_val;
+                if (const char* f = full_key(k)) k = f;
+                if (k == "ColorSpace") {
+                    if (val.is_name()) {
+                        if (const char* f = full_cs(val.str_val)) {
+                            val.str_val = f;
+                        } else if (val.str_val != "DeviceGray" &&
+                                   val.str_val != "DeviceRGB" &&
+                                   val.str_val != "DeviceCMYK" &&
+                                   val.str_val != "Indexed") {
+                            // Named colorspace: resolve through /Resources so
+                            // downstream consumers see the real definition.
+                            auto cs_dict = doc.resolve(res.get("ColorSpace"));
+                            auto resolved = cs_dict.is_dict()
+                                ? doc.resolve(cs_dict.get(val.str_val))
+                                : PdfObj{};
+                            if (!resolved.is_none()) val = std::move(resolved);
+                        }
+                    } else if (val.is_arr()) {
+                        for (auto& e : val.arr)
+                            if (e.is_name())
+                                if (const char* f = full_cs(e.str_val))
+                                    e.str_val = f;
+                    }
+                } else if (k == "Filter") {
+                    if (val.is_name()) {
+                        if (const char* f = full_filter(val.str_val))
+                            val.str_val = f;
+                    } else if (val.is_arr()) {
+                        for (auto& e : val.arr)
+                            if (e.is_name())
+                                if (const char* f = full_filter(e.str_val))
+                                    e.str_val = f;
+                    }
+                }
+                img.dict.push_back({std::move(k), std::move(val)});
+            } else if (!PdfLexer::is_delim(c)) {
+                size_t s = lex.pos;
+                while (lex.pos < lex.len &&
+                       !PdfLexer::is_ws(lex.data[lex.pos]) &&
+                       !PdfLexer::is_delim(lex.data[lex.pos]))
+                    lex.pos++;
+                if (lex.pos - s == 2 && lex.data[s] == 'I' &&
+                    lex.data[s + 1] == 'D') {
+                    have_id = true;
+                    break;
+                }
+                if (lex.pos == s) lex.pos++;
+            } else {
+                lex.pos++;
+            }
+        }
+        if (!have_id) {
+            result.inline_scan_bailouts++;
+            lex.pos = lex.len;
+            return;
+        }
+
+        std::vector<std::string> flist;
+        {
+            auto& f = img.get("Filter");
+            if (f.is_name()) flist.push_back(f.str_val);
+            else if (f.is_arr())
+                for (auto& e : f.arr)
+                    if (e.is_name()) flist.push_back(e.str_val);
+        }
+
+        // One whitespace byte separates ID from the samples. A CRLF from a
+        // Windows producer counts as one separator only for ASCII filters,
+        // where '\n' cannot be a data byte.
+        bool ascii_first = !flist.empty() && (flist[0] == "ASCIIHexDecode" ||
+                                              flist[0] == "ASCII85Decode");
+        if (lex.pos < lex.len && PdfLexer::is_ws(lex.data[lex.pos])) {
+            bool was_cr = lex.data[lex.pos] == '\r';
+            lex.pos++;
+            if (was_cr && ascii_first && lex.pos < lex.len &&
+                lex.data[lex.pos] == '\n')
+                lex.pos++;
+        }
+        const size_t data_start = lex.pos;
+
+        auto ei_at = [&](size_t p) -> bool {
+            if (p + 1 >= lex.len) return false;
+            if (lex.data[p] != 'E' || lex.data[p + 1] != 'I') return false;
+            size_t q = p + 2;
+            return q >= lex.len || PdfLexer::is_ws(lex.data[q]) ||
+                   PdfLexer::is_delim(lex.data[q]);
+        };
+        // Payload candidate [data_start, end): valid when whitespace and then
+        // EI at a token boundary follows. Producers may emit more than one
+        // separator byte, especially after a length-delimited payload.
+        auto valid_end = [&](size_t end, size_t& after) -> bool {
+            size_t p = end;
+            while (p < lex.len && PdfLexer::is_ws(lex.data[p]))
+                p++;
+            if (!ei_at(p)) return false;
+            after = p + 2;
+            return true;
+        };
+
+        size_t payload_end = SIZE_MAX, resume = SIZE_MAX;
+
+        // 1. /L names the payload length outright (PDF 2.0 added it for
+        //    exactly this — skipping the scan-for-EI).
+        int64_t L = img.get("Length").as_int();
+        if (L > 0 && static_cast<uint64_t>(L) <= lex.len - data_start) {
+            size_t after;
+            if (valid_end(data_start + static_cast<size_t>(L), after)) {
+                payload_end = data_start + static_cast<size_t>(L);
+                resume = after;
+            }
+        }
+
+        // 2. Unfiltered: the sample size is exact.
+        if (payload_end == SIZE_MAX && flist.empty()) {
+            int iw = img.get("Width").as_int();
+            int ih = img.get("Height").as_int();
+            int bpc = img.get("BitsPerComponent").as_int();
+            if (img.get("ImageMask").bool_val) bpc = 1;
+            else if (bpc <= 0) bpc = 8;
+            int comps = 1;
+            {
+                auto& cs = img.get("ColorSpace");
+                std::string cn;
+                if (cs.is_name()) cn = cs.str_val;
+                else if (cs.is_arr() && !cs.arr.empty() && cs.arr[0].is_name())
+                    cn = cs.arr[0].str_val;
+                if (cn == "DeviceRGB") comps = 3;
+                else if (cn == "DeviceCMYK") comps = 4;
+            }
+            if (iw > 0 && ih > 0 && iw < (1 << 20) && ih < (1 << 20)) {
+                uint64_t row = (static_cast<uint64_t>(iw) * comps * bpc + 7) / 8;
+                uint64_t need = row * static_cast<uint64_t>(ih);
+                if (need <= lex.len - data_start) {
+                    size_t after;
+                    if (valid_end(data_start + static_cast<size_t>(need), after)) {
+                        payload_end = data_start + static_cast<size_t>(need);
+                        resume = after;
+                    }
+                }
+            }
+        }
+
+        // 3. A single Flate stream has an unambiguous compressed-stream end.
+        //    Locate that first: decode_flate intentionally returns partial
+        //    output for truncated data and therefore cannot validate an EI
+        //    candidate embedded inside the compressed bytes.
+        const bool single_flate =
+            flist.size() == 1 && flist[0] == "FlateDecode";
+        if (payload_end == SIZE_MAX && single_flate) {
+            constexpr size_t kMaxInlineScan = 8u << 20;
+            const size_t limit = std::min(lex.len, data_start + kMaxInlineScan);
+            size_t encoded = 0;
+            if (flate_encoded_size(lex.data + data_start, limit - data_start,
+                                   encoded)) {
+                size_t after;
+                if (valid_end(data_start + encoded, after)) {
+                    payload_end = data_start + encoded;
+                    resume = after;
+                }
+            }
+        }
+
+        // 4. Scan for ws+EI at a token boundary. 'E','I' are ordinary data
+        //    bytes, so validate cheap-to-check codecs before accepting. A
+        //    failed single-Flate probe must not fall back to partial decoding.
+        if (payload_end == SIZE_MAX) {
+            constexpr size_t kMaxInlineScan = 8u << 20;
+            const size_t limit = std::min(lex.len, data_start + kMaxInlineScan);
+            const bool dct = !flist.empty() && flist.back() == "DCTDecode";
+            const bool flate = !single_flate && !flist.empty() &&
+                               flist.back() == "FlateDecode";
+            int probes = 0;
+            for (size_t p = data_start;
+                 !single_flate && p + 2 < limit; p++) {
+                if (!PdfLexer::is_ws(lex.data[p]) || !ei_at(p + 1)) continue;
+                const size_t cand_len = p - data_start;
+                if (dct) {
+                    if (cand_len < 4 || lex.data[data_start] != 0xFF ||
+                        lex.data[data_start + 1] != 0xD8)
+                        break; // not JPEG at all — bail out below
+                    size_t t0 = cand_len > 16 ? p - 16 : data_start;
+                    bool eoi = false;
+                    for (size_t t = t0; t + 1 < p; t++)
+                        if (lex.data[t] == 0xFF && lex.data[t + 1] == 0xD9) {
+                            eoi = true;
+                            break;
+                        }
+                    if (!eoi) continue;
+                } else if (flate) {
+                    if (++probes > 32) break;
+                    if (decode_flate(lex.data + data_start, cand_len).empty())
+                        continue;
+                }
+                payload_end = p;
+                resume = p + 3;
+                break;
+            }
+        }
+
+        if (payload_end == SIZE_MAX) {
+            // Truncated or unrecognizable payload. Consuming the rest of the
+            // stream loses the tail, which beats lexing binary as operators.
+            result.inline_scan_bailouts++;
+            lex.pos = lex.len;
+            return;
+        }
+
+        result.inline_images++;
+        if (collect_render_paths) {
+            img.type = ObjType::STREAM;
+            img.stream_data.assign(lex.data + data_start,
+                                   lex.data + payload_end);
+            ImagePlacement ip;
+            ip.inline_img = std::make_shared<const PdfObj>(std::move(img));
+            std::memcpy(ip.ctm, gs.ctm, sizeof(gs.ctm));
+            ip.fill_r = gs.fill_r;
+            ip.fill_g = gs.fill_g;
+            ip.fill_b = gs.fill_b;
+            ip.alpha = gs.fill_alpha;
+            copy_clip(gs, ip.clip);
+            ip.seq = draw_seq++;
+            result.images.push_back(std::move(ip));
+        }
+        lex.pos = resume;
     };
 
     while (lex.pos < lex.len) {
@@ -876,10 +1528,12 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
                 if (operands.size() >= 3) { gs.stroke_r = pop_num(2); gs.stroke_g = pop_num(1); gs.stroke_b = pop_num(0); }
             } else if (op.is("rg")) {
                 if (operands.size() >= 3) { gs.fill_r = pop_num(2); gs.fill_g = pop_num(1); gs.fill_b = pop_num(0); }
+                gs.fill_shading.reset();
             } else if (op.is("G")) {
                 double g = pop_num(0); gs.stroke_r = gs.stroke_g = gs.stroke_b = g;
             } else if (op.is("g")) {
                 double g = pop_num(0); gs.fill_r = gs.fill_g = gs.fill_b = g;
+                gs.fill_shading.reset();
             } else if (op.is("K")) {
                 if (operands.size() >= 4) {
                     std::array<uint8_t, 3> px;
@@ -892,9 +1546,38 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
                     cmyk_to_rgb8(pop_num(3), pop_num(2), pop_num(1), pop_num(0), px);
                     gs.fill_r = px[0] / 255.0; gs.fill_g = px[1] / 255.0; gs.fill_b = px[2] / 255.0;
                 }
+                gs.fill_shading.reset();
             } else if (op.is("SC") || op.is("SCN") || op.is("sc") || op.is("scn")) {
                 bool is_fill = (op.is("sc") || op.is("scn"));
                 const auto& cs = is_fill ? gs.fill_cs : gs.stroke_cs;
+                // Pattern operand: shading patterns (type 2) install their
+                // dict for fills; tiling patterns stay a flat color.
+                const PdfObj* pname = operands.empty()
+                    ? nullptr : operand_object(operands.size() - 1);
+                if (pname && pname->is_name()) {
+                    if (is_fill) gs.fill_shading.reset();
+                    if (collect_render_paths) {
+                        auto pats = doc.resolve(res.get("Pattern"));
+                        auto pat = pats.is_dict()
+                            ? doc.resolve(pats.get(pname->str_val)) : PdfObj{};
+                        if (pat.is_dict()) {
+                            int ptype =
+                                doc.resolve(pat.get("PatternType")).as_int();
+                            auto shp = doc.resolve(pat.get("Shading"));
+                            if (ptype == 2 && shp.is_dict() && is_fill) {
+                                gs.fill_shading =
+                                    std::make_shared<const PdfObj>(
+                                        std::move(shp));
+                            } else {
+                                result.shading_unsupported++;
+                            }
+                        }
+                    }
+                    operands.clear();
+                    object_operands.clear();
+                    continue;
+                }
+                if (is_fill) gs.fill_shading.reset();
                 double r = -1, g = -1, b = -1;
                 if (cs && cs->kind == CsInfo::TINT && operands.size() >= 1 &&
                     !cs->lut.empty()) {
@@ -962,6 +1645,7 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
                     if (is_fill) {
                         gs.fill_cs = info;
                         gs.fill_r = r; gs.fill_g = g; gs.fill_b = b;
+                        gs.fill_shading.reset();
                     } else {
                         gs.stroke_cs = info;
                         gs.stroke_r = r; gs.stroke_g = g; gs.stroke_b = b;
@@ -1181,6 +1865,27 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
                 commit_pending_clip(gs);
             }
 
+            // ── Inline image: consume in every mode (see the lambda) ──
+            else if (op.is("BI")) {
+                parse_inline_image();
+            }
+
+            // ── Shading operator ──
+            else if (op.is("sh")) {
+                if (collect_render_paths) {
+                    const PdfObj* nm = operands.empty()
+                        ? nullptr : operand_object(operands.size() - 1);
+                    if (nm && nm->is_name()) {
+                        auto shd = doc.resolve(res.get("Shading"));
+                        auto sh = shd.is_dict()
+                            ? doc.resolve(shd.get(nm->str_val)) : PdfObj{};
+                        double region[4];
+                        if (sh.is_dict() && shading_region(region))
+                            emit_shading_paths(sh, region);
+                    }
+                }
+            }
+
             // ── XObject (images) ──
             else if (op.is("Do")) {
                 const PdfObj* name =
@@ -1210,16 +1915,51 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
                                 }
                                 auto& form_res = xobj.get("Resources");
                                 const PdfObj& sub_res = form_res.is_none() ? res : form_res;
+                                // /BBox is a required clip (8.10.1): content
+                                // outside it must not paint. Intersect its
+                                // transformed AABB into the inherited state.
+                                GfxState form_gs = gs;
+                                auto bbox = doc.resolve(xobj.get("BBox"));
+                                if (bbox.is_arr() && bbox.arr.size() >= 4) {
+                                    double b0 = bbox.arr[0].as_num();
+                                    double b1 = bbox.arr[1].as_num();
+                                    double b2 = bbox.arr[2].as_num();
+                                    double b3 = bbox.arr[3].as_num();
+                                    double cx[4], cy[4];
+                                    transform_point(form_ctm, b0, b1, cx[0], cy[0]);
+                                    transform_point(form_ctm, b2, b1, cx[1], cy[1]);
+                                    transform_point(form_ctm, b0, b3, cx[2], cy[2]);
+                                    transform_point(form_ctm, b2, b3, cx[3], cy[3]);
+                                    double fx0 = std::min({cx[0], cx[1], cx[2], cx[3]});
+                                    double fx1 = std::max({cx[0], cx[1], cx[2], cx[3]});
+                                    double fy0 = std::min({cy[0], cy[1], cy[2], cy[3]});
+                                    double fy1 = std::max({cy[0], cy[1], cy[2], cy[3]});
+                                    if (std::isfinite(fx0) && std::isfinite(fx1) &&
+                                        std::isfinite(fy0) && std::isfinite(fy1)) {
+                                        form_gs.clip_x0 = std::max(form_gs.clip_x0, fx0);
+                                        form_gs.clip_y0 = std::max(form_gs.clip_y0, fy0);
+                                        form_gs.clip_x1 = std::min(form_gs.clip_x1, fx1);
+                                        form_gs.clip_y1 = std::min(form_gs.clip_y1, fy1);
+                                    }
+                                }
                                 auto sub = parse_content_stream(
                                     doc, form_stream, sub_res, page_height,
                                     font_cache, options,
                                     form_ctm, depth + 1,
-                                    &gs);
+                                    &form_gs);
                                 // sub is a temporary discarded right after — move
                                 // its elements into the parent instead of copying.
                                 result.chars.insert(result.chars.end(),
                                     std::make_move_iterator(sub.chars.begin()),
                                     std::make_move_iterator(sub.chars.end()));
+                                result.visible_text_chars +=
+                                    sub.visible_text_chars;
+                                result.inline_images += sub.inline_images;
+                                result.inline_scan_bailouts +=
+                                    sub.inline_scan_bailouts;
+                                result.shading_unsupported +=
+                                    sub.shading_unsupported;
+                                result.shading_paths += sub.shading_paths;
                                 result.segments.insert(result.segments.end(),
                                     std::make_move_iterator(sub.segments.begin()),
                                     std::make_move_iterator(sub.segments.end()));
@@ -1247,6 +1987,7 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
                             ip.fill_g = gs.fill_g;
                             ip.fill_b = gs.fill_b;
                             ip.alpha = gs.fill_alpha;
+                            copy_clip(gs, ip.clip);
                             ip.seq = draw_seq++;
                             result.images.push_back(ip);
                         }
@@ -1395,8 +2136,11 @@ std::vector<TextLine> reorder_column_lines(std::vector<TextLine>& lines,
     return result;
 }
 
-std::vector<TextLine> chars_to_lines(const std::vector<TextChar>& chars,
-                                    double* out_col_boundary) {
+// Group chars that all share one writing direction into lines. Callers reach
+// this through chars_to_lines(), which rotates each non-upright direction into
+// this function's frame first.
+static std::vector<TextLine> lines_from_upright_chars(
+    const std::vector<TextChar>& chars, double* out_col_boundary) {
     if (chars.empty()) return {};
 
     // Sort by y (descending, top-first) then x (left-to-right)
@@ -1520,6 +2264,92 @@ std::vector<TextLine> chars_to_lines(const std::vector<TextChar>& chars,
 
     if (col_boundary > 0)
         lines = reorder_column_lines(lines, col_boundary);
+
+    return lines;
+}
+
+std::vector<TextLine> chars_to_lines(const std::vector<TextChar>& chars,
+                                    double* out_col_boundary) {
+    if (out_col_boundary) *out_col_boundary = 0;
+    if (chars.empty()) return {};
+
+    // Which writing directions are present. A page of ordinary prose has only
+    // the upright one, and takes the same path it always did.
+    bool present[24] = {};
+    for (auto& ch : chars)
+        if (ch.rot >= 0 && ch.rot < 24) present[ch.rot] = true;
+    int directions = 0;
+    for (bool p : present) directions += p ? 1 : 0;
+    if (directions <= 1 && present[0])
+        return lines_from_upright_chars(chars, out_col_boundary);
+
+    // Upright text first and unchanged — it drives the column boundary and
+    // keeps the body's reading order. Rotated runs follow, each grouped in its
+    // own frame, so a 90° dimension label reads along its baseline.
+    std::vector<TextLine> lines;
+    if (present[0]) {
+        std::vector<TextChar> upright;
+        upright.reserve(chars.size());
+        for (auto& ch : chars)
+            if (ch.rot == 0) upright.push_back(ch);
+        lines = lines_from_upright_chars(upright, out_col_boundary);
+    }
+
+    const double kDegToRad = 3.14159265358979323846 / 180.0;
+    for (int r = 1; r < 24; r++) {
+        if (!present[r]) continue;
+        const double theta = r * 15.0 * kDegToRad;
+        const double cs = std::cos(theta), sn = std::sin(theta);
+        // Into the direction's own frame (rotate by -theta), and back out.
+        auto fwd = [&](double px, double py, double& ox, double& oy) {
+            ox = px * cs + py * sn;
+            oy = -px * sn + py * cs;
+        };
+        auto back = [&](double px, double py, double& ox, double& oy) {
+            ox = px * cs - py * sn;
+            oy = px * sn + py * cs;
+        };
+
+        std::vector<TextChar> rot_chars;
+        for (auto& ch : chars) {
+            if (ch.rot != r) continue;
+            TextChar t = ch;
+            fwd(ch.x, ch.y, t.x, t.y);
+            // Rotating the page-space AABB is exact on the quarter turns that
+            // real documents use, and a slight over-estimate off them.
+            double bx[4] = {ch.left, ch.right, ch.left, ch.right};
+            double by[4] = {ch.top, ch.top, ch.bot, ch.bot};
+            double rx[4], ry[4];
+            for (int k = 0; k < 4; k++) fwd(bx[k], by[k], rx[k], ry[k]);
+            t.left = *std::min_element(rx, rx + 4);
+            t.right = *std::max_element(rx, rx + 4);
+            t.top = *std::max_element(ry, ry + 4);
+            t.bot = *std::min_element(ry, ry + 4);
+            t.rot = 0;
+            rot_chars.push_back(t);
+        }
+
+        for (auto& ln : lines_from_upright_chars(rot_chars, nullptr)) {
+            // Report the line where it sits on the page, not where it sat in
+            // the rotated frame: table matching and ordering work in page
+            // space. The line's box maps back to a page-space AABB.
+            double top = ln.y_center + ln.font_size * 0.8;
+            double bot = ln.y_center - ln.font_size * 0.2;
+            double bx[4] = {ln.x_left, ln.x_right, ln.x_left, ln.x_right};
+            double by[4] = {top, top, bot, bot};
+            double px[4], py[4];
+            for (int k = 0; k < 4; k++) back(bx[k], by[k], px[k], py[k]);
+            ln.x_left = *std::min_element(px, px + 4);
+            ln.x_right = *std::max_element(px, px + 4);
+            ln.y_center = (*std::min_element(py, py + 4) +
+                           *std::max_element(py, py + 4)) / 2;
+            // The geometry is page-space now, so the direction is the only
+            // thing left saying this line does not belong to a body row it
+            // happens to sit beside.
+            ln.rot = r;
+            lines.push_back(std::move(ln));
+        }
+    }
 
     return lines;
 }

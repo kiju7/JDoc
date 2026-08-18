@@ -2,7 +2,9 @@
 // License: MIT
 
 #include "jdoc/office.h"
+#include "jdoc/detect.h"
 #include "zip_reader.h"
+#include "common/string_utils.h"
 #include "legacy/ole_reader.h"
 #include "ooxml/xlsb_parser.h"
 #include <iostream>
@@ -248,6 +250,150 @@ static std::string text_shape(const std::string& tag, const std::string& text) {
 static std::string convert_pptx(const std::string& pptx) {
     return jdoc::office_to_markdown_mem(
         reinterpret_cast<const uint8_t*>(pptx.data()), pptx.size(), "deck.pptx");
+}
+
+// An object inserted into a deck or document is kept as its own package part
+// under <ppt|word|xl>/embeddings/. jdoc does not open those payloads, so they
+// used to vanish without a trace.
+void test_ooxml_embedded_parts() {
+    std::cerr << "\nOOXML embedded object parts:\n";
+
+    TEST(embedded_parts_listed)
+        auto md = convert_pptx(make_pptx(
+            text_shape("sp", "slide body"),
+            {{"ppt/embeddings/Microsoft_Excel_Worksheet1.xlsx",
+              std::string(2048, 'x')},
+             {"ppt/embeddings/plan.dwg", "AC1032" + std::string(1024, '\0')}}));
+        ASSERT(md.find("## Attachments") != std::string::npos);
+        ASSERT(md.find("Microsoft_Excel_Worksheet1.xlsx (2.0 KB)") != std::string::npos);
+        ASSERT(md.find("plan.dwg (1.0 KB)") != std::string::npos);
+        // The slide's own text is untouched.
+        ASSERT(count_occurrences(md, "slide body") == 1);
+        // Only the leaf name is listed, not the package path.
+        ASSERT(md.find("ppt/embeddings/") == std::string::npos);
+    TEST_END
+
+    TEST(no_attachments_section_without_embeddings)
+        auto md = convert_pptx(make_pptx(text_shape("sp", "slide body")));
+        ASSERT(md.find("## Attachments") == std::string::npos);
+    TEST_END
+
+    TEST(part_name_cannot_forge_document_structure)
+        // Zip entry names are attacker-controlled and may hold newlines. One
+        // carrying markdown would otherwise fabricate headings in the output.
+        std::string evil = "ppt/embeddings/benign.xlsx\n\n## Table of Contents"
+                           "\n\n- INJECTED HEADING\n\nmore.bin";
+        auto md = convert_pptx(make_pptx(text_shape("sp", "slide body"),
+                                         {{evil, std::string(1234, 'x')}}));
+        // The name is still reported in full — it is only prevented from
+        // starting a line, which is what makes markdown structure.
+        ASSERT(md.find("INJECTED HEADING") != std::string::npos);
+        ASSERT(md.find("\n## Table of Contents") == std::string::npos);
+        ASSERT(count_occurrences(md, "\n## Attachments") == 1);
+        // Collapsed to a single list item.
+        ASSERT(count_occurrences(md, "\n- ") == 1);
+    TEST_END
+
+    TEST(chunk_api_agrees_with_whole_document)
+        // A chunk pipeline must not be told less than convert() is: the
+        // listing mirrors into the last chunk, the way the header/footer and
+        // master-layout trailers already do.
+        auto pptx = make_pptx(text_shape("sp", "slide body"),
+                              {{"ppt/embeddings/plan.dwg", std::string(2048, 'd')}});
+        auto md = convert_pptx(pptx);
+        auto chunks = jdoc::office_to_markdown_chunks_mem(
+            reinterpret_cast<const uint8_t*>(pptx.data()), pptx.size(), "deck.pptx");
+        ASSERT(md.find("plan.dwg (2.0 KB)") != std::string::npos);
+        ASSERT(!chunks.empty());
+        std::string joined;
+        for (auto& c : chunks) joined += c.text;
+        ASSERT(joined.find("## Attachments") != std::string::npos);
+        ASSERT(joined.find("plan.dwg (2.0 KB)") != std::string::npos);
+    TEST_END
+
+    TEST(part_name_bytes_cannot_break_utf8)
+        // make_zip sets the UTF-8 name flag, so ZipReader passes these bytes
+        // through untouched. A caller that demands UTF-8 (pybind11 does) would
+        // fail to decode the whole conversion over one bad part name.
+        std::string bad = "ppt/embeddings/";
+        bad += "\xff\xfe\x80"; bad += "bad.xlsx";
+        auto md = convert_pptx(make_pptx(text_shape("sp", "slide body"),
+                                         {{bad, std::string(512, 'z')}}));
+        // Well-formed already, so repairing it changes nothing. (is_valid_utf8
+        // is the wrong oracle here — it reports U+FFFD itself as invalid, and
+        // repair is exactly what puts one there.)
+        ASSERT(jdoc::util::sanitize_utf8(md) == md);
+        ASSERT(md.find('\xff') == std::string::npos);
+        ASSERT(md.find("bad.xlsx") != std::string::npos);
+        ASSERT(md.find("slide body") != std::string::npos);
+    TEST_END
+
+    TEST(only_direct_children_of_embeddings_listed)
+        // A substring match on "/embeddings/" would also claim these.
+        auto md = convert_pptx(make_pptx(
+            text_shape("sp", "slide body"),
+            {{"ppt/media/embeddings/logo.png", std::string(4096, 'p')},
+             {"ppt/embeddings/nested/deep.bin", std::string(512, 'd')},
+             {"ppt/embeddings/", ""}}));
+        ASSERT(md.find("## Attachments") == std::string::npos);
+    TEST_END
+}
+
+// DWFx is an XPS package: it carries [Content_Types].xml like an OOXML
+// document, so without a separate check it lands in the office layer and is
+// rejected as an unsupported document.
+void test_dwfx_not_office() {
+    std::cerr << "\nDWFx vs OOXML package:\n";
+
+    auto detect_zip = [](const std::string& zip) {
+        return jdoc::detect(zip.data(), zip.size(), "");
+    };
+    const std::string ct =
+        "<?xml version=\"1.0\"?><Types xmlns=\"http://schemas.openxmlformats.org/"
+        "package/2006/content-types\"/>";
+
+    TEST(dwfx_3d_without_fdseq_detected)
+        // Autodesk names the sequence part FixedDocumentSequence.fdseq in 2D
+        // packages but DWFDocumentSequence.dwfseq in 3D ones, so only the
+        // dwf/ parts are a reliable marker.
+        auto zip = make_zip({{"[Content_Types].xml", ct},
+                             {"DWFDocumentSequence.dwfseq", "<x/>"},
+                             {"dwf/documents/1/manifest.xml", "<m/>"}});
+        auto info = detect_zip(zip);
+        ASSERT(info.format == "DWFX");
+        ASSERT(!info.convertible);
+    TEST_END
+
+    TEST(plain_xps_stays_office)
+        auto zip = make_zip({{"[Content_Types].xml", ct},
+                             {"FixedDocumentSequence.fdseq", "<x/>"},
+                             {"Documents/1/Pages/1.fpage", "<p/>"}});
+        ASSERT(detect_zip(zip).format != "DWFX");
+    TEST_END
+
+    TEST(office_document_carrying_a_dwf_part_stays_convertible)
+        // Misreading a real document as a drawing would drop its whole body.
+        auto zip = make_zip({{"[Content_Types].xml", ct},
+                             {"word/document.xml",
+                              "<?xml version=\"1.0\"?><w:document xmlns:w=\"http://"
+                              "schemas.openxmlformats.org/wordprocessingml/2006/main\">"
+                              "<w:body><w:p><w:r><w:t>quarterly report body</w:t>"
+                              "</w:r></w:p></w:body></w:document>"},
+                             {"dwf/documents/1/manifest.xml", "<m/>"}});
+        ASSERT(detect_zip(zip).format != "DWFX");
+        auto md = jdoc::office_to_markdown_mem(
+            reinterpret_cast<const uint8_t*>(zip.data()), zip.size(), "report.docx");
+        ASSERT(md.find("quarterly report body") != std::string::npos);
+    TEST_END
+
+    TEST(ordinary_zip_with_dwf_folder_stays_archive)
+        // No OPC marker: a user's zip that happens to hold a dwf/ directory
+        // must still be walked as an archive.
+        auto zip = make_zip({{"dwf/notes.txt", "hello"}, {"readme.txt", "hi"}});
+        auto info = detect_zip(zip);
+        ASSERT(info.format == "ZIP");
+        ASSERT(info.convertible);
+    TEST_END
 }
 
 void test_pptx_shape_tree() {
@@ -1100,6 +1246,8 @@ int main() {
     test_zip_reader();
     test_ole_reader();
     test_rtf_parser();
+    test_ooxml_embedded_parts();
+    test_dwfx_not_office();
     test_pptx_shape_tree();
     test_pptx_master_layout();
     test_pptx_shared_media();

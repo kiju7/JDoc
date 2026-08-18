@@ -121,6 +121,72 @@ void test_document_magic() {
     TEST_END
 }
 
+// CAD drawings are recognized but never convertible: a DWG keeps its text in a
+// compressed object section, and DWF/DWFx would need a WHIP! opcode walker.
+// Naming them lets a caller route or skip instead of seeing a bare UNKNOWN.
+void test_cad_magic() {
+    std::cerr << "CAD drawings (detect-only, convertible=false):\n";
+
+    TEST("dwg")
+        std::string s("AC1032\0", 7);                // AutoCAD 2018
+        std::vector<unsigned char> b(s.begin(), s.end());
+        b.resize(64, 0);
+        auto info = detect_bytes(b);
+        expect(info, "DWG", jdoc::FormatCategory::Image, false);
+        ASSERT(info.extension == ".dwg");
+        ASSERT(info.mime == "image/vnd.dwg");
+    TEST_END
+
+    TEST("dwg_signature_needs_the_trailing_nul")
+        // Six bytes of "AC10" + digits is ordinary text, and the magic check
+        // runs ahead of both the extension and the is-it-text heuristic, so a
+        // report opening this way would be claimed as a drawing and could
+        // never recover. Every real DWG has a NUL at offset 6; no text does.
+        for (const char* prose : {
+                "AC1032 cable was pulled from panel A to panel B.\n",
+                "AC1099,Cable tray,120\nAC1024,Conduit,80\n",
+                "AC10 units of cable were pulled to the riser.\n"}) {
+            std::string s = prose;
+            std::vector<unsigned char> b(s.begin(), s.end());
+            auto info = detect_bytes(b, "notes.txt");
+            if (info.format != "TXT")
+                throw std::runtime_error(std::string("claimed as ") +
+                                         info.format + ": " + prose);
+        }
+    TEST_END
+
+    TEST("dwf")
+        std::string s = "(DWF V06.00)PK\x03\x04";
+        std::vector<unsigned char> b(s.begin(), s.end());
+        b.resize(64, 0);
+        expect(detect_bytes(b), "DWF", jdoc::FormatCategory::Image, false);
+    TEST_END
+
+    TEST("dxf_binary")
+        std::string s = "AutoCAD Binary DXF\r\n\x1a";
+        std::vector<unsigned char> b(s.begin(), s.end());
+        b.resize(64, 0);
+        expect(detect_bytes(b), "DXF", jdoc::FormatCategory::Image, false);
+    TEST_END
+
+    TEST("dxf_ascii_stays_text")
+        // An ASCII DXF deliberately does NOT classify as a drawing. Its
+        // TEXT/MTEXT payloads are the only searchable content a drawing has,
+        // and calling it CAD would make it unconvertible to keep out the
+        // group-code noise — a one-sided trade.
+        std::string s = "  0\r\nSECTION\r\n  2\r\nENTITIES\r\n  0\r\nTEXT\r\n"
+                        "  1\r\nDRAWING NO. M-204\r\n  0\r\nEOF\r\n";
+        std::vector<unsigned char> b(s.begin(), s.end());
+        auto info = detect_bytes(b, "plan.dxf");
+        expect(info, "TXT", jdoc::FormatCategory::Text, true);
+    TEST_END
+
+    TEST("dwfx_by_extension")
+        auto info = jdoc::detect("/no/such/drawing.dwfx");
+        expect(info, "DWFX", jdoc::FormatCategory::Image, false);
+    TEST_END
+}
+
 void test_real_files(const std::string& root) {
     std::cerr << "Real fixture files:\n";
 
@@ -170,6 +236,7 @@ int main(int argc, char** argv) {
     std::cerr << "\n=== jdoc::detect tests ===\n\n";
     test_image_magic();
     test_document_magic();
+    test_cad_magic();
     test_real_files(root);
 
     std::cerr << "\n" << tests_passed << " passed, " << tests_failed

@@ -1514,6 +1514,7 @@ std::vector<TableData> detect_shading_tables(
             for (auto& c : row)
                 if (c.size() > max_cell) max_cell = c.size();
         if (max_cell > 300) continue;
+        t.kind = TableData::SHADING;
         result.push_back(std::move(t));
     }
     return result;
@@ -1531,7 +1532,8 @@ std::vector<TableData> detect_shading_tables(
 //  S4. rejection: list-like, caption, continuation, numeric-cell ratio
 namespace text_tables {
 
-struct CharInfo { double x, y, left, right, top, bot; unsigned int unicode; };
+struct CharInfo { double x, y, left, right, top, bot; unsigned int unicode;
+                  int16_t rot; };
 
 struct TextRow {
     double y_center;
@@ -1833,8 +1835,34 @@ static TableData build_table_from_band(
 
         std::vector<std::string> cells(n_cols);
         std::vector<double> last_right(n_cols, -1e9);
+        std::vector<int16_t> last_rot(n_cols, 0);
 
-        for (size_t idx : ci) {
+        // Column assignment above works in page space, but the text of a cell
+        // has to be emitted in the run's own reading order — a 180° run
+        // advances toward -x, so ci's left-to-right order spells it backwards.
+        // An upright row already is that order, which is nearly every row, so
+        // it keeps ci and skips the resort. Direction is the primary key so a
+        // row mixing them stays a strict weak ordering.
+        std::vector<size_t> ri;
+        const std::vector<size_t>* order = &ci;
+        bool rotated = false;
+        for (size_t idx : ci)
+            if (chars[idx].rot != 0) { rotated = true; break; }
+        if (rotated) {
+            ri = ci;
+            std::sort(ri.begin(), ri.end(), [&](size_t a, size_t b) {
+                const auto& ca = chars[a];
+                const auto& cb = chars[b];
+                if (ca.rot != cb.rot) return ca.rot < cb.rot;
+                double a_lo, a_hi, b_lo, b_hi;
+                text_along_span(ca.rot, ca.left, ca.right, ca.top, ca.bot, a_lo, a_hi);
+                text_along_span(cb.rot, cb.left, cb.right, cb.top, cb.bot, b_lo, b_hi);
+                return a_lo < b_lo;
+            });
+            order = &ri;
+        }
+
+        for (size_t idx : *order) {
             const auto& ch = chars[idx];
             double cmid = (ch.left + ch.right) / 2.0;
             int col = -1;
@@ -1856,10 +1884,20 @@ static TableData build_table_from_band(
                 if (cmid < row_bounds.front()) col = 0;
                 else col = n_cols - 1;
             }
-            if (!cells[col].empty() && (ch.left - last_right[col]) >= word_gap)
+            // Word gaps are measured along the advance too, so a rotated run
+            // does not read as one gapless word (its page-space gaps run
+            // backwards and never clear the threshold). Across a direction
+            // change the two frames share no axis, so the difference is
+            // meaningless — the runs are separated unconditionally instead,
+            // which is what get_text_in_rect does by breaking the row there.
+            double lo, hi;
+            text_along_span(ch.rot, ch.left, ch.right, ch.top, ch.bot, lo, hi);
+            if (!cells[col].empty() &&
+                (ch.rot != last_rot[col] || (lo - last_right[col]) >= word_gap))
                 cells[col] += ' ';
             util::append_utf8(cells[col], ch.unicode);
-            last_right[col] = ch.right;
+            last_right[col] = hi;
+            last_rot[col] = ch.rot;
         }
 
         for (auto& c : cells) c = util::trim(c);
@@ -2347,7 +2385,7 @@ static std::vector<TableData> detect_text_tables_range(
         if (ch.x < 0 || ch.x > page_width || ch.y < 0 || ch.y > page_height) continue;
         if (ch.x < x_lo || ch.x >= x_hi) continue;
         chars.push_back({ch.x, ch.y, ch.left, ch.right, ch.top, ch.bot,
-                         ch.unicode});
+                         ch.unicode, ch.rot});
     }
     if (chars.size() < 10) return {};
 
@@ -2512,6 +2550,7 @@ static std::vector<TableData> detect_text_tables_range(
         // S4-S5: rejection
         if (!accept_table(table)) continue;
 
+        table.kind = TableData::TEXT;
         result.push_back(std::move(table));
     }
     return result;

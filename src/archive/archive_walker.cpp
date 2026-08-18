@@ -32,24 +32,55 @@ namespace {
 bool has_skippable_ext(const std::string& name, bool extracting_images) {
     auto dot = name.rfind('.');
     if (dot == std::string::npos) return false;
-    std::string ext = name.substr(dot + 1);
-    for (auto& c : ext) c = std::tolower(static_cast<unsigned char>(c));
+    // This runs for every archive member. Compare the suffix in place instead
+    // of allocating and lowercasing a temporary extension string.
+    auto ext_is = [&](const char* wanted) {
+        const size_t len = std::strlen(wanted);
+        if (name.size() - dot - 1 != len) return false;
+        for (size_t i = 0; i < len; ++i) {
+            unsigned char c = static_cast<unsigned char>(name[dot + 1 + i]);
+            if (std::tolower(c) != static_cast<unsigned char>(wanted[i]))
+                return false;
+        }
+        return true;
+    };
     // Raster images jdoc can save as-is: skipped only when image extraction is
     // off (nothing to do with them then); processed as IMAGE members when on.
     static const char* kImages[] = {
         "png", "jpg", "jpeg", "gif", "bmp", "tif", "tiff", "webp",
     };
     for (auto* s : kImages)
-        if (ext == s) return !extracting_images;
+        if (ext_is(s)) return !extracting_images;
     static const char* kSkip[] = {
         "ico",
         "mp3", "mp4", "avi", "mov", "mkv", "wav", "flac",
         "exe", "dll", "so", "dylib", "class", "o", "a",
         "ttf", "otf", "woff", "woff2",
+        // CAD drawings: jdoc extracts nothing from them, and a set of sheets
+        // runs to hundreds of megabytes that used to be inflated in full
+        // before being discarded. "dxf" is not here — an ASCII DXF is text,
+        // and skipping it would lose the TEXT/MTEXT strings that are the only
+        // searchable content a drawing carries.
+        "dwg", "dwf", "dwfx",
     };
     for (auto* s : kSkip)
-        if (ext == s) return true;
+        if (ext_is(s)) return true;
     return false;
+}
+
+// Report for a member skipped on its extension alone. The extension still
+// names the format family — "CAD" rather than the exact "DWG" that detect()
+// would report from the bytes, which is the point: nothing was inflated. A
+// caller that asked for unsupported members learns a drawing was in the
+// archive, not merely that something was.
+MemberResult skipped_member(const std::string& member_path, uint64_t size) {
+    MemberResult r;
+    r.member_path = member_path;
+    r.format = file_format_name(format_from_extension(member_path));
+    r.error_code = MemberErrorCode::UNSUPPORTED;
+    r.error = "unsupported format";
+    r.uncompressed_size = size;
+    return r;
 }
 
 // macOS archiving tools add AppleDouble sidecars ("._name", "__MACOSX/")
@@ -57,22 +88,26 @@ bool has_skippable_ext(const std::string& name, bool extracting_images) {
 bool is_metadata_member(const std::string& name) {
     if (name.compare(0, 9, "__MACOSX/") == 0) return true;
     auto slash = name.rfind('/');
-    std::string base = slash == std::string::npos ? name : name.substr(slash + 1);
-    return base.compare(0, 2, "._") == 0 || base == ".DS_Store";
+    size_t base = slash == std::string::npos ? 0 : slash + 1;
+    size_t len = name.size() - base;
+    return (len >= 2 && name[base] == '.' && name[base + 1] == '_') ||
+           (len == 9 && name.compare(base, len, ".DS_Store") == 0);
 }
 
 // Convert both archive separator styles and discard traversal components so
 // the result is always a display-friendly relative path on every platform.
 std::string normalize_member_name(const std::string& name) {
     std::string out;
+    out.reserve(name.size());
     size_t pos = 0;
     while (pos < name.size()) {
         size_t slash = name.find_first_of("/\\", pos);
         size_t len = (slash == std::string::npos ? name.size() : slash) - pos;
-        std::string comp = name.substr(pos, len);
-        if (!comp.empty() && comp != "." && comp != "..") {
+        bool dot = len == 1 && name[pos] == '.';
+        bool dotdot = len == 2 && name[pos] == '.' && name[pos + 1] == '.';
+        if (len != 0 && !dot && !dotdot) {
             if (!out.empty()) out += '/';
-            out += comp;
+            out.append(name, pos, len);
         }
         pos = (slash == std::string::npos) ? name.size() : slash + 1;
     }
@@ -225,7 +260,12 @@ bool handle_member_bytes(const std::string& member_path, const uint8_t* bytes,
                                 depth + 1, budget, opts, cb);
     }
 
-    if (fmt == FileFormat::UNKNOWN) {
+    // CAD joins UNKNOWN here: it is recognized (r.format already names it) but
+    // holds nothing jdoc can read, so it is reported rather than handed to a
+    // converter that would only throw. Members named *.dwg and friends never
+    // get this far — has_skippable_ext drops them before decompression — so
+    // this covers the ones whose extension does not say what they are.
+    if (fmt == FileFormat::UNKNOWN || fmt == FileFormat::CAD) {
         if (!opts.archive.include_unsupported) return true;
         r.error_code = MemberErrorCode::UNSUPPORTED;
         r.error = "unsupported format";
@@ -381,12 +421,8 @@ bool walk_zip(const ZipReader& zip, const std::string& prefix, int depth,
 
         if (has_skippable_ext(e.name, opts.images)) {
             if (opts.archive.include_unsupported) {
-                MemberResult r;
-                r.member_path = member_path;
-                r.error_code = MemberErrorCode::UNSUPPORTED;
-                r.error = "unsupported format";
-                r.uncompressed_size = e.uncompressed_size;
-                if (!cb(std::move(r))) return false;
+                if (!cb(skipped_member(member_path, e.uncompressed_size)))
+                    return false;
             }
             continue;
         }
@@ -443,12 +479,8 @@ bool walk_7z(const SevenZipReader& sz, const std::string& prefix, int depth,
 
         if (has_skippable_ext(e.name, opts.images)) {
             if (opts.archive.include_unsupported) {
-                MemberResult r;
-                r.member_path = member_path;
-                r.error_code = MemberErrorCode::UNSUPPORTED;
-                r.error = "unsupported format";
-                r.uncompressed_size = e.uncompressed_size;
-                if (!cb(std::move(r))) return false;
+                if (!cb(skipped_member(member_path, e.uncompressed_size)))
+                    return false;
             }
             continue;
         }
@@ -538,12 +570,8 @@ bool walk_tar(InputStream& src, const std::string& prefix, int depth,
 
         if (has_skippable_ext(m.name, opts.images)) {
             if (opts.archive.include_unsupported) {
-                MemberResult r;
-                r.member_path = member_path;
-                r.error_code = MemberErrorCode::UNSUPPORTED;
-                r.error = "unsupported format";
-                r.uncompressed_size = m.size;
-                if (!cb(std::move(r))) return false;
+                if (!cb(skipped_member(member_path, m.size)))
+                    return false;
             }
             if (!tar.skip_data()) break;
             continue;
@@ -630,12 +658,8 @@ bool walk_alz(InputStream& src, const std::string& name_hint,
 
         if (has_skippable_ext(m.name, opts.images)) {
             if (opts.archive.include_unsupported) {
-                MemberResult r;
-                r.member_path = member_path;
-                r.error_code = MemberErrorCode::UNSUPPORTED;
-                r.error = "unsupported format";
-                r.uncompressed_size = m.uncompressed_size;
-                if (!cb(std::move(r))) return false;
+                if (!cb(skipped_member(member_path, m.uncompressed_size)))
+                    return false;
             }
             if (!alz.skip_data()) break;
             continue;
@@ -688,12 +712,8 @@ bool walk_rar(InputStream& src, const std::string& name_hint,
 
         if (has_skippable_ext(m.name, opts.images)) {
             if (opts.archive.include_unsupported) {
-                MemberResult r;
-                r.member_path = member_path;
-                r.error_code = MemberErrorCode::UNSUPPORTED;
-                r.error = "unsupported format";
-                r.uncompressed_size = m.uncompressed_size;
-                if (!cb(std::move(r))) return false;
+                if (!cb(skipped_member(member_path, m.uncompressed_size)))
+                    return false;
             }
             if (!rar.skip_data()) break;
             continue;
@@ -779,8 +799,12 @@ bool walk_egg_solid(EggReader& egg, const std::string& prefix, int depth,
                 }
                 if (has_skippable_ext(mem.name, opts.images) || mem.encrypted) {
                     if (mem.encrypted || opts.archive.include_unsupported) {
+                        // Named from the extension like every other skipped
+                        // member; this site handles encryption too, so it
+                        // could not share the helper wholesale.
                         MemberResult r;
                         r.member_path = path;
+                        r.format = file_format_name(format_from_extension(mem.name));
                         r.uncompressed_size = mem.uncompressed_size;
                         r.error_code = mem.encrypted
                             ? MemberErrorCode::ENCRYPTED
@@ -908,12 +932,8 @@ bool walk_egg(InputStream& src, const std::string& name_hint,
 
         if (has_skippable_ext(m.name, opts.images)) {
             if (opts.archive.include_unsupported) {
-                MemberResult r;
-                r.member_path = member_path;
-                r.error_code = MemberErrorCode::UNSUPPORTED;
-                r.error = "unsupported format";
-                r.uncompressed_size = m.uncompressed_size;
-                if (!cb(std::move(r))) return false;
+                if (!cb(skipped_member(member_path, m.uncompressed_size)))
+                    return false;
             }
             if (!egg.skip_data()) break;
             continue;

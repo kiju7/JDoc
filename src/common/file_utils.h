@@ -2,9 +2,12 @@
 // File and path utility functions
 // License: MIT
 
+#include "common/string_utils.h"
+
 #include <algorithm>
 #include <cctype>
 #include <cstdint>
+#include <cstdio>
 #include <limits>
 #include <string>
 #include <utility>
@@ -56,6 +59,37 @@ inline std::string trim(const std::string& s) {
     if (start == std::string::npos) return "";
     auto end = s.find_last_not_of(" \t\r\n");
     return s.substr(start, end - start + 1);
+}
+
+// Byte count for human eyes ("9.7 KB", "2.0 MB", "512 B"). Used wherever a
+// listing names a payload jdoc does not open, so the reader can judge whether
+// the thing that was left behind mattered.
+inline std::string human_bytes(uint64_t bytes) {
+    char buf[32];
+    if (bytes >= 1024ull * 1024)
+        snprintf(buf, sizeof buf, "%.1f MB", bytes / (1024.0 * 1024));
+    else if (bytes >= 1024)
+        snprintf(buf, sizeof buf, "%.1f KB", bytes / 1024.0);
+    else
+        snprintf(buf, sizeof buf, "%llu B",
+                 static_cast<unsigned long long>(bytes));
+    return buf;
+}
+
+// One line of valid UTF-8, always. A name that jdoc did not author — a PDF
+// filespec, a zip entry — reaches the markdown as a list item, and it is
+// trusted for neither structure nor encoding: a newline would let the document
+// forge headings and lists of its own, and a stray byte would make the whole
+// conversion undecodable to a caller that demands UTF-8 (pybind11 raises
+// UnicodeDecodeError on the returned string, losing an otherwise fine
+// document). Control characters collapse to spaces; invalid sequences are
+// repaired.
+inline std::string to_single_line(const std::string& s) {
+    std::string out;
+    out.reserve(s.size());
+    for (unsigned char c : s)
+        out += (c < 0x20 || c == 0x7F) ? ' ' : static_cast<char>(c);
+    return trim(sanitize_utf8(out));
 }
 
 // Escape pipe and newline for markdown table cells.

@@ -3,6 +3,7 @@
 
 #include "ooxml/pptx_parser.h"
 #include "xml_utils.h"
+#include "ooxml/embedded_parts.h"
 #include "common/file_utils.h"
 #include "common/image_utils.h"
 #include "common/png_encode.h"
@@ -803,6 +804,7 @@ std::string PptxParser::to_markdown(const ConvertOptions& opts) {
         if (!body.empty() && body.back() != '\n') body += "\n";
         body += extra;
     }
+    body += format_embedded_parts(zip_);
     return body;
 }
 
@@ -909,6 +911,7 @@ std::vector<PageChunk> PptxParser::to_chunks(const ConvertOptions& opts) {
         chunks.push_back(std::move(c));
         return true;
     });
+    append_embedded_parts(zip_, chunks);
     return chunks;
 }
 
