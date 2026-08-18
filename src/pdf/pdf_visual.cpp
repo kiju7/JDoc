@@ -1138,6 +1138,22 @@ std::vector<ExtractedImage> extract_page_images(PdfDoc& doc, const PdfObj& resou
             }
         }
 
+        // A stencil or soft-masked image whose alpha never rises above zero
+        // paints nothing on the page; HWP-to-PDF prints emit such whiteout
+        // masks freely, and each would export as a blank file.
+        if (img_rgba && img.components == 4 && !img.pixels.empty()) {
+            bool visible = false;
+            for (size_t ai = 3; ai < img.pixels.size(); ai += 4)
+                if (img.pixels[ai] != 0) {
+                    visible = true;
+                    break;
+                }
+            if (!visible) {
+                policy_skips++;
+                continue;
+            }
+        }
+
         if (!img.data.empty() || !img.pixels.empty()) {
             // Save in the viewer's orientation: a raster stored sideways
             // (rotated placement, or an unrotated placement on a /Rotate
