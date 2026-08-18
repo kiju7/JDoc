@@ -1,5 +1,6 @@
 #include "pdf_extract.h"
 #include "pdf_limits.h"
+#include "jbig2.h"
 #include "jpx.h"
 #include "common/png_encode.h"
 #include <chrono>
@@ -1633,7 +1634,25 @@ ImageData render_page_composite(PdfDoc& doc, const PdfObj& resources,
                 auto last = doc.resolve(pre_filter.arr.back());
                 if (last.is_name()) pre_last = last.str_val;
             }
-            if (pre_last == "JBIG2Decode" || pre_last == "JPXDecode") continue;
+            if (pre_last == "JPXDecode") continue;
+            if (pre_last == "JBIG2Decode") {
+                // The arithmetic subset now covers symbol text; raise the
+                // DPI only when a header probe confirms the stream stays
+                // inside it — a rejected variant would still pay for a
+                // large, mostly blank canvas.
+                bool single = pre_filter.is_name() ||
+                              (pre_filter.is_arr() &&
+                               pre_filter.arr.size() == 1);
+                if (!single || !xobj.raw_stream_data()) continue;
+                std::vector<uint8_t> gl;
+                auto parms = doc.resolve(xobj.get("DecodeParms"));
+                auto g = doc.resolve(parms.get("JBIG2Globals"));
+                if (g.is_stream()) gl = doc.decode_stream(g);
+                if (!jbig2_supported(xobj.raw_stream_data(),
+                                     xobj.raw_stream_size(),
+                                     gl.data(), gl.size()))
+                    continue;
+            }
             int iw = xobj.get("Width").as_int();
             int ih = xobj.get("Height").as_int();
             double pw_pt = std::hypot(ip.ctm[0], ip.ctm[1]);

@@ -84,6 +84,44 @@ int main() {
         std::cout << "[1] jbig2 generic region: OK (" << w << "x" << h << ")\n";
     }
 
+    // [1b] JBIG2 symbol dictionary + text region, in the PDF embedding
+    // layout (dictionary in the globals stream, text region in the image
+    // stream) — jbig2enc -s output, cross-checked against jbig2dec.
+    {
+        auto globals = slurp("test/fixtures/pdf/symtext.sym");
+        auto stream = slurp("test/fixtures/pdf/symtext.jbig2");
+        int w = 0, h = 0;
+        auto bits = jdoc::pdf_detail::jbig2_decode(stream.data(), stream.size(),
+                                                   globals.data(),
+                                                   globals.size(), w, h);
+        CHECK(!bits.empty());
+        CHECK(w == 400 && h == 120);
+        auto expect =
+            pnm_payload(slurp("test/fixtures/pdf/symtext_expected.pbm"), 3);
+        CHECK(bits.size() == expect.size());
+        CHECK(std::memcmp(bits.data(), expect.data(), bits.size()) == 0);
+        std::cout << "[1b] jbig2 symbol dictionary + text region: OK ("
+                  << w << "x" << h << ")\n";
+    }
+
+    // [1c] Denser variant: 12 random glyph classes over 14 lines, TPGD on.
+    {
+        auto globals = slurp("test/fixtures/pdf/symtext2.sym");
+        auto stream = slurp("test/fixtures/pdf/symtext2.jbig2");
+        int w = 0, h = 0;
+        auto bits = jdoc::pdf_detail::jbig2_decode(stream.data(), stream.size(),
+                                                   globals.data(),
+                                                   globals.size(), w, h);
+        CHECK(!bits.empty());
+        CHECK(w == 600 && h == 400);
+        auto expect =
+            pnm_payload(slurp("test/fixtures/pdf/symtext2_expected.pbm"), 3);
+        CHECK(bits.size() == expect.size());
+        CHECK(std::memcmp(bits.data(), expect.data(), bits.size()) == 0);
+        std::cout << "[1c] jbig2 symbol text, dense multi-class: OK ("
+                  << w << "x" << h << ")\n";
+    }
+
     // [2] JPX reversible (5/3 + RCT): byte-exact round trip
     {
         auto stream = slurp("test/fixtures/pdf/jpx_lossless.j2k");

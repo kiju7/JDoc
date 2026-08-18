@@ -251,6 +251,26 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    // Test 11: JBIG2 symbol dictionary + text region through the PDF path
+    // (dictionary in /JBIG2Globals). These used to decode to nothing.
+    std::cout << "[11] Testing JBIG2 symbol text extraction...\n";
+    {
+        std::ifstream f("test/fixtures/pdf/jbig2_symtext.pdf");
+        if (!f.good()) {
+            std::cout << "    SKIP: fixture not found\n";
+        } else {
+            f.close();
+            auto chunks = jdoc::pdf_to_markdown_chunks(
+                "test/fixtures/pdf/jbig2_symtext.pdf");
+            assert(chunks.size() == 1);
+            assert(chunks[0].images.size() == 1);
+            assert(chunks[0].degraded_images == 0);
+            assert(chunks[0].images[0].width == 400);
+            assert(chunks[0].images[0].height == 120);
+            std::cout << "    400x120 symbol-text image extracted OK\n";
+        }
+    }
+
     std::cout << "\n=== All tests passed ===\n";
     return 0;
 }
