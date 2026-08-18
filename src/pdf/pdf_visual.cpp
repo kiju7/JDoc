@@ -656,19 +656,23 @@ std::vector<ExtractedImage> extract_page_images(PdfDoc& doc, const PdfObj& resou
     const PdfObj& res = resources;
 
     for (auto& ip : parse_result.images) {
-        PdfObj xobj;
-        if (ip.xobj_ref >= 0) {
-            xobj = doc.get_obj(ip.xobj_ref);
+        PdfObj xobj_res;
+        if (ip.inline_img) {
+            // Inline image: synthesized stream, no /Subtype to check.
+        } else if (ip.xobj_ref >= 0) {
+            xobj_res = doc.get_obj(ip.xobj_ref);
         } else if (!ip.xobj_name.empty()) {
             auto& xobjects = res.get("XObject");
             auto xd = doc.resolve(xobjects);
-            if (xd.is_dict()) xobj = doc.resolve(xd.get(ip.xobj_name));
+            if (xd.is_dict()) xobj_res = doc.resolve(xd.get(ip.xobj_name));
         }
+        const PdfObj& xobj = ip.inline_img ? *ip.inline_img : xobj_res;
 
         if (!xobj.is_stream()) continue;
 
         auto& subtype = xobj.get("Subtype");
-        if (!subtype.is_name() || subtype.str_val != "Image") continue;
+        if (!ip.inline_img &&
+            (!subtype.is_name() || subtype.str_val != "Image")) continue;
 
         considered++;
         if (diag) diag->images_total++;
@@ -1417,13 +1421,16 @@ ImageData render_page_composite(PdfDoc& doc, const PdfObj& resources,
     {
         const PdfObj& pre_res = resources;
         for (auto& ip : parse_result.images) {
-            PdfObj xobj;
-            if (ip.xobj_ref >= 0) {
-                xobj = doc.get_obj(ip.xobj_ref);
+            PdfObj xobj_res;
+            if (ip.inline_img) {
+                // Inline strips carry their own dims and filter.
+            } else if (ip.xobj_ref >= 0) {
+                xobj_res = doc.get_obj(ip.xobj_ref);
             } else if (!ip.xobj_name.empty()) {
                 auto xd = doc.resolve(pre_res.get("XObject"));
-                if (xd.is_dict()) xobj = doc.resolve(xd.get(ip.xobj_name));
+                if (xd.is_dict()) xobj_res = doc.resolve(xd.get(ip.xobj_name));
             }
+            const PdfObj& xobj = ip.inline_img ? *ip.inline_img : xobj_res;
             if (!xobj.is_stream()) continue;
             // Images the compositor may fail to decode must not inflate the
             // canvas. The in-tree JBIG2/JPX decoders cover subsets
@@ -1784,14 +1791,17 @@ ImageData render_page_composite(PdfDoc& doc, const PdfObj& resources,
 
     int images_drawn = 0;
     auto draw_image = [&](const ImagePlacement& ip) {
-        PdfObj xobj;
-        if (ip.xobj_ref >= 0) {
-            xobj = doc.get_obj(ip.xobj_ref);
+        PdfObj xobj_res;
+        if (ip.inline_img) {
+            // Inline image: the synthesized stream carries dict and payload.
+        } else if (ip.xobj_ref >= 0) {
+            xobj_res = doc.get_obj(ip.xobj_ref);
         } else if (!ip.xobj_name.empty()) {
             auto& xobjects = res.get("XObject");
             auto xd = doc.resolve(xobjects);
-            if (xd.is_dict()) xobj = doc.resolve(xd.get(ip.xobj_name));
+            if (xd.is_dict()) xobj_res = doc.resolve(xd.get(ip.xobj_name));
         }
+        const PdfObj& xobj = ip.inline_img ? *ip.inline_img : xobj_res;
         if (!xobj.is_stream()) return;
 
         auto& subtype = xobj.get("Subtype");

@@ -108,6 +108,9 @@ struct PdfFillRect {
 struct ImagePlacement {
     int xobj_ref = -1;
     std::string xobj_name;
+    // Inline image (BI…ID…EI): a synthesized stream object carrying the
+    // normalized dict and payload; null for XObject placements.
+    std::shared_ptr<const PdfObj> inline_img;
     double ctm[6];
     double fill_r = 0, fill_g = 0, fill_b = 0; // fill color for ImageMask
     double alpha = 1; // ExtGState /ca in force at the Do (watermark fades)
@@ -133,6 +136,8 @@ struct ContentParseResult {
     std::vector<RenderPath> paths; // for vector rendering
     int draw_ops = 0; // total paths+images recorded (seq offset for nested forms)
     int visible_text_chars = 0; // chars emitted outside Tr 3/7 (invisible text)
+    int inline_images = 0;        // BI…ID…EI images consumed
+    int inline_scan_bailouts = 0; // EI never found; rest of stream skipped
 };
 
 struct TextLine {

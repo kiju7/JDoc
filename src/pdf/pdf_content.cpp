@@ -819,6 +819,256 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
         }
     };
 
+    // ── Inline images (BI … ID … EI) ──────────────────────
+    // The payload after ID is raw binary. It must be consumed in every parse
+    // mode — left in place, the operator loop reads sample bytes as tokens,
+    // and a stray 'q'/'cm'/'(' corrupts the graphics state (or swallows the
+    // stream) for everything after the image.
+    auto parse_inline_image = [&]() {
+        auto full_key = [](const std::string& k) -> const char* {
+            if (k == "W") return "Width";
+            if (k == "H") return "Height";
+            if (k == "BPC") return "BitsPerComponent";
+            if (k == "CS") return "ColorSpace";
+            if (k == "F") return "Filter";
+            if (k == "DP") return "DecodeParms";
+            if (k == "D") return "Decode";
+            if (k == "IM") return "ImageMask";
+            if (k == "I") return "Interpolate";
+            if (k == "L") return "Length";
+            return nullptr;
+        };
+        auto full_cs = [](const std::string& n) -> const char* {
+            if (n == "G") return "DeviceGray";
+            if (n == "RGB") return "DeviceRGB";
+            if (n == "CMYK") return "DeviceCMYK";
+            if (n == "I") return "Indexed";
+            return nullptr;
+        };
+        auto full_filter = [](const std::string& n) -> const char* {
+            if (n == "AHx") return "ASCIIHexDecode";
+            if (n == "A85") return "ASCII85Decode";
+            if (n == "LZW") return "LZWDecode";
+            if (n == "Fl") return "FlateDecode";
+            if (n == "RL") return "RunLengthDecode";
+            if (n == "CCF") return "CCITTFaxDecode";
+            if (n == "DCT") return "DCTDecode";
+            return nullptr;
+        };
+
+        PdfObj img = PdfObj::make_dict();
+        bool have_id = false;
+        while (lex.pos < lex.len) {
+            lex.skip_ws();
+            if (lex.pos >= lex.len) break;
+            uint8_t c = lex.data[lex.pos];
+            if (c == '/') {
+                PdfObj key = lex.parse_object();
+                PdfObj val = lex.parse_object();
+                if (!key.is_name()) continue;
+                std::string k = key.str_val;
+                if (const char* f = full_key(k)) k = f;
+                if (k == "ColorSpace") {
+                    if (val.is_name()) {
+                        if (const char* f = full_cs(val.str_val)) {
+                            val.str_val = f;
+                        } else if (val.str_val != "DeviceGray" &&
+                                   val.str_val != "DeviceRGB" &&
+                                   val.str_val != "DeviceCMYK" &&
+                                   val.str_val != "Indexed") {
+                            // Named colorspace: resolve through /Resources so
+                            // downstream consumers see the real definition.
+                            auto cs_dict = doc.resolve(res.get("ColorSpace"));
+                            auto resolved = cs_dict.is_dict()
+                                ? doc.resolve(cs_dict.get(val.str_val))
+                                : PdfObj{};
+                            if (!resolved.is_none()) val = std::move(resolved);
+                        }
+                    } else if (val.is_arr()) {
+                        for (auto& e : val.arr)
+                            if (e.is_name())
+                                if (const char* f = full_cs(e.str_val))
+                                    e.str_val = f;
+                    }
+                } else if (k == "Filter") {
+                    if (val.is_name()) {
+                        if (const char* f = full_filter(val.str_val))
+                            val.str_val = f;
+                    } else if (val.is_arr()) {
+                        for (auto& e : val.arr)
+                            if (e.is_name())
+                                if (const char* f = full_filter(e.str_val))
+                                    e.str_val = f;
+                    }
+                }
+                img.dict.push_back({std::move(k), std::move(val)});
+            } else if (!PdfLexer::is_delim(c)) {
+                size_t s = lex.pos;
+                while (lex.pos < lex.len &&
+                       !PdfLexer::is_ws(lex.data[lex.pos]) &&
+                       !PdfLexer::is_delim(lex.data[lex.pos]))
+                    lex.pos++;
+                if (lex.pos - s == 2 && lex.data[s] == 'I' &&
+                    lex.data[s + 1] == 'D') {
+                    have_id = true;
+                    break;
+                }
+                if (lex.pos == s) lex.pos++;
+            } else {
+                lex.pos++;
+            }
+        }
+        if (!have_id) {
+            result.inline_scan_bailouts++;
+            lex.pos = lex.len;
+            return;
+        }
+
+        std::vector<std::string> flist;
+        {
+            auto& f = img.get("Filter");
+            if (f.is_name()) flist.push_back(f.str_val);
+            else if (f.is_arr())
+                for (auto& e : f.arr)
+                    if (e.is_name()) flist.push_back(e.str_val);
+        }
+
+        // One whitespace byte separates ID from the samples. A CRLF from a
+        // Windows producer counts as one separator only for ASCII filters,
+        // where '\n' cannot be a data byte.
+        bool ascii_first = !flist.empty() && (flist[0] == "ASCIIHexDecode" ||
+                                              flist[0] == "ASCII85Decode");
+        if (lex.pos < lex.len && PdfLexer::is_ws(lex.data[lex.pos])) {
+            bool was_cr = lex.data[lex.pos] == '\r';
+            lex.pos++;
+            if (was_cr && ascii_first && lex.pos < lex.len &&
+                lex.data[lex.pos] == '\n')
+                lex.pos++;
+        }
+        const size_t data_start = lex.pos;
+
+        auto ei_at = [&](size_t p) -> bool {
+            if (p + 1 >= lex.len) return false;
+            if (lex.data[p] != 'E' || lex.data[p + 1] != 'I') return false;
+            size_t q = p + 2;
+            return q >= lex.len || PdfLexer::is_ws(lex.data[q]) ||
+                   PdfLexer::is_delim(lex.data[q]);
+        };
+        // Payload candidate [data_start, end): valid when at most a little
+        // whitespace and then EI at a token boundary follows.
+        auto valid_end = [&](size_t end, size_t& after) -> bool {
+            size_t p = end;
+            for (int ws = 0; ws < 4 && p < lex.len &&
+                             PdfLexer::is_ws(lex.data[p]); ws++)
+                p++;
+            if (!ei_at(p)) return false;
+            after = p + 2;
+            return true;
+        };
+
+        size_t payload_end = SIZE_MAX, resume = SIZE_MAX;
+
+        // 1. /L names the payload length outright (PDF 2.0 added it for
+        //    exactly this — skipping the scan-for-EI).
+        int64_t L = img.get("Length").as_int();
+        if (L > 0 && static_cast<uint64_t>(L) <= lex.len - data_start) {
+            size_t after;
+            if (valid_end(data_start + static_cast<size_t>(L), after)) {
+                payload_end = data_start + static_cast<size_t>(L);
+                resume = after;
+            }
+        }
+
+        // 2. Unfiltered: the sample size is exact.
+        if (payload_end == SIZE_MAX && flist.empty()) {
+            int iw = img.get("Width").as_int();
+            int ih = img.get("Height").as_int();
+            int bpc = img.get("BitsPerComponent").as_int();
+            if (img.get("ImageMask").bool_val) bpc = 1;
+            else if (bpc <= 0) bpc = 8;
+            int comps = 1;
+            {
+                auto& cs = img.get("ColorSpace");
+                std::string cn;
+                if (cs.is_name()) cn = cs.str_val;
+                else if (cs.is_arr() && !cs.arr.empty() && cs.arr[0].is_name())
+                    cn = cs.arr[0].str_val;
+                if (cn == "DeviceRGB") comps = 3;
+                else if (cn == "DeviceCMYK") comps = 4;
+            }
+            if (iw > 0 && ih > 0 && iw < (1 << 20) && ih < (1 << 20)) {
+                uint64_t row = (static_cast<uint64_t>(iw) * comps * bpc + 7) / 8;
+                uint64_t need = row * static_cast<uint64_t>(ih);
+                if (need <= lex.len - data_start) {
+                    size_t after;
+                    if (valid_end(data_start + static_cast<size_t>(need), after)) {
+                        payload_end = data_start + static_cast<size_t>(need);
+                        resume = after;
+                    }
+                }
+            }
+        }
+
+        // 3. Scan for ws+EI at a token boundary. 'E','I' are ordinary data
+        //    bytes, so validate cheap-to-check codecs before accepting.
+        if (payload_end == SIZE_MAX) {
+            constexpr size_t kMaxInlineScan = 8u << 20;
+            const size_t limit = std::min(lex.len, data_start + kMaxInlineScan);
+            const bool dct = !flist.empty() && flist.back() == "DCTDecode";
+            const bool flate = !flist.empty() && flist.back() == "FlateDecode";
+            int probes = 0;
+            for (size_t p = data_start; p + 2 < limit; p++) {
+                if (!PdfLexer::is_ws(lex.data[p]) || !ei_at(p + 1)) continue;
+                const size_t cand_len = p - data_start;
+                if (dct) {
+                    if (cand_len < 4 || lex.data[data_start] != 0xFF ||
+                        lex.data[data_start + 1] != 0xD8)
+                        break; // not JPEG at all — bail out below
+                    size_t t0 = cand_len > 16 ? p - 16 : data_start;
+                    bool eoi = false;
+                    for (size_t t = t0; t + 1 < p; t++)
+                        if (lex.data[t] == 0xFF && lex.data[t + 1] == 0xD9) {
+                            eoi = true;
+                            break;
+                        }
+                    if (!eoi) continue;
+                } else if (flate) {
+                    if (++probes > 32) break;
+                    if (decode_flate(lex.data + data_start, cand_len).empty())
+                        continue;
+                }
+                payload_end = p;
+                resume = p + 3;
+                break;
+            }
+        }
+
+        if (payload_end == SIZE_MAX) {
+            // Truncated or unrecognizable payload. Consuming the rest of the
+            // stream loses the tail, which beats lexing binary as operators.
+            result.inline_scan_bailouts++;
+            lex.pos = lex.len;
+            return;
+        }
+
+        result.inline_images++;
+        if (collect_render_paths) {
+            img.type = ObjType::STREAM;
+            img.stream_data.assign(lex.data + data_start,
+                                   lex.data + payload_end);
+            ImagePlacement ip;
+            ip.inline_img = std::make_shared<const PdfObj>(std::move(img));
+            std::memcpy(ip.ctm, gs.ctm, sizeof(gs.ctm));
+            ip.fill_r = gs.fill_r;
+            ip.fill_g = gs.fill_g;
+            ip.fill_b = gs.fill_b;
+            ip.alpha = gs.fill_alpha;
+            ip.seq = draw_seq++;
+            result.images.push_back(std::move(ip));
+        }
+        lex.pos = resume;
+    };
+
     while (lex.pos < lex.len) {
         lex.skip_ws();
         if (lex.pos >= lex.len) break;
@@ -1228,6 +1478,11 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
                 commit_pending_clip(gs);
             }
 
+            // ── Inline image: consume in every mode (see the lambda) ──
+            else if (op.is("BI")) {
+                parse_inline_image();
+            }
+
             // ── XObject (images) ──
             else if (op.is("Do")) {
                 const PdfObj* name =
@@ -1269,6 +1524,9 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
                                     std::make_move_iterator(sub.chars.end()));
                                 result.visible_text_chars +=
                                     sub.visible_text_chars;
+                                result.inline_images += sub.inline_images;
+                                result.inline_scan_bailouts +=
+                                    sub.inline_scan_bailouts;
                                 result.segments.insert(result.segments.end(),
                                     std::make_move_iterator(sub.segments.begin()),
                                     std::make_move_iterator(sub.segments.end()));

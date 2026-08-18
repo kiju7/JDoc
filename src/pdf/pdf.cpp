@@ -389,10 +389,16 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
 
             auto xobjects = doc.resolve(resources.get("XObject"));
             for (auto& ip : parse_result.images) {
-                PdfObj xobj;
-                if (ip.xobj_ref >= 0) xobj = doc.get_obj(ip.xobj_ref);
-                else if (xobjects.is_dict() && !ip.xobj_name.empty())
-                    xobj = doc.resolve(xobjects.get(ip.xobj_name));
+                PdfObj xobj_res;
+                if (ip.inline_img) {
+                    // GDI drivers emit inline strips; they classify like any
+                    // other placement.
+                } else if (ip.xobj_ref >= 0) {
+                    xobj_res = doc.get_obj(ip.xobj_ref);
+                } else if (xobjects.is_dict() && !ip.xobj_name.empty()) {
+                    xobj_res = doc.resolve(xobjects.get(ip.xobj_name));
+                }
+                const PdfObj& xobj = ip.inline_img ? *ip.inline_img : xobj_res;
                 if (!xobj.is_stream()) continue;
 
                 bool stencil = xobj.get("ImageMask").bool_val;
@@ -483,6 +489,12 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
                 }
             }
         }
+
+        // Set after the image pipeline: the per-attempt diag resets above must
+        // not wipe the parse-time inline counters.
+        result.page_diags[p].inline_images = parse_result.inline_images;
+        result.page_diags[p].inline_scan_bailouts =
+            parse_result.inline_scan_bailouts;
     };
 
     // Each worker owns one pre-sized result slot. Shared object/font caches
