@@ -140,6 +140,7 @@ struct RenderPath {
     double line_width;
     bool do_fill, do_stroke;
     bool even_odd = false; // f*/B*/b*: even-odd fill rule (default nonzero)
+    bool synthetic = false; // gradient strip/disk, not author-drawn geometry
     float clip[4] = {-1e30f, -1e30f, 1e30f, 1e30f}; // page-space clip rect
     int seq = 0; // draw order shared with ImagePlacement
 };

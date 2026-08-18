@@ -478,6 +478,7 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
             rp.clip[1] = static_cast<float>(region[1]);
             rp.clip[2] = static_cast<float>(region[2]);
             rp.clip[3] = static_cast<float>(region[3]);
+            rp.synthetic = true;
             rp.seq = draw_seq++;
             result.shading_paths++;
             result.paths.push_back(std::move(rp));
@@ -573,6 +574,7 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
             rp.clip[1] = static_cast<float>(region[1]);
             rp.clip[2] = static_cast<float>(region[2]);
             rp.clip[3] = static_cast<float>(region[3]);
+            rp.synthetic = true;
             rp.seq = draw_seq++;
             result.shading_paths++;
             result.paths.push_back(std::move(rp));

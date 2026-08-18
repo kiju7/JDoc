@@ -1514,6 +1514,7 @@ std::vector<TableData> detect_shading_tables(
             for (auto& c : row)
                 if (c.size() > max_cell) max_cell = c.size();
         if (max_cell > 300) continue;
+        t.kind = TableData::SHADING;
         result.push_back(std::move(t));
     }
     return result;
@@ -2549,6 +2550,7 @@ static std::vector<TableData> detect_text_tables_range(
         // S4-S5: rejection
         if (!accept_table(table)) continue;
 
+        table.kind = TableData::TEXT;
         result.push_back(std::move(table));
     }
     return result;

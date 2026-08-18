@@ -2532,7 +2532,6 @@ ImageData render_region_composite(PdfDoc& doc, const PdfObj& resources,
         ip.clip[3] -= static_cast<float>(y0);
         sub.images.push_back(std::move(ip));
     }
-    if (sub.images.empty()) return {};
 
     for (const auto& rp : parse_result.paths) {
         double bx0, by0, bx1, by1;
@@ -2566,6 +2565,9 @@ ImageData render_region_composite(PdfDoc& doc, const PdfObj& resources,
         sp.clip[3] -= static_cast<float>(y0);
         sub.paths.push_back(std::move(sp));
     }
+    // Vector-figure regions legitimately hold paths only; a region with
+    // neither is nothing to draw.
+    if (sub.images.empty() && sub.paths.empty()) return {};
 
     return render_page_composite(doc, resources, sub, page_num, rgn_w, rgn_h,
                                  output_dir, img_idx, diag);

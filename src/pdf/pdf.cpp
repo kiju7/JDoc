@@ -7,6 +7,7 @@
 #include "common/mapped_file.h"
 #include <fstream>
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cassert>
 #include <cmath>
@@ -568,6 +569,7 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
                 result.page_diags[p] = {};
                 int img_idx = 0;
                 std::vector<char> handled(parse_result.images.size(), 0);
+                std::vector<std::array<double, 4>> done_regions;
                 for (auto& c : clusters) {
                     if (!qualifies(c)) continue;
                     double rgn[4] = {std::max(0.0, c.x0), std::max(0.0, c.y0),
@@ -599,7 +601,253 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
                     // order; only whole-page composites pin to top-of-page.
                     result.all_image_y[p].push_back(rgn[3]);
                     result.all_image_x[p].push_back(rgn[0]);
+                    done_regions.push_back({rgn[0], rgn[1], rgn[2], rgn[3]});
                     img_idx++;
+                }
+
+                // ── Vector figures ──────────────────────────────
+                // A schematic or chart drawn as paths (often with a few small
+                // glyph images sprinkled in) has no representation at all
+                // outside a whole-page composite. Cluster author-drawn path
+                // bboxes the same way and composite dense regions that are
+                // not tables and hold no body text.
+                constexpr size_t kFigureMinPaths = 10;
+                constexpr size_t kFigureMaxPaths = 1500;
+                const size_t author_paths =
+                    parse_result.paths.size() -
+                    static_cast<size_t>(parse_result.shading_paths);
+                if (author_paths >= kFigureMinPaths &&
+                    author_paths <= kFigureMaxPaths) {
+                    struct PathBox {
+                        double x0, y0, x1, y1;
+                        bool dark;
+                    };
+                    std::vector<PathBox> pb;
+                    pb.reserve(author_paths);
+                    for (auto& rp : parse_result.paths) {
+                        if (rp.synthetic) continue;
+                        // Real figures carry ink; a cluster of nothing but
+                        // pastel fills is a decorated text background.
+                        auto lum = [](double r, double g, double b) {
+                            return 0.299 * r + 0.587 * g + 0.114 * b;
+                        };
+                        bool dark =
+                            (rp.do_stroke &&
+                             lum(rp.stroke_r, rp.stroke_g, rp.stroke_b) <
+                                 0.7) ||
+                            (rp.do_fill &&
+                             lum(rp.fill_r, rp.fill_g, rp.fill_b) < 0.7);
+                        double bx0 = 1e300, by0 = 1e300;
+                        double bx1 = -1e300, by1 = -1e300;
+                        for (auto& pt : rp.points) {
+                            if (pt.type == PathPoint::CLOSE) continue;
+                            bx0 = std::min(bx0, pt.x);
+                            bx1 = std::max(bx1, pt.x);
+                            by0 = std::min(by0, pt.y);
+                            by1 = std::max(by1, pt.y);
+                            if (pt.type == PathPoint::CURVE) {
+                                bx0 = std::min({bx0, pt.cx1, pt.cx2});
+                                bx1 = std::max({bx1, pt.cx1, pt.cx2});
+                                by0 = std::min({by0, pt.cy1, pt.cy2});
+                                by1 = std::max({by1, pt.cy1, pt.cy2});
+                            }
+                        }
+                        if (bx0 > bx1 || !std::isfinite(bx0) ||
+                            !std::isfinite(bx1) || !std::isfinite(by0) ||
+                            !std::isfinite(by1))
+                            continue;
+                        if (rp.do_stroke) {
+                            double pad = rp.line_width * 0.5;
+                            bx0 -= pad; by0 -= pad;
+                            bx1 += pad; by1 += pad;
+                        }
+                        bx0 = std::max(bx0, static_cast<double>(rp.clip[0]));
+                        by0 = std::max(by0, static_cast<double>(rp.clip[1]));
+                        bx1 = std::min(bx1, static_cast<double>(rp.clip[2]));
+                        by1 = std::min(by1, static_cast<double>(rp.clip[3]));
+                        double w = bx1 - bx0, h = by1 - by0;
+                        if (w < 0.5 && h < 0.5) continue;
+                        if (bx1 < 0 || bx0 > page_w || by1 < 0 || by0 > page_h)
+                            continue;
+                        // Page borders/backgrounds join everything and mean
+                        // nothing; long rules are separators, not figures.
+                        if (w > 0.7 * page_w && h > 0.7 * page_h) continue;
+                        double longd = std::max(w, h);
+                        double shortd = std::max(std::min(w, h), 0.04);
+                        if (longd > 25.0 * shortd &&
+                            longd > 0.3 * std::max(page_w, page_h))
+                            continue;
+                        pb.push_back({bx0, by0, bx1, by1, dark});
+                    }
+
+                    const size_t np = pb.size();
+                    std::vector<size_t> fparent(np);
+                    for (size_t i = 0; i < np; i++) fparent[i] = i;
+                    auto ffind = [&](size_t a) {
+                        while (fparent[a] != a) {
+                            fparent[a] = fparent[fparent[a]];
+                            a = fparent[a];
+                        }
+                        return a;
+                    };
+                    for (size_t a = 0; a < np; a++)
+                        for (size_t b = a + 1; b < np; b++) {
+                            double gx = std::max(pb[a].x0, pb[b].x0) -
+                                        std::min(pb[a].x1, pb[b].x1);
+                            double gy = std::max(pb[a].y0, pb[b].y0) -
+                                        std::min(pb[a].y1, pb[b].y1);
+                            if (gx <= eps && gy <= eps) {
+                                size_t ra = ffind(a), rb = ffind(b);
+                                if (ra != rb) fparent[rb] = ra;
+                            }
+                        }
+
+                    struct FigCluster {
+                        size_t n = 0, dark = 0;
+                        double x0 = 1e300, y0 = 1e300;
+                        double x1 = -1e300, y1 = -1e300;
+                    };
+                    std::vector<FigCluster> figs;
+                    {
+                        std::unordered_map<size_t, size_t> root_to_fig;
+                        for (size_t i = 0; i < np; i++) {
+                            auto [it, fresh] = root_to_fig.try_emplace(
+                                ffind(i), figs.size());
+                            if (fresh) figs.emplace_back();
+                            auto& fc = figs[it->second];
+                            fc.n++;
+                            if (pb[i].dark) fc.dark++;
+                            fc.x0 = std::min(fc.x0, pb[i].x0);
+                            fc.y0 = std::min(fc.y0, pb[i].y0);
+                            fc.x1 = std::max(fc.x1, pb[i].x1);
+                            fc.y1 = std::max(fc.y1, pb[i].y1);
+                        }
+                    }
+                    // Two clusters can interleave — union boxes overlapping
+                    // while no member pair touches (a wire bus crossing a
+                    // component row). Merge until the boxes are disjoint.
+                    for (bool merged = true; merged;) {
+                        merged = false;
+                        for (size_t a = 0; a < figs.size() && !merged; a++)
+                            for (size_t b = a + 1; b < figs.size(); b++) {
+                                if (std::max(figs[a].x0, figs[b].x0) -
+                                        std::min(figs[a].x1, figs[b].x1) >
+                                    eps)
+                                    continue;
+                                if (std::max(figs[a].y0, figs[b].y0) -
+                                        std::min(figs[a].y1, figs[b].y1) >
+                                    eps)
+                                    continue;
+                                figs[a].n += figs[b].n;
+                                figs[a].dark += figs[b].dark;
+                                figs[a].x0 = std::min(figs[a].x0, figs[b].x0);
+                                figs[a].y0 = std::min(figs[a].y0, figs[b].y0);
+                                figs[a].x1 = std::max(figs[a].x1, figs[b].x1);
+                                figs[a].y1 = std::max(figs[a].y1, figs[b].y1);
+                                figs.erase(figs.begin() + b);
+                                merged = true;
+                                break;
+                            }
+                    }
+
+                    for (auto& fc : figs) {
+                        if (fc.n < kFigureMinPaths) continue;
+                        if (fc.dark < 2) continue;
+                        double rgn[4] = {std::max(0.0, fc.x0),
+                                         std::max(0.0, fc.y0),
+                                         std::min(page_w, fc.x1),
+                                         std::min(page_h, fc.y1)};
+                        double fw = rgn[2] - rgn[0], fh = rgn[3] - rgn[1];
+                        if (fw < 1.0 || fh < 1.0) continue;
+                        double farea = fw * fh;
+                        double parea = page_w * page_h;
+                        if (farea < 0.006 * parea || farea > 0.65 * parea)
+                            continue;
+                        auto overlap = [&](double x0, double y0, double x1,
+                                           double y1) {
+                            double ox = std::min(rgn[2], x1) -
+                                        std::max(rgn[0], x0);
+                            double oy = std::min(rgn[3], y1) -
+                                        std::max(rgn[1], y0);
+                            return ox > 0 && oy > 0 ? ox * oy : 0.0;
+                        };
+                        // Ruled/shaded tables cluster densely too, and text
+                        // blocks carry decorations; both must stay text.
+                        int veto_code = 0;
+                        for (auto& t : result.all_tables[p]) {
+                            // Text-detected tables own no drawn geometry;
+                            // paths under them are a figure, not the table.
+                            if (t.kind == TableData::TEXT) continue;
+                            if (overlap(t.x0, t.y0, t.x1, t.y1) >
+                                0.3 * farea) {
+                                veto_code = 1;
+                                break;
+                            }
+                        }
+                        if (!veto_code) {
+                            // Body text vetoes; a figure's own short labels
+                            // (pin names, axis ticks) do not — the region is
+                            // still a drawing, and the label characters stay
+                            // in the markdown text either way.
+                            int body_lines = 0;
+                            for (auto& ln : result.all_lines[p]) {
+                                if (ln.y_center < rgn[1] ||
+                                    ln.y_center > rgn[3])
+                                    continue;
+                                double lw = ln.x_right - ln.x_left;
+                                if (lw <= std::max(0.5 * fw, 60.0)) continue;
+                                // Sparse label rows (pin names merged onto
+                                // one baseline) span width with few glyphs;
+                                // body lines carry real character mass.
+                                if (ln.text.size() < 30) continue;
+                                if (std::min(static_cast<double>(ln.x_right),
+                                             rgn[2]) >
+                                    std::max(static_cast<double>(ln.x_left),
+                                             rgn[0]))
+                                    body_lines++;
+                            }
+                            if (body_lines >= 2) veto_code = 2;
+                        }
+                        bool veto = veto_code != 0;
+                        if (!veto)
+                            for (auto& dr : done_regions)
+                                if (overlap(dr[0], dr[1], dr[2], dr[3]) >
+                                    0.3 * farea) {
+                                    veto = true;
+                                    break;
+                                }
+                        if (veto) continue;
+
+                        // Glyph images inside the figure render with it.
+                        std::vector<size_t> members;
+                        for (auto& info : infos)
+                            if (!handled[info.idx] &&
+                                overlap(info.x0, info.y0, info.x1, info.y1) >
+                                    0)
+                                members.push_back(info.idx);
+                        std::sort(members.begin(), members.end());
+                        ImageData rendered;
+                        {
+                            CompositeMemoryLease lease(
+                                composite_memory,
+                                composite_memory_cost(fw, fh));
+                            rendered = render_region_composite(
+                                doc, resources, parse_result, members, p,
+                                rgn, image_dir, img_idx,
+                                &result.page_diags[p]);
+                        }
+                        if (rendered.data.empty() &&
+                            rendered.pixels.empty() &&
+                            rendered.saved_path.empty())
+                            continue;
+                        for (size_t mi : members) handled[mi] = 1;
+                        result.all_images[p].push_back(std::move(rendered));
+                        result.all_image_y[p].push_back(rgn[3]);
+                        result.all_image_x[p].push_back(rgn[0]);
+                        done_regions.push_back(
+                            {rgn[0], rgn[1], rgn[2], rgn[3]});
+                        img_idx++;
+                    }
                 }
 
                 std::vector<size_t> remaining;
