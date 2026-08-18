@@ -388,6 +388,222 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
             current_path = *g.clip_path;
     };
 
+    // ── Shading (sh + PatternType 2 fills) ────────────────
+    // Axial (type 2) and radial (type 3) shadings decompose at parse time
+    // into flat-fill strips/disks. That reuses the whole raster pipeline —
+    // z-order via draw_seq and the rect clip trim the strips for free — so
+    // the compositor needs no gradient machinery of its own.
+    // A 1-in function may be an array of 1-out functions, one per component.
+    auto eval_shading_fn = [&](const PdfObj& fn_ref,
+                               double t) -> std::vector<double> {
+        auto fn = doc.resolve(fn_ref);
+        if (fn.is_arr()) {
+            std::vector<double> comps;
+            for (auto& e : fn.arr) {
+                auto v = eval_function_1d(doc, e, t);
+                if (v.empty()) return {};
+                comps.insert(comps.end(), v.begin(), v.end());
+            }
+            return comps;
+        }
+        return eval_function_1d(doc, fn_ref, t);
+    };
+
+    // Emit gradient geometry for one shading dict, restricted to `region`
+    // (viewing coords, x0 y0 x1 y1 — already intersected with the clip).
+    auto emit_shading_paths = [&](const PdfObj& sh, const double region[4]) {
+        int stype = doc.resolve(sh.get("ShadingType")).as_int();
+        if (stype != 2 && stype != 3) {
+            result.shading_unsupported++;
+            return;
+        }
+        auto coords = doc.resolve(sh.get("Coords"));
+        size_t need = stype == 2 ? 4 : 6;
+        if (!coords.is_arr() || coords.arr.size() < need) {
+            result.shading_unsupported++;
+            return;
+        }
+        double t0 = 0, t1 = 1;
+        {
+            auto dom = doc.resolve(sh.get("Domain"));
+            if (dom.is_arr() && dom.arr.size() >= 2) {
+                t0 = dom.arr[0].as_num();
+                t1 = dom.arr[1].as_num();
+            }
+        }
+        bool ext0 = false, ext1 = false;
+        {
+            auto ext = doc.resolve(sh.get("Extend"));
+            if (ext.is_arr() && ext.arr.size() >= 2) {
+                ext0 = ext.arr[0].bool_val;
+                ext1 = ext.arr[1].bool_val;
+            }
+        }
+        // 256-entry RGB ramp over the domain. Components map through the
+        // alternate-space conversion; exotic shading colorspaces (Separation
+        // ramps) come out as gray, which still reads correctly in tone.
+        std::array<std::array<uint8_t, 3>, 256> ramp;
+        auto& fn = sh.get("Function");
+        if (fn.is_none()) {
+            result.shading_unsupported++;
+            return;
+        }
+        for (int v = 0; v < 256; v++) {
+            double t = t0 + (t1 - t0) * (v / 255.0);
+            auto comps = eval_shading_fn(fn, t);
+            if (comps.empty()) {
+                result.shading_unsupported++;
+                return;
+            }
+            alt_components_to_rgb(comps, ramp[v]);
+        }
+        auto push_quad = [&](double ax, double ay, double bx, double by,
+                             double cx, double cy, double dx, double dy,
+                             const std::array<uint8_t, 3>& col) {
+            RenderPath rp;
+            rp.points = {{ax, ay, PathPoint::MOVE},
+                         {bx, by, PathPoint::LINE},
+                         {cx, cy, PathPoint::LINE},
+                         {dx, dy, PathPoint::LINE},
+                         {0, 0, PathPoint::CLOSE}};
+            rp.fill_r = col[0] / 255.0;
+            rp.fill_g = col[1] / 255.0;
+            rp.fill_b = col[2] / 255.0;
+            rp.stroke_r = rp.stroke_g = rp.stroke_b = 0;
+            rp.fill_alpha = gs.fill_alpha;
+            rp.line_width = 0;
+            rp.do_fill = true;
+            rp.do_stroke = false;
+            rp.clip[0] = static_cast<float>(region[0]);
+            rp.clip[1] = static_cast<float>(region[1]);
+            rp.clip[2] = static_cast<float>(region[2]);
+            rp.clip[3] = static_cast<float>(region[3]);
+            rp.seq = draw_seq++;
+            result.shading_paths++;
+            result.paths.push_back(std::move(rp));
+        };
+        const double diag = std::hypot(region[2] - region[0],
+                                       region[3] - region[1]);
+        if (diag <= 0) return;
+
+        if (stype == 2) {
+            double p0x, p0y, p1x, p1y;
+            transform_point(gs.ctm, coords.arr[0].as_num(),
+                            coords.arr[1].as_num(), p0x, p0y);
+            transform_point(gs.ctm, coords.arr[2].as_num(),
+                            coords.arr[3].as_num(), p1x, p1y);
+            double dx = p1x - p0x, dy = p1y - p0y;
+            double len2 = dx * dx + dy * dy;
+            if (!(len2 > 1e-9)) {
+                // Degenerate axis: single flat fill of the region.
+                push_quad(region[0], region[1], region[2], region[1],
+                          region[2], region[3], region[0], region[3],
+                          ramp[128]);
+                return;
+            }
+            // Project region corners onto the axis (s: 0 at p0, 1 at p1).
+            double smin = 1e300, smax = -1e300;
+            for (int c = 0; c < 4; c++) {
+                double px = (c & 1) ? region[2] : region[0];
+                double py = (c & 2) ? region[3] : region[1];
+                double s = ((px - p0x) * dx + (py - p0y) * dy) / len2;
+                smin = std::min(smin, s);
+                smax = std::max(smax, s);
+            }
+            if (!ext0) smin = std::max(smin, 0.0);
+            if (!ext1) smax = std::min(smax, 1.0);
+            if (smin >= smax) return;
+            double len = std::sqrt(len2) * (smax - smin);
+            int K = std::max(16, std::min(128, static_cast<int>(len)));
+            // Perpendicular half-width big enough to cross the region.
+            double nx = -dy, ny = dx;
+            double nl = std::hypot(nx, ny);
+            nx = nx / nl * diag;
+            ny = ny / nl * diag;
+            for (int k = 0; k < K; k++) {
+                double sa = smin + (smax - smin) * k / K;
+                // Slight overlap avoids AA seams between strips.
+                double sb = smin + (smax - smin) * (k + 1.3) / K;
+                double sm = std::min(1.0, std::max(0.0, (sa + sb) / 2));
+                auto& col = ramp[static_cast<int>(sm * 255.0 + 0.5)];
+                double ax = p0x + sa * dx, ay = p0y + sa * dy;
+                double bx = p0x + sb * dx, by = p0y + sb * dy;
+                push_quad(ax + nx, ay + ny, bx + nx, by + ny,
+                          bx - nx, by - ny, ax - nx, ay - ny, col);
+            }
+            return;
+        }
+
+        // Radial: concentric disks, outermost first; each smaller disk
+        // overdraws toward the inner color. Circles approximate ellipses
+        // under a non-uniform CTM by the average axis scale.
+        double c0x, c0y, c1x, c1y;
+        transform_point(gs.ctm, coords.arr[0].as_num(),
+                        coords.arr[1].as_num(), c0x, c0y);
+        transform_point(gs.ctm, coords.arr[3].as_num(),
+                        coords.arr[4].as_num(), c1x, c1y);
+        double rscale = ctm_pen_scale(gs.ctm);
+        double r0 = std::abs(coords.arr[2].as_num()) * rscale;
+        double r1 = std::abs(coords.arr[5].as_num()) * rscale;
+        auto push_disk = [&](double cx, double cy, double r,
+                             const std::array<uint8_t, 3>& col) {
+            if (r <= 0) return;
+            constexpr double kKappa = 0.5522847498;
+            RenderPath rp;
+            double h = r * kKappa;
+            rp.points.push_back({cx + r, cy, PathPoint::MOVE});
+            rp.points.push_back({cx, cy + r, PathPoint::CURVE,
+                                 cx + r, cy + h, cx + h, cy + r});
+            rp.points.push_back({cx - r, cy, PathPoint::CURVE,
+                                 cx - h, cy + r, cx - r, cy + h});
+            rp.points.push_back({cx, cy - r, PathPoint::CURVE,
+                                 cx - r, cy - h, cx - h, cy - r});
+            rp.points.push_back({cx + r, cy, PathPoint::CURVE,
+                                 cx + h, cy - r, cx + r, cy - h});
+            rp.points.push_back({0, 0, PathPoint::CLOSE});
+            rp.fill_r = col[0] / 255.0;
+            rp.fill_g = col[1] / 255.0;
+            rp.fill_b = col[2] / 255.0;
+            rp.stroke_r = rp.stroke_g = rp.stroke_b = 0;
+            rp.fill_alpha = gs.fill_alpha;
+            rp.line_width = 0;
+            rp.do_fill = true;
+            rp.do_stroke = false;
+            rp.clip[0] = static_cast<float>(region[0]);
+            rp.clip[1] = static_cast<float>(region[1]);
+            rp.clip[2] = static_cast<float>(region[2]);
+            rp.clip[3] = static_cast<float>(region[3]);
+            rp.seq = draw_seq++;
+            result.shading_paths++;
+            result.paths.push_back(std::move(rp));
+        };
+        if (ext1 && r1 >= r0) {
+            // Outer extend: the region beyond the end circle keeps t1.
+            push_quad(region[0], region[1], region[2], region[1],
+                      region[2], region[3], region[0], region[3], ramp[255]);
+        }
+        int K = std::max(16, std::min(128,
+            static_cast<int>(std::max(r0, r1))));
+        for (int k = K; k >= 0; k--) {
+            double f = static_cast<double>(k) / K;
+            auto& col = ramp[static_cast<int>(f * 255.0 + 0.5)];
+            push_disk(c0x + (c1x - c0x) * f, c0y + (c1y - c0y) * f,
+                      r0 + (r1 - r0) * f, col);
+        }
+    };
+
+    // Viewing-coord region for a shading: current clip ∩ page box.
+    auto shading_region = [&](double region[4]) -> bool {
+        double pw = options.page_width > 0 ? options.page_width
+                                           : page_height * 1.5;
+        region[0] = std::max(gs.clip_x0, 0.0);
+        region[1] = std::max(gs.clip_y0, 0.0);
+        region[2] = std::min(gs.clip_x1, pw);
+        region[3] = std::min(gs.clip_y1, page_height);
+        return region[0] < region[2] && region[1] < region[3];
+    };
+
+
     std::unordered_map<std::string, std::shared_ptr<const CsInfo>> cs_cache;
     auto lookup_colorspace =
         [&](const std::string& name) -> std::shared_ptr<const CsInfo> {
@@ -613,6 +829,24 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
     auto record_render_path = [&](bool do_fill, bool do_stroke,
                                   bool even_odd = false) {
         if (collect_render_paths) {
+            // Shading-pattern fill: a rect-ish path becomes gradient strips
+            // clipped to its box (exact for the title-bar idiom); other
+            // shapes keep the flat backstop color set at scn time.
+            if (do_fill && gs.fill_shading && current_path.size() <= 6) {
+                double bx0, by0, bx1, by1;
+                path_bbox(current_path, bx0, by0, bx1, by1);
+                double region[4] = {
+                    std::max(bx0, gs.clip_x0), std::max(by0, gs.clip_y0),
+                    std::min(bx1, gs.clip_x1), std::min(by1, gs.clip_y1)};
+                if (region[0] < region[2] && region[1] < region[3]) {
+                    emit_shading_paths(*gs.fill_shading, region);
+                    if (!do_stroke) {
+                        current_path.clear();
+                        return;
+                    }
+                    do_fill = false;
+                }
+            }
             RenderPath rp;
             rp.points = std::move(current_path);
             rp.fill_r = gs.fill_r; rp.fill_g = gs.fill_g; rp.fill_b = gs.fill_b;
@@ -1193,10 +1427,12 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
                 if (operands.size() >= 3) { gs.stroke_r = pop_num(2); gs.stroke_g = pop_num(1); gs.stroke_b = pop_num(0); }
             } else if (op.is("rg")) {
                 if (operands.size() >= 3) { gs.fill_r = pop_num(2); gs.fill_g = pop_num(1); gs.fill_b = pop_num(0); }
+                gs.fill_shading.reset();
             } else if (op.is("G")) {
                 double g = pop_num(0); gs.stroke_r = gs.stroke_g = gs.stroke_b = g;
             } else if (op.is("g")) {
                 double g = pop_num(0); gs.fill_r = gs.fill_g = gs.fill_b = g;
+                gs.fill_shading.reset();
             } else if (op.is("K")) {
                 if (operands.size() >= 4) {
                     std::array<uint8_t, 3> px;
@@ -1209,9 +1445,38 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
                     cmyk_to_rgb8(pop_num(3), pop_num(2), pop_num(1), pop_num(0), px);
                     gs.fill_r = px[0] / 255.0; gs.fill_g = px[1] / 255.0; gs.fill_b = px[2] / 255.0;
                 }
+                gs.fill_shading.reset();
             } else if (op.is("SC") || op.is("SCN") || op.is("sc") || op.is("scn")) {
                 bool is_fill = (op.is("sc") || op.is("scn"));
                 const auto& cs = is_fill ? gs.fill_cs : gs.stroke_cs;
+                // Pattern operand: shading patterns (type 2) install their
+                // dict for fills; tiling patterns stay a flat color.
+                const PdfObj* pname = operands.empty()
+                    ? nullptr : operand_object(operands.size() - 1);
+                if (pname && pname->is_name()) {
+                    if (is_fill) gs.fill_shading.reset();
+                    if (collect_render_paths) {
+                        auto pats = doc.resolve(res.get("Pattern"));
+                        auto pat = pats.is_dict()
+                            ? doc.resolve(pats.get(pname->str_val)) : PdfObj{};
+                        if (pat.is_dict()) {
+                            int ptype =
+                                doc.resolve(pat.get("PatternType")).as_int();
+                            auto shp = doc.resolve(pat.get("Shading"));
+                            if (ptype == 2 && shp.is_dict() && is_fill) {
+                                gs.fill_shading =
+                                    std::make_shared<const PdfObj>(
+                                        std::move(shp));
+                            } else {
+                                result.shading_unsupported++;
+                            }
+                        }
+                    }
+                    operands.clear();
+                    object_operands.clear();
+                    continue;
+                }
+                if (is_fill) gs.fill_shading.reset();
                 double r = -1, g = -1, b = -1;
                 if (cs && cs->kind == CsInfo::TINT && operands.size() >= 1 &&
                     !cs->lut.empty()) {
@@ -1279,6 +1544,7 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
                     if (is_fill) {
                         gs.fill_cs = info;
                         gs.fill_r = r; gs.fill_g = g; gs.fill_b = b;
+                        gs.fill_shading.reset();
                     } else {
                         gs.stroke_cs = info;
                         gs.stroke_r = r; gs.stroke_g = g; gs.stroke_b = b;
@@ -1503,6 +1769,22 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
                 parse_inline_image();
             }
 
+            // ── Shading operator ──
+            else if (op.is("sh")) {
+                if (collect_render_paths) {
+                    const PdfObj* nm = operands.empty()
+                        ? nullptr : operand_object(operands.size() - 1);
+                    if (nm && nm->is_name()) {
+                        auto shd = doc.resolve(res.get("Shading"));
+                        auto sh = shd.is_dict()
+                            ? doc.resolve(shd.get(nm->str_val)) : PdfObj{};
+                        double region[4];
+                        if (sh.is_dict() && shading_region(region))
+                            emit_shading_paths(sh, region);
+                    }
+                }
+            }
+
             // ── XObject (images) ──
             else if (op.is("Do")) {
                 const PdfObj* name =
@@ -1574,6 +1856,9 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
                                 result.inline_images += sub.inline_images;
                                 result.inline_scan_bailouts +=
                                     sub.inline_scan_bailouts;
+                                result.shading_unsupported +=
+                                    sub.shading_unsupported;
+                                result.shading_paths += sub.shading_paths;
                                 result.segments.insert(result.segments.end(),
                                     std::make_move_iterator(sub.segments.begin()),
                                     std::make_move_iterator(sub.segments.end()));

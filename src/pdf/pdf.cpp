@@ -332,6 +332,7 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
         } else {
             parse_options.graphics = GraphicsCollection::TableGeometry;
         }
+        parse_options.page_width = page_w;
         auto parse_result = parse_content_stream(
             doc, content_data, resources, page_h, &font_cache, parse_options,
             initial_ctm);
@@ -379,8 +380,13 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
             // page text: the page is visually a scan and composites like one.
             bool no_text = result.all_lines[p].size() <= 2 ||
                            parse_result.visible_text_chars == 0;
+            // Gradient strips are synthesized geometry, not evidence of
+            // vectorized glyphs — a page with one shaded banner must not
+            // count as a vector-text page.
+            size_t drawn_paths = parse_result.paths.size() -
+                                 static_cast<size_t>(parse_result.shading_paths);
             bool vector_text_page = no_text &&
-                                    parse_result.paths.size() >= kVectorTextMinPaths;
+                                    drawn_paths >= kVectorTextMinPaths;
 
             struct PlacementInfo {
                 size_t idx;             // index into parse_result.images
@@ -614,9 +620,14 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
                     }
                 }
 
-                // Fallback: render page for scanned/vector-only pages
+                // Fallback: render page for scanned/vector-only pages.
+                // Paths count too: gradient strips and curved vector art
+                // never produce segments, and such a page has no other
+                // representation than a composite.
                 if (result.all_images[p].empty() && result.all_lines[p].empty()) {
-                    if (!parse_result.images.empty() || !parse_result.segments.empty()) {
+                    if (!parse_result.images.empty() ||
+                        !parse_result.segments.empty() ||
+                        !parse_result.paths.empty()) {
                         result.page_diags[p] = {};
                         auto rendered = render_composite();
                         if (!rendered.data.empty() || !rendered.pixels.empty() || !rendered.saved_path.empty()) {
@@ -641,10 +652,12 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
         }
 
         // Set after the image pipeline: the per-attempt diag resets above must
-        // not wipe the parse-time inline counters.
+        // not wipe the parse-time counters.
         result.page_diags[p].inline_images = parse_result.inline_images;
         result.page_diags[p].inline_scan_bailouts =
             parse_result.inline_scan_bailouts;
+        result.page_diags[p].shading_unsupported =
+            parse_result.shading_unsupported;
     };
 
     // Each worker owns one pre-sized result slot. Shared object/font caches

@@ -69,6 +69,9 @@ struct GfxState {
     std::shared_ptr<const std::vector<PathPoint>> clip_path;
     double clip_x0 = -kClipUnbounded, clip_y0 = -kClipUnbounded;
     double clip_x1 = kClipUnbounded, clip_y1 = kClipUnbounded;
+    // Shading dict of the active fill pattern (scn /P with PatternType 2);
+    // fills decompose into gradient strips while it is set.
+    std::shared_ptr<const PdfObj> fill_shading;
     double line_width = 1;
     int line_cap = 0, line_join = 0;
     double miter_limit = 10;
@@ -151,6 +154,8 @@ struct ContentParseResult {
     int visible_text_chars = 0; // chars emitted outside Tr 3/7 (invisible text)
     int inline_images = 0;        // BI…ID…EI images consumed
     int inline_scan_bailouts = 0; // EI never found; rest of stream skipped
+    int shading_unsupported = 0;  // sh/pattern types beyond axial+radial
+    int shading_paths = 0;        // gradient strips in `paths` (not drawings)
 };
 
 struct TextLine {
@@ -372,6 +377,9 @@ enum class GraphicsCollection {
 
 struct ContentParseOptions {
     GraphicsCollection graphics = GraphicsCollection::RenderPaths;
+    // Page width in viewing coordinates; bounds unclipped shading regions.
+    // 0 = unknown (a page-height-based bound is used instead).
+    double page_width = 0;
 };
 
 // Cross-translation-unit declarations.

@@ -10,6 +10,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <fstream>
 #include <iostream>
 #include <iomanip>
 #include <limits>
@@ -554,6 +555,37 @@ void test_pdf_composite_applies_clip_rect() {
     CHECK(px(90, 10) == 255);  // opposite corner: white
 }
 
+// Axial (type 2) shadings decompose into gradient strips at parse time; the
+// composite must run red→blue across the page instead of rendering nothing
+// (the `sh` operator used to be ignored entirely).
+void test_pdf_composite_renders_axial_shading() {
+    const char* fixture = "test/fixtures/pdf/axial_shading.pdf";
+    std::ifstream probe(fixture);
+    if (!probe.good()) {
+        std::cout << "  (skip: fixture not found)\n";
+        return;
+    }
+    probe.close();
+    auto chunks = jdoc::pdf_to_markdown_chunks(fixture);
+    CHECK(chunks.size() == 1);
+    CHECK(chunks[0].images.size() == 1);
+    CHECK(chunks[0].images[0].format == "png");
+    auto png = decode_test_png(chunks[0].images[0].data);
+    CHECK(png.comps == 3);
+    auto rgb = [&](unsigned x, unsigned y) {
+        size_t stride = 1 + static_cast<size_t>(png.w) * 3;
+        const uint8_t* p = png.rows.data() + y * stride + 1 +
+                           static_cast<size_t>(x) * 3;
+        return std::array<uint8_t, 3>{p[0], p[1], p[2]};
+    };
+    auto left = rgb(png.w / 50, png.h / 2);
+    auto mid = rgb(png.w / 2, png.h / 2);
+    auto right = rgb(png.w - 1 - png.w / 50, png.h / 2);
+    CHECK(left[0] > 220 && left[2] < 40);   // red end
+    CHECK(right[2] > 220 && right[0] < 40); // blue end
+    CHECK(mid[0] > 90 && mid[0] < 165 && mid[2] > 90 && mid[2] < 165);
+}
+
 void test_pdf_reads_rotated_text() {
     const std::string pdf = rotated_text_pdf();
     const std::string text = jdoc::pdf_to_markdown_mem(
@@ -809,6 +841,7 @@ int main() {
     test_pdf_honors_images_option();
     test_pdf_composite_clips_extreme_coordinates_before_narrowing();
     test_pdf_composite_applies_clip_rect();
+    test_pdf_composite_renders_axial_shading();
     test_pdf_reads_rotated_text();
     test_pdf_table_cell_rotated_text();
     test_pdf_line_width_follows_ctm();
