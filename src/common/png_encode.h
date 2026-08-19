@@ -15,28 +15,104 @@
 #include <cstdint>
 #include <cstring>
 #include <algorithm>
+#include <cerrno>
 #include <limits>
 #include <memory>
-#include <mutex>
+
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#else
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 
 namespace jdoc { namespace util {
 
-// Choose and write an output filename while holding a process-wide lock. This
-// prevents simultaneous conversions that share image_dir from truncating one
-// another's "pageN_imgM.ext" files. Existing files are preserved by adding a
-// numeric suffix before the extension. The returned path is the name actually
-// written, so callers can put the collision-free name into Markdown.
+enum class ExclusiveWriteResult { written, exists, failed };
+
+// Atomically create a new file. CREATE_NEW and O_EXCL make filename selection
+// safe across both threads and processes; a separate exists-then-open sequence
+// cannot provide that guarantee.
+inline ExclusiveWriteResult write_exclusive_file(const std::string& path,
+                                                  const void* data,
+                                                  size_t size) {
+#ifdef _WIN32
+    const auto wide_path = io_path(path);
+    HANDLE file = CreateFileW(wide_path.c_str(), GENERIC_WRITE, FILE_SHARE_READ,
+                              nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL,
+                              nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        const DWORD error = GetLastError();
+        return error == ERROR_FILE_EXISTS || error == ERROR_ALREADY_EXISTS
+                   ? ExclusiveWriteResult::exists
+                   : ExclusiveWriteResult::failed;
+    }
+
+    const auto* bytes = static_cast<const uint8_t*>(data);
+    size_t remaining = size;
+    bool ok = true;
+    while (remaining != 0) {
+        const DWORD chunk = static_cast<DWORD>(std::min<size_t>(
+            remaining, static_cast<size_t>(std::numeric_limits<DWORD>::max())));
+        DWORD written = 0;
+        if (!WriteFile(file, bytes, chunk, &written, nullptr) || written == 0) {
+            ok = false;
+            break;
+        }
+        bytes += written;
+        remaining -= written;
+    }
+    if (!CloseHandle(file)) ok = false;
+    if (!ok) {
+        DeleteFileW(wide_path.c_str());
+        return ExclusiveWriteResult::failed;
+    }
+#else
+    int file;
+    do {
+        file = ::open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0666);
+    } while (file < 0 && errno == EINTR);
+    if (file < 0)
+        return errno == EEXIST ? ExclusiveWriteResult::exists
+                              : ExclusiveWriteResult::failed;
+
+    const auto* bytes = static_cast<const uint8_t*>(data);
+    size_t remaining = size;
+    bool ok = true;
+    while (remaining != 0) {
+        const size_t chunk = std::min<size_t>(
+            remaining, static_cast<size_t>(std::numeric_limits<ssize_t>::max()));
+        const ssize_t written = ::write(file, bytes, chunk);
+        if (written < 0 && errno == EINTR) continue;
+        if (written <= 0) {
+            ok = false;
+            break;
+        }
+        bytes += written;
+        remaining -= static_cast<size_t>(written);
+    }
+    if (::close(file) != 0) ok = false;
+    if (!ok) {
+        ::unlink(path.c_str());
+        return ExclusiveWriteResult::failed;
+    }
+#endif
+    return ExclusiveWriteResult::written;
+}
+
+// Choose and atomically write an output filename. Existing files are preserved
+// by adding a numeric suffix before the extension. The returned path is the
+// name actually written, so callers can put it into Markdown.
 inline std::string save_unique_named_file(const std::string& dir,
                                           const std::string& filename,
                                           const void* data, size_t size) {
     if (dir.empty() || filename.empty() || !data || size == 0) return "";
-    if (size > static_cast<size_t>(std::numeric_limits<std::streamsize>::max()))
-        return "";
-    static std::mutex output_mutex;
-    std::lock_guard<std::mutex> lock(output_mutex);
-    // Directory creation is part of the same critical section as filename
-    // selection and writing. In particular, concurrent create_directories()
-    // calls for the same missing path are not reliable on every Windows CRT.
     ensure_dirs(dir);
 
     const size_t dot = filename.rfind('.');
@@ -48,16 +124,9 @@ inline std::string save_unique_named_file(const std::string& dir,
         if (suffix != 0) candidate += "_" + std::to_string(suffix);
         candidate += ext;
         std::string path = dir + "/" + candidate;
-        {
-            std::ifstream existing(io_path(path), std::ios::binary);
-            if (existing.good()) continue;
-        }
-        std::ofstream ofs(io_path(path), std::ios::binary);
-        if (!ofs) return "";
-        ofs.write(static_cast<const char*>(data),
-                  static_cast<std::streamsize>(size));
-        ofs.close();
-        return ofs ? path : std::string();
+        const auto result = write_exclusive_file(path, data, size);
+        if (result == ExclusiveWriteResult::written) return path;
+        if (result == ExclusiveWriteResult::failed) return "";
     }
     return "";
 }
