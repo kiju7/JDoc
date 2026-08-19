@@ -1401,28 +1401,17 @@ private:
             meta_text = metafile_extract_text(ext.c_str(), image_data.data(),
                                               image_data.size());
 
-        // BinData named the extension; keep it verbatim, the same as the
-        // no-image path above and every other container-declared name.
-        filename = unified + util::image_ext_for_save("." + ext, ext);
-        std::string saved_path;
-        if (!opts_.image_dir.empty()) {
-            saved_path = util::save_named_file(
-                opts_.image_dir, filename,
-                image_data.data(), image_data.size());
-            if (saved_path.empty()) return "";
-            filename = util::get_filename(saved_path);
-        }
-
         ImageData idata;
         idata.page_number = chunk.page_number;
         idata.name = unified;
         idata.format = ext;
-        idata.saved_path = saved_path;
         idata.embedded_text = meta_text;
-        if (opts_.image_dir.empty()) {
-            idata.data.assign(reinterpret_cast<const char*>(image_data.data()),
-                              reinterpret_cast<const char*>(image_data.data()) + image_data.size());
-        }
+        // BinData named the extension; store_image keeps it verbatim. The
+        // bytes stay in image_data — the overload writes straight from there
+        // rather than copying them onto idata first.
+        filename = util::store_image(idata, opts_, "." + ext,
+                                     image_data.data(), image_data.size());
+        if (filename.empty()) return "";
         media_cache_.insert(cache_key, idata, filename);
         chunk.images.push_back(std::move(idata));
 

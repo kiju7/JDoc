@@ -604,23 +604,10 @@ std::string HtmlParser::convert(const ConvertOptions& opts,
                 std::string ref = src;
                 std::string declared_ext;
                 if (decode_data_uri(src, img.data, img.format, declared_ext)) {
-                    util::populate_image_dimensions(img);
-                    if (util::is_image_too_small(img, opts.min_image_size))
-                        continue;
-                    if (opts.images && !opts.image_dir.empty()) {
-                        img.saved_path = util::save_named_file(
-                            opts.image_dir,
-                            img.name + util::image_ext_for_save(declared_ext,
-                                                                img.format),
-                            img.data.data(), img.data.size());
-                        if (!img.saved_path.empty()) {
-                            img.data.clear();
-                            img.data.shrink_to_fit();
-                        }
-                    }
-                    ref = opts.image_ref_prefix +
-                          util::image_ref_name(img.name, img.format,
-                                               img.saved_path);
+                    const std::string name = util::store_image(img, opts,
+                                                               declared_ext);
+                    if (name.empty()) continue;
+                    ref = opts.image_ref_prefix + name;
                 } else {
                     img.format =
                         util::image_format_from_ext(util::get_extension(src));

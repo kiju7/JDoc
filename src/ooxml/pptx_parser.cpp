@@ -716,23 +716,13 @@ bool PptxParser::resolve_image(const std::string& media_path, int page_number,
     }
 
     ImageData img = extract_image_data(media_path, page_number, opts);
-    if (util::is_image_too_small(img, opts.min_image_size)) {
+    // media_path is what the package named the part; store_image keeps
+    // its extension.
+    ref_name = util::store_image(img, opts,
+                                 util::get_extension(media_path));
+    if (ref_name.empty()) {
         media_cache_.insert_skipped(media_path);
         return false;
-    }
-
-    std::string ext = util::get_extension(media_path);
-    // Keep the extension the package declared, verbatim.
-    ref_name = img.name + util::image_ext_for_save(ext, img.format);
-
-    if (opts.images) {
-        img.saved_path = util::save_named_file(
-            opts.image_dir, ref_name, img.data.data(), img.data.size());
-        if (!img.saved_path.empty()) {
-            ref_name = util::get_filename(img.saved_path);
-            img.data.clear();
-            img.data.shrink_to_fit();
-        }
     }
 
     media_cache_.insert(media_path, img, ref_name);

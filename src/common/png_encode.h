@@ -444,4 +444,68 @@ inline std::string save_named_file(const std::string& dir,
     return save_unique_named_file(dir, filename, data, size);
 }
 
+// The one place an extracted image becomes a file. Every parser hands over a
+// filled ImageData (name, format, data) and gets back the name to write into
+// its Markdown, so the size filter, the extension rule, the write, the payload
+// hand-off and the reference all follow one policy instead of a copy per
+// parser.
+//
+// Returns:
+//   ""   do not reference this image — it was filtered out as too small, or an
+//        image_dir was set and the write failed. A reference to a file that
+//        does not exist is worse than no reference at all.
+//   name the reference to emit. When extraction was asked for and an
+//        image_dir given, the file exists under it and img.saved_path names
+//        it, the payload having been handed to disk. Otherwise nothing is
+//        written, the bytes stay on img.data for the caller to deliver, and
+//        the name is the nominal one.
+//
+// declared_ext is the extension the container named the part with (".jpeg"
+// from a zip entry, ".bmp" from a BinData record). Leave it empty where the
+// container declares a type code rather than a name — an Escher BLIP record,
+// an RTF \pngblip, a PDF filter — and the canonical extension for the format
+// is used instead.
+inline std::string store_image(ImageData& img, const ConvertOptions& opts,
+                               const std::string& declared_ext = "") {
+    populate_image_dimensions(img);
+    if (is_image_too_small(img, opts.min_image_size)) return "";
+
+    const std::string filename =
+        img.name + image_ext_for_save(declared_ext, img.format);
+    // Nothing is written unless extraction was asked for and an image_dir
+    // was given. Otherwise the reference is the nominal name and the bytes
+    // stay on img.data for an in-memory consumer to deliver.
+    if (!opts.images || opts.image_dir.empty()) return filename;
+
+    img.saved_path = save_named_file(opts.image_dir, filename,
+                                     img.data.data(), img.data.size());
+    if (img.saved_path.empty()) return "";
+    img.data.clear();
+    img.data.shrink_to_fit();
+    return get_filename(img.saved_path);
+}
+
+// Same, with the payload still in the caller's buffer. Used where the bytes
+// are already held elsewhere and copying them onto the ImageData merely to
+// write them out would be a copy for nothing. Where no file is written the
+// bytes are copied onto img.data after all, since that is how the caller
+// delivers them.
+inline std::string store_image(ImageData& img, const ConvertOptions& opts,
+                               const std::string& declared_ext,
+                               const void* data, size_t size) {
+    const auto* bytes = static_cast<const char*>(data);
+    populate_image_dimensions(img, reinterpret_cast<const uint8_t*>(data), size);
+    if (is_image_too_small(img, opts.min_image_size)) return "";
+
+    const std::string filename =
+        img.name + image_ext_for_save(declared_ext, img.format);
+    if (!opts.images || opts.image_dir.empty()) {
+        if (bytes && size) img.data.assign(bytes, bytes + size);
+        return filename;
+    }
+    img.saved_path = save_named_file(opts.image_dir, filename, data, size);
+    if (img.saved_path.empty()) return "";
+    return get_filename(img.saved_path);
+}
+
 }} // namespace jdoc::util

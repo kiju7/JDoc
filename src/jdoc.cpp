@@ -270,14 +270,15 @@ static std::string metafile_to_markdown(FileFormat fmt, const uint8_t* data,
     int i = 0;
     for (auto& bmp : c.images) {
         std::string name = "page1_img" + std::to_string(i++);
-        std::string saved;
-        if (!opts.image_dir.empty()) {
-            saved = util::save_image_to_file(opts.image_dir, name, "bmp",
-                                             bmp.data(), bmp.size());
-            // Don't reference a bitmap that could not be written to image_dir.
-            if (saved.empty()) continue;
-        }
-        const std::string filename = util::image_ref_name(name, "bmp", saved);
+        ImageData img;
+        img.page_number = 1;
+        img.name = name;
+        img.format = "bmp";
+        img.data = std::move(bmp);
+        // A metafile's bitmaps are synthesized, so there is no declared name.
+        const std::string filename = util::store_image(img, opts);
+        // Don't reference a bitmap that could not be written to image_dir.
+        if (filename.empty()) continue;
         if (!md.empty() && md.back() != '\n') md += "\n\n";
         md += "![" + filename + "](" + opts.image_ref_prefix + filename + ")\n\n";
     }
@@ -302,17 +303,9 @@ static PageChunk metafile_to_chunk(FileFormat fmt, const uint8_t* data,
         img.name = name;
         img.format = "bmp";
         img.data = std::move(bmp);           // BMP buffer moved in, no copy
-        util::populate_image_dimensions(img);
-        if (!opts.image_dir.empty()) {
-            img.saved_path = util::save_image_to_file(
-                opts.image_dir, name, "bmp", img.data.data(), img.data.size());
-            if (!img.saved_path.empty()) {
-                img.data.clear();
-                img.data.shrink_to_fit();
-            }
-        }
-        const std::string filename =
-            util::image_ref_name(name, "bmp", img.saved_path);
+        // A metafile's bitmaps are synthesized, so there is no declared name.
+        const std::string filename = util::store_image(img, opts);
+        if (filename.empty()) continue;
         if (!chunk.text.empty() && chunk.text.back() != '\n')
             chunk.text += "\n\n";
         chunk.text += "![" + filename + "](" + opts.image_ref_prefix +
@@ -380,19 +373,16 @@ static PageChunk image_to_chunk(const uint8_t* data, size_t size,
     chunk.page_number = 1;
     if (!opts.images) return chunk;
 
-    std::string filename = image_basename(data, size, name_hint);
+    const std::string basename = image_basename(data, size, name_hint);
     ImageData img;
     img.page_number = 1;
-    img.name = strip_ext(filename);
+    img.name = strip_ext(basename);
     img.format = util::detect_image_format(data, size);
-    util::populate_image_dimensions(img, data, size);
-    if (!opts.image_dir.empty()) {
-        img.saved_path =
-            util::save_named_file(opts.image_dir, filename, data, size);
-        if (!img.saved_path.empty()) filename = util::get_filename(img.saved_path);
-    }
-    if (img.saved_path.empty())
-        img.data.assign(data, data + size);  // memory mode: caller needs bytes
+    // The input file named its own extension; store_image keeps it, and writes
+    // straight from the source buffer so the bytes are not copied to be saved.
+    const std::string filename = util::store_image(
+        img, opts, util::get_extension(basename), data, size);
+    if (filename.empty()) return chunk;
     chunk.text = "![" + filename + "](" + opts.image_ref_prefix + filename + ")\n";
     chunk.images.push_back(std::move(img));
     return chunk;

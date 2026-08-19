@@ -942,20 +942,12 @@ std::string XlsParser::to_markdown(const ConvertOptions& opts) {
         auto images = extract_images(opts.min_image_size);
         // Write the images out, the way every other parser does; a
         // reference to a file that was never created helps no one.
-        if (opts.images && !opts.image_dir.empty()) {
-            for (auto& img : images) {
-                img.saved_path = util::save_image_to_file(
-                    opts.image_dir, img.name, img.format,
-                    img.data.data(), img.data.size());
-                if (!img.saved_path.empty()) {
-                    img.data.clear();
-                    img.data.shrink_to_fit();
-                }
-            }
-        }
-        for (const auto& img : images) {
-            std::string filename = util::image_ref_name(
-                img.name, img.format, img.saved_path);
+        // An Escher BLIP record declares a type rather than a filename, so
+        // store_image settles the extension from the format. An image that
+        // could not be written is not referenced.
+        for (auto& img : images) {
+            const std::string filename = util::store_image(img, opts);
+            if (filename.empty()) continue;
             if (opts.images)
                 md += "![" + filename + "](" + opts.image_ref_prefix + filename + ")\n\n";
             else
@@ -972,16 +964,14 @@ std::vector<PageChunk> XlsParser::to_chunks(const ConvertOptions& opts) {
     std::vector<PageChunk> chunks;
 
     auto images = opts.images ? extract_images(opts.min_image_size) : std::vector<ImageData>{};
-    if (opts.images && !opts.image_dir.empty()) {
-        for (auto& img : images) {
-            img.saved_path = util::save_image_to_file(
-                opts.image_dir, img.name, img.format,
-                img.data.data(), img.data.size());
-            if (!img.saved_path.empty()) {
-                img.data.clear();
-                img.data.shrink_to_fit();
-            }
-        }
+    if (opts.images) {
+        // An image that could not be written is dropped rather than handed
+        // over as a chunk image pointing at nothing.
+        std::vector<ImageData> kept;
+        for (auto& img : images)
+            if (!util::store_image(img, opts).empty())
+                kept.push_back(std::move(img));
+        images = std::move(kept);
     }
     // A workbook whose sheets did not parse still divides here; guard the
     // zero before it becomes a division by zero.

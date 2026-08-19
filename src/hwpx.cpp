@@ -903,26 +903,14 @@ private:
                    "_img" + std::to_string(image_idx);
         img.width = width;
         img.height = height;
-        util::populate_image_dimensions(img);
-        if (util::is_image_too_small(img, opts_.min_image_size)) {
+        // declared_ext is what BinData named the part; store_image keeps it.
+        const std::string ref = util::store_image(img, opts_, declared_ext);
+        if (ref.empty()) {
             media_cache_.insert_skipped(file_path);
             return {};
         }
 
-        // Save to disk if requested (BMP -> PNG for compression)
-        if (opts_.images) {
-            // Keep the extension BinData declared, verbatim.
-            img.saved_path = util::save_named_file(
-                opts_.image_dir,
-                img.name + util::image_ext_for_save(declared_ext, img.format),
-                img.data.data(), img.data.size());
-            if (!img.saved_path.empty()) {
-                img.data.clear();
-                img.data.shrink_to_fit();
-            }
-        }
-
-        media_cache_.insert(file_path, img, util::get_filename(img.saved_path));
+        media_cache_.insert(file_path, img, ref);
         ++image_idx;
         return img;
     }

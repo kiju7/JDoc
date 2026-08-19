@@ -1444,20 +1444,9 @@ std::vector<ImageData> XlsxParser::extract_images(
                 img.name = "page" + std::to_string(sheet_num) + "_img" + std::to_string(img_idx);
 
                 img.data = zip_.read_entry(media_path);
-                util::populate_image_dimensions(img);
-                if (util::is_image_too_small(img, opts.min_image_size))
-                    continue;
+                // ext is what the package named the part; store_image keeps it.
+                if (util::store_image(img, opts, ext).empty()) continue;
                 img_idx++;
-
-                // Keep the extension the package declared, verbatim.
-                img.saved_path = util::save_named_file(
-                    opts.image_dir,
-                    img.name + util::image_ext_for_save(ext, img.format),
-                    img.data.data(), img.data.size());
-                if (!img.saved_path.empty()) {
-                    img.data.clear();
-                    img.data.shrink_to_fit();
-                }
                 images.push_back(std::move(img));
             }
         }
@@ -1476,20 +1465,9 @@ std::vector<ImageData> XlsxParser::extract_images(
         img.name = "page1_img" + std::to_string(img_idx);
 
         img.data = zip_.read_entry(*entry);
-        util::populate_image_dimensions(img);
-        if (util::is_image_too_small(img, opts.min_image_size))
-            continue;
+        // ext is what the package named the part; store_image keeps it.
+        if (util::store_image(img, opts, ext).empty()) continue;
         img_idx++;
-
-        // Keep the extension the package declared, verbatim.
-        img.saved_path = util::save_named_file(
-            opts.image_dir,
-            img.name + util::image_ext_for_save(ext, img.format),
-            img.data.data(), img.data.size());
-        if (!img.saved_path.empty()) {
-            img.data.clear();
-            img.data.shrink_to_fit();
-        }
         images.push_back(std::move(img));
     }
     return images;

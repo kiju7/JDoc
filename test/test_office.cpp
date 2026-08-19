@@ -1058,6 +1058,28 @@ void test_image_reference_matches_file() {
         std::filesystem::remove_all(dir);
     TEST_END
 
+    TEST(a_failed_write_emits_no_reference)
+        // Every parser now routes through store_image, so a write that cannot
+        // happen costs the reference too — a link to a file that does not exist
+        // is worse than no link. image_dir points inside a regular file here,
+        // so the directory cannot be created and no image can land.
+        std::string base = temp_image_dir("write_failure");
+        std::string blocker = base + "/not_a_dir";
+        { std::ofstream f(blocker); f << "x"; }
+
+        auto book = make_media_xlsx();
+        jdoc::ConvertOptions opts;
+        opts.images = true;
+        opts.min_image_size = 0;
+        opts.image_dir = blocker + "/images";
+
+        auto md = jdoc::office_to_markdown_mem(
+            reinterpret_cast<const uint8_t*>(book.data()), book.size(),
+            "book.xlsx", opts);
+        ASSERT(md.find("![") == std::string::npos);
+        std::filesystem::remove_all(base);
+    TEST_END
+
     TEST(pptx_reference_follows_the_collision_suffix)
         // Guard the paths that already got this right against regressing.
         auto deck = make_shared_media_pptx();

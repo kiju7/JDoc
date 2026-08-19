@@ -516,18 +516,8 @@ std::vector<ImageData> RtfParser::build_images(
         if (!pi.bin_data.empty()) img.data = pi.bin_data;
         else if (!pi.hex_data.empty()) img.data = hex_to_binary(pi.hex_data);
 
-        util::populate_image_dimensions(img);
-        if (util::is_image_too_small(img, opts.min_image_size)) continue;
-
-        if (!opts.image_dir.empty()) {
-            img.saved_path = util::save_image_to_file(
-                opts.image_dir, img.name, img.format,
-                img.data.data(), img.data.size());
-            if (!img.saved_path.empty()) {
-                img.data.clear();
-                img.data.shrink_to_fit();
-            }
-        }
+        // \pngblip declares a type, not a filename, so no declared_ext.
+        if (util::store_image(img, opts).empty()) continue;
         images.push_back(std::move(img));
     }
     return images;

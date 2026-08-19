@@ -185,19 +185,9 @@ std::vector<ImageData> OdfParser::extract_images(const ConvertOptions& opts) {
         img.format = util::image_format_from_ext(ext);
         img.data = zip_.read_entry(*entry);
 
-        util::populate_image_dimensions(img);
-        if (util::is_image_too_small(img, opts.min_image_size)) continue;
-
-        // Keep the extension the package declared, verbatim.
-        std::string filename =
-            img.name + util::image_ext_for_save(ext, img.format);
-        img.saved_path = util::save_named_file(
-            opts.image_dir, filename, img.data.data(), img.data.size());
-        if (!img.saved_path.empty()) {
-            filename = util::get_filename(img.saved_path);
-            img.data.clear();
-            img.data.shrink_to_fit();
-        }
+        // ext is what the package named the part; store_image keeps it.
+        std::string filename = util::store_image(img, opts, ext);
+        if (filename.empty()) continue;
         image_name_map_[util::get_filename(entry->name)] = filename;
         images.push_back(std::move(img));
         img_idx++;

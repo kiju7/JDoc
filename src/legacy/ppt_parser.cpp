@@ -695,18 +695,14 @@ std::string PptParser::to_markdown(const ConvertOptions& opts) {
     std::string md;
     auto all_images = extract_images(opts.min_image_size);
 
-    // Save images to disk if requested
-    if (opts.images) {
-        for (auto& img : all_images) {
-            img.saved_path = util::save_image_to_file(
-                opts.image_dir, img.name, img.format,
-                img.data.data(), img.data.size());
-            if (!img.saved_path.empty()) {
-                img.data.clear();
-                img.data.shrink_to_fit();
-            }
-        }
-    }
+    // One reference per image, in BLIP order. Slides address images by index,
+    // so the vector is never compacted; an empty entry means the image must
+    // not be referenced, because the write failed. An Escher BLIP record
+    // declares a type rather than a filename, so store_image settles the
+    // extension from the format.
+    std::vector<std::string> refs;
+    refs.reserve(all_images.size());
+    for (auto& img : all_images) refs.push_back(util::store_image(img, opts));
 
     for (const auto& slide : slides_) {
         if (!opts.pages.empty()) {
@@ -722,8 +718,8 @@ std::string PptParser::to_markdown(const ConvertOptions& opts) {
         for (int blip_idx : slide.blip_indices) {
             if (blip_idx >= 1 && blip_idx <= static_cast<int>(all_images.size())) {
                 auto& img = all_images[blip_idx - 1];
-                std::string filename = util::image_ref_name(
-                    img.name, img.format, img.saved_path);
+                const std::string& filename = refs[blip_idx - 1];
+                if (filename.empty()) continue;
                 if (opts.images)
                     md += "![" + filename + "](" + opts.image_ref_prefix + filename + ")\n\n";
                 else
@@ -741,17 +737,14 @@ std::vector<PageChunk> PptParser::to_chunks(const ConvertOptions& opts) {
     std::vector<PageChunk> chunks;
     auto all_images = extract_images(opts.min_image_size);
 
-    if (opts.images) {
-        for (auto& img : all_images) {
-            img.saved_path = util::save_image_to_file(
-                opts.image_dir, img.name, img.format,
-                img.data.data(), img.data.size());
-            if (!img.saved_path.empty()) {
-                img.data.clear();
-                img.data.shrink_to_fit();
-            }
-        }
-    }
+    // One reference per image, in BLIP order. Slides address images by index,
+    // so the vector is never compacted; an empty entry means the image must
+    // not be referenced, because the write failed. An Escher BLIP record
+    // declares a type rather than a filename, so store_image settles the
+    // extension from the format.
+    std::vector<std::string> refs;
+    refs.reserve(all_images.size());
+    for (auto& img : all_images) refs.push_back(util::store_image(img, opts));
 
     for (const auto& slide : slides_) {
         if (!opts.pages.empty()) {
@@ -770,8 +763,8 @@ std::vector<PageChunk> PptParser::to_chunks(const ConvertOptions& opts) {
         for (int blip_idx : slide.blip_indices) {
             if (blip_idx >= 1 && blip_idx <= static_cast<int>(all_images.size())) {
                 auto& img = all_images[blip_idx - 1];
-                std::string filename = util::image_ref_name(
-                    img.name, img.format, img.saved_path);
+                const std::string& filename = refs[blip_idx - 1];
+                if (filename.empty()) continue;
                 if (opts.images)
                     slide_md += "![" + filename + "](" + opts.image_ref_prefix + filename + ")\n\n";
                 else
