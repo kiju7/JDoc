@@ -1330,7 +1330,7 @@ private:
 
         std::string unified = "page" + std::to_string(chunk.page_number)
                              + "_img" + std::to_string(image_idx);
-        std::string filename = unified + "." + ext;
+        std::string filename = unified + util::image_ext_for_save("." + ext, ext);
 
         // When images not requested, emit embedded reference without loading data
         if (!opts_.images) {
@@ -1401,7 +1401,9 @@ private:
             meta_text = metafile_extract_text(ext.c_str(), image_data.data(),
                                               image_data.size());
 
-        filename = unified + "." + (ext == "jpeg" ? "jpg" : ext);
+        // BinData named the extension; keep it verbatim, the same as the
+        // no-image path above and every other container-declared name.
+        filename = unified + util::image_ext_for_save("." + ext, ext);
         std::string saved_path;
         if (!opts_.image_dir.empty()) {
             saved_path = util::save_named_file(

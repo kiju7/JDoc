@@ -1266,6 +1266,85 @@ void test_xls_images() {
     TEST_END
 }
 
+// ── RTF images ───────────────────────────────────────────────
+
+// An RTF holding `count` \pngblip pictures, hex-encoded the way Word writes
+// them.
+static std::string make_rtf_with_pictures(int count) {
+    static const char* kHex = "0123456789abcdef";
+    const std::string raw = png_bytes();
+    std::string hex;
+    for (unsigned char c : raw) { hex += kHex[c >> 4]; hex += kHex[c & 0x0F]; }
+
+    std::string rtf = "{\\rtf1\\ansi\\deff0{\\fonttbl{\\f0 Times;}}\n"
+                      "\\pard body text\\par\n";
+    for (int i = 0; i < count; i++)
+        rtf += "{\\pict\\pngblip\\picw1\\pich1 " + hex + "}\n";
+    rtf += "}";
+    return rtf;
+}
+
+static std::string convert_rtf_with(const std::string& rtf,
+                                    const jdoc::ConvertOptions& opts) {
+    return jdoc::office_to_markdown_mem(
+        reinterpret_cast<const uint8_t*>(rtf.data()), rtf.size(), "doc.rtf",
+        opts);
+}
+
+void test_rtf_images() {
+    std::cerr << "\nRTF images:\n";
+
+    TEST(pictures_are_written_to_image_dir)
+        // RTF referenced its pictures without ever writing one: nothing in
+        // rtf_parser.cpp called the writer.
+        std::string dir = temp_image_dir("rtf_images");
+        jdoc::ConvertOptions opts;
+        opts.images = true;
+        opts.min_image_size = 0;
+        opts.image_dir = dir;
+
+        auto md = convert_rtf_with(make_rtf_with_pictures(2), opts);
+        ASSERT(count_occurrences(md, "![") == 2);
+        assert_targets_exist(md, dir);
+        std::filesystem::remove_all(dir);
+    TEST_END
+
+    TEST(names_match_every_other_parser)
+        // to_markdown used to name them "rtf_image_1" while its own to_chunks
+        // called the same picture "page1_img0".
+        std::string dir = temp_image_dir("rtf_image_names");
+        jdoc::ConvertOptions opts;
+        opts.images = true;
+        opts.min_image_size = 0;
+        opts.image_dir = dir;
+
+        auto md = convert_rtf_with(make_rtf_with_pictures(1), opts);
+        auto chunks = jdoc::office_to_markdown_chunks_mem(
+            reinterpret_cast<const uint8_t*>(make_rtf_with_pictures(1).data()),
+            make_rtf_with_pictures(1).size(), "doc.rtf", opts);
+        ASSERT(image_targets(md).size() == 1);
+        ASSERT(image_targets(md)[0].find("page1_img0.png") != std::string::npos);
+        ASSERT(chunks.size() == 1);
+        ASSERT(chunks[0].images.size() == 1);
+        ASSERT(chunks[0].images[0].name == "page1_img0");
+        ASSERT(!chunks[0].images[0].saved_path.empty());
+        std::filesystem::remove_all(dir);
+    TEST_END
+
+    TEST(memory_mode_keeps_the_bytes)
+        jdoc::ConvertOptions opts;
+        opts.images = true;
+        opts.min_image_size = 0;
+
+        std::string rtf = make_rtf_with_pictures(1);
+        auto chunks = jdoc::office_to_markdown_chunks_mem(
+            reinterpret_cast<const uint8_t*>(rtf.data()), rtf.size(), "doc.rtf",
+            opts);
+        ASSERT(chunks[0].images.size() == 1);
+        ASSERT(!chunks[0].images[0].data.empty());
+    TEST_END
+}
+
 // ── XLSX streaming (SAX) path ────────────────────────────────
 
 // A workbook exercising every construct the streaming scanner must replicate
@@ -1713,6 +1792,7 @@ int main() {
     test_xlsx_fixes();
     test_image_reference_matches_file();
     test_xls_images();
+    test_rtf_images();
     test_xlsx_streaming();
     test_xls_sst_continue();
     test_xlsb_sparse_cells();

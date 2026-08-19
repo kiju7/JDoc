@@ -4,6 +4,7 @@
 #include "common/emf_text.h"
 #include "common/file_utils.h"
 #include "common/image_utils.h"
+#include "common/png_encode.h"
 #include "common/string_utils.h"
 
 #include <algorithm>
@@ -496,6 +497,58 @@ static std::string rtf_cells_to_markdown(const std::string& raw) {
     return md;
 }
 
+// One ImageData per \pict, named and filtered the way every other parser does,
+// and written to image_dir when one is set. \pngblip and friends declare a
+// type rather than a filename, so the extension is the canonical one for the
+// format — as with an Escher BLIP record or a PDF filter.
+std::vector<ImageData> RtfParser::build_images(
+    const std::vector<PictImage>& pict_images, const ConvertOptions& opts) {
+    std::vector<ImageData> images;
+    for (size_t i = 0; i < pict_images.size(); ++i) {
+        const auto& pi = pict_images[i];
+        ImageData img;
+        img.page_number = 1;
+        img.name = "page1_img" + std::to_string(images.size());
+        img.format = pi.format.empty() ? "bin" : pi.format;
+        img.width = pi.width;
+        img.height = pi.height;
+
+        if (!pi.bin_data.empty()) img.data = pi.bin_data;
+        else if (!pi.hex_data.empty()) img.data = hex_to_binary(pi.hex_data);
+
+        util::populate_image_dimensions(img);
+        if (util::is_image_too_small(img, opts.min_image_size)) continue;
+
+        if (!opts.image_dir.empty()) {
+            img.saved_path = util::save_image_to_file(
+                opts.image_dir, img.name, img.format,
+                img.data.data(), img.data.size());
+            if (!img.saved_path.empty()) {
+                img.data.clear();
+                img.data.shrink_to_fit();
+            }
+        }
+        images.push_back(std::move(img));
+    }
+    return images;
+}
+
+// Text drawn into a metafile is document content, not decoration, so it is
+// recovered whether or not images are being extracted.
+std::string RtfParser::metafile_text(const std::vector<PictImage>& pict_images) {
+    std::string out;
+    for (const auto& pi : pict_images) {
+        if (pi.format != "emf" && pi.format != "wmf") continue;
+        std::vector<char> bytes = !pi.bin_data.empty()
+            ? pi.bin_data : hex_to_binary(pi.hex_data);
+        std::string t = metafile_extract_text(
+            pi.format.c_str(),
+            reinterpret_cast<const uint8_t*>(bytes.data()), bytes.size());
+        if (!t.empty()) out += "\n\n" + t;
+    }
+    return out;
+}
+
 std::string RtfParser::to_markdown(const ConvertOptions& opts) {
     std::string text;
     std::vector<PictImage> pict_images;
@@ -504,27 +557,19 @@ std::string RtfParser::to_markdown(const ConvertOptions& opts) {
     // Convert cell separators to markdown tables
     text = rtf_cells_to_markdown(text);
 
-    if (!pict_images.empty()) {
-        text += "\n\n---\n\n";
-        for (size_t i = 0; i < pict_images.size(); ++i) {
-            const auto& pi = pict_images[i];
-            std::string name = "rtf_image_" + std::to_string(i + 1);
-            std::string ext = pi.format.empty() ? "bin" : pi.format;
-            std::string filename = name + "." + ext;
-            if (opts.images)
-                text += "![" + filename + "](" + opts.image_ref_prefix + filename + ")\n\n";
-            else
-                text += "![" + filename + "](" + filename + ")\n\n";
-            if (pi.format == "emf" || pi.format == "wmf") {
-                std::vector<char> bytes = !pi.bin_data.empty()
-                    ? pi.bin_data : hex_to_binary(pi.hex_data);
-                std::string t = metafile_extract_text(
-                    pi.format.c_str(),
-                    reinterpret_cast<const uint8_t*>(bytes.data()), bytes.size());
-                if (!t.empty()) text += t + "\n\n";
+    if (opts.images) {
+        auto images = build_images(pict_images, opts);
+        if (!images.empty()) {
+            text += "\n\n---\n\n";
+            for (const auto& img : images) {
+                const std::string ref = util::image_ref_name(
+                    img.name, img.format, img.saved_path);
+                text += "![" + ref + "](" + opts.image_ref_prefix + ref + ")\n\n";
+                if (!img.embedded_text.empty()) text += img.embedded_text + "\n\n";
             }
         }
     }
+    text += metafile_text(pict_images);
 
     return text;
 }
@@ -541,42 +586,9 @@ std::vector<PageChunk> RtfParser::to_chunks(const ConvertOptions& opts) {
     chunk.page_height = 792.0;
     chunk.body_font_size = 12.0;
 
-    // Metafile text is content (not an image), so recover it regardless of
-    // whether image extraction is enabled.
-    for (const auto& pi : pict_images) {
-        if (pi.format != "emf" && pi.format != "wmf") continue;
-        std::vector<char> bytes = !pi.bin_data.empty()
-            ? pi.bin_data : hex_to_binary(pi.hex_data);
-        std::string t = metafile_extract_text(
-            pi.format.c_str(),
-            reinterpret_cast<const uint8_t*>(bytes.data()), bytes.size());
-        if (!t.empty()) chunk.text += "\n\n" + t;
-    }
+    chunk.text += metafile_text(pict_images);
 
-    if (opts.images) {
-        for (size_t i = 0; i < pict_images.size(); ++i) {
-            const auto& pi = pict_images[i];
-            ImageData img;
-            img.page_number = 1;
-            img.name = "page1_img" + std::to_string(i);
-            img.format = pi.format.empty() ? "bin" : pi.format;
-            img.width = pi.width;
-            img.height = pi.height;
-
-            // Decode image data.
-            if (!pi.bin_data.empty()) {
-                img.data = pi.bin_data;
-            } else if (!pi.hex_data.empty()) {
-                img.data = hex_to_binary(pi.hex_data);
-            }
-
-            util::populate_image_dimensions(img);
-            if (util::is_image_too_small(img, opts.min_image_size))
-                continue;
-
-            chunk.images.push_back(std::move(img));
-        }
-    }
+    if (opts.images) chunk.images = build_images(pict_images, opts);
 
     std::vector<PageChunk> chunks;
     chunks.push_back(std::move(chunk));
