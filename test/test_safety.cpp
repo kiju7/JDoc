@@ -1218,34 +1218,41 @@ void test_utf8_file_and_output_paths() {
 } // namespace
 
 int main() {
-    test_ole_rejects_invalid_sector_shift();
-    test_ole_rejects_oversized_directory_name();
-    test_ole_directory_cycle_terminates();
-    test_ole_rejects_stream_larger_than_source();
-    test_png_rejects_short_pixels();
-    test_png_converts_cmyk();
-    test_pdf_honors_images_option();
-    test_pdf_composite_clips_extreme_coordinates_before_narrowing();
-    test_pdf_region_composite_matches_translated_geometry();
-    test_pdf_inline_flate_ignores_embedded_ei();
-    test_pdf_pattern_shading_does_not_fill_triangle_bbox();
-    test_pdf_radial_shading_preserves_unextended_center();
-    test_pdf_composite_skips_fully_transparent_masks();
-    test_pdf_composite_applies_clip_rect();
-    test_pdf_composite_renders_axial_shading();
-    test_pdf_reads_rotated_text();
-    test_pdf_table_cell_rotated_text();
-    test_pdf_line_width_follows_ctm();
-    test_pdf_cell_assembly_reading_order();
-    test_pdf_lists_attachments();
-    test_pdf_preserves_same_named_attachments();
-    test_pdf_attachment_name_cannot_forge_structure();
-    test_pdf_rotated_run_not_merged_into_body_line();
-    test_pdf_name_tree_cycle_terminates();
-    test_pdf_decodes_surrogate_pair();
-    test_memory_streaming_supports_eml();
-    test_empty_memory_and_invalid_pages_are_consistent();
-    test_concurrent_image_saves_do_not_overwrite();
-    test_utf8_file_and_output_paths();
+    const auto run = [](const char* name, void (*test)()) {
+        std::cerr << "[ RUN      ] " << name << std::endl;
+        test();
+        std::cerr << "[       OK ] " << name << std::endl;
+    };
+#define RUN_TEST(test) run(#test, &test)
+    RUN_TEST(test_ole_rejects_invalid_sector_shift);
+    RUN_TEST(test_ole_rejects_oversized_directory_name);
+    RUN_TEST(test_ole_directory_cycle_terminates);
+    RUN_TEST(test_ole_rejects_stream_larger_than_source);
+    RUN_TEST(test_png_rejects_short_pixels);
+    RUN_TEST(test_png_converts_cmyk);
+    RUN_TEST(test_pdf_honors_images_option);
+    RUN_TEST(test_pdf_composite_clips_extreme_coordinates_before_narrowing);
+    RUN_TEST(test_pdf_region_composite_matches_translated_geometry);
+    RUN_TEST(test_pdf_inline_flate_ignores_embedded_ei);
+    RUN_TEST(test_pdf_pattern_shading_does_not_fill_triangle_bbox);
+    RUN_TEST(test_pdf_radial_shading_preserves_unextended_center);
+    RUN_TEST(test_pdf_composite_skips_fully_transparent_masks);
+    RUN_TEST(test_pdf_composite_applies_clip_rect);
+    RUN_TEST(test_pdf_composite_renders_axial_shading);
+    RUN_TEST(test_pdf_reads_rotated_text);
+    RUN_TEST(test_pdf_table_cell_rotated_text);
+    RUN_TEST(test_pdf_line_width_follows_ctm);
+    RUN_TEST(test_pdf_cell_assembly_reading_order);
+    RUN_TEST(test_pdf_lists_attachments);
+    RUN_TEST(test_pdf_preserves_same_named_attachments);
+    RUN_TEST(test_pdf_attachment_name_cannot_forge_structure);
+    RUN_TEST(test_pdf_rotated_run_not_merged_into_body_line);
+    RUN_TEST(test_pdf_name_tree_cycle_terminates);
+    RUN_TEST(test_pdf_decodes_surrogate_pair);
+    RUN_TEST(test_memory_streaming_supports_eml);
+    RUN_TEST(test_empty_memory_and_invalid_pages_are_consistent);
+    RUN_TEST(test_concurrent_image_saves_do_not_overwrite);
+    RUN_TEST(test_utf8_file_and_output_paths);
+#undef RUN_TEST
     std::cout << "Safety regression tests passed\n";
 }
