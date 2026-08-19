@@ -722,12 +722,12 @@ bool PptxParser::resolve_image(const std::string& media_path, int page_number,
     }
 
     std::string ext = util::get_extension(media_path);
-    ref_name = img.name + (ext.empty() ? ".png" : ext);
+    // Keep the extension the package declared, verbatim.
+    ref_name = img.name + util::image_ext_for_save(ext, img.format);
 
     if (opts.images) {
-        img.saved_path = util::save_image_to_file(
-            opts.image_dir, img.name, img.format,
-            img.data.data(), img.data.size());
+        img.saved_path = util::save_named_file(
+            opts.image_dir, ref_name, img.data.data(), img.data.size());
         if (!img.saved_path.empty()) {
             ref_name = util::get_filename(img.saved_path);
             img.data.clear();

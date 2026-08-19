@@ -74,6 +74,27 @@ inline std::string image_file_ext(const std::string& format) {
     return format.empty() ? std::string("bin") : format;
 }
 
+// The dotted extension an extracted image is written with. A container that
+// named the part — a zip entry, an OLE stream — has already declared it, and
+// that declaration is kept verbatim: ".jpeg" stays ".jpeg" rather than being
+// normalized to ".jpg", and an extension jdoc has no format name for (".webp",
+// ".ico") stays itself rather than collapsing to ".bin". Only a container that
+// declares a type code instead of a name (an Escher BLIP record, a PDF filter)
+// has no extension to keep, and falls back to the canonical one.
+//
+// The declaration is document-controlled text, so it is taken only when it is
+// a plain alphanumeric ".ext": a part named "a.png/../../x" must not steer the
+// write out of image_dir.
+inline std::string image_ext_for_save(const std::string& declared_ext,
+                                      const std::string& format) {
+    const bool usable =
+        declared_ext.size() > 1 && declared_ext.size() <= 16 &&
+        declared_ext[0] == '.' &&
+        std::all_of(declared_ext.begin() + 1, declared_ext.end(),
+                    [](unsigned char c) { return std::isalnum(c) != 0; });
+    return usable ? declared_ext : "." + image_file_ext(format);
+}
+
 // The name that belongs in a Markdown image reference. Once an image reaches
 // disk that is the basename actually written — collision suffix and all, since
 // a name already taken in image_dir is written as "<stem>_1.<ext>". Only an

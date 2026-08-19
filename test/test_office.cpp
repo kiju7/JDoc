@@ -1028,6 +1028,36 @@ void test_image_reference_matches_file() {
         std::filesystem::remove_all(dir);
     TEST_END
 
+    TEST(declared_extension_is_kept_verbatim)
+        // The extension the package declared is what the extracted file gets.
+        // It used to round-trip through the format name, which is lossy:
+        // ".jpeg" came back ".jpg", ".tif" came back ".tiff", and anything
+        // jdoc has no format name for (".webp") came back ".bin".
+        auto book = make_xlsx(
+            "worksheets/sheet1.xml",
+            "<row r=\"1\"><c r=\"A1\" t=\"inlineStr\"><is><t>C</t></is></c></row>",
+            {{"xl/media/image1.jpeg", png_bytes()},
+             {"xl/media/image2.webp", png_bytes()},
+             {"xl/media/image3.tif",  png_bytes()}});
+        std::string dir = temp_image_dir("xlsx_declared_ext");
+        jdoc::ConvertOptions opts;
+        opts.images = true;
+        opts.min_image_size = 0;
+        opts.image_dir = dir;
+
+        auto md = jdoc::office_to_markdown_mem(
+            reinterpret_cast<const uint8_t*>(book.data()), book.size(),
+            "book.xlsx", opts);
+        assert_targets_exist(md, dir);
+        std::set<std::string> written;
+        for (auto& e : std::filesystem::directory_iterator(dir))
+            written.insert(e.path().filename().string());
+        ASSERT(written == std::set<std::string>({"page1_img0.jpeg",
+                                                 "page1_img1.webp",
+                                                 "page1_img2.tif"}));
+        std::filesystem::remove_all(dir);
+    TEST_END
+
     TEST(pptx_reference_follows_the_collision_suffix)
         // Guard the paths that already got this right against regressing.
         auto deck = make_shared_media_pptx();

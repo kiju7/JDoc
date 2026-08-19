@@ -897,7 +897,8 @@ private:
         if (raw.empty()) return img;
 
         img.data.assign(raw.begin(), raw.end());
-        img.format = util::image_format_from_ext(util::get_extension(file_path));
+        const std::string declared_ext = util::get_extension(file_path);
+        img.format = util::image_format_from_ext(declared_ext);
         img.name = "page" + std::to_string(page_number) +
                    "_img" + std::to_string(image_idx);
         img.width = width;
@@ -910,8 +911,10 @@ private:
 
         // Save to disk if requested (BMP -> PNG for compression)
         if (opts_.images) {
-            img.saved_path = util::save_image_to_file(
-                opts_.image_dir, img.name, img.format,
+            // Keep the extension BinData declared, verbatim.
+            img.saved_path = util::save_named_file(
+                opts_.image_dir,
+                img.name + util::image_ext_for_save(declared_ext, img.format),
                 img.data.data(), img.data.size());
             if (!img.saved_path.empty()) {
                 img.data.clear();

@@ -1449,8 +1449,10 @@ std::vector<ImageData> XlsxParser::extract_images(
                     continue;
                 img_idx++;
 
-                img.saved_path = util::save_image_to_file(
-                    opts.image_dir, img.name, img.format,
+                // Keep the extension the package declared, verbatim.
+                img.saved_path = util::save_named_file(
+                    opts.image_dir,
+                    img.name + util::image_ext_for_save(ext, img.format),
                     img.data.data(), img.data.size());
                 if (!img.saved_path.empty()) {
                     img.data.clear();
@@ -1479,8 +1481,10 @@ std::vector<ImageData> XlsxParser::extract_images(
             continue;
         img_idx++;
 
-        img.saved_path = util::save_image_to_file(
-            opts.image_dir, img.name, img.format,
+        // Keep the extension the package declared, verbatim.
+        img.saved_path = util::save_named_file(
+            opts.image_dir,
+            img.name + util::image_ext_for_save(ext, img.format),
             img.data.data(), img.data.size());
         if (!img.saved_path.empty()) {
             img.data.clear();
