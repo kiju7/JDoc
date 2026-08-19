@@ -11,6 +11,7 @@
 
 #include <cstdint>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <exception>
@@ -1161,15 +1162,21 @@ void test_concurrent_image_saves_do_not_overwrite() {
     for (size_t i = 0; i < kCount; ++i) {
         payloads[i] = "payload-" + std::to_string(i);
         threads.emplace_back([&, i] {
+            std::fprintf(stderr, "[ image-save %zu started ]\n", i);
+            std::fflush(stderr);
             try {
                 paths[i] = jdoc::util::save_named_file(
                     dir, "page1_img0.png", payloads[i].data(), payloads[i].size());
             } catch (...) {
                 errors[i] = std::current_exception();
             }
+            std::fprintf(stderr, "[ image-save %zu finished ]\n", i);
+            std::fflush(stderr);
         });
     }
     for (auto& thread : threads) thread.join();
+    std::fprintf(stderr, "[ image-save workers joined ]\n");
+    std::fflush(stderr);
     for (const auto& error : errors)
         if (error) std::rethrow_exception(error);
 
