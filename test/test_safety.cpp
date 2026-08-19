@@ -11,7 +11,6 @@
 
 #include <cstdint>
 #include <chrono>
-#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <exception>
@@ -1162,21 +1161,15 @@ void test_concurrent_image_saves_do_not_overwrite() {
     for (size_t i = 0; i < kCount; ++i) {
         payloads[i] = "payload-" + std::to_string(i);
         threads.emplace_back([&, i] {
-            std::fprintf(stderr, "[ image-save %zu started ]\n", i);
-            std::fflush(stderr);
             try {
                 paths[i] = jdoc::util::save_named_file(
                     dir, "page1_img0.png", payloads[i].data(), payloads[i].size());
             } catch (...) {
                 errors[i] = std::current_exception();
             }
-            std::fprintf(stderr, "[ image-save %zu finished ]\n", i);
-            std::fflush(stderr);
         });
     }
     for (auto& thread : threads) thread.join();
-    std::fprintf(stderr, "[ image-save workers joined ]\n");
-    std::fflush(stderr);
     for (const auto& error : errors)
         if (error) std::rethrow_exception(error);
 
@@ -1185,14 +1178,20 @@ void test_concurrent_image_saves_do_not_overwrite() {
     std::set<std::string> actual_payloads;
     for (const auto& path : paths) {
         CHECK(!path.empty());
-        std::ifstream in(jdoc::util::io_path(path), std::ios::binary);
-        CHECK(in.good());
-        actual_payloads.emplace(std::istreambuf_iterator<char>(in),
-                                std::istreambuf_iterator<char>());
-        std::filesystem::remove(jdoc::util::io_path(path));
+        {
+            std::ifstream in(jdoc::util::io_path(path), std::ios::binary);
+            CHECK(in.good());
+            actual_payloads.emplace(std::istreambuf_iterator<char>(in),
+                                    std::istreambuf_iterator<char>());
+        } // Windows requires the read handle to close before deletion.
+        std::error_code remove_error;
+        CHECK(std::filesystem::remove(jdoc::util::io_path(path), remove_error));
+        CHECK(!remove_error);
     }
     CHECK(actual_payloads == std::set<std::string>(payloads.begin(), payloads.end()));
-    std::filesystem::remove(jdoc::util::io_path(dir));
+    std::error_code remove_error;
+    CHECK(std::filesystem::remove(jdoc::util::io_path(dir), remove_error));
+    CHECK(!remove_error);
 }
 
 void test_utf8_file_and_output_paths() {
