@@ -65,6 +65,26 @@ inline std::string image_format_from_ext(const std::string& ext) {
     return "bin";
 }
 
+// The extension save_image_to_file() gives a payload of this format. A JPEG
+// lands as ".jpg" and an unrecognized format as ".bin", so a caller that names
+// the file from the format string alone would point at a file that is not
+// there. Kept next to the inverse mapping above; the writer uses it too.
+inline std::string image_file_ext(const std::string& format) {
+    if (format == "jpeg") return "jpg";
+    return format.empty() ? std::string("bin") : format;
+}
+
+// The name that belongs in a Markdown image reference. Once an image reaches
+// disk that is the basename actually written — collision suffix and all, since
+// a name already taken in image_dir is written as "<stem>_1.<ext>". Only an
+// image that was never written falls back to the derived name.
+inline std::string image_ref_name(const std::string& name,
+                                  const std::string& format,
+                                  const std::string& saved_path) {
+    if (!saved_path.empty()) return get_filename(saved_path);
+    return name + "." + image_file_ext(format);
+}
+
 // Trim leading/trailing whitespace.
 inline std::string trim(const std::string& s) {
     auto start = s.find_first_not_of(" \t\r\n");

@@ -471,14 +471,10 @@ private:
                         para_has_content = true;
                         // Add image reference in markdown
                         auto& saved = chunk.images.back();
-                        if (!saved.saved_path.empty()) {
-                            auto slash = saved.saved_path.find_last_of('/');
-                            std::string ref = (slash != std::string::npos)
-                                ? saved.saved_path.substr(slash + 1) : saved.saved_path;
-                            para_text += "![" + saved.name + "](" + opts_.image_ref_prefix + ref + ")";
-                        } else {
-                            para_text += "![" + saved.name + "](" + opts_.image_ref_prefix + saved.name + "." + saved.format + ")";
-                        }
+                        const std::string ref = util::image_ref_name(
+                            saved.name, saved.format, saved.saved_path);
+                        para_text += "![" + saved.name + "](" +
+                                     opts_.image_ref_prefix + ref + ")";
                     }
                 }
                 else if (is_shape_element(in)) {
@@ -729,14 +725,8 @@ private:
             for (auto& pic : table_pics) {
                 ImageData idata = process_picture(pic, page_number, *p_image_idx);
                 if (!idata.name.empty()) {
-                    // Name the file that was actually written: save_image_to_file
-                    // settles the extension from the magic bytes (a "jpeg"
-                    // format lands as .jpg), so deriving the reference from the
-                    // format string alone points at a file that is not there.
-                    std::string ref = idata.saved_path.empty()
-                        ? idata.name + "." +
-                          (idata.format == "jpeg" ? "jpg" : idata.format)
-                        : util::get_filename(idata.saved_path);
+                    std::string ref = util::image_ref_name(
+                        idata.name, idata.format, idata.saved_path);
                     md += "\n![" + idata.name + "](" + opts_.image_ref_prefix + ref + ")\n";
                 }
             }

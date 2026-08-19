@@ -270,12 +270,14 @@ static std::string metafile_to_markdown(FileFormat fmt, const uint8_t* data,
     int i = 0;
     for (auto& bmp : c.images) {
         std::string name = "page1_img" + std::to_string(i++);
-        std::string filename = name + ".bmp";
-        // Don't reference a bitmap that could not be written to image_dir.
-        if (!opts.image_dir.empty() &&
-            util::save_image_to_file(opts.image_dir, name, "bmp",
-                                     bmp.data(), bmp.size()).empty())
-            continue;
+        std::string saved;
+        if (!opts.image_dir.empty()) {
+            saved = util::save_image_to_file(opts.image_dir, name, "bmp",
+                                             bmp.data(), bmp.size());
+            // Don't reference a bitmap that could not be written to image_dir.
+            if (saved.empty()) continue;
+        }
+        const std::string filename = util::image_ref_name(name, "bmp", saved);
         if (!md.empty() && md.back() != '\n') md += "\n\n";
         md += "![" + filename + "](" + opts.image_ref_prefix + filename + ")\n\n";
     }
@@ -295,7 +297,6 @@ static PageChunk metafile_to_chunk(FileFormat fmt, const uint8_t* data,
     int i = 0;
     for (auto& bmp : c.images) {
         std::string name = "page1_img" + std::to_string(i++);
-        std::string filename = name + ".bmp";
         ImageData img;
         img.page_number = 1;
         img.name = name;
@@ -310,6 +311,8 @@ static PageChunk metafile_to_chunk(FileFormat fmt, const uint8_t* data,
                 img.data.shrink_to_fit();
             }
         }
+        const std::string filename =
+            util::image_ref_name(name, "bmp", img.saved_path);
         if (!chunk.text.empty() && chunk.text.back() != '\n')
             chunk.text += "\n\n";
         chunk.text += "![" + filename + "](" + opts.image_ref_prefix +

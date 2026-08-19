@@ -429,9 +429,9 @@ inline std::string save_image_to_file(const std::string& dir,
     // Keep the extension the container declared (zip entry name, BLIP record
     // type, OLE stream) rather than second-guessing it with a magic-byte sniff:
     // the extracted file should carry its real, source-declared extension.
-    std::string ext = (format == "jpeg") ? "jpg" : format;
-    if (ext.empty()) ext = "bin";
-    return save_unique_named_file(dir, name + "." + ext, data, size);
+    // image_ref_name() derives the Markdown reference from the same mapping.
+    return save_unique_named_file(dir, name + "." + image_file_ext(format),
+                                  data, size);
 }
 
 // Save bytes to "<dir>/<filename>" verbatim — the filename (including its

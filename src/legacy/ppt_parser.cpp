@@ -722,7 +722,8 @@ std::string PptParser::to_markdown(const ConvertOptions& opts) {
         for (int blip_idx : slide.blip_indices) {
             if (blip_idx >= 1 && blip_idx <= static_cast<int>(all_images.size())) {
                 auto& img = all_images[blip_idx - 1];
-                std::string filename = img.name + "." + img.format;
+                std::string filename = util::image_ref_name(
+                    img.name, img.format, img.saved_path);
                 if (opts.images)
                     md += "![" + filename + "](" + opts.image_ref_prefix + filename + ")\n\n";
                 else
@@ -769,7 +770,8 @@ std::vector<PageChunk> PptParser::to_chunks(const ConvertOptions& opts) {
         for (int blip_idx : slide.blip_indices) {
             if (blip_idx >= 1 && blip_idx <= static_cast<int>(all_images.size())) {
                 auto& img = all_images[blip_idx - 1];
-                std::string filename = img.name + "." + img.format;
+                std::string filename = util::image_ref_name(
+                    img.name, img.format, img.saved_path);
                 if (opts.images)
                     slide_md += "![" + filename + "](" + opts.image_ref_prefix + filename + ")\n\n";
                 else

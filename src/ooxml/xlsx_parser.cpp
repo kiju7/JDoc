@@ -1442,7 +1442,6 @@ std::vector<ImageData> XlsxParser::extract_images(
                 std::string ext = util::get_extension(media_path);
                 img.format = util::image_format_from_ext(ext);
                 img.name = "page" + std::to_string(sheet_num) + "_img" + std::to_string(img_idx);
-                std::string filename = img.name + (ext.empty() ? ".png" : ext);
 
                 img.data = zip_.read_entry(media_path);
                 util::populate_image_dimensions(img);
@@ -1473,7 +1472,6 @@ std::vector<ImageData> XlsxParser::extract_images(
         std::string ext = util::get_extension(entry->name);
         img.format = util::image_format_from_ext(ext);
         img.name = "page1_img" + std::to_string(img_idx);
-        std::string filename = img.name + (ext.empty() ? ".png" : ext);
 
         img.data = zip_.read_entry(*entry);
         util::populate_image_dimensions(img);
@@ -1544,9 +1542,13 @@ std::string XlsxParser::to_markdown(const ConvertOptions& opts) {
     // Extract and reference images
     auto images = extract_images(opts);
     for (auto& img : images) {
+        // Name the file that was actually written, extension and
+        // collision suffix included; a bare img.name pointed at nothing.
+        const std::string ref =
+            util::image_ref_name(img.name, img.format, img.saved_path);
         out += "![" ; out += img.name; out += "](";
-        if (opts.images) { out += opts.image_ref_prefix; out += img.name; }
-        else { out += img.name; out += "."; out += img.format; }
+        if (opts.images) out += opts.image_ref_prefix;
+        out += ref;
         out += ")\n\n";
     }
 
@@ -1693,12 +1695,10 @@ bool XlsxParser::to_chunks(const ConvertOptions& opts, const PageSink& sink) {
         // sheet, so moving it out here is safe.
         for (auto& img : all_images) {
             if (target_sheet(img) != sheet_num) continue;
-            std::string ref_name = img.name;
-            if (!img.saved_path.empty()) {
-                auto sl = img.saved_path.find_last_of('/');
-                ref_name = (sl != std::string::npos) ? img.saved_path.substr(sl + 1) : img.saved_path;
-            }
-            chunk.text += "![" + img.name + "](" + ref_name + ")\n\n";
+            const std::string ref_name =
+                util::image_ref_name(img.name, img.format, img.saved_path);
+            chunk.text += "![" + img.name + "](" +
+                          opts.image_ref_prefix + ref_name + ")\n\n";
             chunk.images.push_back(std::move(img));
         }
 

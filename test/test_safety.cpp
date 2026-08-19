@@ -1155,6 +1155,35 @@ std::string scratch_dir(const std::string& tag) {
     return base + "/jdoc-" + tag + "-" + std::to_string(nonce);
 }
 
+void test_image_ref_name_matches_the_writer() {
+    // The Markdown reference and the file on disk come from one rule. A "jpeg"
+    // payload is written as .jpg and an unknown format as .bin, so deriving the
+    // reference from the format string alone must agree with that.
+    CHECK(jdoc::util::image_ref_name("page1_img0", "jpeg", "") ==
+          "page1_img0.jpg");
+    CHECK(jdoc::util::image_ref_name("page1_img0", "png", "") ==
+          "page1_img0.png");
+    CHECK(jdoc::util::image_ref_name("page1_img0", "", "") ==
+          "page1_img0.bin");
+    // Once written, the name that landed wins — collision suffix included.
+    CHECK(jdoc::util::image_ref_name("page1_img0", "png",
+                                     "out/images/page1_img0_3.png") ==
+          "page1_img0_3.png");
+
+    // and the writer agrees: the same payload saved twice keeps both files.
+    const std::string dir = scratch_dir("ref-name");
+    const std::string payload = "bytes";
+    const std::string first = jdoc::util::save_image_to_file(
+        dir, "page1_img0", "jpeg", payload.data(), payload.size());
+    const std::string second = jdoc::util::save_image_to_file(
+        dir, "page1_img0", "jpeg", payload.data(), payload.size());
+    CHECK(jdoc::util::get_filename(first) == "page1_img0.jpg");
+    CHECK(jdoc::util::get_filename(second) == "page1_img0_1.jpg");
+    CHECK(jdoc::util::image_ref_name("page1_img0", "jpeg", second) ==
+          "page1_img0_1.jpg");
+    std::filesystem::remove_all(jdoc::util::io_path(dir));
+}
+
 void test_save_recreates_a_removed_output_directory() {
     // Nothing probes the directory before each save, so a cleanup that removes
     // image_dir mid-run must not cost the next image: the write reports the
@@ -1315,6 +1344,7 @@ int main() {
     RUN_TEST(test_pdf_decodes_surrogate_pair);
     RUN_TEST(test_memory_streaming_supports_eml);
     RUN_TEST(test_empty_memory_and_invalid_pages_are_consistent);
+    RUN_TEST(test_image_ref_name_matches_the_writer);
     RUN_TEST(test_save_recreates_a_removed_output_directory);
     RUN_TEST(test_concurrent_image_saves_do_not_overwrite);
     RUN_TEST(test_utf8_file_and_output_paths);

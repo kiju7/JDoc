@@ -940,7 +940,8 @@ std::string XlsParser::to_markdown(const ConvertOptions& opts) {
     {
         auto images = extract_images(opts.min_image_size);
         for (const auto& img : images) {
-            std::string filename = img.name + "." + img.format;
+            std::string filename = util::image_ref_name(
+                img.name, img.format, img.saved_path);
             if (opts.images)
                 md += "![" + filename + "](" + opts.image_ref_prefix + filename + ")\n\n";
             else

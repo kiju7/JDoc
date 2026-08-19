@@ -177,7 +177,8 @@ static std::string replace_image_markers(const std::string& md,
             static_cast<uint8_t>(md[i + 2]) == 0xBC) {
             if (img_idx < images.size()) {
                 const auto& img = images[img_idx];
-                std::string fn = img.name + "." + img.format;
+                std::string fn = util::image_ref_name(
+                    img.name, img.format, img.saved_path);
                 result += "\n![" + fn + "](" + prefix + fn + ")\n";
                 if (!img.embedded_text.empty())
                     result += img.embedded_text + "\n";
@@ -190,7 +191,8 @@ static std::string replace_image_markers(const std::string& md,
     }
     for (; img_idx < images.size(); ++img_idx) {
         const auto& img = images[img_idx];
-        std::string fn = img.name + "." + img.format;
+        std::string fn = util::image_ref_name(img.name, img.format,
+                                              img.saved_path);
         result += "\n![" + fn + "](" + fn + ")\n";
         if (!img.embedded_text.empty())
             result += img.embedded_text + "\n";

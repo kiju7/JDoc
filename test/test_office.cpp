@@ -930,6 +930,127 @@ void test_xlsx_fixes() {
     TEST_END
 }
 
+// ── Image references name the file that was written ──────────
+
+// Every "![alt](target)" in the markdown, in document order.
+static std::vector<std::string> image_targets(const std::string& md) {
+    std::vector<std::string> targets;
+    for (size_t p = md.find("]("); p != std::string::npos;
+         p = md.find("](", p + 2)) {
+        size_t end = md.find(')', p);
+        if (end == std::string::npos) break;
+        targets.push_back(md.substr(p + 2, end - p - 2));
+    }
+    return targets;
+}
+
+// Fail unless every reference resolves to a file that is actually in dir.
+static void assert_targets_exist(const std::string& md, const std::string& dir) {
+    auto targets = image_targets(md);
+    if (targets.empty()) throw std::runtime_error("no image references emitted");
+    for (const auto& t : targets) {
+        std::string base = t.substr(t.find_last_of('/') + 1);
+        if (!std::filesystem::exists(std::filesystem::path(dir) / base))
+            throw std::runtime_error("reference points at a missing file: " + t);
+    }
+}
+
+static std::string make_media_xlsx() {
+    return make_xlsx(
+        "worksheets/sheet1.xml",
+        "<row r=\"1\"><c r=\"A1\" t=\"inlineStr\"><is><t>Cell</t></is></c></row>",
+        {{"xl/media/image1.png", png_bytes()}});
+}
+
+void test_image_reference_matches_file() {
+    std::cerr << "\nImage reference names the written file:\n";
+
+    TEST(xlsx_reference_carries_the_extension)
+        // The reference used to be the bare stem ("page1_img0"), which resolves
+        // to nothing: the file on disk is "page1_img0.png".
+        auto book = make_media_xlsx();
+        std::string dir = temp_image_dir("xlsx_image_ref");
+        jdoc::ConvertOptions opts;
+        opts.images = true;
+        opts.min_image_size = 0;
+        opts.image_dir = dir;
+        auto md = jdoc::office_to_markdown_mem(
+            reinterpret_cast<const uint8_t*>(book.data()), book.size(),
+            "book.xlsx", opts);
+        assert_targets_exist(md, dir);
+        std::filesystem::remove_all(dir);
+    TEST_END
+
+    TEST(xlsx_reference_follows_the_collision_suffix)
+        // A second conversion into the same image_dir cannot overwrite the
+        // first document's file, so it is written as "page1_img0_1.png" — and
+        // the markdown has to say so, or it points at the other document.
+        auto book = make_media_xlsx();
+        std::string dir = temp_image_dir("xlsx_image_ref_shared");
+        jdoc::ConvertOptions opts;
+        opts.images = true;
+        opts.min_image_size = 0;
+        opts.image_dir = dir;
+
+        auto first = jdoc::office_to_markdown_mem(
+            reinterpret_cast<const uint8_t*>(book.data()), book.size(),
+            "book.xlsx", opts);
+        auto second = jdoc::office_to_markdown_mem(
+            reinterpret_cast<const uint8_t*>(book.data()), book.size(),
+            "book.xlsx", opts);
+
+        assert_targets_exist(first, dir);
+        assert_targets_exist(second, dir);
+        ASSERT(image_targets(first) != image_targets(second));
+        std::filesystem::remove_all(dir);
+    TEST_END
+
+    TEST(xlsx_chunk_reference_matches_markdown)
+        // The chunk API emits its own references; they used to drop both the
+        // extension and image_ref_prefix that the markdown API applies.
+        auto book = make_media_xlsx();
+        std::string dir = temp_image_dir("xlsx_image_ref_chunks");
+        jdoc::ConvertOptions opts;
+        opts.images = true;
+        opts.min_image_size = 0;
+        opts.image_dir = dir;
+        opts.image_ref_prefix = "media/";
+
+        auto chunks = jdoc::office_to_markdown_chunks_mem(
+            reinterpret_cast<const uint8_t*>(book.data()), book.size(),
+            "book.xlsx", opts);
+        std::string text;
+        for (const auto& c : chunks) text += c.text;
+        auto targets = image_targets(text);
+        ASSERT(targets.size() == 1);
+        ASSERT(targets[0].rfind("media/", 0) == 0);
+        assert_targets_exist(text, dir);
+        std::filesystem::remove_all(dir);
+    TEST_END
+
+    TEST(pptx_reference_follows_the_collision_suffix)
+        // Guard the paths that already got this right against regressing.
+        auto deck = make_shared_media_pptx();
+        std::string dir = temp_image_dir("pptx_image_ref_shared");
+        jdoc::ConvertOptions opts;
+        opts.images = true;
+        opts.min_image_size = 0;
+        opts.image_dir = dir;
+
+        auto first = jdoc::office_to_markdown_mem(
+            reinterpret_cast<const uint8_t*>(deck.data()), deck.size(),
+            "deck.pptx", opts);
+        auto second = jdoc::office_to_markdown_mem(
+            reinterpret_cast<const uint8_t*>(deck.data()), deck.size(),
+            "deck.pptx", opts);
+
+        assert_targets_exist(first, dir);
+        assert_targets_exist(second, dir);
+        ASSERT(image_targets(first) != image_targets(second));
+        std::filesystem::remove_all(dir);
+    TEST_END
+}
+
 // ── XLSX streaming (SAX) path ────────────────────────────────
 
 // A workbook exercising every construct the streaming scanner must replicate
@@ -1253,6 +1374,7 @@ int main() {
     test_pptx_shared_media();
     test_docx_header_footer();
     test_xlsx_fixes();
+    test_image_reference_matches_file();
     test_xlsx_streaming();
     test_xls_sst_continue();
     test_xlsb_sparse_cells();
