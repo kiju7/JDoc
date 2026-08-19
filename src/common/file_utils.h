@@ -14,12 +14,6 @@
 #include <utility>
 #include <vector>
 
-#ifdef _WIN32
-  #include <direct.h>
-#else
-  #include <sys/stat.h>
-#endif
-
 namespace jdoc { namespace util {
 
 // Public APIs carry UTF-8 paths on every platform. std::filesystem::u8path
@@ -38,15 +32,6 @@ inline FILE* fopen_utf8(const std::string& path, const char* mode) {
     return _wfopen(io_path(path).c_str(), wide_mode.c_str());
 #else
     return std::fopen(path.c_str(), mode);
-#endif
-}
-
-inline void make_dir_utf8(const std::string& path) {
-    if (path.empty()) return;
-#ifdef _WIN32
-    _wmkdir(io_path(path).c_str());
-#else
-    mkdir(path.c_str(), 0755);
 #endif
 }
 
@@ -137,17 +122,14 @@ inline std::string escape_cell(const std::string& text) {
 
 // Create a directory (no error on existing).
 inline void ensure_dir(const std::string& dir) {
-    make_dir_utf8(dir);
+    if (dir.empty()) return;
+    std::error_code ignored;
+    std::filesystem::create_directories(io_path(dir), ignored);
 }
 
 // Create a directory and any missing parents (mkdir -p).
-// Splits on both separators so Windows-style "\" paths work too.
 inline void ensure_dirs(const std::string& dir) {
-    for (size_t pos = 0; pos != std::string::npos; ) {
-        pos = dir.find_first_of("/\\", pos + 1);
-        std::string parent = dir.substr(0, pos);
-        make_dir_utf8(parent);
-    }
+    ensure_dir(dir);
 }
 
 // Render rows as a GitHub-flavored markdown table; the first row is the header.
