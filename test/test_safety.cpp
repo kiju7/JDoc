@@ -13,6 +13,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <fstream>
 #include <iostream>
 #include <iomanip>
@@ -1155,15 +1156,22 @@ void test_concurrent_image_saves_do_not_overwrite() {
     constexpr size_t kCount = 8;
     std::vector<std::string> paths(kCount);
     std::vector<std::string> payloads(kCount);
+    std::vector<std::exception_ptr> errors(kCount);
     std::vector<std::thread> threads;
     for (size_t i = 0; i < kCount; ++i) {
         payloads[i] = "payload-" + std::to_string(i);
         threads.emplace_back([&, i] {
-            paths[i] = jdoc::util::save_named_file(
-                dir, "page1_img0.png", payloads[i].data(), payloads[i].size());
+            try {
+                paths[i] = jdoc::util::save_named_file(
+                    dir, "page1_img0.png", payloads[i].data(), payloads[i].size());
+            } catch (...) {
+                errors[i] = std::current_exception();
+            }
         });
     }
     for (auto& thread : threads) thread.join();
+    for (const auto& error : errors)
+        if (error) std::rethrow_exception(error);
 
     std::set<std::string> unique_paths(paths.begin(), paths.end());
     CHECK(unique_paths.size() == kCount);
