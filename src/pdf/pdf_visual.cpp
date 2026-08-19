@@ -1219,17 +1219,9 @@ std::vector<ExtractedImage> extract_page_images(PdfDoc& doc, const PdfObj& resou
             }
 
             if (!output_dir.empty()) {
-                std::string ext, path;
-                if (img.format == "jpeg") ext = ".jpg";
-                else if (img.format == "jp2") ext = ".jp2";
-                else ext = ".png";
-                path = output_dir + "/" + img.name + ext;
-
-                std::ofstream ofs(path, std::ios::binary);
-                if (ofs) {
-                    ofs.write(img.data.data(), img.data.size());
-                    img.saved_path = path;
-                }
+                img.saved_path = util::save_image_to_file(
+                    output_dir, img.name, img.format,
+                    img.data.data(), img.data.size());
                 if (!img.saved_path.empty()) {
                     discard_image_payload(img);
                 }
@@ -2514,12 +2506,8 @@ static ImageData render_composite_view(
     img.data = std::move(png);
 
     if (!output_dir.empty()) {
-        std::string path = output_dir + "/" + img.name + ".png";
-        std::ofstream f(path, std::ios::binary);
-        if (f) {
-            f.write(img.data.data(), static_cast<std::streamsize>(img.data.size()));
-            img.saved_path = path;
-        }
+        img.saved_path = util::save_image_to_file(
+            output_dir, img.name, "png", img.data.data(), img.data.size());
         if (!img.saved_path.empty()) {
             discard_image_payload(img);
         }

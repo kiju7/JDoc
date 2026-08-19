@@ -10,6 +10,7 @@ import com.sun.jna.Structure;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.List;
 
 /**
@@ -24,7 +25,8 @@ import java.util.List;
  */
 public interface JdocLibrary extends Library {
 
-    JdocLibrary INSTANCE = Native.load("jdoc", JdocLibrary.class);
+    JdocLibrary INSTANCE = Native.load("jdoc", JdocLibrary.class,
+            Collections.singletonMap(Library.OPTION_STRING_ENCODING, "UTF-8"));
 
     /** Mirrors the C {@code JDocOptions} struct. A zero-filled struct is NOT a
      *  valid default (tables would be off and images unfiltered) — build one
@@ -114,11 +116,15 @@ public interface JdocLibrary extends Library {
     Pointer jdoc_convert(String filePath, JDocOptions opts,
                          byte[] errBuf, int errBufSize);
 
+    Pointer jdoc_convert_mem(byte[] data, int size, String nameHint,
+                             JDocOptions opts, byte[] errBuf, int errBufSize);
+
     void jdoc_free_string(Pointer str);
 
     /** Mirrors the C {@code JDocImage} struct. All pointers are owned natively. */
     @Structure.FieldOrder({"page_number", "name", "width", "height",
-                           "data", "data_size", "format", "saved_path"})
+                           "data", "data_size", "format", "saved_path",
+                           "components", "pixels", "pixels_size", "embedded_text"})
     class JDocImage extends Structure {
         public int page_number;
         public Pointer name;
@@ -128,18 +134,48 @@ public interface JdocLibrary extends Library {
         public int data_size;
         public Pointer format;
         public Pointer saved_path;
+        public int components;
+        public Pointer pixels;
+        public int pixels_size;
+        public Pointer embedded_text;
 
         public JDocImage() {}
         public JDocImage(Pointer p) { super(p); }
     }
 
+    @Structure.FieldOrder({"cells", "cell_count"})
+    class JDocTableRow extends Structure {
+        public Pointer cells;       // char*[cell_count]
+        public int cell_count;
+
+        public JDocTableRow() {}
+        public JDocTableRow(Pointer p) { super(p); }
+    }
+
+    @Structure.FieldOrder({"rows", "row_count"})
+    class JDocTable extends Structure {
+        public Pointer rows;        // JDocTableRow[row_count]
+        public int row_count;
+
+        public JDocTable() {}
+        public JDocTable(Pointer p) { super(p); }
+    }
+
     /** Mirrors the C {@code JDocPage} struct. */
-    @Structure.FieldOrder({"page_number", "text", "images", "image_count"})
+    @Structure.FieldOrder({"page_number", "text", "images", "image_count",
+                           "page_width", "page_height", "body_font_size",
+                           "tables", "table_count", "degraded_images"})
     class JDocPage extends Structure {
         public int page_number;
         public Pointer text;
         public Pointer images;      // JDocImage[image_count]
         public int image_count;
+        public double page_width;
+        public double page_height;
+        public double body_font_size;
+        public Pointer tables;      // JDocTable[table_count]
+        public int table_count;
+        public int degraded_images;
 
         public JDocPage() {}
         public JDocPage(Pointer p) { super(p); }
@@ -165,9 +201,19 @@ public interface JdocLibrary extends Library {
                                com.sun.jna.ptr.IntByReference outCount,
                                byte[] errBuf, int errBufSize);
 
+    Pointer jdoc_convert_pages_mem(byte[] data, int size, String nameHint,
+                                   JDocOptions opts,
+                                   com.sun.jna.ptr.IntByReference outCount,
+                                   byte[] errBuf, int errBufSize);
+
     int jdoc_convert_pages_stream(String filePath, JDocOptions opts,
                                   JDocPageCallback cb, Pointer userdata,
                                   byte[] errBuf, int errBufSize);
+
+    int jdoc_convert_pages_mem_stream(byte[] data, int size, String nameHint,
+                                      JDocOptions opts, JDocPageCallback cb,
+                                      Pointer userdata, byte[] errBuf,
+                                      int errBufSize);
 
     void jdoc_free_pages(Pointer pages, int count);
 

@@ -3,19 +3,25 @@
 #include "common/string_utils.h"
 #include "pdf/pdf_content.h"
 #include "pdf/pdf_extract.h"
+#include "jdoc/detect.h"
 #include "jdoc/jdoc.h"
 #include "jdoc/pdf.h"
 
 #include <zlib.h>
 
 #include <cstdint>
+#include <chrono>
+#include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <fstream>
 #include <iostream>
 #include <iomanip>
 #include <limits>
+#include <set>
 #include <sstream>
 #include <stdexcept>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -1118,34 +1124,160 @@ void test_memory_streaming_supports_eml() {
     CHECK(chunks[0].text.find("streamed body") != std::string::npos);
 }
 
+void test_empty_memory_and_invalid_pages_are_consistent() {
+    CHECK(jdoc::detect(nullptr, 0, "empty.txt").format == "TXT");
+    CHECK(jdoc::convert(nullptr, 0, "empty.txt") == "");
+    const auto pages = jdoc::convert_chunks(nullptr, 0, "empty.txt");
+    CHECK(pages.size() == 1);
+    CHECK(pages[0].text.empty());
+
+    jdoc::ConvertOptions opts;
+    opts.pages = {-1};
+    bool rejected = false;
+    try {
+        (void)jdoc::convert(nullptr, 0, "empty.txt", opts);
+    } catch (const std::invalid_argument&) {
+        rejected = true;
+    }
+    CHECK(rejected);
+}
+
+void test_concurrent_image_saves_do_not_overwrite() {
+    std::string base = "/tmp";
+    for (const char* var : {"TMPDIR", "TEMP", "TMP"}) {
+        const char* value = std::getenv(var);
+        if (value && *value) { base = value; break; }
+    }
+    const auto nonce = std::chrono::high_resolution_clock::now()
+                           .time_since_epoch().count();
+    const std::string dir = base + "/jdoc-save-collision-" +
+                            std::to_string(nonce);
+
+    constexpr size_t kCount = 8;
+    std::vector<std::string> paths(kCount);
+    std::vector<std::string> payloads(kCount);
+    std::vector<std::exception_ptr> errors(kCount);
+    std::vector<std::thread> threads;
+    for (size_t i = 0; i < kCount; ++i) {
+        payloads[i] = "payload-" + std::to_string(i);
+        threads.emplace_back([&, i] {
+            try {
+                paths[i] = jdoc::util::save_named_file(
+                    dir, "page1_img0.png", payloads[i].data(), payloads[i].size());
+            } catch (...) {
+                errors[i] = std::current_exception();
+            }
+        });
+    }
+    for (auto& thread : threads) thread.join();
+    for (const auto& error : errors)
+        if (error) std::rethrow_exception(error);
+
+    std::set<std::string> unique_paths(paths.begin(), paths.end());
+    CHECK(unique_paths.size() == kCount);
+    std::set<std::string> actual_payloads;
+    for (const auto& path : paths) {
+        CHECK(!path.empty());
+        {
+            std::ifstream in(jdoc::util::io_path(path), std::ios::binary);
+            CHECK(in.good());
+            actual_payloads.emplace(std::istreambuf_iterator<char>(in),
+                                    std::istreambuf_iterator<char>());
+        } // Windows requires the read handle to close before deletion.
+        std::error_code remove_error;
+        CHECK(std::filesystem::remove(jdoc::util::io_path(path), remove_error));
+        CHECK(!remove_error);
+    }
+    CHECK(actual_payloads == std::set<std::string>(payloads.begin(), payloads.end()));
+    std::error_code remove_error;
+    CHECK(std::filesystem::remove(jdoc::util::io_path(dir), remove_error));
+    CHECK(!remove_error);
+}
+
+void test_utf8_file_and_output_paths() {
+    std::string base = "/tmp";
+    for (const char* var : {"TMPDIR", "TEMP", "TMP"}) {
+        const char* value = std::getenv(var);
+        if (value && *value) { base = value; break; }
+    }
+    const auto nonce = std::chrono::high_resolution_clock::now()
+                           .time_since_epoch().count();
+    const std::string dir = base + "/jdoc-ê²½ë¡-" +
+                            std::to_string(nonce);
+    const std::string input = dir + "/ë¬¸ì.pdf";
+    const std::string image_dir = dir + "/ì´ë¯¸ì§";
+
+    jdoc::util::ensure_dirs(dir);
+    {
+        std::ofstream out(jdoc::util::io_path(input), std::ios::binary);
+        CHECK(out.good());
+        const std::string pdf = image_pdf();
+        out.write(pdf.data(), static_cast<std::streamsize>(pdf.size()));
+    }
+
+    CHECK(jdoc::detect(input).format == "PDF");
+    jdoc::ConvertOptions opts;
+    opts.image_dir = image_dir;
+    opts.min_image_size = 0;
+    const auto pages = jdoc::convert_chunks(input, opts);
+    CHECK(pages.size() == 1);
+    CHECK(pages[0].images.size() == 1);
+    CHECK(!pages[0].images[0].saved_path.empty());
+    CHECK(std::filesystem::exists(
+        jdoc::util::io_path(pages[0].images[0].saved_path)));
+
+    std::filesystem::remove_all(jdoc::util::io_path(dir));
+}
+
 } // namespace
 
 int main() {
-    test_ole_rejects_invalid_sector_shift();
-    test_ole_rejects_oversized_directory_name();
-    test_ole_directory_cycle_terminates();
-    test_ole_rejects_stream_larger_than_source();
-    test_png_rejects_short_pixels();
-    test_png_converts_cmyk();
-    test_pdf_honors_images_option();
-    test_pdf_composite_clips_extreme_coordinates_before_narrowing();
-    test_pdf_region_composite_matches_translated_geometry();
-    test_pdf_inline_flate_ignores_embedded_ei();
-    test_pdf_pattern_shading_does_not_fill_triangle_bbox();
-    test_pdf_radial_shading_preserves_unextended_center();
-    test_pdf_composite_skips_fully_transparent_masks();
-    test_pdf_composite_applies_clip_rect();
-    test_pdf_composite_renders_axial_shading();
-    test_pdf_reads_rotated_text();
-    test_pdf_table_cell_rotated_text();
-    test_pdf_line_width_follows_ctm();
-    test_pdf_cell_assembly_reading_order();
-    test_pdf_lists_attachments();
-    test_pdf_preserves_same_named_attachments();
-    test_pdf_attachment_name_cannot_forge_structure();
-    test_pdf_rotated_run_not_merged_into_body_line();
-    test_pdf_name_tree_cycle_terminates();
-    test_pdf_decodes_surrogate_pair();
-    test_memory_streaming_supports_eml();
+    const auto run = [](const char* name, void (*test)()) {
+        std::cerr << "[ RUN      ] " << name << std::endl;
+        try {
+            test();
+        } catch (const std::exception& error) {
+            std::cerr << "[  FAILED  ] " << name << ": " << error.what()
+                      << std::endl;
+            return false;
+        } catch (...) {
+            std::cerr << "[  FAILED  ] " << name << ": unknown exception"
+                      << std::endl;
+            return false;
+        }
+        std::cerr << "[       OK ] " << name << std::endl;
+        return true;
+    };
+#define RUN_TEST(test) do { if (!run(#test, &test)) return 1; } while (false)
+    RUN_TEST(test_ole_rejects_invalid_sector_shift);
+    RUN_TEST(test_ole_rejects_oversized_directory_name);
+    RUN_TEST(test_ole_directory_cycle_terminates);
+    RUN_TEST(test_ole_rejects_stream_larger_than_source);
+    RUN_TEST(test_png_rejects_short_pixels);
+    RUN_TEST(test_png_converts_cmyk);
+    RUN_TEST(test_pdf_honors_images_option);
+    RUN_TEST(test_pdf_composite_clips_extreme_coordinates_before_narrowing);
+    RUN_TEST(test_pdf_region_composite_matches_translated_geometry);
+    RUN_TEST(test_pdf_inline_flate_ignores_embedded_ei);
+    RUN_TEST(test_pdf_pattern_shading_does_not_fill_triangle_bbox);
+    RUN_TEST(test_pdf_radial_shading_preserves_unextended_center);
+    RUN_TEST(test_pdf_composite_skips_fully_transparent_masks);
+    RUN_TEST(test_pdf_composite_applies_clip_rect);
+    RUN_TEST(test_pdf_composite_renders_axial_shading);
+    RUN_TEST(test_pdf_reads_rotated_text);
+    RUN_TEST(test_pdf_table_cell_rotated_text);
+    RUN_TEST(test_pdf_line_width_follows_ctm);
+    RUN_TEST(test_pdf_cell_assembly_reading_order);
+    RUN_TEST(test_pdf_lists_attachments);
+    RUN_TEST(test_pdf_preserves_same_named_attachments);
+    RUN_TEST(test_pdf_attachment_name_cannot_forge_structure);
+    RUN_TEST(test_pdf_rotated_run_not_merged_into_body_line);
+    RUN_TEST(test_pdf_name_tree_cycle_terminates);
+    RUN_TEST(test_pdf_decodes_surrogate_pair);
+    RUN_TEST(test_memory_streaming_supports_eml);
+    RUN_TEST(test_empty_memory_and_invalid_pages_are_consistent);
+    RUN_TEST(test_concurrent_image_saves_do_not_overwrite);
+    RUN_TEST(test_utf8_file_and_output_paths);
+#undef RUN_TEST
     std::cout << "Safety regression tests passed\n";
 }

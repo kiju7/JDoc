@@ -3,7 +3,9 @@ plugins {
 }
 
 group = 'com.jiran'
-version = '1.0.0'
+def versionMatch = file('../../CMakeLists.txt').text =~
+        /project\(jdoc VERSION ([0-9]+\.[0-9]+\.[0-9]+)/
+version = versionMatch.find() ? versionMatch.group(1) : 'unspecified'
 
 repositories {
     mavenCentral()

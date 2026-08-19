@@ -27,12 +27,32 @@ class CMakeExtension(Extension):
 class CMakeBuild(build_ext):
     def build_extension(self, ext):
         extdir = os.fspath(Path(self.get_ext_fullpath(ext.name)).parent.resolve())
+        expected_name = Path(self.get_ext_fullpath(ext.name)).name
+        # bdist_wheel collects files from build/lib. Remove only stale native
+        # modules for this extension; otherwise a previous cpXY build can be
+        # bundled alongside the current ABI even when CMake now builds the
+        # correct file.
+        for candidate in Path(extdir).glob(f"{ext.name}.*"):
+            if (candidate.name != expected_name and
+                    candidate.suffix.lower() in {".so", ".pyd", ".dylib"}):
+                candidate.unlink()
         cfg = "Release"
 
         import pybind11
         cmake_args = [
             f"-DCMAKE_LIBRARY_OUTPUT_DIRECTORY={extdir}",
+            # Multi-config generators (notably Visual Studio) otherwise place
+            # the module in an extra Release/ directory where wheel assembly
+            # does not find it.
+            f"-DCMAKE_LIBRARY_OUTPUT_DIRECTORY_{cfg.upper()}={extdir}",
+            # Pass both modern FindPython and legacy spellings. The build
+            # directory may contain a cache from another interpreter; without
+            # the modern variable a cpXY wheel can accidentally contain an
+            # extension carrying a different CPython ABI suffix.
+            f"-DPython_EXECUTABLE={sys.executable}",
+            f"-DPython3_EXECUTABLE={sys.executable}",
             f"-DPYTHON_EXECUTABLE={sys.executable}",
+            f"-DPython_ROOT_DIR={sys.prefix}",
             f"-Dpybind11_DIR={pybind11.get_cmake_dir()}",
             f"-DCMAKE_BUILD_TYPE={cfg}",
             "-DBUILD_PYTHON=ON",
@@ -43,7 +63,9 @@ class CMakeBuild(build_ext):
 
         build_args = ["--config", cfg, "--target", "_jdoc"]
 
-        build_temp = Path(self.build_temp) / ext.name
+        # Never reuse a CMake cache created for another CPython ABI.
+        build_temp = (Path(self.build_temp) /
+                      f"{ext.name}-{sys.implementation.cache_tag}")
         build_temp.mkdir(parents=True, exist_ok=True)
 
         subprocess.run(

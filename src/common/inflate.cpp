@@ -1,5 +1,6 @@
 // inflate.cpp - libdeflate-backed whole-buffer decompression. License: MIT
 #include "common/inflate.h"
+#include "common/libdeflate_init.h"
 #include <libdeflate.h>
 #include <limits>
 
@@ -10,6 +11,7 @@ namespace {
 // One decompressor per thread, reused across calls (libdeflate decompressors
 // are stateless between calls) and released when the thread exits.
 libdeflate_decompressor* thread_decompressor() {
+    util::ensure_libdeflate_runtime_initialized();
     struct Holder {
         Holder() : ptr(libdeflate_alloc_decompressor()) {}
         ~Holder() { libdeflate_free_decompressor(ptr); }

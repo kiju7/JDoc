@@ -4,6 +4,7 @@
 
 #include "jdoc/jdoc.h"
 #include "jdoc/archive.h"
+#include "common/file_utils.h"
 #include <cstdint>
 #include <iostream>
 #include <fstream>
@@ -188,7 +189,7 @@ int main(int argc, char* argv[]) {
             std::ofstream ofs;
             std::ostream* out = &std::cout;
             if (!output_path.empty()) {
-                ofs.open(output_path);
+                ofs.open(jdoc::util::io_path(output_path));
                 if (!ofs) {
                     std::cerr << "Error: Cannot write to " << output_path << "\n";
                     return 1;
@@ -216,7 +217,7 @@ int main(int argc, char* argv[]) {
             std::ofstream ofs;
             std::ostream* out = &std::cout;
             if (!output_path.empty()) {
-                ofs.open(output_path);
+                ofs.open(jdoc::util::io_path(output_path));
                 if (!ofs) {
                     std::cerr << "Error: Cannot write to " << output_path << "\n";
                     return 1;
@@ -240,7 +241,7 @@ int main(int argc, char* argv[]) {
             if (output_path.empty()) {
                 std::cout << md << std::endl;
             } else {
-                std::ofstream ofs(output_path);
+                std::ofstream ofs(jdoc::util::io_path(output_path));
                 if (!ofs) {
                     std::cerr << "Error: Cannot write to " << output_path << "\n";
                     return 1;

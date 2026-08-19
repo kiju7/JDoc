@@ -109,7 +109,8 @@ std::string decode_encoded_words(const std::string& in) {
 // ── Constructors ────────────────────────────────────────────
 
 EmlParser::EmlParser(const std::string& file_path) {
-    std::ifstream ifs(file_path, std::ios::binary | std::ios::ate);
+    std::ifstream ifs(util::io_path(file_path),
+                      std::ios::binary | std::ios::ate);
     if (!ifs) return;
     std::streamsize size = ifs.tellg();
     if (size <= 0) return;

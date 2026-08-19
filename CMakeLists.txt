@@ -12,6 +12,10 @@ if(MSVC)
 endif()
 
 option(JDOC_ENABLE_SANITIZERS "Enable AddressSanitizer and UBSan" OFF)
+option(JDOC_ENABLE_THREAD_SANITIZER "Enable ThreadSanitizer" OFF)
+if(JDOC_ENABLE_SANITIZERS AND JDOC_ENABLE_THREAD_SANITIZER)
+    message(FATAL_ERROR "ASan/UBSan and ThreadSanitizer cannot be enabled together")
+endif()
 if(JDOC_ENABLE_SANITIZERS)
     if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
         add_compile_options(-fsanitize=address,undefined
@@ -20,6 +24,15 @@ if(JDOC_ENABLE_SANITIZERS)
     else()
         message(FATAL_ERROR
             "JDOC_ENABLE_SANITIZERS requires Clang or GCC")
+    endif()
+endif()
+if(JDOC_ENABLE_THREAD_SANITIZER)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+        add_compile_options(-fsanitize=thread -fno-omit-frame-pointer)
+        add_link_options(-fsanitize=thread)
+    else()
+        message(FATAL_ERROR
+            "JDOC_ENABLE_THREAD_SANITIZER requires Clang or GCC")
     endif()
 endif()
 
@@ -193,6 +206,14 @@ target_compile_definitions(lzma_sdk PRIVATE Z7_PPMD_SUPPORT)
 # fail with a clear error.
 option(JDOC_WITH_BZIP2 "Decode bzip2 (.bz2, alz/egg members) via system libbz2" OFF)
 
+# GCC 8 requires explicit linking for std::filesystem.  This must be a public
+# dependency of the core archive because filesystem paths are used by library
+# translation units as well as the CLI and tests.
+set(JDOC_FILESYSTEM_LIB "")
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS 9)
+    set(JDOC_FILESYSTEM_LIB stdc++fs)
+endif()
+
 add_library(jdoc_lib STATIC
     # common + zip
     src/common/string_utils.cpp
@@ -264,7 +285,8 @@ target_include_directories(jdoc_lib
     PUBLIC include
     PRIVATE src vendor vendor/pugixml vendor/lzma)
 target_link_libraries(jdoc_lib PUBLIC ZLIB::ZLIB JPEG::JPEG Threads::Threads
-                                       libdeflate::libdeflate_static)
+                                       libdeflate::libdeflate_static
+                                       ${JDOC_FILESYSTEM_LIB})
 if(JDOC_WITH_BZIP2)
     find_package(BZip2 REQUIRED)
     target_compile_definitions(jdoc_lib PRIVATE JDOC_WITH_BZIP2)
@@ -279,7 +301,7 @@ target_include_directories(jdoc_shared PUBLIC include PRIVATE src)
 set_target_properties(jdoc_shared PROPERTIES
     OUTPUT_NAME "jdoc"
     VERSION ${PROJECT_VERSION}
-    SOVERSION 4
+    SOVERSION 5
 )
 
 
@@ -293,14 +315,6 @@ endif()
 add_executable(jdoc src/main.cpp)
 target_link_libraries(jdoc PRIVATE jdoc_lib)
 target_include_directories(jdoc PRIVATE include src)
-
-# GCC 8 requires explicit linking for std::filesystem
-set(JDOC_FILESYSTEM_LIB "")
-if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS 9)
-    set(JDOC_FILESYSTEM_LIB stdc++fs)
-    target_link_libraries(jdoc PRIVATE ${JDOC_FILESYSTEM_LIB})
-endif()
-
 
 # ── Tests ─────────────────────────────────────────────────────
 # Opt-in: `cmake -B build` yields just the library + CLI. Configure with
@@ -321,6 +335,12 @@ if(JDOC_BUILD_TESTS)
                  WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
     endforeach()
 
+    add_executable(test_c_api test/test_c_api.cpp)
+    target_link_libraries(test_c_api PRIVATE jdoc_shared)
+    target_include_directories(test_c_api PRIVATE include)
+    add_test(NAME test_c_api COMMAND test_c_api
+             WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
     # Concurrency test: exercises the C API from many threads, so it links the
     # shared library (where the C API lives) rather than jdoc_lib.
     add_executable(test_thread_safety test/test_thread_safety.cpp)
@@ -328,6 +348,10 @@ if(JDOC_BUILD_TESTS)
     target_include_directories(test_thread_safety PRIVATE include src)
     add_test(NAME test_thread_safety COMMAND test_thread_safety
              WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+    if(JDOC_ENABLE_THREAD_SANITIZER)
+        set_tests_properties(test_thread_safety PROPERTIES
+            ENVIRONMENT "JDOC_THREAD_TEST_QUICK=1")
+    endif()
 endif()
 
 # ── Python bindings (pybind11) ────────────────────────────────

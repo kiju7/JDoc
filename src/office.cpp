@@ -79,7 +79,7 @@ DocFormat detect_office_format(const std::string& file_path) {
     // Read first 8 bytes for magic detection
     unsigned char magic[8] = {};
     {
-        std::ifstream f(file_path, std::ios::binary);
+        std::ifstream f(util::io_path(file_path), std::ios::binary);
         if (!f) return DocFormat::UNKNOWN;
         f.read(reinterpret_cast<char*>(magic), 8);
     }
@@ -166,7 +166,7 @@ DocFormat detect_office_format(const std::string& file_path) {
     // Content-based HTML detection: look for <html or <!DOCTYPE
     if (magic[0] == '<') {
         // Read more bytes for detection
-        std::ifstream f(file_path, std::ios::binary);
+        std::ifstream f(util::io_path(file_path), std::ios::binary);
         if (f) {
             char buf[256] = {};
             f.read(buf, sizeof(buf));

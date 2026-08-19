@@ -2,6 +2,7 @@
 // License: MIT
 
 #include "archive/input_stream.h"
+#include "common/file_utils.h"
 #include <zlib.h>
 #include <cstdint>
 #include <cstring>
@@ -105,7 +106,7 @@ const uint8_t* FileStream::view(size_t len) {
 #else  // non-POSIX: buffered FILE*, no mapping (view() falls back to read())
 
 FileStream::FileStream(const std::string& path) {
-    fp_ = fopen(path.c_str(), "rb");
+    fp_ = util::fopen_utf8(path, "rb");
 }
 
 FileStream::~FileStream() {

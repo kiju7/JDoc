@@ -18,7 +18,7 @@ namespace jdoc {
 HtmlParser::HtmlParser(const std::string& file_path,
                        const std::string& charset_hint)
     : file_path_(file_path), charset_hint_(charset_hint) {
-    std::ifstream ifs(file_path, std::ios::binary);
+    std::ifstream ifs(util::io_path(file_path), std::ios::binary);
     if (!ifs) return;
     ifs.seekg(0, std::ios::end);
     size_t size = ifs.tellg();

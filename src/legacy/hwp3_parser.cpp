@@ -726,7 +726,7 @@ bool is_hwp3_signature(const uint8_t* data, size_t size) {
 }
 
 Hwp3Parser::Hwp3Parser(const std::string& file_path) {
-    std::ifstream f(file_path, std::ios::binary);
+    std::ifstream f(util::io_path(file_path), std::ios::binary);
     if (!f) throw std::runtime_error("Cannot open file: " + file_path);
     owned_.assign(std::istreambuf_iterator<char>(f),
                   std::istreambuf_iterator<char>());
@@ -756,4 +756,3 @@ std::vector<PageChunk> Hwp3Parser::to_chunks(const ConvertOptions& opts) {
 }
 
 } // namespace jdoc
-

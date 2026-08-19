@@ -23,6 +23,11 @@ std::string convert(const void* data, size_t size, const std::string& name_hint,
 std::vector<PageChunk> convert_chunks(const std::string& file_path,
                                        ConvertOptions opts = {});
 
+// In-memory counterpart to convert_chunks(file_path).
+std::vector<PageChunk> convert_chunks(const void* data, size_t size,
+                                      const std::string& name_hint,
+                                      ConvertOptions opts = {});
+
 // Streaming variant: pages are delivered one at a time to `sink` and not
 // accumulated, so peak memory tracks a single page rather than the whole
 // document and the first page is available before the rest are parsed.

@@ -7,8 +7,7 @@ extern "C" {
 
 /* ── Options ──────────────────────────────────────────────── */
 
-/* Field names match the C++ ConvertOptions / Python keywords one-to-one.
- * Initialize with jdoc_default_options(); a zero-filled struct is NOT a
+/* Initialize with jdoc_default_options(); a zero-filled struct is NOT a
  * valid default (tables would be off). */
 typedef struct {
     /* conversion */
@@ -41,19 +40,39 @@ typedef struct {
     char* name;                      /* e.g. "page1_img0" */
     unsigned int width;
     unsigned int height;
-    char* data;                      /* raw image bytes (jpeg/png/bmp) */
+    char* data;                      /* encoded image bytes (jpeg/png/bmp) */
     int data_size;
     char* format;                    /* "jpeg", "png", "bmp", ... */
     char* saved_path;                /* disk path if image_dir was set */
+    int components;                  /* raw pixel components: 1/3/4 */
+    char* pixels;                    /* raw pixel bytes, if retained */
+    int pixels_size;
+    char* embedded_text;             /* text recovered from EMF/WMF */
 } JDocImage;
 
 /* ── Page ─────────────────────────────────────────────────── */
+
+typedef struct {
+    char** cells;
+    int cell_count;
+} JDocTableRow;
+
+typedef struct {
+    JDocTableRow* rows;
+    int row_count;
+} JDocTable;
 
 typedef struct {
     int page_number;
     char* text;                      /* markdown or plaintext for this page */
     JDocImage* images;               /* images belonging to this page */
     int image_count;
+    double page_width;
+    double page_height;
+    double body_font_size;
+    JDocTable* tables;
+    int table_count;
+    int degraded_images;
 } JDocPage;
 
 /* ── API ──────────────────────────────────────────────────── */
@@ -61,6 +80,8 @@ typedef struct {
 /* Convert document to text. Returns malloc'd string.
  * opts may be NULL for defaults.
  * Returns NULL on error; message written to err_buf. */
+/* All path and name strings accepted or returned by this API are UTF-8 on
+ * every platform, including Windows. */
 char* jdoc_convert(const char* file_path, const JDocOptions* opts,
                    char* err_buf, int err_buf_size);
 
@@ -85,6 +106,17 @@ typedef int (*JDocPageCallback)(const JDocPage* page, void* userdata);
 int jdoc_convert_pages_stream(const char* file_path, const JDocOptions* opts,
                               JDocPageCallback cb, void* userdata,
                               char* err_buf, int err_buf_size);
+
+/* In-memory counterparts to jdoc_convert_pages / _stream. */
+JDocPage* jdoc_convert_pages_mem(const void* data, int size,
+                                 const char* name_hint,
+                                 const JDocOptions* opts, int* out_count,
+                                 char* err_buf, int err_buf_size);
+int jdoc_convert_pages_mem_stream(const void* data, int size,
+                                  const char* name_hint,
+                                  const JDocOptions* opts,
+                                  JDocPageCallback cb, void* userdata,
+                                  char* err_buf, int err_buf_size);
 
 /* ── Archive ──────────────────────────────────────────────── */
 
@@ -125,7 +157,8 @@ JDocMember* jdoc_convert_archive(const char* file_path, const JDocOptions* opts,
                                  char* err_buf, int err_buf_size);
 
 /* Convert a document held in memory. name_hint (e.g. original filename)
- * resolves extension-based format ambiguity; may be NULL. */
+ * resolves extension-based format ambiguity; may be NULL. data may be NULL
+ * only when size is 0; an empty input is treated as an empty text document. */
 char* jdoc_convert_mem(const void* data, int size, const char* name_hint,
                        const JDocOptions* opts,
                        char* err_buf, int err_buf_size);
