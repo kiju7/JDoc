@@ -32,10 +32,12 @@ inline std::string save_unique_named_file(const std::string& dir,
     if (dir.empty() || filename.empty() || !data || size == 0) return "";
     if (size > static_cast<size_t>(std::numeric_limits<std::streamsize>::max()))
         return "";
-    ensure_dirs(dir);
-
     static std::mutex output_mutex;
     std::lock_guard<std::mutex> lock(output_mutex);
+    // Directory creation is part of the same critical section as filename
+    // selection and writing. In particular, concurrent create_directories()
+    // calls for the same missing path are not reliable on every Windows CRT.
+    ensure_dirs(dir);
 
     const size_t dot = filename.rfind('.');
     const bool has_ext = dot != std::string::npos && dot != 0;
