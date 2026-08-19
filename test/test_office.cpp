@@ -1059,6 +1059,31 @@ void test_image_reference_matches_file() {
         std::filesystem::remove_all(dir);
     TEST_END
 
+    TEST(a_directory_in_the_way_is_stepped_over)
+        // A name already taken by a directory is taken all the same: the
+        // writer must move to the next name, not give up. POSIX reports this
+        // as EEXIST; this pins that Windows agrees, since the two report it
+        // through completely different error codes.
+        std::string dir = temp_image_dir("dir_in_the_way");
+        std::filesystem::create_directories(
+            std::filesystem::path(dir) / "page1_img0.png");
+
+        auto book = make_media_xlsx();
+        jdoc::ConvertOptions opts;
+        opts.images = true;
+        opts.min_image_size = 0;
+        opts.image_dir = dir;
+
+        auto md = jdoc::office_to_markdown_mem(
+            reinterpret_cast<const uint8_t*>(book.data()), book.size(),
+            "book.xlsx", opts);
+        auto targets = image_targets(md);
+        ASSERT(targets.size() == 1);
+        ASSERT(targets[0].find("page1_img0_1.png") != std::string::npos);
+        assert_targets_exist(md, dir);
+        std::filesystem::remove_all(dir);
+    TEST_END
+
     TEST(a_failed_write_emits_no_reference)
         // Every parser now routes through store_image, so a write that cannot
         // happen costs the reference too — a link to a file that does not exist

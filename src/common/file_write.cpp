@@ -46,6 +46,14 @@ ExclusiveWriteResult write_exclusive_file(const std::string& path,
             return ExclusiveWriteResult::exists;
         if (error == ERROR_PATH_NOT_FOUND || error == ERROR_FILE_NOT_FOUND)
             return ExclusiveWriteResult::missing_dir;
+        // POSIX reports every taken name as EEXIST, whatever is sitting there.
+        // Windows is narrower: only a file in the way is a collision, while a
+        // directory of that name comes back as ACCESS_DENIED and a locked file
+        // as a sharing violation. Ask what is actually there — anything at all
+        // means the name is taken and the writer should move to the next one,
+        // which is what POSIX does. A genuine failure has nothing there.
+        if (GetFileAttributesW(wide_path.c_str()) != INVALID_FILE_ATTRIBUTES)
+            return ExclusiveWriteResult::exists;
         return ExclusiveWriteResult::failed;
     }
 
