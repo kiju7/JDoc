@@ -228,7 +228,9 @@ ConvertOptions member_convert_opts(const ConvertOptions& opts,
     ConvertOptions member_opts = opts;
     member_opts.image_dir = opts.image_dir + "/" + member_path;
     member_opts.image_ref_prefix = opts.image_ref_prefix + member_path + "/";
-    util::ensure_dirs(member_opts.image_dir);
+    // The directory is not created here: the writer makes it on demand, so
+    // a member that turns out to hold no images leaves no empty folder
+    // behind — a text member used to leave one per entry.
     return member_opts;
 }
 

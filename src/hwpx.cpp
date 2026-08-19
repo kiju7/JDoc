@@ -471,14 +471,10 @@ private:
                         para_has_content = true;
                         // Add image reference in markdown
                         auto& saved = chunk.images.back();
-                        if (!saved.saved_path.empty()) {
-                            auto slash = saved.saved_path.find_last_of('/');
-                            std::string ref = (slash != std::string::npos)
-                                ? saved.saved_path.substr(slash + 1) : saved.saved_path;
-                            para_text += "![" + saved.name + "](" + opts_.image_ref_prefix + ref + ")";
-                        } else {
-                            para_text += "![" + saved.name + "](" + opts_.image_ref_prefix + saved.name + "." + saved.format + ")";
-                        }
+                        const std::string ref = util::image_ref_name(
+                            saved.name, saved.format, saved.saved_path);
+                        para_text += "![" + saved.name + "](" +
+                                     opts_.image_ref_prefix + ref + ")";
                     }
                 }
                 else if (is_shape_element(in)) {
@@ -729,14 +725,8 @@ private:
             for (auto& pic : table_pics) {
                 ImageData idata = process_picture(pic, page_number, *p_image_idx);
                 if (!idata.name.empty()) {
-                    // Name the file that was actually written: save_image_to_file
-                    // settles the extension from the magic bytes (a "jpeg"
-                    // format lands as .jpg), so deriving the reference from the
-                    // format string alone points at a file that is not there.
-                    std::string ref = idata.saved_path.empty()
-                        ? idata.name + "." +
-                          (idata.format == "jpeg" ? "jpg" : idata.format)
-                        : util::get_filename(idata.saved_path);
+                    std::string ref = util::image_ref_name(
+                        idata.name, idata.format, idata.saved_path);
                     md += "\n![" + idata.name + "](" + opts_.image_ref_prefix + ref + ")\n";
                 }
             }
@@ -907,29 +897,20 @@ private:
         if (raw.empty()) return img;
 
         img.data.assign(raw.begin(), raw.end());
-        img.format = util::image_format_from_ext(util::get_extension(file_path));
+        const std::string declared_ext = util::get_extension(file_path);
+        img.format = util::image_format_from_ext(declared_ext);
         img.name = "page" + std::to_string(page_number) +
                    "_img" + std::to_string(image_idx);
         img.width = width;
         img.height = height;
-        util::populate_image_dimensions(img);
-        if (util::is_image_too_small(img, opts_.min_image_size)) {
+        // declared_ext is what BinData named the part; store_image keeps it.
+        const std::string ref = util::store_image(img, opts_, declared_ext);
+        if (ref.empty()) {
             media_cache_.insert_skipped(file_path);
             return {};
         }
 
-        // Save to disk if requested (BMP -> PNG for compression)
-        if (opts_.images) {
-            img.saved_path = util::save_image_to_file(
-                opts_.image_dir, img.name, img.format,
-                img.data.data(), img.data.size());
-            if (!img.saved_path.empty()) {
-                img.data.clear();
-                img.data.shrink_to_fit();
-            }
-        }
-
-        media_cache_.insert(file_path, img, util::get_filename(img.saved_path));
+        media_cache_.insert(file_path, img, ref);
         ++image_idx;
         return img;
     }

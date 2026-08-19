@@ -65,6 +65,47 @@ inline std::string image_format_from_ext(const std::string& ext) {
     return "bin";
 }
 
+// The extension save_image_to_file() gives a payload of this format. A JPEG
+// lands as ".jpg" and an unrecognized format as ".bin", so a caller that names
+// the file from the format string alone would point at a file that is not
+// there. Kept next to the inverse mapping above; the writer uses it too.
+inline std::string image_file_ext(const std::string& format) {
+    if (format == "jpeg") return "jpg";
+    return format.empty() ? std::string("bin") : format;
+}
+
+// The dotted extension an extracted image is written with. A container that
+// named the part — a zip entry, an OLE stream — has already declared it, and
+// that declaration is kept verbatim: ".jpeg" stays ".jpeg" rather than being
+// normalized to ".jpg", and an extension jdoc has no format name for (".webp",
+// ".ico") stays itself rather than collapsing to ".bin". Only a container that
+// declares a type code instead of a name (an Escher BLIP record, a PDF filter)
+// has no extension to keep, and falls back to the canonical one.
+//
+// The declaration is document-controlled text, so it is taken only when it is
+// a plain alphanumeric ".ext": a part named "a.png/../../x" must not steer the
+// write out of image_dir.
+inline std::string image_ext_for_save(const std::string& declared_ext,
+                                      const std::string& format) {
+    const bool usable =
+        declared_ext.size() > 1 && declared_ext.size() <= 16 &&
+        declared_ext[0] == '.' &&
+        std::all_of(declared_ext.begin() + 1, declared_ext.end(),
+                    [](unsigned char c) { return std::isalnum(c) != 0; });
+    return usable ? declared_ext : "." + image_file_ext(format);
+}
+
+// The name that belongs in a Markdown image reference. Once an image reaches
+// disk that is the basename actually written — collision suffix and all, since
+// a name already taken in image_dir is written as "<stem>_1.<ext>". Only an
+// image that was never written falls back to the derived name.
+inline std::string image_ref_name(const std::string& name,
+                                  const std::string& format,
+                                  const std::string& saved_path) {
+    if (!saved_path.empty()) return get_filename(saved_path);
+    return name + "." + image_file_ext(format);
+}
+
 // Trim leading/trailing whitespace.
 inline std::string trim(const std::string& s) {
     auto start = s.find_first_not_of(" \t\r\n");

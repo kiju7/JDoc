@@ -18,6 +18,7 @@
 #include <cerrno>
 #include <limits>
 #include <memory>
+#include <mutex>
 
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -34,7 +35,13 @@
 
 namespace jdoc { namespace util {
 
-enum class ExclusiveWriteResult { written, exists, failed };
+enum class ExclusiveWriteResult { written, exists, missing_dir, failed };
+
+// One write() call never carries more than this. macOS rejects a write larger
+// than INT_MAX outright (EINVAL, and it does not attempt a partial write),
+// while Linux silently shortens it and Windows accepts it; a fixed cap makes
+// the loop below behave identically on all three, at one extra call per GiB.
+constexpr size_t kMaxWriteChunk = static_cast<size_t>(1) << 30;
 
 // Atomically create a new file. CREATE_NEW and O_EXCL make filename selection
 // safe across both threads and processes; a separate exists-then-open sequence
@@ -49,17 +56,19 @@ inline ExclusiveWriteResult write_exclusive_file(const std::string& path,
                               nullptr);
     if (file == INVALID_HANDLE_VALUE) {
         const DWORD error = GetLastError();
-        return error == ERROR_FILE_EXISTS || error == ERROR_ALREADY_EXISTS
-                   ? ExclusiveWriteResult::exists
-                   : ExclusiveWriteResult::failed;
+        if (error == ERROR_FILE_EXISTS || error == ERROR_ALREADY_EXISTS)
+            return ExclusiveWriteResult::exists;
+        if (error == ERROR_PATH_NOT_FOUND || error == ERROR_FILE_NOT_FOUND)
+            return ExclusiveWriteResult::missing_dir;
+        return ExclusiveWriteResult::failed;
     }
 
     const auto* bytes = static_cast<const uint8_t*>(data);
     size_t remaining = size;
     bool ok = true;
     while (remaining != 0) {
-        const DWORD chunk = static_cast<DWORD>(std::min<size_t>(
-            remaining, static_cast<size_t>(std::numeric_limits<DWORD>::max())));
+        const DWORD chunk =
+            static_cast<DWORD>(std::min<size_t>(remaining, kMaxWriteChunk));
         DWORD written = 0;
         if (!WriteFile(file, bytes, chunk, &written, nullptr) || written == 0) {
             ok = false;
@@ -78,16 +87,17 @@ inline ExclusiveWriteResult write_exclusive_file(const std::string& path,
     do {
         file = ::open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0666);
     } while (file < 0 && errno == EINTR);
-    if (file < 0)
-        return errno == EEXIST ? ExclusiveWriteResult::exists
-                              : ExclusiveWriteResult::failed;
+    if (file < 0) {
+        if (errno == EEXIST) return ExclusiveWriteResult::exists;
+        if (errno == ENOENT) return ExclusiveWriteResult::missing_dir;
+        return ExclusiveWriteResult::failed;
+    }
 
     const auto* bytes = static_cast<const uint8_t*>(data);
     size_t remaining = size;
     bool ok = true;
     while (remaining != 0) {
-        const size_t chunk = std::min<size_t>(
-            remaining, static_cast<size_t>(std::numeric_limits<ssize_t>::max()));
+        const size_t chunk = std::min<size_t>(remaining, kMaxWriteChunk);
         const ssize_t written = ::write(file, bytes, chunk);
         if (written < 0 && errno == EINTR) continue;
         if (written <= 0) {
@@ -106,6 +116,16 @@ inline ExclusiveWriteResult write_exclusive_file(const std::string& path,
     return ExclusiveWriteResult::written;
 }
 
+// Create the output directory under a process-wide lock. Concurrent
+// create_directories() calls for the same missing path are not reliable on
+// every Windows CRT, and the atomic file creation below guards the filename
+// only — not the directory that has to exist first.
+inline void ensure_output_dir(const std::string& dir) {
+    static std::mutex dir_mutex;
+    std::lock_guard<std::mutex> lock(dir_mutex);
+    ensure_dirs(dir);
+}
+
 // Choose and atomically write an output filename. Existing files are preserved
 // by adding a numeric suffix before the extension. The returned path is the
 // name actually written, so callers can put it into Markdown.
@@ -113,20 +133,30 @@ inline std::string save_unique_named_file(const std::string& dir,
                                           const std::string& filename,
                                           const void* data, size_t size) {
     if (dir.empty() || filename.empty() || !data || size == 0) return "";
-    ensure_dirs(dir);
 
     const size_t dot = filename.rfind('.');
     const bool has_ext = dot != std::string::npos && dot != 0;
     const std::string stem = has_ext ? filename.substr(0, dot) : filename;
     const std::string ext = has_ext ? filename.substr(dot) : std::string();
+    bool dir_ensured = false;
     for (uint64_t suffix = 0; suffix < UINT64_MAX; ++suffix) {
         std::string candidate = stem;
         if (suffix != 0) candidate += "_" + std::to_string(suffix);
         candidate += ext;
         std::string path = dir + "/" + candidate;
-        const auto result = write_exclusive_file(path, data, size);
+        auto result = write_exclusive_file(path, data, size);
+        // The directory is created on demand rather than probed before every
+        // save: an image_dir that already exists then costs no extra syscall,
+        // and the one create that matters still happens under the lock. A
+        // directory removed mid-run (a concurrent cleanup) is recreated once
+        // rather than costing the image.
+        if (result == ExclusiveWriteResult::missing_dir && !dir_ensured) {
+            dir_ensured = true;
+            ensure_output_dir(dir);
+            result = write_exclusive_file(path, data, size);
+        }
         if (result == ExclusiveWriteResult::written) return path;
-        if (result == ExclusiveWriteResult::failed) return "";
+        if (result != ExclusiveWriteResult::exists) return "";
     }
     return "";
 }
@@ -399,9 +429,9 @@ inline std::string save_image_to_file(const std::string& dir,
     // Keep the extension the container declared (zip entry name, BLIP record
     // type, OLE stream) rather than second-guessing it with a magic-byte sniff:
     // the extracted file should carry its real, source-declared extension.
-    std::string ext = (format == "jpeg") ? "jpg" : format;
-    if (ext.empty()) ext = "bin";
-    return save_unique_named_file(dir, name + "." + ext, data, size);
+    // image_ref_name() derives the Markdown reference from the same mapping.
+    return save_unique_named_file(dir, name + "." + image_file_ext(format),
+                                  data, size);
 }
 
 // Save bytes to "<dir>/<filename>" verbatim — the filename (including its
@@ -412,6 +442,70 @@ inline std::string save_named_file(const std::string& dir,
                                    const std::string& filename,
                                    const void* data, size_t size) {
     return save_unique_named_file(dir, filename, data, size);
+}
+
+// The one place an extracted image becomes a file. Every parser hands over a
+// filled ImageData (name, format, data) and gets back the name to write into
+// its Markdown, so the size filter, the extension rule, the write, the payload
+// hand-off and the reference all follow one policy instead of a copy per
+// parser.
+//
+// Returns:
+//   ""   do not reference this image — it was filtered out as too small, or an
+//        image_dir was set and the write failed. A reference to a file that
+//        does not exist is worse than no reference at all.
+//   name the reference to emit. When extraction was asked for and an
+//        image_dir given, the file exists under it and img.saved_path names
+//        it, the payload having been handed to disk. Otherwise nothing is
+//        written, the bytes stay on img.data for the caller to deliver, and
+//        the name is the nominal one.
+//
+// declared_ext is the extension the container named the part with (".jpeg"
+// from a zip entry, ".bmp" from a BinData record). Leave it empty where the
+// container declares a type code rather than a name — an Escher BLIP record,
+// an RTF \pngblip, a PDF filter — and the canonical extension for the format
+// is used instead.
+inline std::string store_image(ImageData& img, const ConvertOptions& opts,
+                               const std::string& declared_ext = "") {
+    populate_image_dimensions(img);
+    if (is_image_too_small(img, opts.min_image_size)) return "";
+
+    const std::string filename =
+        img.name + image_ext_for_save(declared_ext, img.format);
+    // Nothing is written unless extraction was asked for and an image_dir
+    // was given. Otherwise the reference is the nominal name and the bytes
+    // stay on img.data for an in-memory consumer to deliver.
+    if (!opts.images || opts.image_dir.empty()) return filename;
+
+    img.saved_path = save_named_file(opts.image_dir, filename,
+                                     img.data.data(), img.data.size());
+    if (img.saved_path.empty()) return "";
+    img.data.clear();
+    img.data.shrink_to_fit();
+    return get_filename(img.saved_path);
+}
+
+// Same, with the payload still in the caller's buffer. Used where the bytes
+// are already held elsewhere and copying them onto the ImageData merely to
+// write them out would be a copy for nothing. Where no file is written the
+// bytes are copied onto img.data after all, since that is how the caller
+// delivers them.
+inline std::string store_image(ImageData& img, const ConvertOptions& opts,
+                               const std::string& declared_ext,
+                               const void* data, size_t size) {
+    const auto* bytes = static_cast<const char*>(data);
+    populate_image_dimensions(img, reinterpret_cast<const uint8_t*>(data), size);
+    if (is_image_too_small(img, opts.min_image_size)) return "";
+
+    const std::string filename =
+        img.name + image_ext_for_save(declared_ext, img.format);
+    if (!opts.images || opts.image_dir.empty()) {
+        if (bytes && size) img.data.assign(bytes, bytes + size);
+        return filename;
+    }
+    img.saved_path = save_named_file(opts.image_dir, filename, data, size);
+    if (img.saved_path.empty()) return "";
+    return get_filename(img.saved_path);
 }
 
 }} // namespace jdoc::util

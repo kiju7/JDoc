@@ -270,12 +270,15 @@ static std::string metafile_to_markdown(FileFormat fmt, const uint8_t* data,
     int i = 0;
     for (auto& bmp : c.images) {
         std::string name = "page1_img" + std::to_string(i++);
-        std::string filename = name + ".bmp";
+        ImageData img;
+        img.page_number = 1;
+        img.name = name;
+        img.format = "bmp";
+        img.data = std::move(bmp);
+        // A metafile's bitmaps are synthesized, so there is no declared name.
+        const std::string filename = util::store_image(img, opts);
         // Don't reference a bitmap that could not be written to image_dir.
-        if (!opts.image_dir.empty() &&
-            util::save_image_to_file(opts.image_dir, name, "bmp",
-                                     bmp.data(), bmp.size()).empty())
-            continue;
+        if (filename.empty()) continue;
         if (!md.empty() && md.back() != '\n') md += "\n\n";
         md += "![" + filename + "](" + opts.image_ref_prefix + filename + ")\n\n";
     }
@@ -295,21 +298,14 @@ static PageChunk metafile_to_chunk(FileFormat fmt, const uint8_t* data,
     int i = 0;
     for (auto& bmp : c.images) {
         std::string name = "page1_img" + std::to_string(i++);
-        std::string filename = name + ".bmp";
         ImageData img;
         img.page_number = 1;
         img.name = name;
         img.format = "bmp";
         img.data = std::move(bmp);           // BMP buffer moved in, no copy
-        util::populate_image_dimensions(img);
-        if (!opts.image_dir.empty()) {
-            img.saved_path = util::save_image_to_file(
-                opts.image_dir, name, "bmp", img.data.data(), img.data.size());
-            if (!img.saved_path.empty()) {
-                img.data.clear();
-                img.data.shrink_to_fit();
-            }
-        }
+        // A metafile's bitmaps are synthesized, so there is no declared name.
+        const std::string filename = util::store_image(img, opts);
+        if (filename.empty()) continue;
         if (!chunk.text.empty() && chunk.text.back() != '\n')
             chunk.text += "\n\n";
         chunk.text += "![" + filename + "](" + opts.image_ref_prefix +
@@ -377,19 +373,22 @@ static PageChunk image_to_chunk(const uint8_t* data, size_t size,
     chunk.page_number = 1;
     if (!opts.images) return chunk;
 
-    std::string filename = image_basename(data, size, name_hint);
+    const std::string basename = image_basename(data, size, name_hint);
     ImageData img;
     img.page_number = 1;
-    img.name = strip_ext(filename);
+    img.name = strip_ext(basename);
     img.format = util::detect_image_format(data, size);
-    util::populate_image_dimensions(img, data, size);
-    if (!opts.image_dir.empty()) {
-        img.saved_path =
-            util::save_named_file(opts.image_dir, filename, data, size);
-        if (!img.saved_path.empty()) filename = util::get_filename(img.saved_path);
-    }
-    if (img.saved_path.empty())
-        img.data.assign(data, data + size);  // memory mode: caller needs bytes
+    // A standalone image is the document, not a decoration inside one, so the
+    // min_image_size filter does not apply: it exists to drop bullets and
+    // icons embedded in a document, and must not refuse the very file the
+    // caller handed over. image_to_markdown() has never filtered it either.
+    ConvertOptions image_opts = opts;
+    image_opts.min_image_size = 0;
+    // The input file named its own extension; store_image keeps it, and writes
+    // straight from the source buffer so the bytes are not copied to be saved.
+    const std::string filename = util::store_image(
+        img, image_opts, util::get_extension(basename), data, size);
+    if (filename.empty()) return chunk;
     chunk.text = "![" + filename + "](" + opts.image_ref_prefix + filename + ")\n";
     chunk.images.push_back(std::move(img));
     return chunk;

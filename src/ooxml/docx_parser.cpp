@@ -289,19 +289,9 @@ std::vector<ImageData> DocxParser::extract_images(
 
         img.data = zip_.read_entry(*entry);
 
-        util::populate_image_dimensions(img);
-        if (util::is_image_too_small(img, opts.min_image_size))
-            continue;
-
-        std::string filename = img.name + (ext.empty() ? ".png" : ext);
-        img.saved_path = util::save_image_to_file(
-            opts.image_dir, img.name, fmt,
-            img.data.data(), img.data.size());
-        if (!img.saved_path.empty()) {
-            filename = util::get_filename(img.saved_path);
-            img.data.clear();
-            img.data.shrink_to_fit();
-        }
+        // ext is what the package named the part; store_image keeps it.
+        std::string filename = util::store_image(img, opts, ext);
+        if (filename.empty()) continue;
 
         std::string orig_name = util::get_filename(entry->name);
         image_name_map_[orig_name] = filename;

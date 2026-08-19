@@ -2,6 +2,7 @@
 // License: MIT
 
 #include "jdoc/office.h"
+#include "jdoc/archive.h"
 #include "jdoc/detect.h"
 #include "zip_reader.h"
 #include "common/string_utils.h"
@@ -930,6 +931,472 @@ void test_xlsx_fixes() {
     TEST_END
 }
 
+// ── Image references name the file that was written ──────────
+
+// Every "![alt](target)" in the markdown, in document order.
+static std::vector<std::string> image_targets(const std::string& md) {
+    std::vector<std::string> targets;
+    for (size_t p = md.find("]("); p != std::string::npos;
+         p = md.find("](", p + 2)) {
+        size_t end = md.find(')', p);
+        if (end == std::string::npos) break;
+        targets.push_back(md.substr(p + 2, end - p - 2));
+    }
+    return targets;
+}
+
+// Fail unless every reference resolves to a file that is actually in dir.
+static void assert_targets_exist(const std::string& md, const std::string& dir) {
+    auto targets = image_targets(md);
+    if (targets.empty()) throw std::runtime_error("no image references emitted");
+    for (const auto& t : targets) {
+        std::string base = t.substr(t.find_last_of('/') + 1);
+        if (!std::filesystem::exists(std::filesystem::path(dir) / base))
+            throw std::runtime_error("reference points at a missing file: " + t);
+    }
+}
+
+static std::string make_media_xlsx() {
+    return make_xlsx(
+        "worksheets/sheet1.xml",
+        "<row r=\"1\"><c r=\"A1\" t=\"inlineStr\"><is><t>Cell</t></is></c></row>",
+        {{"xl/media/image1.png", png_bytes()}});
+}
+
+void test_image_reference_matches_file() {
+    std::cerr << "\nImage reference names the written file:\n";
+
+    TEST(xlsx_reference_carries_the_extension)
+        // The reference used to be the bare stem ("page1_img0"), which resolves
+        // to nothing: the file on disk is "page1_img0.png".
+        auto book = make_media_xlsx();
+        std::string dir = temp_image_dir("xlsx_image_ref");
+        jdoc::ConvertOptions opts;
+        opts.images = true;
+        opts.min_image_size = 0;
+        opts.image_dir = dir;
+        auto md = jdoc::office_to_markdown_mem(
+            reinterpret_cast<const uint8_t*>(book.data()), book.size(),
+            "book.xlsx", opts);
+        assert_targets_exist(md, dir);
+        std::filesystem::remove_all(dir);
+    TEST_END
+
+    TEST(xlsx_reference_follows_the_collision_suffix)
+        // A second conversion into the same image_dir cannot overwrite the
+        // first document's file, so it is written as "page1_img0_1.png" — and
+        // the markdown has to say so, or it points at the other document.
+        auto book = make_media_xlsx();
+        std::string dir = temp_image_dir("xlsx_image_ref_shared");
+        jdoc::ConvertOptions opts;
+        opts.images = true;
+        opts.min_image_size = 0;
+        opts.image_dir = dir;
+
+        auto first = jdoc::office_to_markdown_mem(
+            reinterpret_cast<const uint8_t*>(book.data()), book.size(),
+            "book.xlsx", opts);
+        auto second = jdoc::office_to_markdown_mem(
+            reinterpret_cast<const uint8_t*>(book.data()), book.size(),
+            "book.xlsx", opts);
+
+        assert_targets_exist(first, dir);
+        assert_targets_exist(second, dir);
+        ASSERT(image_targets(first) != image_targets(second));
+        std::filesystem::remove_all(dir);
+    TEST_END
+
+    TEST(xlsx_chunk_reference_matches_markdown)
+        // The chunk API emits its own references; they used to drop both the
+        // extension and image_ref_prefix that the markdown API applies.
+        auto book = make_media_xlsx();
+        std::string dir = temp_image_dir("xlsx_image_ref_chunks");
+        jdoc::ConvertOptions opts;
+        opts.images = true;
+        opts.min_image_size = 0;
+        opts.image_dir = dir;
+        opts.image_ref_prefix = "media/";
+
+        auto chunks = jdoc::office_to_markdown_chunks_mem(
+            reinterpret_cast<const uint8_t*>(book.data()), book.size(),
+            "book.xlsx", opts);
+        std::string text;
+        for (const auto& c : chunks) text += c.text;
+        auto targets = image_targets(text);
+        ASSERT(targets.size() == 1);
+        ASSERT(targets[0].rfind("media/", 0) == 0);
+        assert_targets_exist(text, dir);
+        std::filesystem::remove_all(dir);
+    TEST_END
+
+    TEST(declared_extension_is_kept_verbatim)
+        // The extension the package declared is what the extracted file gets.
+        // It used to round-trip through the format name, which is lossy:
+        // ".jpeg" came back ".jpg", ".tif" came back ".tiff", and anything
+        // jdoc has no format name for (".webp") came back ".bin".
+        auto book = make_xlsx(
+            "worksheets/sheet1.xml",
+            "<row r=\"1\"><c r=\"A1\" t=\"inlineStr\"><is><t>C</t></is></c></row>",
+            {{"xl/media/image1.jpeg", png_bytes()},
+             {"xl/media/image2.webp", png_bytes()},
+             {"xl/media/image3.tif",  png_bytes()}});
+        std::string dir = temp_image_dir("xlsx_declared_ext");
+        jdoc::ConvertOptions opts;
+        opts.images = true;
+        opts.min_image_size = 0;
+        opts.image_dir = dir;
+
+        auto md = jdoc::office_to_markdown_mem(
+            reinterpret_cast<const uint8_t*>(book.data()), book.size(),
+            "book.xlsx", opts);
+        assert_targets_exist(md, dir);
+        std::set<std::string> written;
+        for (auto& e : std::filesystem::directory_iterator(dir))
+            written.insert(e.path().filename().string());
+        ASSERT(written == std::set<std::string>({"page1_img0.jpeg",
+                                                 "page1_img1.webp",
+                                                 "page1_img2.tif"}));
+        std::filesystem::remove_all(dir);
+    TEST_END
+
+    TEST(a_failed_write_emits_no_reference)
+        // Every parser now routes through store_image, so a write that cannot
+        // happen costs the reference too — a link to a file that does not exist
+        // is worse than no link. image_dir points inside a regular file here,
+        // so the directory cannot be created and no image can land.
+        std::string base = temp_image_dir("write_failure");
+        std::string blocker = base + "/not_a_dir";
+        { std::ofstream f(blocker); f << "x"; }
+
+        auto book = make_media_xlsx();
+        jdoc::ConvertOptions opts;
+        opts.images = true;
+        opts.min_image_size = 0;
+        opts.image_dir = blocker + "/images";
+
+        auto md = jdoc::office_to_markdown_mem(
+            reinterpret_cast<const uint8_t*>(book.data()), book.size(),
+            "book.xlsx", opts);
+        ASSERT(md.find("![") == std::string::npos);
+        std::filesystem::remove_all(base);
+    TEST_END
+
+    TEST(archive_member_keeps_its_own_name_and_leaves_no_empty_dirs)
+        // An archive member is a file with a name of its own, so it keeps it
+        // rather than becoming page1_img0 — and a member that holds no images
+        // must not leave an empty directory behind for itself.
+        std::string dir = temp_image_dir("archive_members");
+        auto zip = make_zip({{"photo.jpeg", png_bytes()},
+                             {"note.txt", "hello"}});
+        std::string zip_path = (std::filesystem::temp_directory_path() /
+                                "jdoc_test_members.zip").string();
+        { std::ofstream f(zip_path, std::ios::binary); f << zip; }
+
+        jdoc::ConvertOptions opts;
+        opts.images = true;
+        opts.min_image_size = 0;
+        opts.image_dir = dir;
+        opts.image_ref_prefix = "out/";
+
+        std::string md;
+        jdoc::convert_archive(zip_path,
+            [&](jdoc::MemberResult&& m) { md += m.markdown; return true; },
+            opts);
+
+        ASSERT(std::filesystem::exists(std::filesystem::path(dir) / "photo.jpeg"));
+        ASSERT(!std::filesystem::exists(std::filesystem::path(dir) / "note.txt"));
+        ASSERT(md.find("out/photo.jpeg") != std::string::npos);
+        std::filesystem::remove(zip_path);
+        std::filesystem::remove_all(dir);
+    TEST_END
+
+    TEST(pptx_reference_follows_the_collision_suffix)
+        // Guard the paths that already got this right against regressing.
+        auto deck = make_shared_media_pptx();
+        std::string dir = temp_image_dir("pptx_image_ref_shared");
+        jdoc::ConvertOptions opts;
+        opts.images = true;
+        opts.min_image_size = 0;
+        opts.image_dir = dir;
+
+        auto first = jdoc::office_to_markdown_mem(
+            reinterpret_cast<const uint8_t*>(deck.data()), deck.size(),
+            "deck.pptx", opts);
+        auto second = jdoc::office_to_markdown_mem(
+            reinterpret_cast<const uint8_t*>(deck.data()), deck.size(),
+            "deck.pptx", opts);
+
+        assert_targets_exist(first, dir);
+        assert_targets_exist(second, dir);
+        ASSERT(image_targets(first) != image_targets(second));
+        std::filesystem::remove_all(dir);
+    TEST_END
+}
+
+// ── Legacy .xls image extraction ─────────────────────────────
+
+// A compound file holding one "Workbook" stream — all the .xls image scanner
+// reads. The stream is padded past the mini-stream cutoff so the regular FAT
+// chain carries it and no mini-FAT is needed.
+static std::string make_ole_workbook(const std::string& workbook) {
+    constexpr size_t SEC = 512;
+    constexpr uint32_t FREESECT = 0xFFFFFFFF;
+    constexpr uint32_t ENDOFCHAIN = 0xFFFFFFFE;
+    constexpr uint32_t FATSECT = 0xFFFFFFFD;
+    constexpr uint32_t MINI_CUTOFF = 4096;
+
+    auto set_u16_at = [](std::string& b, size_t off, uint16_t v) {
+        b[off] = static_cast<char>(v & 0xFF);
+        b[off + 1] = static_cast<char>(v >> 8);
+    };
+    auto set_u32_at = [&](std::string& b, size_t off, uint32_t v) {
+        set_u16_at(b, off, static_cast<uint16_t>(v & 0xFFFF));
+        set_u16_at(b, off + 2, static_cast<uint16_t>(v >> 16));
+    };
+
+    std::string data = workbook;
+    size_t want = std::max<size_t>(data.size(), MINI_CUTOFF);
+    want = ((want + SEC - 1) / SEC) * SEC;
+    data.resize(want, '\0');
+    // Declare the padded size: a stream under the mini-stream cutoff would
+    // be looked for in the root mini-stream, which this fixture has not got.
+    const uint32_t stream_size = static_cast<uint32_t>(data.size());
+
+    const uint32_t fat_sec = 0, dir_sec = 1, first_data = 2;
+    const uint32_t sectors = static_cast<uint32_t>(data.size() / SEC);
+
+    std::vector<uint32_t> fat(SEC / 4, FREESECT);
+    fat[fat_sec] = FATSECT;
+    fat[dir_sec] = ENDOFCHAIN;
+    for (uint32_t k = 0; k < sectors; k++)
+        fat[first_data + k] =
+            (k + 1 < sectors) ? (first_data + k + 1) : ENDOFCHAIN;
+
+    // Directory: Root Entry, then the Workbook stream.
+    std::string dir(SEC, '\0');
+    struct Ent { const char* name; uint8_t type; uint32_t start, size; };
+    const Ent ents[] = {
+        {"Root Entry", 5, 0, 0},
+        {"Workbook",   2, first_data, stream_size},
+    };
+    for (size_t i = 0; i < sizeof(ents) / sizeof(ents[0]); i++) {
+        size_t off = i * 128;
+        size_t len = std::strlen(ents[i].name);
+        for (size_t c = 0; c < len; c++)
+            set_u16_at(dir, off + c * 2, static_cast<uint16_t>(ents[i].name[c]));
+        set_u16_at(dir, off + 0x40, static_cast<uint16_t>((len + 1) * 2));
+        dir[off + 0x42] = static_cast<char>(ents[i].type);
+        set_u32_at(dir, off + 0x44, FREESECT);  // left sibling
+        set_u32_at(dir, off + 0x48, FREESECT);  // right sibling
+        set_u32_at(dir, off + 0x4C, i == 0 ? 1u : FREESECT);  // child
+        set_u32_at(dir, off + 0x74, ents[i].start);
+        set_u32_at(dir, off + 0x78, ents[i].size);
+    }
+    for (size_t i = 2; i < SEC / 128; i++) {
+        set_u32_at(dir, i * 128 + 0x44, FREESECT);
+        set_u32_at(dir, i * 128 + 0x48, FREESECT);
+        set_u32_at(dir, i * 128 + 0x4C, FREESECT);
+    }
+
+    std::string hdr(SEC, '\0');
+    const unsigned char sig[8] = {0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1};
+    std::memcpy(&hdr[0], sig, 8);
+    set_u16_at(hdr, 0x18, 0x003E);
+    set_u16_at(hdr, 0x1A, 3);
+    set_u16_at(hdr, 0x1C, 0xFFFE);
+    set_u16_at(hdr, 0x1E, 9);
+    set_u16_at(hdr, 0x20, 6);
+    set_u32_at(hdr, 0x2C, 1);
+    set_u32_at(hdr, 0x30, dir_sec);
+    set_u32_at(hdr, 0x38, MINI_CUTOFF);
+    set_u32_at(hdr, 0x3C, ENDOFCHAIN);
+    set_u32_at(hdr, 0x40, 0);
+    set_u32_at(hdr, 0x44, ENDOFCHAIN);
+    set_u32_at(hdr, 0x48, 0);
+    set_u32_at(hdr, 0x4C, fat_sec);
+    for (int i = 1; i < 109; i++) set_u32_at(hdr, 0x4C + i * 4, FREESECT);
+
+    std::string fat_bytes(SEC, '\0');
+    for (size_t i = 0; i < fat.size(); i++) set_u32_at(fat_bytes, i * 4, fat[i]);
+
+    return hdr + fat_bytes + dir + data;
+}
+
+// A Workbook stream carrying one MSODRAWING record whose OfficeArt payload is
+// a PNG BLIP (record type 0xF01E, 17-byte header before the payload).
+static std::string workbook_with_png_blip() {
+    const std::string png = png_bytes();
+
+    std::string blip;
+    put_u16(blip, 0x6E00);   // ver 0, inst 0x6E0 — the 17-byte-header flavour
+    put_u16(blip, 0xF01E);   // BLIP: PNG
+    put_u32(blip, static_cast<uint32_t>(17 + png.size()));
+    blip.append(16, '\0');   // BLIP UID
+    blip.push_back('\0');    // tag
+    blip += png;
+
+    std::string wb;
+    put_u16(wb, 0x0809);     // BOF — workbook globals
+    put_u16(wb, 4);
+    put_u16(wb, 0x0600);
+    put_u16(wb, 0x0005);
+
+    const std::string sheet_name = "Sheet1";
+    put_u16(wb, 0x0085);     // BOUNDSHEET
+    put_u16(wb, static_cast<uint16_t>(8 + sheet_name.size()));
+    put_u32(wb, 0);          // lbPlyPos
+    put_u16(wb, 0);          // grbit: visible worksheet
+    wb.push_back(static_cast<char>(sheet_name.size()));
+    wb.push_back(0);         // 8-bit name
+    wb += sheet_name;
+
+    put_u16(wb, 0x00EC);     // MSODRAWING
+    put_u16(wb, static_cast<uint16_t>(blip.size()));
+    wb += blip;
+    put_u16(wb, 0x000A);     // EOF
+    put_u16(wb, 0);
+    return wb;
+}
+
+void test_xls_images() {
+    std::cerr << "\nLegacy .xls images:\n";
+
+    TEST(blip_is_written_to_image_dir)
+        // .xls used to emit an image reference without ever writing the file:
+        // extract_images() ran, nothing called the writer.
+        auto book = make_ole_workbook(workbook_with_png_blip());
+        std::string dir = temp_image_dir("xls_images");
+        jdoc::ConvertOptions opts;
+        opts.images = true;
+        opts.min_image_size = 0;
+        opts.image_dir = dir;
+
+        auto md = jdoc::office_to_markdown_mem(
+            reinterpret_cast<const uint8_t*>(book.data()), book.size(),
+            "book.xls", opts);
+        ASSERT(md.find("![") != std::string::npos);
+        assert_targets_exist(md, dir);
+        std::filesystem::remove_all(dir);
+    TEST_END
+
+    TEST(chunk_images_are_written_too)
+        auto book = make_ole_workbook(workbook_with_png_blip());
+        std::string dir = temp_image_dir("xls_images_chunks");
+        jdoc::ConvertOptions opts;
+        opts.images = true;
+        opts.min_image_size = 0;
+        opts.image_dir = dir;
+
+        auto chunks = jdoc::office_to_markdown_chunks_mem(
+            reinterpret_cast<const uint8_t*>(book.data()), book.size(),
+            "book.xls", opts);
+        size_t saved = 0;
+        for (const auto& c : chunks)
+            for (const auto& img : c.images)
+                if (!img.saved_path.empty() &&
+                    std::filesystem::exists(img.saved_path))
+                    saved++;
+        ASSERT(saved == 1);
+        std::filesystem::remove_all(dir);
+    TEST_END
+
+    TEST(memory_mode_keeps_the_bytes)
+        // With no image_dir the payload has to stay on the chunk.
+        auto book = make_ole_workbook(workbook_with_png_blip());
+        jdoc::ConvertOptions opts;
+        opts.images = true;
+        opts.min_image_size = 0;
+
+        auto chunks = jdoc::office_to_markdown_chunks_mem(
+            reinterpret_cast<const uint8_t*>(book.data()), book.size(),
+            "book.xls", opts);
+        size_t with_payload = 0;
+        for (const auto& c : chunks)
+            for (const auto& img : c.images)
+                if (!img.data.empty()) with_payload++;
+        ASSERT(with_payload == 1);
+    TEST_END
+}
+
+// ── RTF images ───────────────────────────────────────────────
+
+// An RTF holding `count` \pngblip pictures, hex-encoded the way Word writes
+// them.
+static std::string make_rtf_with_pictures(int count) {
+    static const char* kHex = "0123456789abcdef";
+    const std::string raw = png_bytes();
+    std::string hex;
+    for (unsigned char c : raw) { hex += kHex[c >> 4]; hex += kHex[c & 0x0F]; }
+
+    std::string rtf = "{\\rtf1\\ansi\\deff0{\\fonttbl{\\f0 Times;}}\n"
+                      "\\pard body text\\par\n";
+    for (int i = 0; i < count; i++)
+        rtf += "{\\pict\\pngblip\\picw1\\pich1 " + hex + "}\n";
+    rtf += "}";
+    return rtf;
+}
+
+static std::string convert_rtf_with(const std::string& rtf,
+                                    const jdoc::ConvertOptions& opts) {
+    return jdoc::office_to_markdown_mem(
+        reinterpret_cast<const uint8_t*>(rtf.data()), rtf.size(), "doc.rtf",
+        opts);
+}
+
+void test_rtf_images() {
+    std::cerr << "\nRTF images:\n";
+
+    TEST(pictures_are_written_to_image_dir)
+        // RTF referenced its pictures without ever writing one: nothing in
+        // rtf_parser.cpp called the writer.
+        std::string dir = temp_image_dir("rtf_images");
+        jdoc::ConvertOptions opts;
+        opts.images = true;
+        opts.min_image_size = 0;
+        opts.image_dir = dir;
+
+        auto md = convert_rtf_with(make_rtf_with_pictures(2), opts);
+        ASSERT(count_occurrences(md, "![") == 2);
+        assert_targets_exist(md, dir);
+        std::filesystem::remove_all(dir);
+    TEST_END
+
+    TEST(names_match_every_other_parser)
+        // to_markdown used to name them "rtf_image_1" while its own to_chunks
+        // called the same picture "page1_img0".
+        std::string dir = temp_image_dir("rtf_image_names");
+        jdoc::ConvertOptions opts;
+        opts.images = true;
+        opts.min_image_size = 0;
+        opts.image_dir = dir;
+
+        auto md = convert_rtf_with(make_rtf_with_pictures(1), opts);
+        auto chunks = jdoc::office_to_markdown_chunks_mem(
+            reinterpret_cast<const uint8_t*>(make_rtf_with_pictures(1).data()),
+            make_rtf_with_pictures(1).size(), "doc.rtf", opts);
+        ASSERT(image_targets(md).size() == 1);
+        ASSERT(image_targets(md)[0].find("page1_img0.png") != std::string::npos);
+        ASSERT(chunks.size() == 1);
+        ASSERT(chunks[0].images.size() == 1);
+        ASSERT(chunks[0].images[0].name == "page1_img0");
+        ASSERT(!chunks[0].images[0].saved_path.empty());
+        std::filesystem::remove_all(dir);
+    TEST_END
+
+    TEST(memory_mode_keeps_the_bytes)
+        jdoc::ConvertOptions opts;
+        opts.images = true;
+        opts.min_image_size = 0;
+
+        std::string rtf = make_rtf_with_pictures(1);
+        auto chunks = jdoc::office_to_markdown_chunks_mem(
+            reinterpret_cast<const uint8_t*>(rtf.data()), rtf.size(), "doc.rtf",
+            opts);
+        ASSERT(chunks[0].images.size() == 1);
+        ASSERT(!chunks[0].images[0].data.empty());
+    TEST_END
+}
+
 // ── XLSX streaming (SAX) path ────────────────────────────────
 
 // A workbook exercising every construct the streaming scanner must replicate
@@ -1132,6 +1599,128 @@ static std::string convert_html(const std::string& html) {
         reinterpret_cast<const uint8_t*>(html.data()), html.size(), "page.html");
 }
 
+// ── HTML embedded images ─────────────────────────────────────
+
+// Base64 for the 1x1 PNG, so a data: URI can carry it the way a browser-saved
+// page or an HTML mail body does.
+static std::string png_base64() {
+    static const char kAlphabet[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const std::string raw = png_bytes();
+    std::string out;
+    for (size_t i = 0; i < raw.size(); i += 3) {
+        uint32_t v = static_cast<unsigned char>(raw[i]) << 16;
+        if (i + 1 < raw.size()) v |= static_cast<unsigned char>(raw[i + 1]) << 8;
+        if (i + 2 < raw.size()) v |= static_cast<unsigned char>(raw[i + 2]);
+        out += kAlphabet[(v >> 18) & 0x3F];
+        out += kAlphabet[(v >> 12) & 0x3F];
+        out += (i + 1 < raw.size()) ? kAlphabet[(v >> 6) & 0x3F] : '=';
+        out += (i + 2 < raw.size()) ? kAlphabet[v & 0x3F] : '=';
+    }
+    return out;
+}
+
+static std::string convert_html_with(const std::string& html,
+                                     const jdoc::ConvertOptions& opts) {
+    return jdoc::office_to_markdown_mem(
+        reinterpret_cast<const uint8_t*>(html.data()), html.size(),
+        "page.html", opts);
+}
+
+void test_html_images() {
+    std::cerr << "\nHTML embedded images:\n";
+
+    const std::string data_img =
+        "<img src=\"data:image/png;base64," + png_base64() + "\" alt=\"logo\">";
+
+    TEST(data_uri_is_extracted_to_image_dir)
+        // The picture lives in the document, so it is extracted like any other
+        // embedded media — and the reference names the file that was written
+        // instead of inlining a base64 blob into the markdown.
+        std::string dir = temp_image_dir("html_data_uri");
+        jdoc::ConvertOptions opts;
+        opts.images = true;
+        opts.min_image_size = 0;
+        opts.image_dir = dir;
+
+        auto md = convert_html_with("<html><body>" + data_img + "</body></html>",
+                                    opts);
+        ASSERT(md.find("base64") == std::string::npos);
+        assert_targets_exist(md, dir);
+        std::filesystem::remove_all(dir);
+    TEST_END
+
+    TEST(data_uri_reference_honours_the_prefix)
+        std::string dir = temp_image_dir("html_data_uri_prefix");
+        jdoc::ConvertOptions opts;
+        opts.images = true;
+        opts.min_image_size = 0;
+        opts.image_dir = dir;
+        opts.image_ref_prefix = "media/";
+
+        auto md = convert_html_with("<html><body>" + data_img + "</body></html>",
+                                    opts);
+        auto targets = image_targets(md);
+        ASSERT(targets.size() == 1);
+        ASSERT(targets[0] == "media/page1_img0.png");
+        assert_targets_exist(md, dir);
+        std::filesystem::remove_all(dir);
+    TEST_END
+
+    TEST(external_src_is_left_alone)
+        // An http(s) or relative src names a file outside the document. There
+        // are no bytes to write, and the reference stays as the author wrote it.
+        std::string dir = temp_image_dir("html_external_src");
+        jdoc::ConvertOptions opts;
+        opts.images = true;
+        opts.min_image_size = 0;
+        opts.image_dir = dir;
+
+        auto md = convert_html_with(
+            "<html><body><img src=\"https://example.com/a.png\" alt=\"x\">"
+            "<img src=\"local.jpg\" alt=\"y\"></body></html>", opts);
+        auto targets = image_targets(md);
+        ASSERT(targets.size() == 2);
+        ASSERT(targets[0] == "https://example.com/a.png");
+        ASSERT(targets[1] == "local.jpg");
+        // and nothing was invented on disk for them
+        ASSERT(std::filesystem::is_empty(dir));
+        std::filesystem::remove_all(dir);
+    TEST_END
+
+    TEST(each_image_is_referenced_once)
+        // The old appendix emitted a second reference per image, pointing at a
+        // file that never existed.
+        std::string dir = temp_image_dir("html_single_reference");
+        jdoc::ConvertOptions opts;
+        opts.images = true;
+        opts.min_image_size = 0;
+        opts.image_dir = dir;
+
+        auto md = convert_html_with("<html><body>" + data_img + "</body></html>",
+                                    opts);
+        ASSERT(count_occurrences(md, "![") == 1);
+        std::filesystem::remove_all(dir);
+    TEST_END
+
+    TEST(memory_mode_keeps_the_bytes)
+        // With no image_dir the decoded payload travels on the chunk.
+        jdoc::ConvertOptions opts;
+        opts.images = true;
+        opts.min_image_size = 0;
+
+        std::string html = "<html><body>" + data_img + "</body></html>";
+        auto chunks = jdoc::office_to_markdown_chunks_mem(
+            reinterpret_cast<const uint8_t*>(html.data()), html.size(),
+            "page.html", opts);
+        size_t with_payload = 0;
+        for (const auto& c : chunks)
+            for (const auto& img : c.images)
+                if (!img.data.empty()) with_payload++;
+        ASSERT(with_payload == 1);
+    TEST_END
+}
+
 void test_html_charset() {
     std::cerr << "\nHTML charset:\n";
 
@@ -1239,6 +1828,71 @@ void test_pptx_linebreak() {
 
 // ── Main ────────────────────────────────────────────────────
 
+// The two APIs must describe the same conversion: the same references in the
+// text, and the same files on disk. They used to drift — .doc stripped the
+// image markers out of its chunk text while its markdown kept them.
+static void assert_apis_agree(const std::string& doc, const std::string& hint,
+                              const std::string& tag) {
+    std::string d1 = temp_image_dir(tag + "_md");
+    std::string d2 = temp_image_dir(tag + "_ch");
+    jdoc::ConvertOptions o1;
+    o1.images = true;
+    o1.min_image_size = 0;
+    o1.image_ref_prefix = "x/";
+    o1.image_dir = d1;
+    jdoc::ConvertOptions o2 = o1;
+    o2.image_dir = d2;
+
+    const auto* bytes = reinterpret_cast<const uint8_t*>(doc.data());
+    std::string md = jdoc::office_to_markdown_mem(bytes, doc.size(), hint, o1);
+    std::string ch;
+    for (auto& c : jdoc::office_to_markdown_chunks_mem(bytes, doc.size(), hint, o2))
+        ch += c.text;
+
+    auto md_refs = image_targets(md), ch_refs = image_targets(ch);
+    std::set<std::string> a(md_refs.begin(), md_refs.end());
+    std::set<std::string> b(ch_refs.begin(), ch_refs.end());
+    if (a != b) throw std::runtime_error("APIs disagree on image references");
+
+    std::set<std::string> f1, f2;
+    for (auto& e : std::filesystem::directory_iterator(d1))
+        f1.insert(e.path().filename().string());
+    for (auto& e : std::filesystem::directory_iterator(d2))
+        f2.insert(e.path().filename().string());
+    if (f1 != f2) throw std::runtime_error("APIs disagree on files written");
+    if (f1.empty()) throw std::runtime_error("no image was written at all");
+
+    std::filesystem::remove_all(d1);
+    std::filesystem::remove_all(d2);
+}
+
+void test_markdown_and_chunk_apis_agree() {
+    std::cerr << "\nMarkdown and chunk APIs agree:\n";
+
+    TEST(xlsx)
+        assert_apis_agree(make_media_xlsx(), "book.xlsx", "agree_xlsx");
+    TEST_END
+
+    TEST(pptx)
+        assert_apis_agree(make_shared_media_pptx(), "deck.pptx", "agree_pptx");
+    TEST_END
+
+    TEST(rtf)
+        assert_apis_agree(make_rtf_with_pictures(2), "doc.rtf", "agree_rtf");
+    TEST_END
+
+    TEST(xls)
+        assert_apis_agree(make_ole_workbook(workbook_with_png_blip()),
+                          "book.xls", "agree_xls");
+    TEST_END
+
+    TEST(html)
+        assert_apis_agree(
+            "<html><body><img src=\"data:image/png;base64," + png_base64() +
+            "\" alt=\"a\"></body></html>", "page.html", "agree_html");
+    TEST_END
+}
+
 int main() {
     std::cerr << "=== jdoc office tests ===\n\n";
 
@@ -1253,10 +1907,15 @@ int main() {
     test_pptx_shared_media();
     test_docx_header_footer();
     test_xlsx_fixes();
+    test_image_reference_matches_file();
+    test_xls_images();
+    test_rtf_images();
+    test_markdown_and_chunk_apis_agree();
     test_xlsx_streaming();
     test_xls_sst_continue();
     test_xlsb_sparse_cells();
     test_html_charset();
+    test_html_images();
     test_pptx_linebreak();
 
     std::cerr << "\n=== Results: " << tests_passed << " passed, "

@@ -49,6 +49,12 @@ private:
     // Parse the RTF content and produce text and images.
     void parse(std::string& out_text, std::vector<PictImage>& out_images);
 
+    // Shared by to_markdown and to_chunks so both name, filter and write
+    // the pictures identically.
+    std::vector<ImageData> build_images(const std::vector<PictImage>& pict_images,
+                                        const ConvertOptions& opts);
+    static std::string metafile_text(const std::vector<PictImage>& pict_images);
+
     // Decode hex string to binary data.
     static std::vector<char> hex_to_binary(const std::string& hex);
 

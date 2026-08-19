@@ -166,7 +166,8 @@ static bool is_picture_fc(const std::vector<PictureFcEntry>& entries, uint32_t f
 
 // Replace U+FFFC markers with inline image references; append leftover images.
 static std::string replace_image_markers(const std::string& md,
-    const std::vector<ImageData>& images, const std::string& prefix) {
+    const std::vector<ImageData>& images, const std::vector<std::string>& refs,
+    const std::string& prefix) {
     std::string result;
     result.reserve(md.size());
     size_t img_idx = 0;
@@ -175,9 +176,9 @@ static std::string replace_image_markers(const std::string& md,
             static_cast<uint8_t>(md[i])     == 0xEF &&
             static_cast<uint8_t>(md[i + 1]) == 0xBF &&
             static_cast<uint8_t>(md[i + 2]) == 0xBC) {
-            if (img_idx < images.size()) {
+            if (img_idx < images.size() && !refs[img_idx].empty()) {
                 const auto& img = images[img_idx];
-                std::string fn = img.name + "." + img.format;
+                const std::string& fn = refs[img_idx];
                 result += "\n![" + fn + "](" + prefix + fn + ")\n";
                 if (!img.embedded_text.empty())
                     result += img.embedded_text + "\n";
@@ -190,7 +191,8 @@ static std::string replace_image_markers(const std::string& md,
     }
     for (; img_idx < images.size(); ++img_idx) {
         const auto& img = images[img_idx];
-        std::string fn = img.name + "." + img.format;
+        const std::string& fn = refs[img_idx];
+        if (fn.empty()) continue;
         result += "\n![" + fn + "](" + fn + ")\n";
         if (!img.embedded_text.empty())
             result += img.embedded_text + "\n";
@@ -1480,23 +1482,20 @@ std::string DocParser::to_markdown(const ConvertOptions& opts) {
 
     auto images = extract_images(opts.min_image_size);
 
-    if (opts.images) {
-        for (auto& img : images) {
-            img.saved_path = util::save_image_to_file(
-                opts.image_dir, img.name, img.format,
-                img.data.data(), img.data.size());
-            if (!img.saved_path.empty()) {
-                img.data.clear();
-                img.data.shrink_to_fit();
-            }
-        }
-    }
+    // One reference per image, in document order. The U+FFFC markers pair with
+    // this vector positionally, so it is never compacted; an empty entry means
+    // the image must not be referenced, because the write failed. An Escher
+    // BLIP record declares a type rather than a filename, so store_image
+    // settles the extension from the format.
+    std::vector<std::string> refs;
+    refs.reserve(images.size());
+    for (auto& img : images) refs.push_back(util::store_image(img, opts));
 
     // No images and no object markers → nothing to rewrite; avoid a full copy
     // of a potentially large body.
     if (images.empty() && md.find("\xEF\xBF\xBC") == std::string::npos)
         return md;
-    return replace_image_markers(md, images, opts.image_ref_prefix);
+    return replace_image_markers(md, images, refs, opts.image_ref_prefix);
 }
 
 std::vector<PageChunk> DocParser::to_chunks(const ConvertOptions& opts) {
@@ -1506,30 +1505,33 @@ std::vector<PageChunk> DocParser::to_chunks(const ConvertOptions& opts) {
     chunk.page_number = 1;
 
     std::string raw = extract_text();
-    chunk.text = strip_image_markers(text_to_markdown(raw));
+    std::string body = text_to_markdown(raw);
 
-    // Recover metafile (EMF/WMF) text regardless of image extraction, since it
-    // is document content; only attach the images themselves when requested.
+    // Metafile (EMF/WMF) text is document content, so it is recovered whether
+    // or not the images themselves are wanted.
     auto images = extract_images(opts.min_image_size);
-    for (const auto& img : images)
-        if (!img.embedded_text.empty())
-            chunk.text += "\n\n" + img.embedded_text;
-    if (opts.images) {
-        // When an image_dir is set, write each image to disk and drop the bytes
-        // (matching to_markdown() and the OOXML parsers). Without it the encoded
-        // bytes stay on the chunk for in-memory consumers.
-        if (!opts.image_dir.empty()) {
-            for (auto& img : images) {
-                img.saved_path = util::save_image_to_file(
-                    opts.image_dir, img.name, img.format,
-                    img.data.data(), img.data.size());
-                if (!img.saved_path.empty()) {
-                    img.data.clear();
-                    img.data.shrink_to_fit();
-                }
-            }
-        }
-        chunk.images = std::move(images);
+
+    if (!opts.images) {
+        chunk.text = strip_image_markers(body);
+        for (const auto& img : images)
+            if (!img.embedded_text.empty())
+                chunk.text += "\n\n" + img.embedded_text;
+    } else {
+        // One reference per image, in document order — the U+FFFC markers pair
+        // with this vector positionally, so it is never compacted.
+        std::vector<std::string> refs;
+        refs.reserve(images.size());
+        for (auto& img : images) refs.push_back(util::store_image(img, opts));
+
+        // The chunk text carries the references where the markers were, the
+        // same as to_markdown(): a chunk consumer should see where in the page
+        // an image sits, not just that the page has one.
+        chunk.text = replace_image_markers(body, images, refs,
+                                           opts.image_ref_prefix);
+
+        // An image that could not be written is not handed over either.
+        for (size_t i = 0; i < images.size(); ++i)
+            if (!refs[i].empty()) chunk.images.push_back(std::move(images[i]));
     }
 
     chunk.page_width = 612.0;

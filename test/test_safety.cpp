@@ -14,6 +14,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <iomanip>
@@ -1142,6 +1143,118 @@ void test_empty_memory_and_invalid_pages_are_consistent() {
     CHECK(rejected);
 }
 
+// A private directory under the platform temp path, named after `tag`.
+std::string scratch_dir(const std::string& tag) {
+    std::string base = "/tmp";
+    for (const char* var : {"TMPDIR", "TEMP", "TMP"}) {
+        const char* value = std::getenv(var);
+        if (value && *value) { base = value; break; }
+    }
+    const auto nonce = std::chrono::high_resolution_clock::now()
+                           .time_since_epoch().count();
+    return base + "/jdoc-" + tag + "-" + std::to_string(nonce);
+}
+
+void test_image_ref_name_matches_the_writer() {
+    // The Markdown reference and the file on disk come from one rule. A "jpeg"
+    // payload is written as .jpg and an unknown format as .bin, so deriving the
+    // reference from the format string alone must agree with that.
+    CHECK(jdoc::util::image_ref_name("page1_img0", "jpeg", "") ==
+          "page1_img0.jpg");
+    CHECK(jdoc::util::image_ref_name("page1_img0", "png", "") ==
+          "page1_img0.png");
+    CHECK(jdoc::util::image_ref_name("page1_img0", "", "") ==
+          "page1_img0.bin");
+    // Once written, the name that landed wins — collision suffix included.
+    CHECK(jdoc::util::image_ref_name("page1_img0", "png",
+                                     "out/images/page1_img0_3.png") ==
+          "page1_img0_3.png");
+
+    // and the writer agrees: the same payload saved twice keeps both files.
+    const std::string dir = scratch_dir("ref-name");
+    const std::string payload = "bytes";
+    const std::string first = jdoc::util::save_image_to_file(
+        dir, "page1_img0", "jpeg", payload.data(), payload.size());
+    const std::string second = jdoc::util::save_image_to_file(
+        dir, "page1_img0", "jpeg", payload.data(), payload.size());
+    CHECK(jdoc::util::get_filename(first) == "page1_img0.jpg");
+    CHECK(jdoc::util::get_filename(second) == "page1_img0_1.jpg");
+    CHECK(jdoc::util::image_ref_name("page1_img0", "jpeg", second) ==
+          "page1_img0_1.jpg");
+    std::filesystem::remove_all(jdoc::util::io_path(dir));
+}
+
+void test_save_recreates_a_removed_output_directory() {
+    // Nothing probes the directory before each save, so a cleanup that removes
+    // image_dir mid-run must not cost the next image: the write reports the
+    // missing path and the directory is created once, then retried.
+    const std::string root = scratch_dir("missing-dir");
+    const std::string dir = root + "/nested/images";
+    const std::string payload = "bytes";
+
+    const std::string first = jdoc::util::save_named_file(
+        dir, "page1_img0.png", payload.data(), payload.size());
+    CHECK(!first.empty());
+
+    std::error_code ignored;
+    std::filesystem::remove_all(jdoc::util::io_path(dir), ignored);
+    CHECK(!std::filesystem::exists(jdoc::util::io_path(dir)));
+
+    const std::string second = jdoc::util::save_named_file(
+        dir, "page1_img0.png", payload.data(), payload.size());
+    CHECK(!second.empty());
+    CHECK(std::filesystem::exists(jdoc::util::io_path(second)));
+    // The directory was empty again, so the plain name is free once more.
+    CHECK(jdoc::util::get_filename(second) == "page1_img0.png");
+
+    std::filesystem::remove_all(jdoc::util::io_path(root), ignored);
+}
+
+// The 1x1 PNG used as a standalone image document.
+std::string tiny_png() {
+    static const unsigned char kPng[] = {
+        0x89,0x50,0x4E,0x47,0x0D,0x0A,0x1A,0x0A, 0x00,0x00,0x00,0x0D,
+        0x49,0x48,0x44,0x52, 0x00,0x00,0x00,0x01, 0x00,0x00,0x00,0x01,
+        0x08,0x06,0x00,0x00,0x00, 0x1F,0x15,0xC4,0x89,
+        0x00,0x00,0x00,0x0A, 0x49,0x44,0x41,0x54,
+        0x78,0x9C,0x63,0x00,0x01,0x00,0x00,0x05,0x00,0x01,
+        0x0D,0x0A,0x2D,0xB4,
+        0x00,0x00,0x00,0x00, 0x49,0x45,0x4E,0x44, 0xAE,0x42,0x60,0x82};
+    return std::string(reinterpret_cast<const char*>(kPng), sizeof(kPng));
+}
+
+void test_standalone_image_is_not_filtered_by_min_image_size() {
+    // min_image_size drops decorations embedded in a document — bullets, icons.
+    // A standalone image IS the document, so the filter must not refuse the
+    // very file the caller handed over, and both APIs must say the same.
+    const std::string dir = scratch_dir("standalone-image");
+    const std::string payload = tiny_png();
+
+    jdoc::ConvertOptions opts;                  // default min_image_size (50)
+    opts.images = true;
+    opts.image_dir = dir;
+
+    const std::string md =
+        jdoc::convert(payload.data(), payload.size(), "tiny.png", opts);
+    CHECK(md.find("![") != std::string::npos);
+    CHECK(md.find("tiny.png") != std::string::npos);
+
+    std::error_code ignored;
+    std::filesystem::remove_all(jdoc::util::io_path(dir), ignored);
+
+    const auto chunks =
+        jdoc::convert_chunks(payload.data(), payload.size(), "tiny.png", opts);
+    std::string chunk_text;
+    size_t images = 0;
+    for (const auto& c : chunks) { chunk_text += c.text; images += c.images.size(); }
+    CHECK(images == 1);
+    CHECK(chunk_text.find("![") != std::string::npos);
+    // Both APIs name the same file.
+    CHECK(chunk_text.find("tiny.png") != std::string::npos);
+
+    std::filesystem::remove_all(jdoc::util::io_path(dir), ignored);
+}
+
 void test_concurrent_image_saves_do_not_overwrite() {
     std::string base = "/tmp";
     for (const char* var : {"TMPDIR", "TEMP", "TMP"}) {
@@ -1276,6 +1389,9 @@ int main() {
     RUN_TEST(test_pdf_decodes_surrogate_pair);
     RUN_TEST(test_memory_streaming_supports_eml);
     RUN_TEST(test_empty_memory_and_invalid_pages_are_consistent);
+    RUN_TEST(test_image_ref_name_matches_the_writer);
+    RUN_TEST(test_save_recreates_a_removed_output_directory);
+    RUN_TEST(test_standalone_image_is_not_filtered_by_min_image_size);
     RUN_TEST(test_concurrent_image_saves_do_not_overwrite);
     RUN_TEST(test_utf8_file_and_output_paths);
 #undef RUN_TEST

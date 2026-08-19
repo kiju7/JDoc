@@ -4,6 +4,7 @@
 #include "common/emf_text.h"
 #include "common/file_utils.h"
 #include "common/image_utils.h"
+#include "common/png_encode.h"
 #include "common/inflate.h"
 #include "common/string_utils.h"
 #include "common/binary_utils.h"
@@ -939,8 +940,14 @@ std::string XlsParser::to_markdown(const ConvertOptions& opts) {
 
     {
         auto images = extract_images(opts.min_image_size);
-        for (const auto& img : images) {
-            std::string filename = img.name + "." + img.format;
+        // Write the images out, the way every other parser does; a
+        // reference to a file that was never created helps no one.
+        // An Escher BLIP record declares a type rather than a filename, so
+        // store_image settles the extension from the format. An image that
+        // could not be written is not referenced.
+        for (auto& img : images) {
+            const std::string filename = util::store_image(img, opts);
+            if (filename.empty()) continue;
             if (opts.images)
                 md += "![" + filename + "](" + opts.image_ref_prefix + filename + ")\n\n";
             else
@@ -957,7 +964,22 @@ std::vector<PageChunk> XlsParser::to_chunks(const ConvertOptions& opts) {
     std::vector<PageChunk> chunks;
 
     auto images = opts.images ? extract_images(opts.min_image_size) : std::vector<ImageData>{};
-    int img_per_sheet = images.empty() ? 0 : static_cast<int>((images.size() + sheets_.size() - 1) / sheets_.size());
+    if (opts.images) {
+        // An image that could not be written is dropped rather than handed
+        // over as a chunk image pointing at nothing.
+        std::vector<ImageData> kept;
+        for (auto& img : images)
+            if (!util::store_image(img, opts).empty())
+                kept.push_back(std::move(img));
+        images = std::move(kept);
+    }
+    // A workbook whose sheets did not parse still divides here; guard the
+    // zero before it becomes a division by zero.
+    int img_per_sheet =
+        (images.empty() || sheets_.empty())
+            ? 0
+            : static_cast<int>((images.size() + sheets_.size() - 1) /
+                               sheets_.size());
 
     for (size_t i = 0; i < sheets_.size(); ++i) {
         PageChunk chunk;
@@ -1001,6 +1023,13 @@ std::vector<PageChunk> XlsParser::to_chunks(const ConvertOptions& opts) {
             int start = static_cast<int>(i) * img_per_sheet;
             int end = std::min(start + img_per_sheet, static_cast<int>(images.size()));
             for (int j = start; j < end; ++j) {
+                // The reference goes in the text too, the same as to_markdown:
+                // a chunk consumer should be told which picture the sheet
+                // shows, not just handed the bytes.
+                const std::string ref = util::image_ref_name(
+                    images[j].name, images[j].format, images[j].saved_path);
+                chunk.text += "\n\n![" + ref + "](" +
+                              opts.image_ref_prefix + ref + ")";
                 if (!images[j].embedded_text.empty())
                     chunk.text += "\n\n" + images[j].embedded_text;
                 chunk.images.push_back(images[j]);
