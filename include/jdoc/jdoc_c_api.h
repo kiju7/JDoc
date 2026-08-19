@@ -42,8 +42,18 @@ typedef struct {
     unsigned int height;
     char* data;                      /* encoded image bytes (jpeg/png/bmp) */
     int data_size;
-    char* format;                    /* "jpeg", "png", "bmp", ... */
-    char* saved_path;                /* disk path if image_dir was set */
+    char* format;                    /* "jpeg", "png", "bmp", ... — a format
+                                      * name, NOT a file extension. The file is
+                                      * written with the extension the source
+                                      * container declared, so "jpeg" lands as
+                                      * .jpg and a .webp part reports "bin".
+                                      * Never build a filename from this. */
+    char* saved_path;                /* the file that was written, when
+                                      * image_dir was set: the only correct
+                                      * source for the name on disk, collision
+                                      * suffix included. Empty when nothing was
+                                      * written (no image_dir), and the bytes
+                                      * are then in `data`. */
     int components;                  /* raw pixel components: 1/3/4 */
     char* pixels;                    /* raw pixel bytes, if retained */
     int pixels_size;

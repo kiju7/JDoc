@@ -380,8 +380,14 @@ type Image struct {
 	Components   int
 	Data         []byte // encoded image bytes (jpeg/png/bmp)
 	Pixels       []byte // raw pixels (width * height * components), when retained
-	Format       string // "jpeg", "png", "bmp", ...
-	SavedPath    string // disk path if image extraction wrote to a directory
+	// Format is a format name, not a file extension: the file is written with
+	// the extension the source container declared, so "jpeg" lands as .jpg and
+	// a .webp part reports "bin". Never build a filename from it.
+	Format string
+	// SavedPath is the file that was written, when ImageDir was set — the only
+	// correct source for the name on disk, collision suffix included. Empty
+	// when nothing was written, and the bytes are then in Data.
+	SavedPath string
 	EmbeddedText string // text recovered from an EMF/WMF image
 }
 

@@ -171,8 +171,16 @@ PYBIND11_MODULE(_jdoc, m) {
         .def_readwrite("height", &jdoc::ImageData::height)
         .def_readwrite("components", &jdoc::ImageData::components)
         .def_readwrite("pixels", &jdoc::ImageData::pixels)
-        .def_readwrite("format", &jdoc::ImageData::format)
-        .def_readwrite("saved_path", &jdoc::ImageData::saved_path)
+        .def_readwrite("format", &jdoc::ImageData::format,
+                       "Format name, not a file extension: the file is written "
+                       "with the extension the source container declared, so "
+                       "'jpeg' lands as .jpg and a .webp part reports 'bin'. "
+                       "Never build a filename from this.")
+        .def_readwrite("saved_path", &jdoc::ImageData::saved_path,
+                       "The file that was written, when image_dir was set - the "
+                       "only correct source for the name on disk, collision "
+                       "suffix included. Empty when nothing was written, and "
+                       "the bytes are then in .data")
         .def_readwrite("embedded_text", &jdoc::ImageData::embedded_text)
         .def_property("data",
             // getter: return image data as Python bytes
