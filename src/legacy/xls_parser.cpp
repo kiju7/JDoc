@@ -4,6 +4,7 @@
 #include "common/emf_text.h"
 #include "common/file_utils.h"
 #include "common/image_utils.h"
+#include "common/png_encode.h"
 #include "common/inflate.h"
 #include "common/string_utils.h"
 #include "common/binary_utils.h"
@@ -939,6 +940,19 @@ std::string XlsParser::to_markdown(const ConvertOptions& opts) {
 
     {
         auto images = extract_images(opts.min_image_size);
+        // Write the images out, the way every other parser does; a
+        // reference to a file that was never created helps no one.
+        if (opts.images && !opts.image_dir.empty()) {
+            for (auto& img : images) {
+                img.saved_path = util::save_image_to_file(
+                    opts.image_dir, img.name, img.format,
+                    img.data.data(), img.data.size());
+                if (!img.saved_path.empty()) {
+                    img.data.clear();
+                    img.data.shrink_to_fit();
+                }
+            }
+        }
         for (const auto& img : images) {
             std::string filename = util::image_ref_name(
                 img.name, img.format, img.saved_path);
@@ -958,7 +972,24 @@ std::vector<PageChunk> XlsParser::to_chunks(const ConvertOptions& opts) {
     std::vector<PageChunk> chunks;
 
     auto images = opts.images ? extract_images(opts.min_image_size) : std::vector<ImageData>{};
-    int img_per_sheet = images.empty() ? 0 : static_cast<int>((images.size() + sheets_.size() - 1) / sheets_.size());
+    if (opts.images && !opts.image_dir.empty()) {
+        for (auto& img : images) {
+            img.saved_path = util::save_image_to_file(
+                opts.image_dir, img.name, img.format,
+                img.data.data(), img.data.size());
+            if (!img.saved_path.empty()) {
+                img.data.clear();
+                img.data.shrink_to_fit();
+            }
+        }
+    }
+    // A workbook whose sheets did not parse still divides here; guard the
+    // zero before it becomes a division by zero.
+    int img_per_sheet =
+        (images.empty() || sheets_.empty())
+            ? 0
+            : static_cast<int>((images.size() + sheets_.size() - 1) /
+                               sheets_.size());
 
     for (size_t i = 0; i < sheets_.size(); ++i) {
         PageChunk chunk;

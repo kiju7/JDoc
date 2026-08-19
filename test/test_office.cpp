@@ -1081,6 +1081,191 @@ void test_image_reference_matches_file() {
     TEST_END
 }
 
+// ── Legacy .xls image extraction ─────────────────────────────
+
+// A compound file holding one "Workbook" stream — all the .xls image scanner
+// reads. The stream is padded past the mini-stream cutoff so the regular FAT
+// chain carries it and no mini-FAT is needed.
+static std::string make_ole_workbook(const std::string& workbook) {
+    constexpr size_t SEC = 512;
+    constexpr uint32_t FREESECT = 0xFFFFFFFF;
+    constexpr uint32_t ENDOFCHAIN = 0xFFFFFFFE;
+    constexpr uint32_t FATSECT = 0xFFFFFFFD;
+    constexpr uint32_t MINI_CUTOFF = 4096;
+
+    auto set_u16_at = [](std::string& b, size_t off, uint16_t v) {
+        b[off] = static_cast<char>(v & 0xFF);
+        b[off + 1] = static_cast<char>(v >> 8);
+    };
+    auto set_u32_at = [&](std::string& b, size_t off, uint32_t v) {
+        set_u16_at(b, off, static_cast<uint16_t>(v & 0xFFFF));
+        set_u16_at(b, off + 2, static_cast<uint16_t>(v >> 16));
+    };
+
+    std::string data = workbook;
+    size_t want = std::max<size_t>(data.size(), MINI_CUTOFF);
+    want = ((want + SEC - 1) / SEC) * SEC;
+    data.resize(want, '\0');
+    // Declare the padded size: a stream under the mini-stream cutoff would
+    // be looked for in the root mini-stream, which this fixture has not got.
+    const uint32_t stream_size = static_cast<uint32_t>(data.size());
+
+    const uint32_t fat_sec = 0, dir_sec = 1, first_data = 2;
+    const uint32_t sectors = static_cast<uint32_t>(data.size() / SEC);
+
+    std::vector<uint32_t> fat(SEC / 4, FREESECT);
+    fat[fat_sec] = FATSECT;
+    fat[dir_sec] = ENDOFCHAIN;
+    for (uint32_t k = 0; k < sectors; k++)
+        fat[first_data + k] =
+            (k + 1 < sectors) ? (first_data + k + 1) : ENDOFCHAIN;
+
+    // Directory: Root Entry, then the Workbook stream.
+    std::string dir(SEC, '\0');
+    struct Ent { const char* name; uint8_t type; uint32_t start, size; };
+    const Ent ents[] = {
+        {"Root Entry", 5, 0, 0},
+        {"Workbook",   2, first_data, stream_size},
+    };
+    for (size_t i = 0; i < sizeof(ents) / sizeof(ents[0]); i++) {
+        size_t off = i * 128;
+        size_t len = std::strlen(ents[i].name);
+        for (size_t c = 0; c < len; c++)
+            set_u16_at(dir, off + c * 2, static_cast<uint16_t>(ents[i].name[c]));
+        set_u16_at(dir, off + 0x40, static_cast<uint16_t>((len + 1) * 2));
+        dir[off + 0x42] = static_cast<char>(ents[i].type);
+        set_u32_at(dir, off + 0x44, FREESECT);  // left sibling
+        set_u32_at(dir, off + 0x48, FREESECT);  // right sibling
+        set_u32_at(dir, off + 0x4C, i == 0 ? 1u : FREESECT);  // child
+        set_u32_at(dir, off + 0x74, ents[i].start);
+        set_u32_at(dir, off + 0x78, ents[i].size);
+    }
+    for (size_t i = 2; i < SEC / 128; i++) {
+        set_u32_at(dir, i * 128 + 0x44, FREESECT);
+        set_u32_at(dir, i * 128 + 0x48, FREESECT);
+        set_u32_at(dir, i * 128 + 0x4C, FREESECT);
+    }
+
+    std::string hdr(SEC, '\0');
+    const unsigned char sig[8] = {0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1};
+    std::memcpy(&hdr[0], sig, 8);
+    set_u16_at(hdr, 0x18, 0x003E);
+    set_u16_at(hdr, 0x1A, 3);
+    set_u16_at(hdr, 0x1C, 0xFFFE);
+    set_u16_at(hdr, 0x1E, 9);
+    set_u16_at(hdr, 0x20, 6);
+    set_u32_at(hdr, 0x2C, 1);
+    set_u32_at(hdr, 0x30, dir_sec);
+    set_u32_at(hdr, 0x38, MINI_CUTOFF);
+    set_u32_at(hdr, 0x3C, ENDOFCHAIN);
+    set_u32_at(hdr, 0x40, 0);
+    set_u32_at(hdr, 0x44, ENDOFCHAIN);
+    set_u32_at(hdr, 0x48, 0);
+    set_u32_at(hdr, 0x4C, fat_sec);
+    for (int i = 1; i < 109; i++) set_u32_at(hdr, 0x4C + i * 4, FREESECT);
+
+    std::string fat_bytes(SEC, '\0');
+    for (size_t i = 0; i < fat.size(); i++) set_u32_at(fat_bytes, i * 4, fat[i]);
+
+    return hdr + fat_bytes + dir + data;
+}
+
+// A Workbook stream carrying one MSODRAWING record whose OfficeArt payload is
+// a PNG BLIP (record type 0xF01E, 17-byte header before the payload).
+static std::string workbook_with_png_blip() {
+    const std::string png = png_bytes();
+
+    std::string blip;
+    put_u16(blip, 0x6E00);   // ver 0, inst 0x6E0 — the 17-byte-header flavour
+    put_u16(blip, 0xF01E);   // BLIP: PNG
+    put_u32(blip, static_cast<uint32_t>(17 + png.size()));
+    blip.append(16, '\0');   // BLIP UID
+    blip.push_back('\0');    // tag
+    blip += png;
+
+    std::string wb;
+    put_u16(wb, 0x0809);     // BOF — workbook globals
+    put_u16(wb, 4);
+    put_u16(wb, 0x0600);
+    put_u16(wb, 0x0005);
+
+    const std::string sheet_name = "Sheet1";
+    put_u16(wb, 0x0085);     // BOUNDSHEET
+    put_u16(wb, static_cast<uint16_t>(8 + sheet_name.size()));
+    put_u32(wb, 0);          // lbPlyPos
+    put_u16(wb, 0);          // grbit: visible worksheet
+    wb.push_back(static_cast<char>(sheet_name.size()));
+    wb.push_back(0);         // 8-bit name
+    wb += sheet_name;
+
+    put_u16(wb, 0x00EC);     // MSODRAWING
+    put_u16(wb, static_cast<uint16_t>(blip.size()));
+    wb += blip;
+    put_u16(wb, 0x000A);     // EOF
+    put_u16(wb, 0);
+    return wb;
+}
+
+void test_xls_images() {
+    std::cerr << "\nLegacy .xls images:\n";
+
+    TEST(blip_is_written_to_image_dir)
+        // .xls used to emit an image reference without ever writing the file:
+        // extract_images() ran, nothing called the writer.
+        auto book = make_ole_workbook(workbook_with_png_blip());
+        std::string dir = temp_image_dir("xls_images");
+        jdoc::ConvertOptions opts;
+        opts.images = true;
+        opts.min_image_size = 0;
+        opts.image_dir = dir;
+
+        auto md = jdoc::office_to_markdown_mem(
+            reinterpret_cast<const uint8_t*>(book.data()), book.size(),
+            "book.xls", opts);
+        ASSERT(md.find("![") != std::string::npos);
+        assert_targets_exist(md, dir);
+        std::filesystem::remove_all(dir);
+    TEST_END
+
+    TEST(chunk_images_are_written_too)
+        auto book = make_ole_workbook(workbook_with_png_blip());
+        std::string dir = temp_image_dir("xls_images_chunks");
+        jdoc::ConvertOptions opts;
+        opts.images = true;
+        opts.min_image_size = 0;
+        opts.image_dir = dir;
+
+        auto chunks = jdoc::office_to_markdown_chunks_mem(
+            reinterpret_cast<const uint8_t*>(book.data()), book.size(),
+            "book.xls", opts);
+        size_t saved = 0;
+        for (const auto& c : chunks)
+            for (const auto& img : c.images)
+                if (!img.saved_path.empty() &&
+                    std::filesystem::exists(img.saved_path))
+                    saved++;
+        ASSERT(saved == 1);
+        std::filesystem::remove_all(dir);
+    TEST_END
+
+    TEST(memory_mode_keeps_the_bytes)
+        // With no image_dir the payload has to stay on the chunk.
+        auto book = make_ole_workbook(workbook_with_png_blip());
+        jdoc::ConvertOptions opts;
+        opts.images = true;
+        opts.min_image_size = 0;
+
+        auto chunks = jdoc::office_to_markdown_chunks_mem(
+            reinterpret_cast<const uint8_t*>(book.data()), book.size(),
+            "book.xls", opts);
+        size_t with_payload = 0;
+        for (const auto& c : chunks)
+            for (const auto& img : c.images)
+                if (!img.data.empty()) with_payload++;
+        ASSERT(with_payload == 1);
+    TEST_END
+}
+
 // ── XLSX streaming (SAX) path ────────────────────────────────
 
 // A workbook exercising every construct the streaming scanner must replicate
@@ -1405,6 +1590,7 @@ int main() {
     test_docx_header_footer();
     test_xlsx_fixes();
     test_image_reference_matches_file();
+    test_xls_images();
     test_xlsx_streaming();
     test_xls_sst_continue();
     test_xlsb_sparse_cells();
