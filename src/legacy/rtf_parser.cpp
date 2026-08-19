@@ -539,6 +539,20 @@ std::string RtfParser::metafile_text(const std::vector<PictImage>& pict_images) 
     return out;
 }
 
+// The pictures follow the body, one reference each. Shared so the chunk API
+// says the same thing the markdown API does.
+static void append_image_refs(std::string& text,
+                              const std::vector<ImageData>& images,
+                              const std::string& prefix) {
+    if (images.empty()) return;
+    text += "\n\n---\n\n";
+    for (const auto& img : images) {
+        const std::string ref =
+            util::image_ref_name(img.name, img.format, img.saved_path);
+        text += "![" + ref + "](" + prefix + ref + ")\n\n";
+    }
+}
+
 std::string RtfParser::to_markdown(const ConvertOptions& opts) {
     std::string text;
     std::vector<PictImage> pict_images;
@@ -547,18 +561,9 @@ std::string RtfParser::to_markdown(const ConvertOptions& opts) {
     // Convert cell separators to markdown tables
     text = rtf_cells_to_markdown(text);
 
-    if (opts.images) {
-        auto images = build_images(pict_images, opts);
-        if (!images.empty()) {
-            text += "\n\n---\n\n";
-            for (const auto& img : images) {
-                const std::string ref = util::image_ref_name(
-                    img.name, img.format, img.saved_path);
-                text += "![" + ref + "](" + opts.image_ref_prefix + ref + ")\n\n";
-                if (!img.embedded_text.empty()) text += img.embedded_text + "\n\n";
-            }
-        }
-    }
+    if (opts.images)
+        append_image_refs(text, build_images(pict_images, opts),
+                          opts.image_ref_prefix);
     text += metafile_text(pict_images);
 
     return text;
@@ -578,7 +583,10 @@ std::vector<PageChunk> RtfParser::to_chunks(const ConvertOptions& opts) {
 
     chunk.text += metafile_text(pict_images);
 
-    if (opts.images) chunk.images = build_images(pict_images, opts);
+    if (opts.images) {
+        chunk.images = build_images(pict_images, opts);
+        append_image_refs(chunk.text, chunk.images, opts.image_ref_prefix);
+    }
 
     std::vector<PageChunk> chunks;
     chunks.push_back(std::move(chunk));

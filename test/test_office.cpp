@@ -1828,6 +1828,71 @@ void test_pptx_linebreak() {
 
 // ── Main ────────────────────────────────────────────────────
 
+// The two APIs must describe the same conversion: the same references in the
+// text, and the same files on disk. They used to drift — .doc stripped the
+// image markers out of its chunk text while its markdown kept them.
+static void assert_apis_agree(const std::string& doc, const std::string& hint,
+                              const std::string& tag) {
+    std::string d1 = temp_image_dir(tag + "_md");
+    std::string d2 = temp_image_dir(tag + "_ch");
+    jdoc::ConvertOptions o1;
+    o1.images = true;
+    o1.min_image_size = 0;
+    o1.image_ref_prefix = "x/";
+    o1.image_dir = d1;
+    jdoc::ConvertOptions o2 = o1;
+    o2.image_dir = d2;
+
+    const auto* bytes = reinterpret_cast<const uint8_t*>(doc.data());
+    std::string md = jdoc::office_to_markdown_mem(bytes, doc.size(), hint, o1);
+    std::string ch;
+    for (auto& c : jdoc::office_to_markdown_chunks_mem(bytes, doc.size(), hint, o2))
+        ch += c.text;
+
+    auto md_refs = image_targets(md), ch_refs = image_targets(ch);
+    std::set<std::string> a(md_refs.begin(), md_refs.end());
+    std::set<std::string> b(ch_refs.begin(), ch_refs.end());
+    if (a != b) throw std::runtime_error("APIs disagree on image references");
+
+    std::set<std::string> f1, f2;
+    for (auto& e : std::filesystem::directory_iterator(d1))
+        f1.insert(e.path().filename().string());
+    for (auto& e : std::filesystem::directory_iterator(d2))
+        f2.insert(e.path().filename().string());
+    if (f1 != f2) throw std::runtime_error("APIs disagree on files written");
+    if (f1.empty()) throw std::runtime_error("no image was written at all");
+
+    std::filesystem::remove_all(d1);
+    std::filesystem::remove_all(d2);
+}
+
+void test_markdown_and_chunk_apis_agree() {
+    std::cerr << "\nMarkdown and chunk APIs agree:\n";
+
+    TEST(xlsx)
+        assert_apis_agree(make_media_xlsx(), "book.xlsx", "agree_xlsx");
+    TEST_END
+
+    TEST(pptx)
+        assert_apis_agree(make_shared_media_pptx(), "deck.pptx", "agree_pptx");
+    TEST_END
+
+    TEST(rtf)
+        assert_apis_agree(make_rtf_with_pictures(2), "doc.rtf", "agree_rtf");
+    TEST_END
+
+    TEST(xls)
+        assert_apis_agree(make_ole_workbook(workbook_with_png_blip()),
+                          "book.xls", "agree_xls");
+    TEST_END
+
+    TEST(html)
+        assert_apis_agree(
+            "<html><body><img src=\"data:image/png;base64," + png_base64() +
+            "\" alt=\"a\"></body></html>", "page.html", "agree_html");
+    TEST_END
+}
+
 int main() {
     std::cerr << "=== jdoc office tests ===\n\n";
 
@@ -1845,6 +1910,7 @@ int main() {
     test_image_reference_matches_file();
     test_xls_images();
     test_rtf_images();
+    test_markdown_and_chunk_apis_agree();
     test_xlsx_streaming();
     test_xls_sst_continue();
     test_xlsb_sparse_cells();

@@ -378,10 +378,16 @@ static PageChunk image_to_chunk(const uint8_t* data, size_t size,
     img.page_number = 1;
     img.name = strip_ext(basename);
     img.format = util::detect_image_format(data, size);
+    // A standalone image is the document, not a decoration inside one, so the
+    // min_image_size filter does not apply: it exists to drop bullets and
+    // icons embedded in a document, and must not refuse the very file the
+    // caller handed over. image_to_markdown() has never filtered it either.
+    ConvertOptions image_opts = opts;
+    image_opts.min_image_size = 0;
     // The input file named its own extension; store_image keeps it, and writes
     // straight from the source buffer so the bytes are not copied to be saved.
     const std::string filename = util::store_image(
-        img, opts, util::get_extension(basename), data, size);
+        img, image_opts, util::get_extension(basename), data, size);
     if (filename.empty()) return chunk;
     chunk.text = "![" + filename + "](" + opts.image_ref_prefix + filename + ")\n";
     chunk.images.push_back(std::move(img));

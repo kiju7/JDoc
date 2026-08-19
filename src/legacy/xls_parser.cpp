@@ -1023,6 +1023,13 @@ std::vector<PageChunk> XlsParser::to_chunks(const ConvertOptions& opts) {
             int start = static_cast<int>(i) * img_per_sheet;
             int end = std::min(start + img_per_sheet, static_cast<int>(images.size()));
             for (int j = start; j < end; ++j) {
+                // The reference goes in the text too, the same as to_markdown:
+                // a chunk consumer should be told which picture the sheet
+                // shows, not just handed the bytes.
+                const std::string ref = util::image_ref_name(
+                    images[j].name, images[j].format, images[j].saved_path);
+                chunk.text += "\n\n![" + ref + "](" +
+                              opts.image_ref_prefix + ref + ")";
                 if (!images[j].embedded_text.empty())
                     chunk.text += "\n\n" + images[j].embedded_text;
                 chunk.images.push_back(images[j]);

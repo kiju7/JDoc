@@ -1210,6 +1210,51 @@ void test_save_recreates_a_removed_output_directory() {
     std::filesystem::remove_all(jdoc::util::io_path(root), ignored);
 }
 
+// The 1x1 PNG used as a standalone image document.
+std::string tiny_png() {
+    static const unsigned char kPng[] = {
+        0x89,0x50,0x4E,0x47,0x0D,0x0A,0x1A,0x0A, 0x00,0x00,0x00,0x0D,
+        0x49,0x48,0x44,0x52, 0x00,0x00,0x00,0x01, 0x00,0x00,0x00,0x01,
+        0x08,0x06,0x00,0x00,0x00, 0x1F,0x15,0xC4,0x89,
+        0x00,0x00,0x00,0x0A, 0x49,0x44,0x41,0x54,
+        0x78,0x9C,0x63,0x00,0x01,0x00,0x00,0x05,0x00,0x01,
+        0x0D,0x0A,0x2D,0xB4,
+        0x00,0x00,0x00,0x00, 0x49,0x45,0x4E,0x44, 0xAE,0x42,0x60,0x82};
+    return std::string(reinterpret_cast<const char*>(kPng), sizeof(kPng));
+}
+
+void test_standalone_image_is_not_filtered_by_min_image_size() {
+    // min_image_size drops decorations embedded in a document — bullets, icons.
+    // A standalone image IS the document, so the filter must not refuse the
+    // very file the caller handed over, and both APIs must say the same.
+    const std::string dir = scratch_dir("standalone-image");
+    const std::string payload = tiny_png();
+
+    jdoc::ConvertOptions opts;                  // default min_image_size (50)
+    opts.images = true;
+    opts.image_dir = dir;
+
+    const std::string md =
+        jdoc::convert(payload.data(), payload.size(), "tiny.png", opts);
+    CHECK(md.find("![") != std::string::npos);
+    CHECK(md.find("tiny.png") != std::string::npos);
+
+    std::error_code ignored;
+    std::filesystem::remove_all(jdoc::util::io_path(dir), ignored);
+
+    const auto chunks =
+        jdoc::convert_chunks(payload.data(), payload.size(), "tiny.png", opts);
+    std::string chunk_text;
+    size_t images = 0;
+    for (const auto& c : chunks) { chunk_text += c.text; images += c.images.size(); }
+    CHECK(images == 1);
+    CHECK(chunk_text.find("![") != std::string::npos);
+    // Both APIs name the same file.
+    CHECK(chunk_text.find("tiny.png") != std::string::npos);
+
+    std::filesystem::remove_all(jdoc::util::io_path(dir), ignored);
+}
+
 void test_concurrent_image_saves_do_not_overwrite() {
     std::string base = "/tmp";
     for (const char* var : {"TMPDIR", "TEMP", "TMP"}) {
@@ -1346,6 +1391,7 @@ int main() {
     RUN_TEST(test_empty_memory_and_invalid_pages_are_consistent);
     RUN_TEST(test_image_ref_name_matches_the_writer);
     RUN_TEST(test_save_recreates_a_removed_output_directory);
+    RUN_TEST(test_standalone_image_is_not_filtered_by_min_image_size);
     RUN_TEST(test_concurrent_image_saves_do_not_overwrite);
     RUN_TEST(test_utf8_file_and_output_paths);
 #undef RUN_TEST

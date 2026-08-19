@@ -1505,25 +1505,33 @@ std::vector<PageChunk> DocParser::to_chunks(const ConvertOptions& opts) {
     chunk.page_number = 1;
 
     std::string raw = extract_text();
-    chunk.text = strip_image_markers(text_to_markdown(raw));
+    std::string body = text_to_markdown(raw);
 
-    // Recover metafile (EMF/WMF) text regardless of image extraction, since it
-    // is document content; only attach the images themselves when requested.
+    // Metafile (EMF/WMF) text is document content, so it is recovered whether
+    // or not the images themselves are wanted.
     auto images = extract_images(opts.min_image_size);
-    for (const auto& img : images)
-        if (!img.embedded_text.empty())
-            chunk.text += "\n\n" + img.embedded_text;
-    if (opts.images) {
-        // When an image_dir is set, write each image to disk and drop the bytes
-        // (matching to_markdown() and the OOXML parsers). Without it the encoded
-        // bytes stay on the chunk for in-memory consumers.
-        // An image that could not be written is dropped rather than handed
-        // over as a chunk image pointing at nothing.
-        std::vector<ImageData> kept;
-        for (auto& img : images)
-            if (!util::store_image(img, opts).empty())
-                kept.push_back(std::move(img));
-        chunk.images = std::move(kept);
+
+    if (!opts.images) {
+        chunk.text = strip_image_markers(body);
+        for (const auto& img : images)
+            if (!img.embedded_text.empty())
+                chunk.text += "\n\n" + img.embedded_text;
+    } else {
+        // One reference per image, in document order — the U+FFFC markers pair
+        // with this vector positionally, so it is never compacted.
+        std::vector<std::string> refs;
+        refs.reserve(images.size());
+        for (auto& img : images) refs.push_back(util::store_image(img, opts));
+
+        // The chunk text carries the references where the markers were, the
+        // same as to_markdown(): a chunk consumer should see where in the page
+        // an image sits, not just that the page has one.
+        chunk.text = replace_image_markers(body, images, refs,
+                                           opts.image_ref_prefix);
+
+        // An image that could not be written is not handed over either.
+        for (size_t i = 0; i < images.size(); ++i)
+            if (!refs[i].empty()) chunk.images.push_back(std::move(images[i]));
     }
 
     chunk.page_width = 612.0;
