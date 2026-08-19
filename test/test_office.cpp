@@ -2,6 +2,7 @@
 // License: MIT
 
 #include "jdoc/office.h"
+#include "jdoc/archive.h"
 #include "jdoc/detect.h"
 #include "zip_reader.h"
 #include "common/string_utils.h"
@@ -1078,6 +1079,35 @@ void test_image_reference_matches_file() {
             "book.xlsx", opts);
         ASSERT(md.find("![") == std::string::npos);
         std::filesystem::remove_all(base);
+    TEST_END
+
+    TEST(archive_member_keeps_its_own_name_and_leaves_no_empty_dirs)
+        // An archive member is a file with a name of its own, so it keeps it
+        // rather than becoming page1_img0 — and a member that holds no images
+        // must not leave an empty directory behind for itself.
+        std::string dir = temp_image_dir("archive_members");
+        auto zip = make_zip({{"photo.jpeg", png_bytes()},
+                             {"note.txt", "hello"}});
+        std::string zip_path = (std::filesystem::temp_directory_path() /
+                                "jdoc_test_members.zip").string();
+        { std::ofstream f(zip_path, std::ios::binary); f << zip; }
+
+        jdoc::ConvertOptions opts;
+        opts.images = true;
+        opts.min_image_size = 0;
+        opts.image_dir = dir;
+        opts.image_ref_prefix = "out/";
+
+        std::string md;
+        jdoc::convert_archive(zip_path,
+            [&](jdoc::MemberResult&& m) { md += m.markdown; return true; },
+            opts);
+
+        ASSERT(std::filesystem::exists(std::filesystem::path(dir) / "photo.jpeg"));
+        ASSERT(!std::filesystem::exists(std::filesystem::path(dir) / "note.txt"));
+        ASSERT(md.find("out/photo.jpeg") != std::string::npos);
+        std::filesystem::remove(zip_path);
+        std::filesystem::remove_all(dir);
     TEST_END
 
     TEST(pptx_reference_follows_the_collision_suffix)

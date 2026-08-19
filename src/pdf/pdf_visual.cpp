@@ -1222,9 +1222,14 @@ std::vector<ExtractedImage> extract_page_images(PdfDoc& doc, const PdfObj& resou
                 img.saved_path = util::save_image_to_file(
                     output_dir, img.name, img.format,
                     img.data.data(), img.data.size());
-                if (!img.saved_path.empty()) {
-                    discard_image_payload(img);
+                // A page that asked for files and got none must not carry a
+                // reference to one: the placement counts as failed, the same
+                // as a decode that produced nothing.
+                if (img.saved_path.empty()) {
+                    if (diag) diag->images_failed++;
+                    continue;
                 }
+                discard_image_payload(img);
             }
 
             ExtractedImage ei;
@@ -2508,9 +2513,10 @@ static ImageData render_composite_view(
     if (!output_dir.empty()) {
         img.saved_path = util::save_image_to_file(
             output_dir, img.name, "png", img.data.data(), img.data.size());
-        if (!img.saved_path.empty()) {
-            discard_image_payload(img);
-        }
+        // Nothing was written, so there is nothing to reference. Hand back an
+        // empty image, as for a canvas that was never painted.
+        if (img.saved_path.empty()) return {};
+        discard_image_payload(img);
     }
     return img;
 }
