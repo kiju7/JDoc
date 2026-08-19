@@ -9,8 +9,14 @@ public final class Image {
     public final int components;
     public final byte[] data;     // encoded image bytes (jpeg/png/bmp); may be empty
     public final byte[] pixels;   // raw pixels; may be empty
-    public final String format;   // "jpeg", "png", "bmp", ...
-    public final String savedPath; // disk path if image extraction wrote to a directory
+    /** A format name, not a file extension: the file is written with the
+     *  extension the source container declared, so "jpeg" lands as .jpg and a
+     *  .webp part reports "bin". Never build a filename from it. */
+    public final String format;
+    /** The file that was written, when imageDir was set — the only correct
+     *  source for the name on disk, collision suffix included. Empty when
+     *  nothing was written, and the bytes are then in {@link #data}. */
+    public final String savedPath;
     public final String embeddedText; // text recovered from EMF/WMF
 
     public Image(int pageNumber, String name, int width, int height,
