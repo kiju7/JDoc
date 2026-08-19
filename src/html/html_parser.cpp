@@ -4,6 +4,9 @@
 #include "html_parser.h"
 #include "html_charset.h"
 #include "common/file_utils.h"
+#include "common/image_utils.h"
+#include "common/png_encode.h"
+#include "common/string_utils.h"
 
 #include <algorithm>
 #include <cctype>
@@ -294,6 +297,37 @@ std::string HtmlParser::read_text(size_t& pos) const {
     return raw_html_.substr(start, pos - start);
 }
 
+// Split a "data:image/png;base64,<payload>" src into its bytes. Returns false
+// for any other src — an http(s) URL or a relative path names a file outside
+// the document, and fetching it is not this parser's business.
+//
+// `format` and `declared_ext` come from the MIME subtype the author declared,
+// the same way a zip entry's name declares the extension of a media part.
+static bool decode_data_uri(const std::string& src, std::vector<char>& out,
+                            std::string& format, std::string& declared_ext) {
+    if (src.compare(0, 5, "data:") != 0) return false;
+    const size_t comma = src.find(',');
+    if (comma == std::string::npos) return false;
+
+    const std::string meta = src.substr(5, comma - 5);
+    if (meta.find("base64") == std::string::npos) return false;  // percent-encoded
+    if (meta.compare(0, 6, "image/") != 0) return false;
+
+    std::string subtype = meta.substr(6, meta.find(';', 6) - 6);
+    for (auto& c : subtype)
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    // "image/jpeg" and "image/svg+xml" name the format; the extension follows
+    // from it, since a data: URI carries no filename of its own.
+    if (subtype == "svg+xml") subtype = "svg";
+    else if (subtype == "x-icon" || subtype == "vnd.microsoft.icon") subtype = "ico";
+    format = subtype.empty() ? "bin" : subtype;
+    declared_ext = "." + util::image_file_ext(format);
+
+    const std::string bytes = util::decode_base64(src.substr(comma + 1));
+    out.assign(bytes.begin(), bytes.end());
+    return !out.empty();
+}
+
 // ── Main conversion ──────────────────────────────────────
 
 std::string HtmlParser::convert(const ConvertOptions& opts,
@@ -558,18 +592,45 @@ std::string HtmlParser::convert(const ConvertOptions& opts,
             if (alt.empty()) alt = "image";
 
             if (!src.empty()) {
-                std::string img_md = "![" + alt + "](" + src + ")";
+                ImageData img;
+                img.page_number = 1;
+                img.name = "page1_img" + std::to_string(img_idx);
+
+                // A data: URI is the only src that carries the picture itself;
+                // it is the document's embedded media, and it is extracted the
+                // way every other format's is. An http(s) or relative src names
+                // a file that lives outside the document — there are no bytes
+                // here to write, so the reference stays as the author wrote it.
+                std::string ref = src;
+                std::string declared_ext;
+                if (decode_data_uri(src, img.data, img.format, declared_ext)) {
+                    util::populate_image_dimensions(img);
+                    if (util::is_image_too_small(img, opts.min_image_size))
+                        continue;
+                    if (opts.images && !opts.image_dir.empty()) {
+                        img.saved_path = util::save_named_file(
+                            opts.image_dir,
+                            img.name + util::image_ext_for_save(declared_ext,
+                                                                img.format),
+                            img.data.data(), img.data.size());
+                        if (!img.saved_path.empty()) {
+                            img.data.clear();
+                            img.data.shrink_to_fit();
+                        }
+                    }
+                    ref = opts.image_ref_prefix +
+                          util::image_ref_name(img.name, img.format,
+                                               img.saved_path);
+                } else {
+                    img.format =
+                        util::image_format_from_ext(util::get_extension(src));
+                }
+
+                std::string img_md = "![" + alt + "](" + ref + ")";
                 if (in_cell) current_cell += img_md;
                 else if (in_li) li_text += img_md;
                 else md += img_md;
 
-                // Create ImageData entry (without actual data for external URLs)
-                ImageData img;
-                img.page_number = 0;
-                img.name = alt.empty() ? ("html_img_" + std::to_string(img_idx)) : alt;
-                img.format = "";
-                std::string ext = util::get_extension(src);
-                if (!ext.empty()) img.format = util::image_format_from_ext(ext);
                 out_images.push_back(std::move(img));
                 img_idx++;
             }
@@ -778,17 +839,6 @@ std::string HtmlParser::convert(const ConvertOptions& opts,
 std::string HtmlParser::to_markdown(const ConvertOptions& opts) {
     std::vector<ImageData> images;
     std::string md = convert(opts, images);
-
-    // Append image references
-    if (!images.empty()) {
-        md += "\n";
-        for (auto& img : images) {
-            if (opts.images)
-                md += "![" + img.name + "](" + opts.image_ref_prefix + img.name + ")\n";
-            else
-                md += "![" + img.name + "](" + img.name + "." + img.format + ")\n";
-        }
-    }
 
     return md;
 }

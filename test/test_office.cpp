@@ -1468,6 +1468,128 @@ static std::string convert_html(const std::string& html) {
         reinterpret_cast<const uint8_t*>(html.data()), html.size(), "page.html");
 }
 
+// ── HTML embedded images ─────────────────────────────────────
+
+// Base64 for the 1x1 PNG, so a data: URI can carry it the way a browser-saved
+// page or an HTML mail body does.
+static std::string png_base64() {
+    static const char kAlphabet[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const std::string raw = png_bytes();
+    std::string out;
+    for (size_t i = 0; i < raw.size(); i += 3) {
+        uint32_t v = static_cast<unsigned char>(raw[i]) << 16;
+        if (i + 1 < raw.size()) v |= static_cast<unsigned char>(raw[i + 1]) << 8;
+        if (i + 2 < raw.size()) v |= static_cast<unsigned char>(raw[i + 2]);
+        out += kAlphabet[(v >> 18) & 0x3F];
+        out += kAlphabet[(v >> 12) & 0x3F];
+        out += (i + 1 < raw.size()) ? kAlphabet[(v >> 6) & 0x3F] : '=';
+        out += (i + 2 < raw.size()) ? kAlphabet[v & 0x3F] : '=';
+    }
+    return out;
+}
+
+static std::string convert_html_with(const std::string& html,
+                                     const jdoc::ConvertOptions& opts) {
+    return jdoc::office_to_markdown_mem(
+        reinterpret_cast<const uint8_t*>(html.data()), html.size(),
+        "page.html", opts);
+}
+
+void test_html_images() {
+    std::cerr << "\nHTML embedded images:\n";
+
+    const std::string data_img =
+        "<img src=\"data:image/png;base64," + png_base64() + "\" alt=\"logo\">";
+
+    TEST(data_uri_is_extracted_to_image_dir)
+        // The picture lives in the document, so it is extracted like any other
+        // embedded media — and the reference names the file that was written
+        // instead of inlining a base64 blob into the markdown.
+        std::string dir = temp_image_dir("html_data_uri");
+        jdoc::ConvertOptions opts;
+        opts.images = true;
+        opts.min_image_size = 0;
+        opts.image_dir = dir;
+
+        auto md = convert_html_with("<html><body>" + data_img + "</body></html>",
+                                    opts);
+        ASSERT(md.find("base64") == std::string::npos);
+        assert_targets_exist(md, dir);
+        std::filesystem::remove_all(dir);
+    TEST_END
+
+    TEST(data_uri_reference_honours_the_prefix)
+        std::string dir = temp_image_dir("html_data_uri_prefix");
+        jdoc::ConvertOptions opts;
+        opts.images = true;
+        opts.min_image_size = 0;
+        opts.image_dir = dir;
+        opts.image_ref_prefix = "media/";
+
+        auto md = convert_html_with("<html><body>" + data_img + "</body></html>",
+                                    opts);
+        auto targets = image_targets(md);
+        ASSERT(targets.size() == 1);
+        ASSERT(targets[0] == "media/page1_img0.png");
+        assert_targets_exist(md, dir);
+        std::filesystem::remove_all(dir);
+    TEST_END
+
+    TEST(external_src_is_left_alone)
+        // An http(s) or relative src names a file outside the document. There
+        // are no bytes to write, and the reference stays as the author wrote it.
+        std::string dir = temp_image_dir("html_external_src");
+        jdoc::ConvertOptions opts;
+        opts.images = true;
+        opts.min_image_size = 0;
+        opts.image_dir = dir;
+
+        auto md = convert_html_with(
+            "<html><body><img src=\"https://example.com/a.png\" alt=\"x\">"
+            "<img src=\"local.jpg\" alt=\"y\"></body></html>", opts);
+        auto targets = image_targets(md);
+        ASSERT(targets.size() == 2);
+        ASSERT(targets[0] == "https://example.com/a.png");
+        ASSERT(targets[1] == "local.jpg");
+        // and nothing was invented on disk for them
+        ASSERT(std::filesystem::is_empty(dir));
+        std::filesystem::remove_all(dir);
+    TEST_END
+
+    TEST(each_image_is_referenced_once)
+        // The old appendix emitted a second reference per image, pointing at a
+        // file that never existed.
+        std::string dir = temp_image_dir("html_single_reference");
+        jdoc::ConvertOptions opts;
+        opts.images = true;
+        opts.min_image_size = 0;
+        opts.image_dir = dir;
+
+        auto md = convert_html_with("<html><body>" + data_img + "</body></html>",
+                                    opts);
+        ASSERT(count_occurrences(md, "![") == 1);
+        std::filesystem::remove_all(dir);
+    TEST_END
+
+    TEST(memory_mode_keeps_the_bytes)
+        // With no image_dir the decoded payload travels on the chunk.
+        jdoc::ConvertOptions opts;
+        opts.images = true;
+        opts.min_image_size = 0;
+
+        std::string html = "<html><body>" + data_img + "</body></html>";
+        auto chunks = jdoc::office_to_markdown_chunks_mem(
+            reinterpret_cast<const uint8_t*>(html.data()), html.size(),
+            "page.html", opts);
+        size_t with_payload = 0;
+        for (const auto& c : chunks)
+            for (const auto& img : c.images)
+                if (!img.data.empty()) with_payload++;
+        ASSERT(with_payload == 1);
+    TEST_END
+}
+
 void test_html_charset() {
     std::cerr << "\nHTML charset:\n";
 
@@ -1595,6 +1717,7 @@ int main() {
     test_xls_sst_continue();
     test_xlsb_sparse_cells();
     test_html_charset();
+    test_html_images();
     test_pptx_linebreak();
 
     std::cerr << "\n=== Results: " << tests_passed << " passed, "
