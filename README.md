@@ -107,6 +107,9 @@ for m in jdoc.convert_archive("docs.zip", max_depth=3):
 
 # 메모리 버퍼에서 직접 변환 (파일 I/O 없음)
 md = jdoc.convert_bytes(open("doc.hwp", "rb").read(), name_hint="doc.hwp")
+pages = jdoc.convert_pages_bytes(data, name_hint="report.pdf")
+for page in jdoc.convert_pages_bytes_stream(data, name_hint="report.pdf"):
+    process(page)
 ```
 
 ### C++
@@ -176,7 +179,8 @@ for (int i = 0; i < page_count; i++) {
     for (int j = 0; j < pages[i].image_count; j++) {
         JDocImage* img = &pages[i].images[j];
         // img->name, img->width, img->height, img->format
-        // img->data (원시 바이트), img->data_size
+        // img->data (JPEG/PNG 등 인코딩 바이트), img->data_size
+        // img->pixels (원시 픽셀), img->pixels_size, img->components
         // img->saved_path (image_dir 설정 시)
     }
 }
@@ -212,7 +216,28 @@ int on_page(const JDocPage* page, void* userdata) {
 jdoc_convert_pages_stream("big.pptx", &opts, on_page, NULL, err, sizeof(err));
 ```
 
-Go(`StreamPages(path).Pages()` → `iter.Seq[Page]`)와 Java(`Jdoc.streamPages(path)` → `Stream<Page>`) 바인딩도 각 언어의 지연 이터레이터로 같은 API를 제공한다 (`bindings/go`, `bindings/java`).
+Go(`StreamPages(path).Pages()` → `iter.Seq[Page]`)와 Java(`Jdoc.streamPages(path)` → `Iterable<Page>`) 바인딩도 각 언어의 지연 이터레이터로 같은 API를 제공한다 (`bindings/go`, `bindings/java`). 메모리 입력은 각각 `StreamPagesBytes`와 `streamPagesBytes`를 사용한다.
+
+## API 일관성과 스레드 안전성
+
+공개 API는 언어별 명명 관례만 다르고 입력 종류, 옵션, 페이지 결과의 의미는 같다. 모든 페이지 결과는 `page_number`, 텍스트, 페이지 크기, 본문 폰트 크기, 표, 이미지, 저품질 이미지 수를 제공하며 페이지 번호는 항상 **0부터 시작**한다.
+
+| 작업 | C++ | C | Python | Go | Java |
+|---|---|---|---|---|---|
+| 파일/메모리 포맷 판별 | `detect` | `jdoc_detect[_mem]` | `detect[_bytes]` | `Detect[Bytes]` | `detect[Bytes]` |
+| 파일/메모리 전체 변환 | `convert` 오버로드 | `jdoc_convert[_mem]` | `convert[_bytes]` | `Convert[Bytes]` | `convert[Bytes]` |
+| 파일/메모리 페이지 목록 | `convert_chunks` 오버로드 | `jdoc_convert_pages[_mem]` | `convert_pages[_bytes]` | `ConvertPages[Bytes]` | `convertPages[Bytes]` |
+| 파일/메모리 페이지 스트림 | `for_each_chunk` 오버로드 | `jdoc_convert_pages[_mem]_stream` | `convert_pages[_bytes]_stream` | `StreamPages[Bytes]` | `streamPages[Bytes]` |
+| 아카이브 멤버 변환 | `convert_archive` | `jdoc_convert_archive` | `convert_archive` | `ConvertArchive` | `convertArchive` |
+
+스레드 안전성 계약은 다음과 같다.
+
+- 서로 다른 문서에 대한 `detect`, `convert`, 페이지 변환, 아카이브 변환 호출은 같은 프로세스에서 동시에 실행할 수 있다. 호출 중 입력 버퍼와 옵션은 변경하지 않아야 한다.
+- 하나의 페이지 스트림은 단일 소비자용이며 한 번만 순회할 수 있다. Python/Java 스트림은 사용 후 닫고, Go는 순회 후 `Err()`를 확인한다.
+- PDF 내부 페이지 병렬 처리와 문서 단위 병렬 호출을 함께 사용할 수 있다. 합성 렌더 작업은 프로세스 전체 메모리 게이트로 제한된다.
+- 같은 프로세스의 여러 변환이 동일한 `image_dir`와 파일명을 사용해도 기존 파일을 덮어쓰지 않고 `_1`, `_2` 접미사를 붙인다. 이 보장은 프로세스 간 잠금까지 포함하지 않는다.
+- C 스트리밍 콜백의 `JDocPage*`만 콜백 동안 빌린 값이다. 나머지 언어 바인딩은 페이지와 이미지 바이트를 각 언어 소유 메모리로 복사한다.
+- 경로 문자열은 모든 API에서 UTF-8이며 Windows에서도 한글 등 비 ASCII 경로를 지원한다.
 
 ## 옵션
 
@@ -247,6 +272,7 @@ CLI는 각 환경의 관례에 맞는 대응 필드·플래그를 제공한다.
 
 - 멤버당·압축비·깊이 초과는 **해당 멤버만 스킵**하고 순회를 계속하며, 누적·멤버 수 초과만 순회를 중단
 - 아카이브 멤버의 이미지는 멤버 간 파일명 충돌을 막기 위해 `image_dir/<멤버 경로>/` 하위에 저장되며(중첩 구조 보존), 마크다운 참조 경로도 함께 조정됨
+- 동일 출력 파일명이 이미 있으면 덮어쓰지 않고 `_1`, `_2` 접미사를 붙이며 실제 저장 경로가 결과와 마크다운에 반영됨
 - C API는 각 필드에 `0` = 라이브러리 기본값, `-1` = 무제한, 양수 = 지정 값
 - bzip2(단독 BZ2/TAR.BZ2, ALZ/EGG 일부 멤버)는 `-DJDOC_WITH_BZIP2=ON` 빌드에서 지원. 기본 OFF 시 해당 멤버만 오류로 보고
 

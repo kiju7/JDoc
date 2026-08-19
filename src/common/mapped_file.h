@@ -18,6 +18,7 @@
 #include <cstdio>
 #include <string>
 #include <vector>
+#include "common/file_utils.h"
 
 #if defined(_WIN32)
 // windows.h defines function-like min/max macros that mangle any later
@@ -60,7 +61,7 @@ private:
 
     // Last resort: pull the whole file into a heap buffer.
     void read_fallback_(const std::string& path) {
-        FILE* fp = std::fopen(path.c_str(), "rb");
+        FILE* fp = util::fopen_utf8(path, "rb");
         if (!fp) return;
         if (std::fseek(fp, 0, SEEK_END) == 0) {
             long sz = std::ftell(fp);
@@ -77,7 +78,8 @@ private:
 
 #if defined(_WIN32)
     void open_(const std::string& path) {
-        file_ = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+        file_ = CreateFileW(util::io_path(path).c_str(), GENERIC_READ,
+                            FILE_SHARE_READ, nullptr,
                             OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
         if (file_ == INVALID_HANDLE_VALUE) return;
         LARGE_INTEGER li;

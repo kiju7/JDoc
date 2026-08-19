@@ -118,7 +118,7 @@ struct PdfObj {
     }
 
     const PdfObj& get(const std::string& key) const {
-        static PdfObj none;
+        static const PdfObj none;
         for (auto& [k, v] : dict)
             if (k == key) return v;
         return none;

@@ -12,6 +12,7 @@
 #include "jdoc/office.h"
 #include "convert_internal.h"
 #include "common/image_magic.h"
+#include "common/file_utils.h"
 
 #include <cstring>
 #include <fstream>
@@ -239,7 +240,7 @@ FormatInfo detect(const std::string& file_path) {
     unsigned char hdr[512] = {};
     size_t n = 0;
     {
-        std::ifstream f(file_path, std::ios::binary);
+        std::ifstream f(util::io_path(file_path), std::ios::binary);
         if (f) {
             f.read(reinterpret_cast<char*>(hdr), sizeof(hdr));
             n = static_cast<size_t>(f.gcount());

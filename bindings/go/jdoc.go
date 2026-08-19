@@ -34,13 +34,22 @@ static int jdoc_stream_pages(const char* path, const JDocOptions* opts,
     return jdoc_convert_pages_stream(path, opts,
         (JDocPageCallback)goJDocPageSink, userdata, err, errsz);
 }
+static int jdoc_stream_pages_mem(const void* data, int size,
+                                 const char* name_hint,
+                                 const JDocOptions* opts, void* userdata,
+                                 char* err, int errsz) {
+    return jdoc_convert_pages_mem_stream(data, size, name_hint, opts,
+        (JDocPageCallback)goJDocPageSink, userdata, err, errsz);
+}
 */
 import "C"
 
 import (
 	"errors"
 	"iter"
+	"runtime"
 	"runtime/cgo"
+	"sync"
 	"unsafe"
 )
 
@@ -90,6 +99,13 @@ type FormatInfo struct {
 
 const errBufSize = 1024
 
+func byteDataPtr(data []byte) unsafe.Pointer {
+	if len(data) == 0 {
+		return nil
+	}
+	return unsafe.Pointer(&data[0])
+}
+
 // Detect identifies a file's format without running a full extraction.
 func Detect(path string) (FormatInfo, error) {
 	cPath := C.CString(path)
@@ -109,8 +125,8 @@ func Detect(path string) (FormatInfo, error) {
 // DetectBytes identifies the format of an in-memory document. nameHint (may be
 // "") resolves extension-based ambiguity.
 func DetectBytes(data []byte, nameHint string) (FormatInfo, error) {
-	if len(data) == 0 {
-		return FormatInfo{}, errors.New("empty data")
+	if int64(len(data)) > int64(1<<31-1) {
+		return FormatInfo{}, errors.New("data exceeds C API size limit")
 	}
 	cHint := C.CString(nameHint)
 	defer C.free(unsafe.Pointer(cHint))
@@ -118,7 +134,7 @@ func DetectBytes(data []byte, nameHint string) (FormatInfo, error) {
 	var info C.JDocFormatInfo
 	errBuf := make([]C.char, errBufSize)
 
-	rc := C.jdoc_detect_mem(unsafe.Pointer(&data[0]), C.int(len(data)), cHint,
+	rc := C.jdoc_detect_mem(byteDataPtr(data), C.int(len(data)), cHint,
 		&info, &errBuf[0], C.int(errBufSize))
 	if rc != 0 {
 		return FormatInfo{}, errors.New(C.GoString(&errBuf[0]))
@@ -247,6 +263,51 @@ func convertWith(path string, opts *C.JDocOptions) (string, error) {
 	return C.GoString(out), nil
 }
 
+// ConvertBytes converts an in-memory document using default options. nameHint
+// (for example "report.docx") resolves extension-based ambiguity.
+func ConvertBytes(data []byte, nameHint string) (string, error) {
+	return convertBytesWith(data, nameHint, nil)
+}
+
+// ConvertBytesWithOptions is ConvertBytes with explicit conversion options.
+func ConvertBytesWithOptions(data []byte, nameHint string, opts Options) (string, error) {
+	c, free := opts.toC()
+	defer free()
+	return convertBytesWith(data, nameHint, c)
+}
+
+func convertBytesWith(data []byte, nameHint string, opts *C.JDocOptions) (string, error) {
+	if int64(len(data)) > int64(1<<31-1) {
+		return "", errors.New("data exceeds C API size limit")
+	}
+	cHint := C.CString(nameHint)
+	defer C.free(unsafe.Pointer(cHint))
+	errBuf := make([]C.char, errBufSize)
+	out := C.jdoc_convert_mem(byteDataPtr(data), C.int(len(data)), cHint,
+		opts, &errBuf[0], C.int(errBufSize))
+	if out == nil {
+		return "", errors.New(C.GoString(&errBuf[0]))
+	}
+	defer C.jdoc_free_string(out)
+	return C.GoString(out), nil
+}
+
+// MemberErrorCode classifies an archive member conversion failure.
+type MemberErrorCode int
+
+const (
+	MemberOK MemberErrorCode = iota
+	MemberLimit
+	RatioLimit
+	TotalLimit
+	EntryLimit
+	DepthLimit
+	MemberEncrypted
+	MemberUnsupported
+	MemberCorrupt
+	MemberConvertFailed
+)
+
 // Member is one document found inside an archive.
 type Member struct {
 	Path             string // e.g. "outer.zip/dir/report.hwp"
@@ -254,6 +315,7 @@ type Member struct {
 	Markdown         string
 	Error            string
 	ErrorCode        int
+	ErrorKind        MemberErrorCode
 	UncompressedSize int64
 }
 
@@ -300,6 +362,7 @@ func convertArchiveWith(path string, opts *C.JDocOptions) ([]Member, error) {
 			Markdown:         C.GoString(m.markdown),
 			Error:            C.GoString(m.error),
 			ErrorCode:        int(m.error_code),
+			ErrorKind:        MemberErrorCode(m.error_code),
 			UncompressedSize: int64(m.uncompressed_size),
 		}
 	}
@@ -310,27 +373,39 @@ func convertArchiveWith(path string, opts *C.JDocOptions) ([]Member, error) {
 
 // Image is one image extracted from a page.
 type Image struct {
-	PageNumber int
-	Name       string
-	Width      uint
-	Height     uint
-	Data       []byte // raw image bytes (jpeg/png/bmp)
-	Format     string // "jpeg", "png", "bmp", ...
-	SavedPath  string // disk path if image extraction wrote to a directory
+	PageNumber   int
+	Name         string
+	Width        uint
+	Height       uint
+	Components   int
+	Data         []byte // encoded image bytes (jpeg/png/bmp)
+	Pixels       []byte // raw pixels (width * height * components), when retained
+	Format       string // "jpeg", "png", "bmp", ...
+	SavedPath    string // disk path if image extraction wrote to a directory
+	EmbeddedText string // text recovered from an EMF/WMF image
 }
 
 // Page is one page/slide/sheet of a converted document.
 type Page struct {
-	PageNumber int
-	Text       string // markdown or plaintext for this page
-	Images     []Image
+	PageNumber     int
+	Text           string // markdown or plaintext for this page
+	PageWidth      float64
+	PageHeight     float64
+	BodyFontSize   float64
+	Tables         [][][]string
+	Images         []Image
+	DegradedImages int
 }
 
 // goPage copies a borrowed C JDocPage into an owned Go Page.
 func goPage(p *C.JDocPage) Page {
 	page := Page{
-		PageNumber: int(p.page_number),
-		Text:       C.GoString(p.text),
+		PageNumber:     int(p.page_number),
+		Text:           C.GoString(p.text),
+		PageWidth:      float64(p.page_width),
+		PageHeight:     float64(p.page_height),
+		BodyFontSize:   float64(p.body_font_size),
+		DegradedImages: int(p.degraded_images),
 	}
 	n := int(p.image_count)
 	if n > 0 && p.images != nil {
@@ -339,15 +414,44 @@ func goPage(p *C.JDocPage) Page {
 		for i := 0; i < n; i++ {
 			si := &imgs[i]
 			page.Images[i] = Image{
-				PageNumber: int(si.page_number),
-				Name:       C.GoString(si.name),
-				Width:      uint(si.width),
-				Height:     uint(si.height),
-				Format:     C.GoString(si.format),
-				SavedPath:  C.GoString(si.saved_path),
+				PageNumber:   int(si.page_number),
+				Name:         C.GoString(si.name),
+				Width:        uint(si.width),
+				Height:       uint(si.height),
+				Components:   int(si.components),
+				Format:       C.GoString(si.format),
+				SavedPath:    C.GoString(si.saved_path),
+				EmbeddedText: C.GoString(si.embedded_text),
 			}
 			if si.data != nil && si.data_size > 0 {
 				page.Images[i].Data = C.GoBytes(unsafe.Pointer(si.data), si.data_size)
+			}
+			if si.pixels != nil && si.pixels_size > 0 {
+				page.Images[i].Pixels = C.GoBytes(unsafe.Pointer(si.pixels), si.pixels_size)
+			}
+		}
+	}
+	tn := int(p.table_count)
+	if tn > 0 && p.tables != nil {
+		tables := unsafe.Slice(p.tables, tn)
+		page.Tables = make([][][]string, tn)
+		for ti := 0; ti < tn; ti++ {
+			rn := int(tables[ti].row_count)
+			if rn <= 0 || tables[ti].rows == nil {
+				continue
+			}
+			rows := unsafe.Slice(tables[ti].rows, rn)
+			page.Tables[ti] = make([][]string, rn)
+			for ri := 0; ri < rn; ri++ {
+				cn := int(rows[ri].cell_count)
+				if cn <= 0 || rows[ri].cells == nil {
+					continue
+				}
+				cells := unsafe.Slice(rows[ri].cells, cn)
+				page.Tables[ti][ri] = make([]string, cn)
+				for ci := 0; ci < cn; ci++ {
+					page.Tables[ti][ri][ci] = C.GoString(cells[ci])
+				}
 			}
 		}
 	}
@@ -392,6 +496,44 @@ func convertPagesWith(path string, opts *C.JDocOptions) ([]Page, error) {
 	return pages, nil
 }
 
+// ConvertPagesBytes converts an in-memory document to page chunks using
+// default options.
+func ConvertPagesBytes(data []byte, nameHint string) ([]Page, error) {
+	return convertPagesBytesWith(data, nameHint, nil)
+}
+
+// ConvertPagesBytesWithOptions is ConvertPagesBytes with explicit options.
+func ConvertPagesBytesWithOptions(data []byte, nameHint string, opts Options) ([]Page, error) {
+	c, free := opts.toC()
+	defer free()
+	return convertPagesBytesWith(data, nameHint, c)
+}
+
+func convertPagesBytesWith(data []byte, nameHint string, opts *C.JDocOptions) ([]Page, error) {
+	if int64(len(data)) > int64(1<<31-1) {
+		return nil, errors.New("data exceeds C API size limit")
+	}
+	cHint := C.CString(nameHint)
+	defer C.free(unsafe.Pointer(cHint))
+	var count C.int
+	errBuf := make([]C.char, errBufSize)
+	arr := C.jdoc_convert_pages_mem(byteDataPtr(data), C.int(len(data)),
+		cHint, opts, &count, &errBuf[0], C.int(errBufSize))
+	if arr == nil {
+		if msg := C.GoString(&errBuf[0]); msg != "" {
+			return nil, errors.New(msg)
+		}
+		return nil, nil
+	}
+	defer C.jdoc_free_pages(arr, count)
+	n := int(count)
+	pages := make([]Page, n)
+	for i, page := range unsafe.Slice(arr, n) {
+		pages[i] = goPage(&page)
+	}
+	return pages, nil
+}
+
 // sinkState carries the caller's yield closure across the C boundary, plus any
 // panic recovered while yielding (re-raised after the C call unwinds).
 type sinkState struct {
@@ -401,7 +543,11 @@ type sinkState struct {
 
 //export goJDocPageSink
 func goJDocPageSink(page *C.JDocPage, userdata unsafe.Pointer) C.int {
-	s := cgo.Handle(userdata).Value().(*sinkState)
+	// userdata points at the cgo.Handle variable owned by Pages. A Handle is an
+	// integer token, not a pointer: converting its numeric value directly to an
+	// unsafe.Pointer trips checkptr (and is explicitly forbidden by runtime/cgo).
+	h := *(*cgo.Handle)(userdata)
+	s := h.Value().(*sinkState)
 	// A panic must not cross the C frame; capture it, stop the stream, and let
 	// StreamPages re-raise it once jdoc_stream_pages has returned.
 	cont := false
@@ -422,9 +568,14 @@ func goJDocPageSink(page *C.JDocPage, userdata unsafe.Pointer) C.int {
 // PageStream drives a lazy, single-pass walk over a document's pages. Iterate
 // with Pages; after the loop, check Err for a conversion failure.
 type PageStream struct {
-	path string
-	opts *Options // nil = C library defaults
-	err  error
+	path     string
+	data     []byte
+	nameHint string
+	memory   bool
+	opts     *Options // nil = C library defaults
+	mu       sync.Mutex
+	err      error
+	used     bool
 }
 
 // StreamPages returns a lazy page iterator for the document at path, using
@@ -442,17 +593,38 @@ func StreamPagesWithOptions(path string, opts Options) *PageStream {
 	return &PageStream{path: path, opts: &opts}
 }
 
+// StreamPagesBytes returns a lazy page iterator over an in-memory document.
+// The input is copied so callers may safely reuse or modify their slice while
+// the iterator is active. nameHint resolves extension-based ambiguity.
+func StreamPagesBytes(data []byte, nameHint string) *PageStream {
+	return &PageStream{data: append([]byte(nil), data...), nameHint: nameHint, memory: true}
+}
+
+// StreamPagesBytesWithOptions is StreamPagesBytes with explicit options.
+func StreamPagesBytesWithOptions(data []byte, nameHint string, opts Options) *PageStream {
+	return &PageStream{
+		data: append([]byte(nil), data...), nameHint: nameHint, memory: true, opts: &opts,
+	}
+}
+
 // Pages returns a single-use iterator over the document's pages. Breaking out
 // of the range loop stops the underlying conversion. Any conversion error is
 // reported by Err after iteration ends.
 func (s *PageStream) Pages() iter.Seq[Page] {
 	return func(yield func(Page) bool) {
+		s.mu.Lock()
+		if s.used {
+			s.err = errors.New("PageStream.Pages is single-use")
+			s.mu.Unlock()
+			return
+		}
+		s.used = true
+		s.err = nil
+		s.mu.Unlock()
+
 		state := &sinkState{yield: yield}
 		h := cgo.NewHandle(state)
 		defer h.Delete()
-
-		cPath := C.CString(s.path)
-		defer C.free(unsafe.Pointer(cPath))
 
 		var cOpts *C.JDocOptions
 		if s.opts != nil {
@@ -462,19 +634,42 @@ func (s *PageStream) Pages() iter.Seq[Page] {
 		}
 
 		errBuf := make([]C.char, errBufSize)
-		rc := C.jdoc_stream_pages(cPath, cOpts, unsafe.Pointer(h),
-			&errBuf[0], C.int(errBufSize))
+		var rc C.int
+		if s.memory {
+			if int64(len(s.data)) > int64(1<<31-1) {
+				s.mu.Lock()
+				s.err = errors.New("data exceeds C API size limit")
+				s.mu.Unlock()
+				return
+			}
+			cHint := C.CString(s.nameHint)
+			defer C.free(unsafe.Pointer(cHint))
+			rc = C.jdoc_stream_pages_mem(byteDataPtr(s.data), C.int(len(s.data)),
+				cHint, cOpts, unsafe.Pointer(&h), &errBuf[0], C.int(errBufSize))
+			runtime.KeepAlive(s.data)
+		} else {
+			cPath := C.CString(s.path)
+			defer C.free(unsafe.Pointer(cPath))
+			rc = C.jdoc_stream_pages(cPath, cOpts, unsafe.Pointer(&h),
+				&errBuf[0], C.int(errBufSize))
+		}
 
 		if state.panic != nil {
 			panic(state.panic) // re-raise a yield panic in the caller's goroutine
 		}
 		if rc != 0 {
 			if msg := C.GoString(&errBuf[0]); msg != "" {
+				s.mu.Lock()
 				s.err = errors.New(msg)
+				s.mu.Unlock()
 			}
 		}
 	}
 }
 
 // Err returns the error from the most recent Pages iteration, if any.
-func (s *PageStream) Err() error { return s.err }
+func (s *PageStream) Err() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.err
+}

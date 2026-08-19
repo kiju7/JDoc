@@ -30,7 +30,7 @@ public final class Options {
     public String imageRefPrefix = null;
     /** Skip images smaller than NxN pixels; 0 = no filter. */
     public int minImageSize = 50;
-    /** Page numbers to extract (1-based); null = all pages. */
+    /** Page numbers to extract (0-based); null = all pages. */
     public int[] pages = null;
     /** "markdown" (default) or "text". */
     public String format = "markdown";
@@ -84,6 +84,14 @@ public final class Options {
      *  whole native call. Returns null for null options (C defaults). */
     static JdocLibrary.JDocOptions toNative(Options opts) {
         if (opts == null) return null;
+        if (opts.minImageSize < 0) {
+            throw new IllegalArgumentException("minImageSize must be >= 0");
+        }
+        if (opts.pages != null) {
+            for (int page : opts.pages) {
+                if (page < 0) throw new IllegalArgumentException("pages must be >= 0");
+            }
+        }
 
         JdocLibrary.JDocOptions o = new JdocLibrary.JDocOptions();
         o.tables = opts.tables ? 1 : 0;

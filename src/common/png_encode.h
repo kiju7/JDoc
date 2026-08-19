@@ -16,8 +16,48 @@
 #include <algorithm>
 #include <limits>
 #include <memory>
+#include <mutex>
 
 namespace jdoc { namespace util {
+
+// Choose and write an output filename while holding a process-wide lock. This
+// prevents simultaneous conversions that share image_dir from truncating one
+// another's "pageN_imgM.ext" files. Existing files are preserved by adding a
+// numeric suffix before the extension. The returned path is the name actually
+// written, so callers can put the collision-free name into Markdown.
+inline std::string save_unique_named_file(const std::string& dir,
+                                          const std::string& filename,
+                                          const void* data, size_t size) {
+    if (dir.empty() || filename.empty() || !data || size == 0) return "";
+    if (size > static_cast<size_t>(std::numeric_limits<std::streamsize>::max()))
+        return "";
+    ensure_dirs(dir);
+
+    static std::mutex output_mutex;
+    std::lock_guard<std::mutex> lock(output_mutex);
+
+    const size_t dot = filename.rfind('.');
+    const bool has_ext = dot != std::string::npos && dot != 0;
+    const std::string stem = has_ext ? filename.substr(0, dot) : filename;
+    const std::string ext = has_ext ? filename.substr(dot) : std::string();
+    for (uint64_t suffix = 0; suffix < UINT64_MAX; ++suffix) {
+        std::string candidate = stem;
+        if (suffix != 0) candidate += "_" + std::to_string(suffix);
+        candidate += ext;
+        std::string path = dir + "/" + candidate;
+        {
+            std::ifstream existing(io_path(path), std::ios::binary);
+            if (existing.good()) continue;
+        }
+        std::ofstream ofs(io_path(path), std::ios::binary);
+        if (!ofs) return "";
+        ofs.write(static_cast<const char*>(data),
+                  static_cast<std::streamsize>(size));
+        ofs.close();
+        return ofs ? path : std::string();
+    }
+    return "";
+}
 
 inline void png_put32(std::vector<char>& v, uint32_t val) {
     char b[4] = {static_cast<char>((val >> 24) & 0xFF),
@@ -283,21 +323,12 @@ inline std::string save_image_to_file(const std::string& dir,
                                        const std::string& format,
                                        const void* data, size_t size) {
     if (dir.empty() || !data || size == 0) return "";
-    ensure_dir(dir);
-
     // Keep the extension the container declared (zip entry name, BLIP record
     // type, OLE stream) rather than second-guessing it with a magic-byte sniff:
     // the extracted file should carry its real, source-declared extension.
     std::string ext = (format == "jpeg") ? "jpg" : format;
     if (ext.empty()) ext = "bin";
-    std::string path = dir + "/" + name + "." + ext;
-    std::ofstream ofs(path, std::ios::binary);
-    if (!ofs) return "";
-    if (size > static_cast<size_t>(std::numeric_limits<std::streamsize>::max()))
-        return "";
-    ofs.write(static_cast<const char*>(data),
-              static_cast<std::streamsize>(size));
-    return path;
+    return save_unique_named_file(dir, name + "." + ext, data, size);
 }
 
 // Save bytes to "<dir>/<filename>" verbatim — the filename (including its
@@ -307,16 +338,7 @@ inline std::string save_image_to_file(const std::string& dir,
 inline std::string save_named_file(const std::string& dir,
                                    const std::string& filename,
                                    const void* data, size_t size) {
-    if (dir.empty() || filename.empty() || !data || size == 0) return "";
-    ensure_dirs(dir);
-    std::string path = dir + "/" + filename;
-    std::ofstream ofs(path, std::ios::binary);
-    if (!ofs) return "";
-    if (size > static_cast<size_t>(std::numeric_limits<std::streamsize>::max()))
-        return "";
-    ofs.write(static_cast<const char*>(data),
-              static_cast<std::streamsize>(size));
-    return path;
+    return save_unique_named_file(dir, filename, data, size);
 }
 
 }} // namespace jdoc::util

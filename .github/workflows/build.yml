@@ -61,6 +61,25 @@ jobs:
       - name: Run tests
         run: ctest --test-dir build --output-on-failure
 
+  thread-sanitizer:
+    name: ThreadSanitizer
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: >-
+          cmake -S . -B build
+          -DCMAKE_BUILD_TYPE=Debug
+          -DJDOC_BUILD_TESTS=ON
+          -DJDOC_ENABLE_THREAD_SANITIZER=ON
+
+      - name: Build concurrency test
+        run: cmake --build build --target test_thread_safety -j 4
+
+      - name: Run concurrency test under TSAN
+        run: ctest --test-dir build -R '^test_thread_safety$' --output-on-failure
+
   bindings:
     name: Language bindings
     runs-on: ubuntu-latest
@@ -96,16 +115,32 @@ jobs:
 
       - name: Test Python binding
         env:
-          PYTHONPATH: build
+          PYTHONPATH: build:python
         run: >-
-          python -c "import _jdoc;
-          assert _jdoc.ConvertOptions().images is True;
-          assert _jdoc.convert_bytes(b'hello', 'x.txt') == 'hello';
-          assert _jdoc.detect_bytes(b'hello', 'x.txt').format == 'TXT'"
+          python -c "import jdoc;
+          from concurrent.futures import ThreadPoolExecutor;
+          assert jdoc.ConvertOptions().images is True;
+          assert jdoc.convert_bytes(b'hello', 'x.txt') == 'hello';
+          assert jdoc.convert_bytes(b'', 'empty.txt') == '';
+          assert jdoc.detect_bytes(b'hello', 'x.txt').format == 'TXT';
+          data = open('test/fixtures/pdf/sample.pdf', 'rb').read();
+          eager = jdoc.convert_pages_bytes(data, 'sample.pdf');
+          streamed = list(jdoc.convert_pages_bytes_stream(data, 'sample.pdf'));
+          assert [(p.page_number, p.text) for p in eager] == [(p.page_number, p.text) for p in streamed];
+          pool = ThreadPoolExecutor(max_workers=8);
+          assert len(list(pool.map(lambda _: jdoc.convert_bytes(data, 'sample.pdf'), range(16)))) == 16;
+          pool.shutdown()"
+
+      - name: Test Python wheel ABI and package exports
+        run: |
+          python -m pip wheel . --no-deps -w wheelhouse
+          python -m pip install --force-reinstall wheelhouse/*.whl
+          cd /tmp
+          python -c "import jdoc; assert hasattr(jdoc, 'convert_pages_bytes_stream')"
 
       - name: Test Go binding
         working-directory: bindings/go
-        run: go test ./...
+        run: go test -race ./...
 
       - name: Test Java binding
         working-directory: bindings/java

@@ -4,7 +4,9 @@ import org.junit.jupiter.api.Test;
 
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.nio.file.Files;
 import java.util.ArrayList;
+import java.util.Iterator;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -47,6 +49,37 @@ class PageStreamTest {
             }
         }
         assertEquals(1, seen);
+    }
+
+    @Test
+    void streamIsSingleUse() {
+        try (PageStream ps = Jdoc.streamPages(samplePdf())) {
+            ps.iterator();
+            assertThrows(IllegalStateException.class, ps::iterator);
+        }
+    }
+
+    @Test
+    void closeUnblocksAnIdleConsumer() {
+        PageStream ps = Jdoc.streamPages(samplePdf());
+        Iterator<Page> iterator = ps.iterator();
+        ps.close();
+        assertFalse(iterator.hasNext());
+    }
+
+    @Test
+    void streamBytesMatchesEager() throws Exception {
+        byte[] data = Files.readAllBytes(Paths.get(samplePdf()));
+        List<Page> eager = Jdoc.convertPagesBytes(data, "sample.pdf");
+        List<Page> streamed = new ArrayList<>();
+        try (PageStream ps = Jdoc.streamPagesBytes(data, "sample.pdf")) {
+            for (Page page : ps) streamed.add(page);
+        }
+        assertEquals(eager.size(), streamed.size());
+        for (int i = 0; i < eager.size(); i++) {
+            assertEquals(eager.get(i).pageNumber, streamed.get(i).pageNumber);
+            assertEquals(eager.get(i).text, streamed.get(i).text);
+        }
     }
 
     @Test

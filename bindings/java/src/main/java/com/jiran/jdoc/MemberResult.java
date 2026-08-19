@@ -7,6 +7,7 @@ public final class MemberResult {
     public final String markdown;      // empty when the member failed
     public final String error;         // empty when the member converted
     public final int errorCode;        // C JDocMemberErrorCode; 0 = OK
+    public final MemberErrorCode errorKind;
     public final long uncompressedSize;
 
     public MemberResult(String memberPath, String format, String markdown,
@@ -16,6 +17,7 @@ public final class MemberResult {
         this.markdown = markdown;
         this.error = error;
         this.errorCode = errorCode;
+        this.errorKind = MemberErrorCode.fromCode(errorCode);
         this.uncompressedSize = uncompressedSize;
     }
 

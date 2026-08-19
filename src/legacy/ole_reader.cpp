@@ -3,6 +3,7 @@
 #include "ole_reader.h"
 #include "common/string_utils.h"
 #include "common/binary_utils.h"
+#include "common/file_utils.h"
 
 #include <algorithm>
 #include <cstring>
@@ -24,7 +25,7 @@ static const uint8_t kOleMagic[8] = {
 // ---------- OleReader --------------------------------------------------------
 
 OleReader::OleReader(const std::string& path) {
-    fp_ = std::fopen(path.c_str(), "rb");
+    fp_ = util::fopen_utf8(path, "rb");
     if (!fp_) return;
 #ifdef _WIN32
     if (_fseeki64(fp_, 0, SEEK_END) != 0) return;
@@ -512,7 +513,7 @@ size_t OleReader::write_stream_to_file(const std::string& name,
     // Mini-stream: small enough to read into memory
     if (e.size < mini_cutoff_) {
         auto data = read_mini_chain(e.start_sector, e.size);
-        FILE* out = std::fopen(path.c_str(), "wb");
+        FILE* out = util::fopen_utf8(path, "wb");
         if (!out) return 0;
         size_t written = std::fwrite(data.data(), 1, data.size(), out);
         std::fclose(out);
@@ -520,7 +521,7 @@ size_t OleReader::write_stream_to_file(const std::string& name,
     }
 
     // Regular chain: stream sector-by-sector to file
-    FILE* out = std::fopen(path.c_str(), "wb");
+    FILE* out = util::fopen_utf8(path, "wb");
     if (!out) return 0;
 
     uint32_t sec = e.start_sector;

@@ -45,8 +45,8 @@ public final class Jdoc {
     /** Detect the format of an in-memory document. nameHint (may be "" or null)
      *  resolves extension-based ambiguity. */
     public static FormatInfo detectBytes(byte[] data, String nameHint) {
-        if (data == null || data.length == 0) {
-            throw new JdocException("empty data");
+        if (data == null) {
+            throw new JdocException("data is null");
         }
         JdocLibrary lib = JdocLibrary.INSTANCE;
         JdocLibrary.JDocFormatInfo out = new JdocLibrary.JDocFormatInfo();
@@ -78,6 +78,32 @@ public final class Jdoc {
         JdocLibrary.JDocOptions nativeOpts = Options.toNative(opts);
         byte[] err = new byte[ERR_BUF_SIZE];
         Pointer p = lib.jdoc_convert(filePath, nativeOpts, err, ERR_BUF_SIZE);
+        if (p == null) {
+            throw new JdocException(cString(err));
+        }
+        try {
+            return p.getString(0, "UTF-8");
+        } finally {
+            lib.jdoc_free_string(p);
+        }
+    }
+
+    /** Convert an in-memory document using default options. {@code nameHint}
+     *  (for example "report.docx") resolves extension-based ambiguity. */
+    public static String convertBytes(byte[] data, String nameHint) {
+        return convertBytes(data, nameHint, null);
+    }
+
+    /** Convert an in-memory document with explicit conversion options. */
+    public static String convertBytes(byte[] data, String nameHint, Options opts) {
+        if (data == null) {
+            throw new JdocException("data is null");
+        }
+        JdocLibrary lib = JdocLibrary.INSTANCE;
+        JdocLibrary.JDocOptions nativeOpts = Options.toNative(opts);
+        byte[] err = new byte[ERR_BUF_SIZE];
+        Pointer p = lib.jdoc_convert_mem(data, data.length,
+                nameHint == null ? "" : nameHint, nativeOpts, err, ERR_BUF_SIZE);
         if (p == null) {
             throw new JdocException(cString(err));
         }
@@ -127,6 +153,47 @@ public final class Jdoc {
         }
     }
 
+    /** Convert an in-memory document to page chunks using default options. */
+    public static List<Page> convertPagesBytes(byte[] data, String nameHint) {
+        return convertPagesBytes(data, nameHint, null);
+    }
+
+    /** Convert an in-memory document to page chunks with explicit options. */
+    public static List<Page> convertPagesBytes(byte[] data, String nameHint,
+                                               Options opts) {
+        if (data == null) {
+            throw new JdocException("data is null");
+        }
+        JdocLibrary lib = JdocLibrary.INSTANCE;
+        JdocLibrary.JDocOptions nativeOpts = Options.toNative(opts);
+        byte[] err = new byte[ERR_BUF_SIZE];
+        IntByReference count = new IntByReference();
+        Pointer arr = lib.jdoc_convert_pages_mem(data, data.length,
+                nameHint == null ? "" : nameHint, nativeOpts, count, err,
+                ERR_BUF_SIZE);
+        if (arr == null) {
+            String msg = cString(err);
+            if (!msg.isEmpty()) throw new JdocException(msg);
+            return new ArrayList<>();
+        }
+        try {
+            int n = count.getValue();
+            List<Page> pages = new ArrayList<>(n);
+            if (n > 0) {
+                JdocLibrary.JDocPage first = new JdocLibrary.JDocPage(arr);
+                first.read();
+                JdocLibrary.JDocPage[] nativePages =
+                        (JdocLibrary.JDocPage[]) first.toArray(n);
+                for (JdocLibrary.JDocPage page : nativePages) {
+                    pages.add(PageStream.fromNative(page));
+                }
+            }
+            return pages;
+        } finally {
+            lib.jdoc_free_pages(arr, count.getValue());
+        }
+    }
+
     /** Open a lazy page iterator for a document, using default options. Yields
      *  one page at a time so peak memory tracks a few pages, not the whole
      *  document. The result must be closed (try-with-resources); see
@@ -140,6 +207,21 @@ public final class Jdoc {
      *  {@link PageStream}. Output matches {@link #convertPages}. */
     public static PageStream streamPages(String filePath, Options opts) {
         return new PageStream(filePath, opts, 4);
+    }
+
+    /** Open a lazy page iterator over an in-memory document. The input is
+     *  copied so the caller may safely reuse its byte array while streaming. */
+    public static PageStream streamPagesBytes(byte[] data, String nameHint) {
+        return streamPagesBytes(data, nameHint, null);
+    }
+
+    /** In-memory streaming conversion with explicit options. */
+    public static PageStream streamPagesBytes(byte[] data, String nameHint,
+                                              Options opts) {
+        if (data == null) {
+            throw new JdocException("data is null");
+        }
+        return new PageStream(data, nameHint, opts, 4);
     }
 
     /** Convert every supported document inside an archive without extracting to

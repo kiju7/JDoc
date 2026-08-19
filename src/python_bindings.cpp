@@ -22,8 +22,18 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
 namespace py = pybind11;
+
+static jdoc::OutputFormat parse_output_format(const std::string& format) {
+    if (format.empty() || format == "markdown")
+        return jdoc::OutputFormat::MARKDOWN;
+    if (format == "text" || format == "plaintext" || format == "plain")
+        return jdoc::OutputFormat::PLAINTEXT;
+    throw std::invalid_argument(
+        "format must be 'markdown', 'text', 'plaintext', or 'plain'");
+}
 
 // Lazy page iterator backing convert_pages_stream(). A background thread runs
 // the C++ core's for_each_chunk with the GIL released, pushing each page into a
@@ -35,6 +45,13 @@ class PageStream {
 public:
     PageStream(std::string path, jdoc::ConvertOptions opts, size_t capacity)
         : path_(std::move(path)), opts_(std::move(opts)), capacity_(capacity) {
+        worker_ = std::thread([this] { run(); });
+    }
+
+    PageStream(std::vector<uint8_t> data, std::string name_hint,
+               jdoc::ConvertOptions opts, size_t capacity)
+        : data_(std::move(data)), name_hint_(std::move(name_hint)),
+          memory_(true), opts_(std::move(opts)), capacity_(capacity) {
         worker_ = std::thread([this] { run(); });
     }
 
@@ -78,7 +95,7 @@ public:
 private:
     void run() {
         try {
-            jdoc::for_each_chunk(path_, opts_, [this](jdoc::PageChunk&& chunk) {
+            const auto sink = [this](jdoc::PageChunk&& chunk) {
                 std::unique_lock<std::mutex> lk(mutex_);
                 not_full_.wait(lk, [this] { return queue_.size() < capacity_ || stop_; });
                 if (stop_) return false;
@@ -86,7 +103,12 @@ private:
                 lk.unlock();
                 not_empty_.notify_one();
                 return true;
-            });
+            };
+            if (memory_)
+                jdoc::for_each_chunk(data_.data(), data_.size(), name_hint_,
+                                     opts_, sink);
+            else
+                jdoc::for_each_chunk(path_, opts_, sink);
         } catch (const std::exception& e) {
             std::lock_guard<std::mutex> lk(mutex_);
             error_ = e.what();
@@ -102,6 +124,9 @@ private:
     }
 
     std::string path_;
+    std::vector<uint8_t> data_;
+    std::string name_hint_;
+    bool memory_ = false;
     jdoc::ConvertOptions opts_;
     size_t capacity_;
 
@@ -174,6 +199,7 @@ PYBIND11_MODULE(_jdoc, m) {
         .def_readwrite("body_font_size", &jdoc::PageChunk::body_font_size)
         .def_readwrite("tables", &jdoc::PageChunk::tables)
         .def_readwrite("images", &jdoc::PageChunk::images)
+        .def_readwrite("degraded_images", &jdoc::PageChunk::degraded_images)
         .def("__repr__", [](const jdoc::PageChunk& c) {
             return "<PageChunk page=" + std::to_string(c.page_number) +
                    " text_len=" + std::to_string(c.text.size()) +
@@ -257,10 +283,7 @@ PYBIND11_MODULE(_jdoc, m) {
         opts.image_dir = image_dir;
         opts.image_ref_prefix = image_ref_prefix;
         opts.min_image_size = min_image_size;
-        if (format == "text" || format == "plaintext" || format == "plain")
-            opts.format = jdoc::OutputFormat::PLAINTEXT;
-        else
-            opts.format = jdoc::OutputFormat::MARKDOWN;
+        opts.format = parse_output_format(format);
         return jdoc::convert(file_path, opts);
     },
     py::arg("file_path"),
@@ -302,10 +325,7 @@ Returns:
         opts.image_dir = image_dir;
         opts.image_ref_prefix = image_ref_prefix;
         opts.min_image_size = min_image_size;
-        if (format == "text" || format == "plaintext" || format == "plain")
-            opts.format = jdoc::OutputFormat::PLAINTEXT;
-        else
-            opts.format = jdoc::OutputFormat::MARKDOWN;
+        opts.format = parse_output_format(format);
         return jdoc::convert_chunks(file_path, opts);
     },
     py::arg("file_path"),
@@ -354,10 +374,7 @@ Returns:
         opts.image_dir = image_dir;
         opts.image_ref_prefix = image_ref_prefix;
         opts.min_image_size = min_image_size;
-        if (format == "text" || format == "plaintext" || format == "plain")
-            opts.format = jdoc::OutputFormat::PLAINTEXT;
-        else
-            opts.format = jdoc::OutputFormat::MARKDOWN;
+        opts.format = parse_output_format(format);
         size_t cap = buffer_size > 0 ? buffer_size : 1;
         return std::unique_ptr<PageStream>(
             new PageStream(file_path, std::move(opts), cap));
@@ -385,6 +402,37 @@ out of the loop) stops it. Same arguments as convert_pages(), plus:
 Yields:
     PageChunk objects, one per page/slide/sheet
 )doc");
+
+    m.def("convert_pages_bytes_stream",
+          [](py::bytes data, const std::string& name_hint,
+             const std::string& format, const std::vector<int>& pages,
+             bool tables, bool images, const std::string& image_dir,
+             const std::string& image_ref_prefix, unsigned min_image_size,
+             unsigned buffer_size) {
+              jdoc::ConvertOptions opts;
+              opts.pages = pages;
+              opts.tables = tables;
+              opts.images = images;
+              opts.image_dir = image_dir;
+              opts.image_ref_prefix = image_ref_prefix;
+              opts.min_image_size = min_image_size;
+              opts.format = parse_output_format(format);
+              char* buffer = nullptr;
+              Py_ssize_t length = 0;
+              if (PyBytes_AsStringAndSize(data.ptr(), &buffer, &length) != 0)
+                  throw py::error_already_set();
+              std::vector<uint8_t> owned(buffer, buffer + length);
+              const size_t cap = buffer_size > 0 ? buffer_size : 1;
+              return std::unique_ptr<PageStream>(new PageStream(
+                  std::move(owned), name_hint, std::move(opts), cap));
+          },
+          py::arg("data"), py::arg("name_hint") = "",
+          py::arg("format") = "markdown",
+          py::arg("pages") = std::vector<int>{}, py::arg("tables") = true,
+          py::arg("images") = true, py::arg("image_dir") = "",
+          py::arg("image_ref_prefix") = "", py::arg("min_image_size") = 50,
+          py::arg("buffer_size") = 4,
+          "Lazily convert an in-memory document to per-page chunks.");
 
     // ── Archive conversion ────────────────────────────────
 
@@ -433,8 +481,7 @@ Yields:
                                  bool include_unsupported)
                                  -> std::vector<jdoc::MemberResult> {
         jdoc::ConvertOptions opts;
-        if (format == "text" || format == "plaintext" || format == "plain")
-            opts.format = jdoc::OutputFormat::PLAINTEXT;
+        opts.format = parse_output_format(format);
         opts.pages = pages;
         opts.tables = tables;
         opts.images = images;
@@ -489,10 +536,19 @@ Returns:
           "True if the file is an archive container rather than a document.");
 
     m.def("convert_bytes", [](py::bytes data, const std::string& name_hint,
-                               const std::string& format) -> std::string {
+                               const std::string& format,
+                               const std::vector<int>& pages, bool tables,
+                               bool images, const std::string& image_dir,
+                               const std::string& image_ref_prefix,
+                               unsigned min_image_size) -> std::string {
         jdoc::ConvertOptions opts;
-        if (format == "text" || format == "plaintext" || format == "plain")
-            opts.format = jdoc::OutputFormat::PLAINTEXT;
+        opts.pages = pages;
+        opts.tables = tables;
+        opts.images = images;
+        opts.image_dir = image_dir;
+        opts.image_ref_prefix = image_ref_prefix;
+        opts.min_image_size = min_image_size;
+        opts.format = parse_output_format(format);
         char* buffer = nullptr;
         Py_ssize_t length = 0;
         if (PyBytes_AsStringAndSize(data.ptr(), &buffer, &length) != 0)
@@ -502,7 +558,38 @@ Returns:
                              name_hint, opts);
     },
     py::arg("data"), py::arg("name_hint") = "", py::arg("format") = "markdown",
+    py::arg("pages") = std::vector<int>{}, py::arg("tables") = true,
+    py::arg("images") = true, py::arg("image_dir") = "",
+    py::arg("image_ref_prefix") = "", py::arg("min_image_size") = 50,
     "Convert a document held in bytes (no file I/O).");
+
+    m.def("convert_pages_bytes",
+          [](py::bytes data, const std::string& name_hint,
+             const std::string& format, const std::vector<int>& pages,
+             bool tables, bool images, const std::string& image_dir,
+             const std::string& image_ref_prefix, unsigned min_image_size) {
+              jdoc::ConvertOptions opts;
+              opts.pages = pages;
+              opts.tables = tables;
+              opts.images = images;
+              opts.image_dir = image_dir;
+              opts.image_ref_prefix = image_ref_prefix;
+              opts.min_image_size = min_image_size;
+              opts.format = parse_output_format(format);
+              char* buffer = nullptr;
+              Py_ssize_t length = 0;
+              if (PyBytes_AsStringAndSize(data.ptr(), &buffer, &length) != 0)
+                  throw py::error_already_set();
+              py::gil_scoped_release release;
+              return jdoc::convert_chunks(
+                  buffer, static_cast<size_t>(length), name_hint, opts);
+          },
+          py::arg("data"), py::arg("name_hint") = "",
+          py::arg("format") = "markdown",
+          py::arg("pages") = std::vector<int>{}, py::arg("tables") = true,
+          py::arg("images") = true, py::arg("image_dir") = "",
+          py::arg("image_ref_prefix") = "", py::arg("min_image_size") = 50,
+          "Convert an in-memory document to per-page chunks.");
 
     // ── Per-format functions (for advanced usage) ────────
 

@@ -1,6 +1,7 @@
 // Thread-safety & benchmark test for JDoc C API.
 // Tests: correctness under concurrency + throughput at scale (1000 docs).
 #include "jdoc/jdoc_c_api.h"
+#include "common/file_utils.h"
 
 #include <iostream>
 #include <iomanip>
@@ -58,7 +59,7 @@ static void create_test_pdf(const std::string& path, int id) {
         << "0000000266 00000 n \n"
         << "trailer<</Size 6/Root 1 0 R>>\nstartxref\n500\n%%EOF\n";
 
-    std::ofstream f(path, std::ios::binary);
+    std::ofstream f(jdoc::util::io_path(path), std::ios::binary);
     f << pdf.str();
 }
 
@@ -113,7 +114,7 @@ static void create_multipage_pdf(const std::string& path, int n_pages) {
     pdf += "trailer<</Size " + std::to_string(objs.size() + 1) +
            "/Root 1 0 R>>\nstartxref\n" + std::to_string(xref_pos) + "\n%%EOF\n";
 
-    std::ofstream f(path, std::ios::binary);
+    std::ofstream f(jdoc::util::io_path(path), std::ios::binary);
     f << pdf;
 }
 
@@ -129,7 +130,7 @@ static void create_test_html(const std::string& path, int id) {
          << "Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua.</p>"
          << "</body></html>";
 
-    std::ofstream f(path, std::ios::binary);
+    std::ofstream f(jdoc::util::io_path(path), std::ios::binary);
     f << html.str();
 }
 
@@ -243,7 +244,7 @@ static bool extract_all_paged(const std::string& path) {
     opts.images = 1;
     int count = 0;
     JDocPage* pages = jdoc_convert_pages(path.c_str(), &opts, &count, err, sizeof(err));
-    if (pages || count == 0) {
+    if (pages || (count == 0 && err[0] == '\0')) {
         jdoc_free_pages(pages, count);
         return true;
     }
@@ -260,9 +261,15 @@ int main() {
         return 1;
     }
 
-    const int SMALL_OPS = 200;
-    const int BENCH_OPS = 1000;
+    const bool quick = std::getenv("JDOC_THREAD_TEST_QUICK") != nullptr;
+    const int SMALL_OPS = quick ? 40 : 200;
+    const int BENCH_OPS = quick ? 100 : 1000;
     const int THREADS[] = {1, 2, 4, 8};
+    int exit_code = 0;
+    auto record = [&](const BenchResult& r) {
+        print_result(r);
+        if (r.fail != 0) exit_code = 1;
+    };
 
     std::cout << "==========================================================" << std::endl;
     std::cout << "  JDoc Thread Safety & Benchmark Test" << std::endl;
@@ -297,6 +304,7 @@ int main() {
     }
     std::cout << "  Baseline: " << baseline_ok << "/20 extracted OK "
               << (baseline_ok == 20 ? "PASS" : "FAIL") << std::endl;
+    if (baseline_ok != 20) exit_code = 1;
 
     // --- 2. Thread safety: extract_text ---
     std::cout << "\n--- [2] Thread safety: jdoc_extract_text ---" << std::endl;
@@ -308,17 +316,17 @@ int main() {
     for (int t : THREADS) {
         auto r = run_bench("PDF " + std::to_string(t) + "T extract_text",
                            pdf_paths, t, SMALL_OPS, extract_text);
-        print_result(r);
+        record(r);
     }
     for (int t : THREADS) {
         auto r = run_bench("HTML " + std::to_string(t) + "T extract_text",
                            html_paths, t, SMALL_OPS, extract_text);
-        print_result(r);
+        record(r);
     }
     for (int t : THREADS) {
         auto r = run_bench("Mixed " + std::to_string(t) + "T extract_text",
                            mixed_paths, t, SMALL_OPS, extract_text);
-        print_result(r);
+        record(r);
     }
 
     // --- 3. Thread safety: extract_all_paged ---
@@ -331,12 +339,12 @@ int main() {
     for (int t : THREADS) {
         auto r = run_bench("PDF " + std::to_string(t) + "T extract_all_paged",
                            pdf_paths, t, SMALL_OPS, extract_all_paged);
-        print_result(r);
+        record(r);
     }
     for (int t : THREADS) {
         auto r = run_bench("HTML " + std::to_string(t) + "T extract_all_paged",
                            html_paths, t, SMALL_OPS, extract_all_paged);
-        print_result(r);
+        record(r);
     }
 
     // --- 4. Benchmark: 1000 documents ---
@@ -350,21 +358,21 @@ int main() {
     for (int t : THREADS) {
         auto r = run_bench("PDF " + std::to_string(t) + "T x" + std::to_string(BENCH_OPS),
                            pdf_paths, t, BENCH_OPS, extract_text);
-        print_result(r);
+        record(r);
     }
 
     // HTML 1000 at various thread counts
     for (int t : THREADS) {
         auto r = run_bench("HTML " + std::to_string(t) + "T x" + std::to_string(BENCH_OPS),
                            html_paths, t, BENCH_OPS, extract_text);
-        print_result(r);
+        record(r);
     }
 
     // Mixed 1000 at 8 threads
     {
         auto r = run_bench("Mixed 8T x" + std::to_string(BENCH_OPS),
                            mixed_paths, 8, BENCH_OPS, extract_text);
-        print_result(r);
+        record(r);
     }
 
     // --- 5. Stress test: extract_all_paged 1000 mixed ---
@@ -377,6 +385,7 @@ int main() {
                   << " | " << r.elapsed_ms << "ms"
                   << " | " << std::fixed << std::setprecision(1) << r.docs_per_sec << " docs/s"
                   << " | " << (r.fail == 0 ? "PASS" : "FAIL") << std::endl;
+        if (r.fail != 0) exit_code = 1;
     }
 
     // --- 6. Same-document parallel page rendering ---
@@ -384,7 +393,6 @@ int main() {
     // internal page workers (PdfDoc load_mu, shared font cache, composite
     // render + PNG encode) overlap with the outer threads, and every result
     // must be byte-identical to the single-threaded baseline signature.
-    int exit_code = 0;
     std::cout << "\n--- [6] Multi-page parallel render (same document) ---" << std::endl;
     {
         const std::string mp_path = tmp + "/bench_multipage.pdf";
@@ -403,7 +411,7 @@ int main() {
                   << " |  Time   | Throughput | Result" << std::endl;
         std::cout << "  " << std::string(85, '-') << std::endl;
 
-        const int MP_OPS = 64;
+        const int MP_OPS = quick ? 8 : 64;
         for (int t : THREADS) {
             auto r = run_bench("MP-PDF " + std::to_string(t) + "T signature match",
                                {mp_path}, t, MP_OPS,
@@ -413,12 +421,14 @@ int main() {
             print_result(r);
             if (r.fail != 0) exit_code = 1;
         }
-        std::remove(mp_path.c_str());
+        std::filesystem::remove(jdoc::util::io_path(mp_path));
     }
 
     // Cleanup
-    for (auto& p : pdf_paths) std::remove(p.c_str());
-    for (auto& p : html_paths) std::remove(p.c_str());
+    for (auto& p : pdf_paths)
+        std::filesystem::remove(jdoc::util::io_path(p));
+    for (auto& p : html_paths)
+        std::filesystem::remove(jdoc::util::io_path(p));
 
     std::cout << "\n==========================================================" << std::endl;
     std::cout << "  All tests complete." << std::endl;

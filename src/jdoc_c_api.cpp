@@ -7,6 +7,7 @@
 #include <climits>
 #include <cstring>
 #include <cstdlib>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -37,9 +38,17 @@ static jdoc::ConvertOptions to_cpp_opts(const JDocOptions* opts) {
     o.min_image_size = opts->min_image_size;
     if (opts->pages && opts->page_count > 0)
         o.pages.assign(opts->pages, opts->pages + opts->page_count);
-    if (opts->format && (strcmp(opts->format, "text") == 0 ||
-                         strcmp(opts->format, "plaintext") == 0))
-        o.format = jdoc::OutputFormat::PLAINTEXT;
+    if (opts->format) {
+        if (strcmp(opts->format, "text") == 0 ||
+            strcmp(opts->format, "plaintext") == 0 ||
+            strcmp(opts->format, "plain") == 0) {
+            o.format = jdoc::OutputFormat::PLAINTEXT;
+        } else if (opts->format[0] != '\0' &&
+                   strcmp(opts->format, "markdown") != 0) {
+            throw std::invalid_argument(
+                "format must be markdown, text, plaintext, or plain");
+        }
+    }
     // Archive limits: 0 keeps the library default; negative disables the
     // guard.
     if (opts->max_depth > 0)
@@ -71,13 +80,33 @@ static jdoc::ConvertOptions to_cpp_opts(const JDocOptions* opts) {
 // Release a JDocPage's inner allocations (not the page struct itself).
 static void free_page_inner(JDocPage& page) {
     free(page.text);
-    for (int i = 0; i < page.image_count; ++i) {
-        free(page.images[i].name);
-        free(page.images[i].data);
-        free(page.images[i].format);
-        free(page.images[i].saved_path);
+    if (page.images) {
+        for (int i = 0; i < page.image_count; ++i) {
+            free(page.images[i].name);
+            free(page.images[i].data);
+            free(page.images[i].format);
+            free(page.images[i].saved_path);
+            free(page.images[i].pixels);
+            free(page.images[i].embedded_text);
+        }
     }
     free(page.images);
+    if (page.tables) {
+        for (int i = 0; i < page.table_count; ++i) {
+            if (page.tables[i].rows) {
+                for (int j = 0; j < page.tables[i].row_count; ++j) {
+                    if (page.tables[i].rows[j].cells) {
+                        for (int k = 0;
+                             k < page.tables[i].rows[j].cell_count; ++k)
+                            free(page.tables[i].rows[j].cells[k]);
+                    }
+                    free(page.tables[i].rows[j].cells);
+                }
+            }
+            free(page.tables[i].rows);
+        }
+    }
+    free(page.tables);
     page = {};
 }
 
@@ -102,20 +131,25 @@ static void free_members(JDocMember* members, size_t count) {
 static bool fill_page(JDocPage& dst, const jdoc::PageChunk& src) {
     dst = {};
     dst.page_number = src.page_number;
+    dst.page_width = src.page_width;
+    dst.page_height = src.page_height;
+    dst.body_font_size = src.body_font_size;
+    dst.degraded_images = src.degraded_images;
     dst.text = strdup_c(src.text);
     if (!dst.text) return false;
 
     size_t n = src.images.size();
-    if (n == 0) return true;
     if (n > INT_MAX) {
         free_page_inner(dst);
         return false;
     }
 
-    dst.images = (JDocImage*)calloc(n, sizeof(JDocImage));
-    if (!dst.images) {
-        free_page_inner(dst);
-        return false;
+    if (n > 0) {
+        dst.images = (JDocImage*)calloc(n, sizeof(JDocImage));
+        if (!dst.images) {
+            free_page_inner(dst);
+            return false;
+        }
     }
     dst.image_count = (int)n;
 
@@ -126,10 +160,12 @@ static bool fill_page(JDocPage& dst, const jdoc::PageChunk& src) {
         di.name = strdup_c(si.name);
         di.width = si.width;
         di.height = si.height;
+        di.components = si.components;
         di.format = strdup_c(si.format);
         di.saved_path = strdup_c(si.saved_path);
-        if (!di.name || !di.format || !di.saved_path ||
-            si.data.size() > INT_MAX) {
+        di.embedded_text = strdup_c(si.embedded_text);
+        if (!di.name || !di.format || !di.saved_path || !di.embedded_text ||
+            si.data.size() > INT_MAX || si.pixels.size() > INT_MAX) {
             free_page_inner(dst);
             return false;
         }
@@ -142,8 +178,95 @@ static bool fill_page(JDocPage& dst, const jdoc::PageChunk& src) {
             }
             memcpy(di.data, si.data.data(), si.data.size());
         }
+        di.pixels_size = (int)si.pixels.size();
+        if (!si.pixels.empty()) {
+            di.pixels = (char*)malloc(si.pixels.size());
+            if (!di.pixels) {
+                free_page_inner(dst);
+                return false;
+            }
+            memcpy(di.pixels, si.pixels.data(), si.pixels.size());
+        }
+    }
+
+    if (src.tables.size() > INT_MAX) {
+        free_page_inner(dst);
+        return false;
+    }
+    dst.table_count = (int)src.tables.size();
+    if (dst.table_count > 0) {
+        dst.tables = (JDocTable*)calloc(src.tables.size(), sizeof(JDocTable));
+        if (!dst.tables) {
+            free_page_inner(dst);
+            return false;
+        }
+    }
+    for (size_t ti = 0; ti < src.tables.size(); ++ti) {
+        const auto& source_table = src.tables[ti];
+        if (source_table.size() > INT_MAX) {
+            free_page_inner(dst);
+            return false;
+        }
+        auto& table = dst.tables[ti];
+        table.row_count = (int)source_table.size();
+        if (table.row_count > 0) {
+            table.rows = (JDocTableRow*)calloc(
+                source_table.size(), sizeof(JDocTableRow));
+            if (!table.rows) {
+                free_page_inner(dst);
+                return false;
+            }
+        }
+        for (size_t ri = 0; ri < source_table.size(); ++ri) {
+            const auto& source_row = source_table[ri];
+            if (source_row.size() > INT_MAX) {
+                free_page_inner(dst);
+                return false;
+            }
+            auto& row = table.rows[ri];
+            row.cell_count = (int)source_row.size();
+            if (row.cell_count > 0) {
+                row.cells = (char**)calloc(source_row.size(), sizeof(char*));
+                if (!row.cells) {
+                    free_page_inner(dst);
+                    return false;
+                }
+            }
+            for (size_t ci = 0; ci < source_row.size(); ++ci) {
+                row.cells[ci] = strdup_c(source_row[ci]);
+                if (!row.cells[ci]) {
+                    free_page_inner(dst);
+                    return false;
+                }
+            }
+        }
     }
     return true;
+}
+
+static JDocPage* marshal_pages(const std::vector<jdoc::PageChunk>& chunks,
+                               int* out_count,
+                               char* err_buf, int err_buf_size) {
+    *out_count = 0;
+    if (chunks.empty()) return nullptr;
+    if (chunks.size() > INT_MAX) {
+        set_error(err_buf, err_buf_size, "too many pages");
+        return nullptr;
+    }
+    JDocPage* pages = (JDocPage*)calloc(chunks.size(), sizeof(JDocPage));
+    if (!pages) {
+        set_error(err_buf, err_buf_size, "memory allocation failed");
+        return nullptr;
+    }
+    for (size_t i = 0; i < chunks.size(); ++i) {
+        if (!fill_page(pages[i], chunks[i])) {
+            free_pages(pages, i + 1);
+            set_error(err_buf, err_buf_size, "memory allocation failed");
+            return nullptr;
+        }
+    }
+    *out_count = (int)chunks.size();
+    return pages;
 }
 
 // ---------------------------------------------------------------------------
@@ -194,28 +317,7 @@ JDocPage* jdoc_convert_pages(const char* file_path, const JDocOptions* opts,
     try {
         auto cpp_opts = to_cpp_opts(opts);
         auto chunks = jdoc::convert_chunks(file_path, cpp_opts);
-        if (chunks.empty()) return nullptr;
-        if (chunks.size() > INT_MAX) {
-            set_error(err_buf, err_buf_size, "too many pages");
-            return nullptr;
-        }
-
-        JDocPage* pages = (JDocPage*)calloc(chunks.size(), sizeof(JDocPage));
-        if (!pages) {
-            set_error(err_buf, err_buf_size, "memory allocation failed");
-            return nullptr;
-        }
-
-        for (size_t i = 0; i < chunks.size(); i++) {
-            if (!fill_page(pages[i], chunks[i])) {
-                free_pages(pages, i + 1);
-                set_error(err_buf, err_buf_size, "memory allocation failed");
-                return nullptr;
-            }
-        }
-
-        *out_count = (int)chunks.size();
-        return pages;
+        return marshal_pages(chunks, out_count, err_buf, err_buf_size);
     } catch (const std::exception& e) {
         set_error(err_buf, err_buf_size, e.what());
         return nullptr;
@@ -246,6 +348,69 @@ int jdoc_convert_pages_stream(const char* file_path, const JDocOptions* opts,
             free_page_inner(page);
             return keep_going != 0;
         });
+        if (allocation_failed) {
+            set_error(err_buf, err_buf_size, "memory allocation failed");
+            return -1;
+        }
+        return 0;
+    } catch (const std::exception& e) {
+        set_error(err_buf, err_buf_size, e.what());
+        return -1;
+    } catch (...) {
+        set_error(err_buf, err_buf_size, "unknown error");
+        return -1;
+    }
+}
+
+JDocPage* jdoc_convert_pages_mem(const void* data, int size,
+                                 const char* name_hint,
+                                 const JDocOptions* opts, int* out_count,
+                                 char* err_buf, int err_buf_size) {
+    set_error(err_buf, err_buf_size, "");
+    if (size < 0 || (!data && size != 0) || !out_count) {
+        set_error(err_buf, err_buf_size,
+                  "invalid data/size or out_count is NULL");
+        return nullptr;
+    }
+    *out_count = 0;
+    try {
+        auto chunks = jdoc::convert_chunks(
+            data, (size_t)size, name_hint ? name_hint : "", to_cpp_opts(opts));
+        return marshal_pages(chunks, out_count, err_buf, err_buf_size);
+    } catch (const std::exception& e) {
+        set_error(err_buf, err_buf_size, e.what());
+        return nullptr;
+    } catch (...) {
+        set_error(err_buf, err_buf_size, "unknown error");
+        return nullptr;
+    }
+}
+
+int jdoc_convert_pages_mem_stream(const void* data, int size,
+                                  const char* name_hint,
+                                  const JDocOptions* opts,
+                                  JDocPageCallback cb, void* userdata,
+                                  char* err_buf, int err_buf_size) {
+    set_error(err_buf, err_buf_size, "");
+    if (size < 0 || (!data && size != 0) || !cb) {
+        set_error(err_buf, err_buf_size,
+                  "invalid data/size or callback is NULL");
+        return -1;
+    }
+    try {
+        bool allocation_failed = false;
+        jdoc::for_each_chunk(
+            data, (size_t)size, name_hint ? name_hint : "", to_cpp_opts(opts),
+            [&](jdoc::PageChunk&& chunk) {
+                JDocPage page = {};
+                if (!fill_page(page, chunk)) {
+                    allocation_failed = true;
+                    return false;
+                }
+                int keep_going = cb(&page, userdata);
+                free_page_inner(page);
+                return keep_going != 0;
+            });
         if (allocation_failed) {
             set_error(err_buf, err_buf_size, "memory allocation failed");
             return -1;
@@ -314,8 +479,8 @@ char* jdoc_convert_mem(const void* data, int size, const char* name_hint,
                        const JDocOptions* opts,
                        char* err_buf, int err_buf_size) {
     set_error(err_buf, err_buf_size, "");
-    if (!data || size <= 0) {
-        set_error(err_buf, err_buf_size, "data is NULL or empty");
+    if (size < 0 || (!data && size != 0)) {
+        set_error(err_buf, err_buf_size, "invalid data or size");
         return nullptr;
     }
     try {
@@ -375,8 +540,8 @@ int jdoc_detect(const char* file_path, JDocFormatInfo* out,
 int jdoc_detect_mem(const void* data, int size, const char* name_hint,
                     JDocFormatInfo* out, char* err_buf, int err_buf_size) {
     set_error(err_buf, err_buf_size, "");
-    if (!data || size <= 0 || !out) {
-        set_error(err_buf, err_buf_size, "data is NULL/empty or out is NULL");
+    if (size < 0 || (!data && size != 0) || !out) {
+        set_error(err_buf, err_buf_size, "invalid data/size or out is NULL");
         return -1;
     }
     try {

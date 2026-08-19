@@ -5,6 +5,7 @@
 #include "archive/data_source.h"
 #include "common/binary_utils.h"
 #include "common/inflate.h"
+#include "common/file_utils.h"
 #include "common/string_utils.h"
 #include <zlib.h>
 #include <cstring>
@@ -330,7 +331,7 @@ std::vector<char> ZipReader::read_entry(const Entry& entry) const {
 }
 
 bool ZipReader::extract_entry_to_file(const Entry& entry, const std::string& output_path) const {
-    FILE* out = fopen(output_path.c_str(), "wb");
+    FILE* out = util::fopen_utf8(output_path, "wb");
     if (!out) return false;
 
     bool ok = read_entry_streamed(entry, [&](const char* data, size_t len) {

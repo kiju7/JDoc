@@ -1404,12 +1404,11 @@ private:
         filename = unified + "." + (ext == "jpeg" ? "jpg" : ext);
         std::string saved_path;
         if (!opts_.image_dir.empty()) {
-            util::ensure_dir(opts_.image_dir);
-            saved_path = opts_.image_dir + "/" + filename;
-            std::ofstream ofs(saved_path, std::ios::binary);
-            if (!ofs) return "";
-            ofs.write(reinterpret_cast<const char*>(image_data.data()),
-                      image_data.size());
+            saved_path = util::save_named_file(
+                opts_.image_dir, filename,
+                image_data.data(), image_data.size());
+            if (saved_path.empty()) return "";
+            filename = util::get_filename(saved_path);
         }
 
         ImageData idata;
@@ -1587,7 +1586,7 @@ static std::string hwp_chunks_to_markdown(HWPParser& parser,
 // Peek at the file head to route HWP 3.x legacy binaries (flat stream,
 // not OLE) to the dedicated parser.
 static bool file_is_hwp3(const std::string& path) {
-    std::ifstream f(path, std::ios::binary);
+    std::ifstream f(util::io_path(path), std::ios::binary);
     if (!f) return false;
     uint8_t head[32] = {};
     f.read(reinterpret_cast<char*>(head), sizeof(head));

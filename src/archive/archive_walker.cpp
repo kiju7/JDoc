@@ -287,10 +287,22 @@ bool handle_member_bytes(const std::string& member_path, const uint8_t* bytes,
             if (!subdir.empty()) subdir += "/";
             subdir += member_path.substr(0, slash);
         }
-        if (!opts.image_dir.empty())
-            util::save_named_file(subdir, basename, bytes, size);
+        std::string ref_path = member_path;
+        if (!opts.image_dir.empty()) {
+            std::string saved =
+                util::save_named_file(subdir, basename, bytes, size);
+            if (saved.empty()) {
+                r.error_code = MemberErrorCode::CONVERT_FAILED;
+                r.error = "failed to save image member";
+                return cb(std::move(r));
+            }
+            basename = util::get_filename(saved);
+            ref_path = slash == std::string::npos
+                ? basename
+                : member_path.substr(0, slash + 1) + basename;
+        }
         r.markdown = "![" + basename + "](" + opts.image_ref_prefix +
-                     member_path + ")";
+                     ref_path + ")";
         return cb(std::move(r));
     }
 

@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include "common/file_utils.h"
 
 #if defined(__unix__) || defined(__APPLE__)
 #include <fcntl.h>
@@ -52,7 +53,7 @@ public:
         }
         size_ = static_cast<uint64_t>(st.st_size);
 #else
-        fp_ = fopen(path.c_str(), "rb");
+        fp_ = util::fopen_utf8(path, "rb");
         if (!fp_) return;
         if (_fseeki64(fp_, 0, SEEK_END) != 0) { close_fp(); return; }
         long long sz = _ftelli64(fp_);

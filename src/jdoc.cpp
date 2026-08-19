@@ -12,6 +12,7 @@
 #include "zip_reader.h"
 #include "legacy/ole_reader.h"
 #include "common/string_utils.h"
+#include "common/file_utils.h"
 #include "common/image_utils.h"
 #include "common/png_encode.h"
 #include "common/emf_text.h"
@@ -21,9 +22,22 @@
 #include <fstream>
 #include <iterator>
 #include <sstream>
+#include <stdexcept>
 
 namespace jdoc {
 namespace {
+
+void validate_options(const ConvertOptions& opts) {
+    for (int page : opts.pages) {
+        if (page < 0)
+            throw std::invalid_argument("pages must contain only 0-based non-negative numbers");
+    }
+}
+
+void validate_memory_input(const void* data, size_t size) {
+    if (!data && size != 0)
+        throw std::invalid_argument("data is NULL but size is non-zero");
+}
 
 // Check if a buffer looks like valid UTF-8/ASCII text (first 8KB sampled).
 // Rejects buffers with NUL bytes or invalid UTF-8 sequences.
@@ -49,7 +63,7 @@ static bool is_likely_text_buf(const uint8_t* u, size_t n) {
 }
 
 static bool is_likely_text(const std::string& path) {
-    std::ifstream f(path, std::ios::binary);
+    std::ifstream f(util::io_path(path), std::ios::binary);
     if (!f) return false;
 
     char buf[8192];
@@ -197,7 +211,7 @@ static FileFormat classify_ole_hwp(const OleReader& ole) {
 }
 
 static std::string read_text_file(const std::string& path) {
-    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    std::ifstream f(util::io_path(path), std::ios::binary | std::ios::ate);
     if (!f) throw std::runtime_error("Cannot open file: " + path);
     // Read the whole file into a single buffer, then move it through the
     // valid-UTF-8 fast path — no intermediate stringstream copy.
@@ -219,7 +233,7 @@ static std::string read_text_file(const std::string& path) {
 // Read a whole file into a raw byte buffer (no text conversion). Throws if the
 // file cannot be opened. Used for binary formats like EMF/WMF metafiles.
 static std::string read_file_bytes(const std::string& path) {
-    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    std::ifstream f(util::io_path(path), std::ios::binary | std::ios::ate);
     if (!f) throw std::runtime_error("Cannot open file: " + path);
     std::string buf;
     std::streamoff size = f.tellg();
@@ -343,9 +357,12 @@ static std::string image_to_markdown(const uint8_t* data, size_t size,
     // A write to image_dir that fails must not leave a markdown reference to a
     // file that was never created. With no image_dir (memory/reference mode) no
     // file is written and the reference is the intended output.
-    if (!opts.image_dir.empty() &&
-        util::save_named_file(opts.image_dir, filename, data, size).empty())
-        return "";
+    if (!opts.image_dir.empty()) {
+        std::string saved =
+            util::save_named_file(opts.image_dir, filename, data, size);
+        if (saved.empty()) return "";
+        filename = util::get_filename(saved);
+    }
     return "![" + filename + "](" + opts.image_ref_prefix + filename + ")\n";
 }
 
@@ -366,9 +383,11 @@ static PageChunk image_to_chunk(const uint8_t* data, size_t size,
     img.name = strip_ext(filename);
     img.format = util::detect_image_format(data, size);
     util::populate_image_dimensions(img, data, size);
-    if (!opts.image_dir.empty())
+    if (!opts.image_dir.empty()) {
         img.saved_path =
             util::save_named_file(opts.image_dir, filename, data, size);
+        if (!img.saved_path.empty()) filename = util::get_filename(img.saved_path);
+    }
     if (img.saved_path.empty())
         img.data.assign(data, data + size);  // memory mode: caller needs bytes
     chunk.text = "![" + filename + "](" + opts.image_ref_prefix + filename + ")\n";
@@ -432,7 +451,7 @@ FileFormat detect_format(const std::string& path) {
     unsigned char magic[262] = {};
     size_t n = 0;
     {
-        std::ifstream f(path, std::ios::binary);
+        std::ifstream f(util::io_path(path), std::ios::binary);
         if (f) {
             f.read(reinterpret_cast<char*>(magic), sizeof(magic));
             n = static_cast<size_t>(f.gcount());
@@ -473,7 +492,11 @@ FileFormat detect_format(const std::string& path) {
 
 FileFormat detect_format_mem(const uint8_t* data, size_t size,
                              const std::string& name_hint) {
-    if (!data || size == 0) return FileFormat::UNKNOWN;
+    if (size == 0) {
+        const FileFormat hinted = format_from_extension(name_hint);
+        return hinted != FileFormat::UNKNOWN ? hinted : FileFormat::TXT;
+    }
+    if (!data) return FileFormat::UNKNOWN;
 
     if (size >= 4 && data[0] == 'P' && data[1] == 'K' && data[2] == 0x03 &&
         data[3] == 0x04) {
@@ -545,7 +568,7 @@ std::string convert_from_memory_as(FileFormat fmt,
         case FileFormat::HWPX:   return hwpx_to_markdown_mem(data, size, opts);
         case FileFormat::HWP:    return hwp_to_markdown_mem(data, size, opts);
         case FileFormat::TXT:
-            return util::plain_text_to_utf8(
+            return size == 0 ? std::string() : util::plain_text_to_utf8(
                 std::string(reinterpret_cast<const char*>(data), size));
         case FileFormat::EML:    return eml_to_markdown_mem(data, size, opts);
         case FileFormat::EMF:
@@ -559,6 +582,7 @@ std::string convert_from_memory_as(FileFormat fmt,
 }
 
 std::string convert(const std::string& file_path, ConvertOptions opts) {
+    validate_options(opts);
     auto fmt = detect_format(file_path);
     switch (fmt) {
         case FileFormat::PDF:    return pdf_to_markdown(file_path, opts);
@@ -588,12 +612,15 @@ std::string convert(const std::string& file_path, ConvertOptions opts) {
 
 std::string convert(const void* data, size_t size, const std::string& name_hint,
                     ConvertOptions opts) {
+    validate_memory_input(data, size);
+    validate_options(opts);
     return convert_from_memory(static_cast<const uint8_t*>(data), size,
                                name_hint, opts);
 }
 
 std::vector<PageChunk> convert_chunks(const std::string& file_path,
                                        ConvertOptions opts) {
+    validate_options(opts);
     auto fmt = detect_format(file_path);
     switch (fmt) {
         case FileFormat::PDF:    return pdf_to_markdown_chunks(file_path, opts);
@@ -628,6 +655,7 @@ std::vector<PageChunk> convert_chunks(const std::string& file_path,
 
 void for_each_chunk(const std::string& file_path, const ConvertOptions& opts,
                     const PageSink& sink) {
+    validate_options(opts);
     auto fmt = detect_format(file_path);
     switch (fmt) {
         case FileFormat::PDF:    pdf_to_markdown_chunks_stream(file_path, opts, sink); return;
@@ -665,6 +693,8 @@ void for_each_chunk(const std::string& file_path, const ConvertOptions& opts,
 
 void for_each_chunk(const void* data, size_t size, const std::string& name_hint,
                     const ConvertOptions& opts, const PageSink& sink) {
+    validate_memory_input(data, size);
+    validate_options(opts);
     const uint8_t* bytes = static_cast<const uint8_t*>(data);
     auto fmt = detect_format_mem(bytes, size, name_hint);
     switch (fmt) {
@@ -683,7 +713,7 @@ void for_each_chunk(const void* data, size_t size, const std::string& name_hint,
         case FileFormat::TXT: {
             PageChunk chunk;
             chunk.page_number = 0;
-            chunk.text = util::plain_text_to_utf8(
+            chunk.text = size == 0 ? std::string() : util::plain_text_to_utf8(
                 std::string(reinterpret_cast<const char*>(bytes), size));
             sink(std::move(chunk));
             return;
@@ -706,6 +736,17 @@ void for_each_chunk(const void* data, size_t size, const std::string& name_hint,
     }
 }
 
+std::vector<PageChunk> convert_chunks(const void* data, size_t size,
+                                      const std::string& name_hint,
+                                      ConvertOptions opts) {
+    std::vector<PageChunk> chunks;
+    for_each_chunk(data, size, name_hint, opts, [&](PageChunk&& chunk) {
+        chunks.push_back(std::move(chunk));
+        return true;
+    });
+    return chunks;
+}
+
 // ── Archive conversion ──────────────────────────────────
 
 bool is_archive_file(const std::string& file_path) {
@@ -714,6 +755,7 @@ bool is_archive_file(const std::string& file_path) {
 
 void convert_archive(const std::string& file_path, const MemberCallback& cb,
                      ConvertOptions opts) {
+    validate_options(opts);
     auto fmt = detect_format(file_path);
 
     if (!is_archive_format(fmt)) {
@@ -744,7 +786,7 @@ void convert_archive(const std::string& file_path, const MemberCallback& cb,
     // Verify the file is openable so callers get a throw (not a silent
     // empty result) for a missing path.
     {
-        std::ifstream f(file_path, std::ios::binary);
+        std::ifstream f(util::io_path(file_path), std::ios::binary);
         if (!f) throw std::runtime_error("Cannot open file: " + file_path);
     }
 

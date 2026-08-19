@@ -62,7 +62,7 @@ std::vector<char> RtfParser::hex_to_binary(const std::string& hex) {
 // ---------- RtfParser --------------------------------------------------------
 
 RtfParser::RtfParser(const std::string& file_path) : file_path_(file_path) {
-    std::ifstream ifs(file_path, std::ios::binary);
+    std::ifstream ifs(util::io_path(file_path), std::ios::binary);
     if (!ifs) return;
 
     ifs.seekg(0, std::ios::end);

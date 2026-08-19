@@ -8,6 +8,7 @@
 #include <cctype>
 #include <cstdint>
 #include <cstdio>
+#include <filesystem>
 #include <limits>
 #include <string>
 #include <utility>
@@ -15,13 +16,39 @@
 
 #ifdef _WIN32
   #include <direct.h>
-  #define jdoc_mkdir(path) _mkdir(path)
 #else
   #include <sys/stat.h>
-  #define jdoc_mkdir(path) mkdir(path, 0755)
 #endif
 
 namespace jdoc { namespace util {
+
+// Public APIs carry UTF-8 paths on every platform. std::filesystem::u8path
+// converts them to UTF-16-backed paths on Windows while remaining a byte path
+// on POSIX systems.
+inline std::filesystem::path io_path(const std::string& path) {
+    return std::filesystem::u8path(path);
+}
+
+inline FILE* fopen_utf8(const std::string& path, const char* mode) {
+#ifdef _WIN32
+    std::wstring wide_mode;
+    for (const unsigned char* p =
+             reinterpret_cast<const unsigned char*>(mode); *p; ++p)
+        wide_mode.push_back(static_cast<wchar_t>(*p));
+    return _wfopen(io_path(path).c_str(), wide_mode.c_str());
+#else
+    return std::fopen(path.c_str(), mode);
+#endif
+}
+
+inline void make_dir_utf8(const std::string& path) {
+    if (path.empty()) return;
+#ifdef _WIN32
+    _wmkdir(io_path(path).c_str());
+#else
+    mkdir(path.c_str(), 0755);
+#endif
+}
 
 // Get lowercase file extension from path (returns ".ext" form, e.g. ".jpg").
 inline std::string get_extension(const std::string& path) {
@@ -110,7 +137,7 @@ inline std::string escape_cell(const std::string& text) {
 
 // Create a directory (no error on existing).
 inline void ensure_dir(const std::string& dir) {
-    if (!dir.empty()) jdoc_mkdir(dir.c_str());
+    make_dir_utf8(dir);
 }
 
 // Create a directory and any missing parents (mkdir -p).
@@ -119,7 +146,7 @@ inline void ensure_dirs(const std::string& dir) {
     for (size_t pos = 0; pos != std::string::npos; ) {
         pos = dir.find_first_of("/\\", pos + 1);
         std::string parent = dir.substr(0, pos);
-        if (!parent.empty()) jdoc_mkdir(parent.c_str());
+        make_dir_utf8(parent);
     }
 }
 
