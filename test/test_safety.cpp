@@ -14,6 +14,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <iomanip>
@@ -1142,6 +1143,44 @@ void test_empty_memory_and_invalid_pages_are_consistent() {
     CHECK(rejected);
 }
 
+// A private directory under the platform temp path, named after `tag`.
+std::string scratch_dir(const std::string& tag) {
+    std::string base = "/tmp";
+    for (const char* var : {"TMPDIR", "TEMP", "TMP"}) {
+        const char* value = std::getenv(var);
+        if (value && *value) { base = value; break; }
+    }
+    const auto nonce = std::chrono::high_resolution_clock::now()
+                           .time_since_epoch().count();
+    return base + "/jdoc-" + tag + "-" + std::to_string(nonce);
+}
+
+void test_save_recreates_a_removed_output_directory() {
+    // Nothing probes the directory before each save, so a cleanup that removes
+    // image_dir mid-run must not cost the next image: the write reports the
+    // missing path and the directory is created once, then retried.
+    const std::string root = scratch_dir("missing-dir");
+    const std::string dir = root + "/nested/images";
+    const std::string payload = "bytes";
+
+    const std::string first = jdoc::util::save_named_file(
+        dir, "page1_img0.png", payload.data(), payload.size());
+    CHECK(!first.empty());
+
+    std::error_code ignored;
+    std::filesystem::remove_all(jdoc::util::io_path(dir), ignored);
+    CHECK(!std::filesystem::exists(jdoc::util::io_path(dir)));
+
+    const std::string second = jdoc::util::save_named_file(
+        dir, "page1_img0.png", payload.data(), payload.size());
+    CHECK(!second.empty());
+    CHECK(std::filesystem::exists(jdoc::util::io_path(second)));
+    // The directory was empty again, so the plain name is free once more.
+    CHECK(jdoc::util::get_filename(second) == "page1_img0.png");
+
+    std::filesystem::remove_all(jdoc::util::io_path(root), ignored);
+}
+
 void test_concurrent_image_saves_do_not_overwrite() {
     std::string base = "/tmp";
     for (const char* var : {"TMPDIR", "TEMP", "TMP"}) {
@@ -1276,6 +1315,7 @@ int main() {
     RUN_TEST(test_pdf_decodes_surrogate_pair);
     RUN_TEST(test_memory_streaming_supports_eml);
     RUN_TEST(test_empty_memory_and_invalid_pages_are_consistent);
+    RUN_TEST(test_save_recreates_a_removed_output_directory);
     RUN_TEST(test_concurrent_image_saves_do_not_overwrite);
     RUN_TEST(test_utf8_file_and_output_paths);
 #undef RUN_TEST
