@@ -6,6 +6,7 @@
 #include "common/file_utils.h"
 #include "common/image_magic.h"
 #include "common/image_utils.h"
+#include "common/libdeflate_init.h"
 #include <zlib.h>          // crc32 for PNG chunk checksums
 #include <libdeflate.h>    // faster DEFLATE compression for the IDAT payload
 #include <fstream>
@@ -83,6 +84,7 @@ inline void png_write_chunk(std::vector<char>& out, const char type[4],
 inline std::vector<char> png_compress_rows(const uint8_t* rows, size_t row_size,
                                            unsigned w, unsigned h,
                                            uint8_t color_type, int level) {
+    ensure_libdeflate_runtime_initialized();
     int ld_level = (level <= 0) ? 6 : (level > 12 ? 12 : level);
     using CompressorPtr = std::unique_ptr<libdeflate_compressor,
         decltype(&libdeflate_free_compressor)>;
