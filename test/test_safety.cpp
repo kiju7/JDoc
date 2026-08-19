@@ -1235,10 +1235,21 @@ void test_utf8_file_and_output_paths() {
 int main() {
     const auto run = [](const char* name, void (*test)()) {
         std::cerr << "[ RUN      ] " << name << std::endl;
-        test();
+        try {
+            test();
+        } catch (const std::exception& error) {
+            std::cerr << "[  FAILED  ] " << name << ": " << error.what()
+                      << std::endl;
+            return false;
+        } catch (...) {
+            std::cerr << "[  FAILED  ] " << name << ": unknown exception"
+                      << std::endl;
+            return false;
+        }
         std::cerr << "[       OK ] " << name << std::endl;
+        return true;
     };
-#define RUN_TEST(test) run(#test, &test)
+#define RUN_TEST(test) do { if (!run(#test, &test)) return 1; } while (false)
     RUN_TEST(test_ole_rejects_invalid_sector_shift);
     RUN_TEST(test_ole_rejects_oversized_directory_name);
     RUN_TEST(test_ole_directory_cycle_terminates);
