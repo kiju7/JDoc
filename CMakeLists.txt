@@ -217,6 +217,7 @@ endif()
 add_library(jdoc_lib STATIC
     # common + zip
     src/common/string_utils.cpp
+    src/common/file_write.cpp
     src/common/cpu_budget.cpp
     src/common/inflate.cpp
     src/common/emf_text.cpp
