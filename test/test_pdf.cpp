@@ -301,6 +301,14 @@ int main(int argc, char* argv[]) {
             // become a figure: it collapses to a handful of distinct vertex
             // positions while being far wider than tall.
             {"test/fixtures/pdf/decoration_band.pdf", 0, "Body text"},
+            // A figure can be tiled out of rasters each placed as small
+            // as a bullet — an attention-map grid, a sheet of glyph
+            // samples. Nine of them on one page is a figure and all nine
+            // must survive the inline-icon gate...
+            {"test/fixtures/pdf/tiled_figure.pdf", 9, "Body text"},
+            // ...while a handful of the same marks is decoration, and
+            // still is.
+            {"test/fixtures/pdf/icon_row.pdf", 0, "Body text"},
         };
         for (auto& c : cases) {
             std::ifstream f(c.fixture);

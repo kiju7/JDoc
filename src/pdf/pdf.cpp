@@ -463,6 +463,7 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
                 double x0, y0, x1, y1;  // device bbox, viewing coords
                 int obj_num;            // resolved ref; -1 for name/inline
                 bool masked;            // stencil/1-bit or /SMask//Mask-backed
+                int px_w, px_h;         // source raster size, /Width x /Height
             };
             std::vector<PlacementInfo> infos;
             auto xobjects = doc.resolve(resources.get("XObject"));
@@ -513,7 +514,9 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
                               xobj.get("BitsPerComponent").as_int() == 1 ||
                               !xobj.get("SMask").is_none() ||
                               !xobj.get("Mask").is_none();
-                infos.push_back({i, bx0, by0, bx1, by1, ip.xobj_ref, masked});
+                infos.push_back({i, bx0, by0, bx1, by1, ip.xobj_ref, masked,
+                                 xobj.get("Width").as_int(),
+                                 xobj.get("Height").as_int()});
             }
 
             const size_t n_inf = infos.size();
@@ -1054,9 +1057,11 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
                     if (!handled[i]) remaining.push_back(i);
                 // Standalone rasters that are page furniture, not figures.
                 //  - Inline icons: a placement under 24pt on both axes is a
-                //    bullet or stamp inside a text line, whatever its pixel
-                //    count (measured: icons <= 17.7pt; the smallest genuine
-                //    figure placement is >= 64pt).
+                //    bullet or stamp inside a text line (measured: icons
+                //    <= 17.7pt; the smallest genuine standalone figure
+                //    placement is >= 64pt) — unless the page is tiled with
+                //    them, which is how a figure built from many small
+                //    rasters looks. See the tile_peers count below.
                 //  - Trim bleed: decoration is deliberately drawn past the
                 //    trim edge so the guillotine cannot leave a white sliver;
                 //    a figure never risks its own data. Crossing the CropBox
@@ -1064,6 +1069,21 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
                 //    chapter banner (measured: 15/16 IMF WEO banners, 0/50
                 //    genuine placements in the HWP thesis).
                 if (!remaining.empty() && !infos.empty()) {
+                // A figure can be tiled out of many small rasters — an
+                // attention-map grid, a sheet of glyph samples — and each
+                // tile is placed as small as a bullet. What separates them is
+                // not the placement but how many siblings share the page:
+                // measured, decoration comes at most 4 to a page while a
+                // tiled figure starts at 8. Fragments shredded by a print
+                // driver also come in the hundreds, so only siblings with
+                // real pixels behind them count (their raster is 2x1 or so,
+                // against 107px and up for a genuine tile).
+                const int kTilePixels = 100;   // short side of the raster
+                size_t tile_peers = 0;
+                for (auto& o : infos)
+                    if (std::max(o.x1 - o.x0, o.y1 - o.y0) < 24.0 &&
+                        std::min(o.px_w, o.px_h) >= kTilePixels)
+                        tile_peers++;
                     std::vector<size_t> kept;
                     kept.reserve(remaining.size());
                     for (size_t idx : remaining) {
@@ -1072,12 +1092,17 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
                             if (info.idx == idx) { pi = &info; break; }
                         if (pi) {
                             double w = pi->x1 - pi->x0, h = pi->y1 - pi->y0;
-                            if (std::max(w, h) < 24.0) {
+                            const bool tile =
+                                tile_peers >= 6 &&
+                                std::min(pi->px_w, pi->px_h) >= kTilePixels;
+                            if (std::max(w, h) < 24.0 && !tile) {
                                 if (fig_debug)
                                     fprintf(stderr,
                                             "[figdbg] p=%d raster skip:icon"
-                                            " (%.1fx%.1fpt)\n",
-                                            p + 1, w, h);
+                                            " (%.1fx%.1fpt px=%dx%d"
+                                            " tiles=%zu)\n",
+                                            p + 1, w, h, pi->px_w,
+                                            pi->px_h, tile_peers);
                                 continue;
                             }
                             // Bleed is judged on the raw placement, not the
