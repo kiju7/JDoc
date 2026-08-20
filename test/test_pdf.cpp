@@ -282,6 +282,56 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    // Test 12: Vector figure regions. A booktabs table draws nothing but
+    // ruling, so it belongs in the markdown table and must not also come out
+    // as a raster; chart panels standing side by side merge their axis and
+    // legend labels into page-wide lines, which must not read as body text
+    // swallowed by the panel.
+    std::cout << "[12] Testing vector figure region gating...\n";
+    {
+        struct Case {
+            const char* fixture;
+            size_t want_images;
+            const char* want_text;
+        };
+        const Case cases[] = {
+            {"test/fixtures/pdf/booktabs_rules.pdf", 0, "ResNet-152"},
+            {"test/fixtures/pdf/panel_charts.pdf", 2, nullptr},
+            // A title decoration band (grey fill + edge hairlines) must not
+            // become a figure: it collapses to a handful of distinct vertex
+            // positions while being far wider than tall.
+            {"test/fixtures/pdf/decoration_band.pdf", 0, "Body text"},
+            // A figure can be tiled out of rasters each placed as small
+            // as a bullet — an attention-map grid, a sheet of glyph
+            // samples. Nine of them on one page is a figure and all nine
+            // must survive the inline-icon gate...
+            {"test/fixtures/pdf/tiled_figure.pdf", 9, "Body text"},
+            // ...while a handful of the same marks is decoration, and
+            // still is.
+            {"test/fixtures/pdf/icon_row.pdf", 0, "Body text"},
+        };
+        for (auto& c : cases) {
+            std::ifstream f(c.fixture);
+            if (!f.good()) {
+                std::cout << "    SKIP: " << c.fixture << "\n";
+                continue;
+            }
+            f.close();
+            auto chunks = jdoc::pdf_to_markdown_chunks(c.fixture);
+            CHECK(chunks.size() == 1);
+            const std::string& md = chunks[0].text;
+            size_t refs = 0;
+            for (size_t i = md.find("!["); i != std::string::npos;
+                 i = md.find("![", i + 2))
+                refs++;
+            std::cout << "    " << c.fixture << ": " << refs
+                      << " refs (expected " << c.want_images << ")\n";
+            CHECK(refs == c.want_images);
+            CHECK(chunks[0].images.size() == c.want_images);
+            CHECK(!c.want_text || md.find(c.want_text) != std::string::npos);
+        }
+    }
+
     std::cout << "\n=== All tests passed ===\n";
     return 0;
 }
