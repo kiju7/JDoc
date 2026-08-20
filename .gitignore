@@ -23,3 +23,6 @@ build-*/
 bindings/java/.gradle/
 bindings/java/build/
 bindings/go/*.test
+# local benchmark scratch: inputs, extracted images and reports, hundreds
+# of MB that belong on disk and not in the history
+scratch-bench/
