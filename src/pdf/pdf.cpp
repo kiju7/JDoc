@@ -1069,6 +1069,12 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
                 //    chapter banner (measured: 15/16 IMF WEO banners, 0/50
                 //    genuine placements in the HWP thesis).
                 if (!remaining.empty() && !infos.empty()) {
+                // Placement lookup by image index: the filter below runs per
+                // remaining image, and a GDI-shredded page carries thousands
+                // of placements — a linear scan per item is O(n^2) there.
+                std::vector<const PlacementInfo*> info_by_idx(
+                    parse_result.images.size(), nullptr);
+                for (auto& info : infos) info_by_idx[info.idx] = &info;
                 // A figure can be tiled out of many small rasters — an
                 // attention-map grid, a sheet of glyph samples — and each
                 // tile is placed as small as a bullet. What separates them is
@@ -1087,9 +1093,7 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
                     std::vector<size_t> kept;
                     kept.reserve(remaining.size());
                     for (size_t idx : remaining) {
-                        const PlacementInfo* pi = nullptr;
-                        for (auto& info : infos)
-                            if (info.idx == idx) { pi = &info; break; }
+                        const PlacementInfo* pi = info_by_idx[idx];
                         if (pi) {
                             double w = pi->x1 - pi->x0, h = pi->y1 - pi->y0;
                             const bool tile =
