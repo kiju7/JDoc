@@ -874,8 +874,15 @@ std::vector<ExtractedImage> extract_page_images(PdfDoc& doc, const PdfObj& resou
                     int byte_idx = y * row_bytes + x / 8;
                     int bit_idx = 7 - (x % 8);
                     bool bit_set = (decoded[byte_idx] >> bit_idx) & 1;
-                    // Decoder uses 1=black convention; if BlackIs1=false, invert
-                    bool is_black = black_is_1 ? bit_set : !bit_set;
+                    // decode_ccitt always hands back the ITU-T convention,
+                    // 1 = black, whatever BlackIs1 said — it takes the flag
+                    // and ignores it. BlackIs1=false, the default and the
+                    // common case, means the filter would have written 0 for
+                    // black, which DeviceGray then renders as black: the two
+                    // inversions cancel and the canonical bit stands. Only
+                    // BlackIs1=true leaves 1-is-black samples for a colour
+                    // space that reads 1 as white, and that is the inversion.
+                    bool is_black = black_is_1 ? !bit_set : bit_set;
                     gray[y * cols + x] = is_black ? 0 : 255;
                 }
             }
@@ -2188,7 +2195,7 @@ static ImageData render_composite_view(
                             // For ImageMask: store raw bit (1=paint, 0=transparent)
                             pixels[y * cols + x] = bit_set ? 255 : 0;
                         } else {
-                            bool is_black = black_is_1 ? bit_set : !bit_set;
+                            bool is_black = black_is_1 ? !bit_set : bit_set;
                             pixels[y * cols + x] = is_black ? 0 : 255;
                         }
                     }

@@ -783,6 +783,17 @@ void PdfDoc::parse_obj_stream(int stream_num) {
             xref[obj_num] = e;
         }
         if (obj_cache.find(obj_num) != obj_cache.end()) continue;
+        // An incremental update rewrites an object into a new container,
+        // and every container in the file gets expanded here — in object
+        // number order, so the superseded one comes first. The xref names
+        // the container that counts; a stale stream must not seed the
+        // cache merely by being parsed earlier. Objects the xref does not
+        // know (a rebuilt or damaged file, which is why this expansion
+        // exists) are still taken from wherever they are found.
+        auto xe = xref.find(obj_num);
+        if (xe != xref.end() && xe->second.in_use &&
+            xe->second.stream_obj != stream_num)
+            continue;
         size_t abs_off = static_cast<size_t>(first + obj_off);
         if (abs_off >= decoded.size()) continue;
         PdfLexer olex(decoded.data(), decoded.size(), abs_off);
