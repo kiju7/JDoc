@@ -297,6 +297,10 @@ int main(int argc, char* argv[]) {
         const Case cases[] = {
             {"test/fixtures/pdf/booktabs_rules.pdf", 0, "ResNet-152"},
             {"test/fixtures/pdf/panel_charts.pdf", 2, nullptr},
+            // A title decoration band (grey fill + edge hairlines) must not
+            // become a figure: it collapses to a handful of distinct vertex
+            // positions while being far wider than tall.
+            {"test/fixtures/pdf/decoration_band.pdf", 0, "Body text"},
         };
         for (auto& c : cases) {
             std::ifstream f(c.fixture);

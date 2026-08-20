@@ -1,0 +1,53 @@
+%PDF-1.4
+%‚„œ”
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [3 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>
+endobj
+4 0 obj
+<< /Length 684 >>
+stream
+BT /F1 11 Tf
+1 0 0 1 90 700 Tm (NOTICE) Tj
+1 0 0 1 72 640 Tm (Body text line one explaining the document conventions in detail.) Tj
+1 0 0 1 72 624 Tm (Body text line two continues the explanation with more details.) Tj
+1 0 0 1 72 608 Tm (Body text line three keeps the page from being vector only.) Tj
+1 0 0 1 72 592 Tm (Body text line four adds ordinary paragraph content here too.) Tj
+ET
+0.84 g 58 745 480 26 re f
+0 G 0.6 w
+58 771 m 178 771 l S
+58 745 m 178 745 l S
+178 771 m 298 771 l S
+178 745 m 298 745 l S
+298 771 m 418 771 l S
+298 745 m 418 745 l S
+418 771 m 538 771 l S
+418 745 m 538 745 l S
+58 745 m 58 758 l S
+58 758 m 58 771 l S
+538 745 m 538 758 l S
+538 758 m 538 771 l S
+endstream
+endobj
+5 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>
+endobj
+xref
+0 6
+0000000000 65535 f 
+0000000015 00000 n 
+0000000064 00000 n 
+0000000121 00000 n 
+0000000247 00000 n 
+0000000981 00000 n 
+trailer
+<< /Size 6 /Root 1 0 R >>
+startxref
+1051
+%%EOF

@@ -277,10 +277,22 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
         if (p < 0 || p >= tp) return;
         auto& page_obj = page_objs[p];
 
+        // Diagnostics for the figure/decoration gates: per-cluster features
+        // and per-raster placements, printed to stderr when JDOC_FIG_DEBUG=1.
+        static const bool fig_debug = [] {
+            const char* e = std::getenv("JDOC_FIG_DEBUG");
+            return e && *e && *e != '0';
+        }();
+
         // Page geometry: MediaBox and /Rotate are inheritable, so climb the
         // page tree for both (CAD exports often keep them on the Pages node).
         double page_w = 612, page_h = 792; // default letter
         double mb_llx = 0, mb_lly = 0;
+        // CropBox bounds in page space (MediaBox origin). Content outside the
+        // CropBox is trim-margin material (printer marks, bleed) that no
+        // viewer shows; it must not seed figures or export as an image.
+        double crop_x0 = 0, crop_y0 = 0, crop_x1 = 0, crop_y1 = 0;
+        bool have_crop = false;
         int page_rotate = 0;
         PdfObj resources; // /Resources is inheritable like MediaBox and /Rotate
         {
@@ -296,6 +308,16 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
                         page_w = mediabox.arr[2].as_num() - mb_llx;
                         page_h = mediabox.arr[3].as_num() - mb_lly;
                         have_box = true;
+                    }
+                }
+                if (!have_crop) {
+                    auto cropbox = doc.resolve(node.get("CropBox"));
+                    if (cropbox.is_arr() && cropbox.arr.size() >= 4) {
+                        crop_x0 = cropbox.arr[0].as_num();
+                        crop_y0 = cropbox.arr[1].as_num();
+                        crop_x1 = cropbox.arr[2].as_num();
+                        crop_y1 = cropbox.arr[3].as_num();
+                        have_crop = true;
                     }
                 }
                 if (!have_rot) {
@@ -317,6 +339,25 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
                 if (!parent.is_dict()) break;
                 node = std::move(parent);
             }
+            if (have_crop) {
+                if (crop_x0 > crop_x1) std::swap(crop_x0, crop_x1);
+                if (crop_y0 > crop_y1) std::swap(crop_y0, crop_y1);
+                crop_x0 = std::max(0.0, crop_x0 - mb_llx);
+                crop_y0 = std::max(0.0, crop_y0 - mb_lly);
+                crop_x1 = std::min(page_w, crop_x1 - mb_llx);
+                crop_y1 = std::min(page_h, crop_y1 - mb_lly);
+                if (crop_x1 - crop_x0 < 1.0 || crop_y1 - crop_y0 < 1.0)
+                    have_crop = false; // degenerate: fall back to MediaBox
+            }
+            if (!have_crop) {
+                crop_x0 = 0; crop_y0 = 0;
+                crop_x1 = page_w; crop_y1 = page_h;
+            }
+            if (fig_debug)
+                fprintf(stderr,
+                        "[figdbg] p=%d media=%.1fx%.1f crop=(%.1f,%.1f)-(%.1f,%.1f)%s\n",
+                        p + 1, page_w, page_h, crop_x0, crop_y0, crop_x1,
+                        crop_y1, have_crop ? "" : " (=media)");
         }
 
         // Normalize into viewing coordinates so downstream consumers (text
@@ -642,10 +683,15 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
                         // and cell shading are axis-aligned; charts and
                         // schematics are not.
                         bool ortho;
+                        // Index into parse_result.paths, for the coordinate
+                        // rank computed per accepted cluster below.
+                        size_t src;
                     };
                     std::vector<PathBox> pb;
                     pb.reserve(author_paths);
+                    size_t rp_idx = static_cast<size_t>(-1);
                     for (auto& rp : parse_result.paths) {
+                        rp_idx++;
                         if (rp.synthetic) continue;
                         // Real figures carry ink; a cluster of nothing but
                         // pastel fills is a decorated text background.
@@ -732,7 +778,8 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
                         bool rule = !has_curve && mind <= 2.0 &&
                                     std::max(w, h) >=
                                         4.0 * std::max(mind, 0.05);
-                        pb.push_back({bx0, by0, bx1, by1, dark, rule, ortho});
+                        pb.push_back(
+                            {bx0, by0, bx1, by1, dark, rule, ortho, rp_idx});
                     }
 
                     const size_t np = pb.size();
@@ -752,6 +799,7 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
                         size_t n = 0, dark = 0, rules = 0, orthos = 0;
                         double x0 = 1e300, y0 = 1e300;
                         double x1 = -1e300, y1 = -1e300;
+                        std::vector<size_t> members; // indices into pb
                     };
                     std::vector<FigCluster> figs;
                     {
@@ -769,6 +817,7 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
                             fc.y0 = std::min(fc.y0, pb[i].y0);
                             fc.x1 = std::max(fc.x1, pb[i].x1);
                             fc.y1 = std::max(fc.y1, pb[i].y1);
+                            fc.members.push_back(i);
                         }
                     }
                     // Two clusters can interleave — union boxes overlapping
@@ -794,30 +843,101 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
                                 figs[a].y0 = std::min(figs[a].y0, figs[b].y0);
                                 figs[a].x1 = std::max(figs[a].x1, figs[b].x1);
                                 figs[a].y1 = std::max(figs[a].y1, figs[b].y1);
+                                figs[a].members.insert(
+                                    figs[a].members.end(),
+                                    figs[b].members.begin(),
+                                    figs[b].members.end());
                                 figs.erase(figs.begin() + b);
                                 merged = true;
                                 break;
                             }
                     }
 
+                    // Coordinate rank: the number of distinct vertex
+                    // positions along each axis, quantized to 2pt. Data
+                    // spreads vertices across both axes; a band is one
+                    // rectangle (rank 2 each way) and a ruled grid starts
+                    // and ends every rule on the same few x positions.
+                    auto coord_rank = [&](const FigCluster& fc, int& rx,
+                                          int& ry) {
+                        std::unordered_set<long> xs, ys;
+                        for (size_t m : fc.members) {
+                            auto& rp = parse_result.paths[pb[m].src];
+                            for (auto& pt : rp.points) {
+                                if (pt.type == PathPoint::CLOSE) continue;
+                                xs.insert(std::lround(pt.x / 2.0));
+                                ys.insert(std::lround(pt.y / 2.0));
+                            }
+                        }
+                        rx = static_cast<int>(xs.size());
+                        ry = static_cast<int>(ys.size());
+                    };
+                    auto figlog = [&](const FigCluster& fc,
+                                      const char* verdict) {
+                        if (!fig_debug) return;
+                        int rx = 0, ry = 0;
+                        coord_rank(fc, rx, ry);
+                        fprintf(stderr,
+                                "[figdbg] p=%d cand n=%zu dark=%zu rules=%zu"
+                                " orthos=%zu bbox=(%.1f,%.1f)-(%.1f,%.1f)"
+                                " rank=%d/%d %s\n",
+                                p + 1, fc.n, fc.dark, fc.rules, fc.orthos,
+                                fc.x0, fc.y0, fc.x1, fc.y1, rx, ry, verdict);
+                    };
                     for (auto& fc : figs) {
-                        if (fc.n < kFigureMinPaths) continue;
-                        if (fc.dark < 2) continue;
+                        if (fc.n < kFigureMinPaths) {
+                            if (fc.n >= 4) figlog(fc, "reject:minpaths");
+                            continue;
+                        }
+                        if (fc.dark < 2) {
+                            figlog(fc, "reject:dark");
+                            continue;
+                        }
                         // Nothing but hairlines is ruling, not a drawing:
                         // a table's rules, a separator band, a box around
                         // text. Rasterising it yields an empty grid, and
                         // the words it frames are already in the markdown.
-                        if (fc.rules == fc.n) continue;
+                        if (fc.rules == fc.n) {
+                            figlog(fc, "reject:all-rules");
+                            continue;
+                        }
                         double rgn[4] = {std::max(0.0, fc.x0),
                                          std::max(0.0, fc.y0),
                                          std::min(page_w, fc.x1),
                                          std::min(page_h, fc.y1)};
                         double fw = rgn[2] - rgn[0], fh = rgn[3] - rgn[1];
-                        if (fw < 1.0 || fh < 1.0) continue;
+                        if (fw < 1.0 || fh < 1.0) {
+                            figlog(fc, "reject:degenerate");
+                            continue;
+                        }
                         double farea = fw * fh;
                         double parea = page_w * page_h;
-                        if (farea < 0.006 * parea || farea > 0.65 * parea)
+                        if (farea < 0.006 * parea || farea > 0.65 * parea) {
+                            figlog(fc, "reject:area");
                             continue;
+                        }
+                        // Bands and decorative strips: one long rectangle
+                        // (plus its edge hairlines) collapses to a handful
+                        // of distinct vertex positions on one axis, and is
+                        // far wider than tall. Either signal alone kills
+                        // real content — sparse box diagrams sit at rank 3
+                        // (aspect <= 5.2 measured) and heatmap grids reach
+                        // rank 11 — so both must agree. Measured margins:
+                        // decorations rank <= 6 / aspect >= 12.6; figures
+                        // rank >= 11 or aspect <= 5.2.
+                        {
+                            double aspect =
+                                std::max(fw, fh) / std::max(std::min(fw, fh),
+                                                            1.0);
+                            if (aspect >= 6.0) {
+                                int rx = 0, ry = 0;
+                                coord_rank(fc, rx, ry);
+                                if (std::min(rx, ry) <= 8) {
+                                    figlog(fc, "reject:band");
+                                    continue;
+                                }
+                            }
+                        }
                         auto overlap = [&](double x0, double y0, double x1,
                                            double y1) {
                             double ox = std::min(rgn[2], x1) -
@@ -886,9 +1006,16 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
                                 if (overlap(dr[0], dr[1], dr[2], dr[3]) >
                                     0.3 * farea) {
                                     veto = true;
+                                    veto_code = 3;
                                     break;
                                 }
-                        if (veto) continue;
+                        if (veto) {
+                            figlog(fc, veto_code == 1   ? "reject:table"
+                                       : veto_code == 2 ? "reject:bodytext"
+                                                        : "reject:overlap");
+                            continue;
+                        }
+                        figlog(fc, "ACCEPT");
 
                         // Glyph images inside the figure render with it.
                         std::vector<size_t> members;
@@ -925,12 +1052,92 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
                 std::vector<size_t> remaining;
                 for (size_t i = 0; i < parse_result.images.size(); i++)
                     if (!handled[i]) remaining.push_back(i);
+                // Standalone rasters that are page furniture, not figures.
+                //  - Inline icons: a placement under 24pt on both axes is a
+                //    bullet or stamp inside a text line, whatever its pixel
+                //    count (measured: icons <= 17.7pt; the smallest genuine
+                //    figure placement is >= 64pt).
+                //  - Trim bleed: decoration is deliberately drawn past the
+                //    trim edge so the guillotine cannot leave a white sliver;
+                //    a figure never risks its own data. Crossing the CropBox
+                //    by more than 2pt on two or more sides marks a cover or
+                //    chapter banner (measured: 15/16 IMF WEO banners, 0/50
+                //    genuine placements in the HWP thesis).
+                if (!remaining.empty() && !infos.empty()) {
+                    std::vector<size_t> kept;
+                    kept.reserve(remaining.size());
+                    for (size_t idx : remaining) {
+                        const PlacementInfo* pi = nullptr;
+                        for (auto& info : infos)
+                            if (info.idx == idx) { pi = &info; break; }
+                        if (pi) {
+                            double w = pi->x1 - pi->x0, h = pi->y1 - pi->y0;
+                            if (std::max(w, h) < 24.0) {
+                                if (fig_debug)
+                                    fprintf(stderr,
+                                            "[figdbg] p=%d raster skip:icon"
+                                            " (%.1fx%.1fpt)\n",
+                                            p + 1, w, h);
+                                continue;
+                            }
+                            // Bleed is judged on the raw placement, not the
+                            // clipped window: a bleeding banner is usually
+                            // clipped to the page box, which erases the very
+                            // evidence looked for here.
+                            const double* m = parse_result.images[idx].ctm;
+                            double rxs[4] = {m[4], m[4] + m[0], m[4] + m[2],
+                                             m[4] + m[0] + m[2]};
+                            double rys[4] = {m[5], m[5] + m[1], m[5] + m[3],
+                                             m[5] + m[1] + m[3]};
+                            double rx0 = std::min({rxs[0], rxs[1], rxs[2],
+                                                   rxs[3]});
+                            double rx1 = std::max({rxs[0], rxs[1], rxs[2],
+                                                   rxs[3]});
+                            double ry0 = std::min({rys[0], rys[1], rys[2],
+                                                   rys[3]});
+                            double ry1 = std::max({rys[0], rys[1], rys[2],
+                                                   rys[3]});
+                            int out_sides = (rx0 < crop_x0 - 2.0) +
+                                            (ry0 < crop_y0 - 2.0) +
+                                            (rx1 > crop_x1 + 2.0) +
+                                            (ry1 > crop_y1 + 2.0);
+                            if (out_sides >= 2) {
+                                if (fig_debug)
+                                    fprintf(stderr,
+                                            "[figdbg] p=%d raster skip:bleed"
+                                            " (%d sides)\n",
+                                            p + 1, out_sides);
+                                continue;
+                            }
+                        }
+                        kept.push_back(idx);
+                    }
+                    remaining.swap(kept);
+                }
                 if (!remaining.empty()) {
                     auto extracted = extract_page_images(
                         doc, resources, parse_result, p, image_dir,
                         opts.min_image_size, &result.page_diags[p],
                         &remaining, img_idx);
                     for (auto& ei : extracted) {
+                        if (fig_debug) {
+                            double ix0 = std::min(ei.ctm[4],
+                                                  ei.ctm[0] + ei.ctm[4]);
+                            double ix1 = std::max(ei.ctm[4],
+                                                  ei.ctm[0] + ei.ctm[4]);
+                            double iy0 = std::min(ei.ctm[5],
+                                                  ei.ctm[3] + ei.ctm[5]);
+                            double iy1 = std::max(ei.ctm[5],
+                                                  ei.ctm[3] + ei.ctm[5]);
+                            fprintf(stderr,
+                                    "[figdbg] p=%d raster bbox=(%.1f,%.1f)-"
+                                    "(%.1f,%.1f) crop=(%.1f,%.1f)-(%.1f,%.1f)"
+                                    " %dx%d\n",
+                                    p + 1, ix0, iy0, ix1, iy1, crop_x0,
+                                    crop_y0, crop_x1, crop_y1,
+                                    static_cast<int>(ei.img.width),
+                                    static_cast<int>(ei.img.height));
+                        }
                         // ctm[5] is the Y translation in PDF coordinates (origin bottom-left)
                         // ctm[3] is vertical scale; y_top = ctm[5] + abs(ctm[3])
                         double y_top = ei.ctm[5] + std::abs(ei.ctm[3]);
