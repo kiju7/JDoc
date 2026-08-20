@@ -1,0 +1,66 @@
+%PDF-1.4
+%‚„œ”
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [3 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>
+endobj
+4 0 obj
+<< /Length 995 >>
+stream
+BT /F1 9 Tf
+1 0 0 1 90 700 Tm (Method         top-1   top-5) Tj
+1 0 0 1 90 686 Tm (VGG-16         28.07    9.33) Tj
+1 0 0 1 90 672 Tm (GoogLeNet          -    9.15) Tj
+1 0 0 1 90 658 Tm (PReLU-net      24.27    7.38) Tj
+1 0 0 1 90 644 Tm (plain-34       28.54   10.02) Tj
+1 0 0 1 90 630 Tm (ResNet-34 A    25.03    7.76) Tj
+1 0 0 1 90 616 Tm (ResNet-34 B    24.52    7.46) Tj
+1 0 0 1 90 602 Tm (ResNet-50      22.85    6.71) Tj
+1 0 0 1 90 588 Tm (ResNet-101     21.75    6.05) Tj
+1 0 0 1 90 574 Tm (ResNet-152     21.43    5.71) Tj
+ET
+0 G 0.5 w
+90 712 m 250 712 l S
+90 698 m 250 698 l S
+90 684 m 250 684 l S
+90 670 m 250 670 l S
+90 656 m 250 656 l S
+90 642 m 250 642 l S
+90 628 m 250 628 l S
+90 614 m 250 614 l S
+90 600 m 250 600 l S
+90 586 m 250 586 l S
+90 570 m 250 570 l S
+158 570 m 158 584 l S
+158 584 m 158 598 l S
+158 598 m 158 612 l S
+158 612 m 158 626 l S
+158 626 m 158 640 l S
+158 640 m 158 654 l S
+158 654 m 158 668 l S
+158 668 m 158 682 l S
+158 682 m 158 696 l S
+158 696 m 158 710 l S
+endstream
+endobj
+5 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>
+endobj
+xref
+0 6
+0000000000 65535 f 
+0000000015 00000 n 
+0000000064 00000 n 
+0000000121 00000 n 
+0000000247 00000 n 
+0000001293 00000 n 
+trailer
+<< /Size 6 /Root 1 0 R >>
+startxref
+1363
+%%EOF

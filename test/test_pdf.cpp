@@ -282,6 +282,44 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    // Test 12: Vector figure regions. A booktabs table draws nothing but
+    // ruling, so it belongs in the markdown table and must not also come out
+    // as a raster; chart panels standing side by side merge their axis and
+    // legend labels into page-wide lines, which must not read as body text
+    // swallowed by the panel.
+    std::cout << "[12] Testing vector figure region gating...\n";
+    {
+        struct Case {
+            const char* fixture;
+            size_t want_images;
+            const char* want_text;
+        };
+        const Case cases[] = {
+            {"test/fixtures/pdf/booktabs_rules.pdf", 0, "ResNet-152"},
+            {"test/fixtures/pdf/panel_charts.pdf", 2, nullptr},
+        };
+        for (auto& c : cases) {
+            std::ifstream f(c.fixture);
+            if (!f.good()) {
+                std::cout << "    SKIP: " << c.fixture << "\n";
+                continue;
+            }
+            f.close();
+            auto chunks = jdoc::pdf_to_markdown_chunks(c.fixture);
+            CHECK(chunks.size() == 1);
+            const std::string& md = chunks[0].text;
+            size_t refs = 0;
+            for (size_t i = md.find("!["); i != std::string::npos;
+                 i = md.find("![", i + 2))
+                refs++;
+            std::cout << "    " << c.fixture << ": " << refs
+                      << " refs (expected " << c.want_images << ")\n";
+            CHECK(refs == c.want_images);
+            CHECK(chunks[0].images.size() == c.want_images);
+            CHECK(!c.want_text || md.find(c.want_text) != std::string::npos);
+        }
+    }
+
     std::cout << "\n=== All tests passed ===\n";
     return 0;
 }

@@ -634,6 +634,14 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
                     struct PathBox {
                         double x0, y0, x1, y1;
                         bool dark;
+                        // Ruling is a hairline: one bbox dimension is a
+                        // stroke wide and the other much longer. A drawn
+                        // shape has two real dimensions.
+                        bool rule;
+                        // No curve and no diagonal segment. Rules, boxes
+                        // and cell shading are axis-aligned; charts and
+                        // schematics are not.
+                        bool ortho;
                     };
                     std::vector<PathBox> pb;
                     pb.reserve(author_paths);
@@ -690,7 +698,41 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
                         if (longd > 25.0 * shortd &&
                             longd > 0.3 * std::max(page_w, page_h))
                             continue;
-                        pb.push_back({bx0, by0, bx1, by1, dark});
+                        bool has_curve = false, ortho = true;
+                        {
+                            double px = 0, py = 0, sx = 0, sy = 0;
+                            bool have = false;
+                            for (auto& pt : rp.points) {
+                                if (pt.type == PathPoint::CURVE) {
+                                    has_curve = true;
+                                    ortho = false;
+                                    break;
+                                }
+                                if (pt.type == PathPoint::CLOSE) {
+                                    if (have &&
+                                        std::abs(sx - px) > 0.05 &&
+                                        std::abs(sy - py) > 0.05)
+                                        ortho = false;
+                                    continue;
+                                }
+                                if (pt.type == PathPoint::MOVE) {
+                                    sx = px = pt.x;
+                                    sy = py = pt.y;
+                                    have = true;
+                                    continue;
+                                }
+                                if (have && std::abs(pt.x - px) > 0.05 &&
+                                    std::abs(pt.y - py) > 0.05)
+                                    ortho = false;
+                                px = pt.x;
+                                py = pt.y;
+                            }
+                        }
+                        double mind = std::min(w, h);
+                        bool rule = !has_curve && mind <= 2.0 &&
+                                    std::max(w, h) >=
+                                        4.0 * std::max(mind, 0.05);
+                        pb.push_back({bx0, by0, bx1, by1, dark, rule, ortho});
                     }
 
                     const size_t np = pb.size();
@@ -707,7 +749,7 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
                         }
 
                     struct FigCluster {
-                        size_t n = 0, dark = 0;
+                        size_t n = 0, dark = 0, rules = 0, orthos = 0;
                         double x0 = 1e300, y0 = 1e300;
                         double x1 = -1e300, y1 = -1e300;
                     };
@@ -721,6 +763,8 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
                             auto& fc = figs[it->second];
                             fc.n++;
                             if (pb[i].dark) fc.dark++;
+                            if (pb[i].rule) fc.rules++;
+                            if (pb[i].ortho) fc.orthos++;
                             fc.x0 = std::min(fc.x0, pb[i].x0);
                             fc.y0 = std::min(fc.y0, pb[i].y0);
                             fc.x1 = std::max(fc.x1, pb[i].x1);
@@ -744,6 +788,8 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
                                     continue;
                                 figs[a].n += figs[b].n;
                                 figs[a].dark += figs[b].dark;
+                                figs[a].rules += figs[b].rules;
+                                figs[a].orthos += figs[b].orthos;
                                 figs[a].x0 = std::min(figs[a].x0, figs[b].x0);
                                 figs[a].y0 = std::min(figs[a].y0, figs[b].y0);
                                 figs[a].x1 = std::max(figs[a].x1, figs[b].x1);
@@ -757,6 +803,11 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
                     for (auto& fc : figs) {
                         if (fc.n < kFigureMinPaths) continue;
                         if (fc.dark < 2) continue;
+                        // Nothing but hairlines is ruling, not a drawing:
+                        // a table's rules, a separator band, a box around
+                        // text. Rasterising it yields an empty grid, and
+                        // the words it frames are already in the markdown.
+                        if (fc.rules == fc.n) continue;
                         double rgn[4] = {std::max(0.0, fc.x0),
                                          std::max(0.0, fc.y0),
                                          std::min(page_w, fc.x1),
@@ -778,10 +829,19 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
                         // Ruled/shaded tables cluster densely too, and text
                         // blocks carry decorations; both must stay text.
                         int veto_code = 0;
+                        // A booktabs table is found by alignment, not by
+                        // its geometry, yet it does own the rules it draws.
+                        // Ruling-only geometry under a text table is that
+                        // table; anything carrying a curve or a diagonal is
+                        // a drawing the detector merely straddled.
+                        bool ruling_only = fc.orthos == fc.n &&
+                                           fc.rules * 10 >= fc.n * 7;
                         for (auto& t : result.all_tables[p]) {
-                            // Text-detected tables own no drawn geometry;
-                            // paths under them are a figure, not the table.
-                            if (t.kind == TableData::TEXT) continue;
+                            // Text-detected tables usually own no drawn
+                            // geometry; paths under them are a figure unless
+                            // they are the table's own ruling.
+                            if (t.kind == TableData::TEXT && !ruling_only)
+                                continue;
                             if (overlap(t.x0, t.y0, t.x1, t.y1) >
                                 0.3 * farea) {
                                 veto_code = 1;
@@ -804,11 +864,19 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
                                 // one baseline) span width with few glyphs;
                                 // body lines carry real character mass.
                                 if (ln.text.size() < 30) continue;
-                                if (std::min(static_cast<double>(ln.x_right),
-                                             rgn[2]) >
+                                // A line the region merely crosses belongs
+                                // to a page-wide row, not to this box: chart
+                                // panels standing side by side share their
+                                // baselines, so the axis ticks and legends of
+                                // every panel merge into one line spanning
+                                // them all. Only a line the region actually
+                                // contains is text the box swallowed.
+                                double inside =
+                                    std::min(static_cast<double>(ln.x_right),
+                                             rgn[2]) -
                                     std::max(static_cast<double>(ln.x_left),
-                                             rgn[0]))
-                                    body_lines++;
+                                             rgn[0]);
+                                if (inside >= 0.7 * lw) body_lines++;
                             }
                             if (body_lines >= 2) veto_code = 2;
                         }
