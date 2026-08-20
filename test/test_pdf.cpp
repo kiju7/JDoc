@@ -4,6 +4,9 @@
 #include <iostream>
 #include <fstream>
 #include <chrono>
+#include <string>
+#include <vector>
+#include <zlib.h>
 
 #define CHECK(condition) \
     do { \
@@ -13,6 +16,60 @@
             return 1; \
         } \
     } while (false)
+
+
+// Fraction of a grayscale PNG's pixels that are dark. Enough of a decoder to
+// judge polarity: the fixtures below are 8-bit grayscale, no interlace.
+static double dark_fraction(const std::vector<char>& png) {
+    auto be32 = [&](size_t i) {
+        return (uint32_t(uint8_t(png[i])) << 24) | (uint32_t(uint8_t(png[i+1])) << 16) |
+               (uint32_t(uint8_t(png[i+2])) << 8) | uint32_t(uint8_t(png[i+3]));
+    };
+    if (png.size() < 8) return -1;
+    uint32_t w = 0, h = 0; int depth = 0, ctype = -1;
+    std::string idat;
+    for (size_t p = 8; p + 8 <= png.size();) {
+        uint32_t len = be32(p);
+        std::string type(png.begin() + p + 4, png.begin() + p + 8);
+        if (type == "IHDR") {
+            w = be32(p + 8); h = be32(p + 12);
+            depth = uint8_t(png[p + 16]); ctype = uint8_t(png[p + 17]);
+        } else if (type == "IDAT") {
+            idat.append(png.begin() + p + 8, png.begin() + p + 8 + len);
+        }
+        p += 12 + len;
+    }
+    if (depth != 8 || ctype != 0 || w == 0 || h == 0) return -1;
+
+    std::vector<unsigned char> raw(size_t(h) * (size_t(w) + 1) * 4);
+    uLongf out_len = uLongf(raw.size());
+    if (uncompress(raw.data(), &out_len,
+                   reinterpret_cast<const Bytef*>(idat.data()),
+                   uLong(idat.size())) != Z_OK)
+        return -1;
+
+    std::vector<unsigned char> prev(w, 0), cur(w, 0);
+    size_t dark = 0, i = 0;
+    for (uint32_t y = 0; y < h && i < out_len; y++) {
+        unsigned char f = raw[i++];
+        for (uint32_t x = 0; x < w && i < out_len; x++, i++) {
+            int a = x ? cur[x - 1] : 0, b = prev[x], c = x ? prev[x - 1] : 0;
+            int v = raw[i];
+            if (f == 1) v += a;
+            else if (f == 2) v += b;
+            else if (f == 3) v += (a + b) / 2;
+            else if (f == 4) {
+                int pp = a + b - c, pa = std::abs(pp - a), pb = std::abs(pp - b),
+                    pc = std::abs(pp - c);
+                v += (pa <= pb && pa <= pc) ? a : (pb <= pc ? b : c);
+            }
+            cur[x] = static_cast<unsigned char>(v);
+            if (cur[x] < 128) dark++;
+        }
+        prev = cur;
+    }
+    return double(dark) / (double(w) * h);
+}
 
 int main(int argc, char* argv[]) {
     const char* test_pdf = (argc > 1) ? argv[1] : "test/fixtures/pdf/sample.pdf";
@@ -329,6 +386,59 @@ int main(int argc, char* argv[]) {
             CHECK(refs == c.want_images);
             CHECK(chunks[0].images.size() == c.want_images);
             CHECK(!c.want_text || md.find(c.want_text) != std::string::npos);
+        }
+    }
+
+    // ── CCITT polarity, and a page the file itself replaced ──
+    std::cout << "\n[13] Testing CCITT polarity and incremental updates...\n";
+    {
+        // decode_ccitt hands back the ITU-T convention (1 = black) whatever
+        // BlackIs1 said — it takes the flag and ignores it. Applying the flag a
+        // second time here turned every scan with the default flag inside out,
+        // which is every scan: a page of paper came out 80% black.
+        std::ifstream f1("test/fixtures/pdf/ccitt_scan.pdf");
+        if (!f1.good()) {
+            std::cout << "    SKIP: ccitt_scan.pdf\n";
+        } else {
+            f1.close();
+            jdoc::ConvertOptions o;
+            o.images = true;
+            o.min_image_size = 0;
+            auto chunks = jdoc::pdf_to_markdown_chunks(
+                "test/fixtures/pdf/ccitt_scan.pdf", o);
+            CHECK(chunks.size() == 1);
+            CHECK(chunks[0].images.size() == 1);
+            double dark = dark_fraction(chunks[0].images[0].data);
+            std::cout << "    ccitt_scan.pdf: dark fraction " << dark
+                      << " (paper ~0.20, inverted ~0.80)\n";
+            CHECK(dark >= 0.0 && dark < 0.35);
+        }
+
+        // An incremental update rewrites objects into a new container while the
+        // superseded one stays in the file. Expanding a container cached every
+        // object in it, so whichever was reached first won — and the older one
+        // is reached first, being numbered lower. The page came back with the
+        // previous revision's content stream and without the /Rotate the update
+        // had added.
+        std::ifstream f2("test/fixtures/pdf/incremental_update.pdf");
+        if (!f2.good()) {
+            std::cout << "    SKIP: incremental_update.pdf\n";
+        } else {
+            f2.close();
+            auto chunks = jdoc::pdf_to_markdown_chunks(
+                "test/fixtures/pdf/incremental_update.pdf");
+            CHECK(chunks.size() == 1);
+            const std::string& md = chunks[0].text;
+            std::cout << "    incremental_update.pdf: "
+                      << (md.find("CURRENT REVISION") != std::string::npos
+                              ? "current revision" : "STALE revision")
+                      << ", page " << chunks[0].page_width << "x"
+                      << chunks[0].page_height << "\n";
+            CHECK(md.find("CURRENT REVISION") != std::string::npos);
+            CHECK(md.find("STALE REVISION") == std::string::npos);
+            // /Rotate 90 belongs to the replacement page object, so a landscape
+            // page proves the newer object was the one that was read.
+            CHECK(chunks[0].page_width > chunks[0].page_height);
         }
     }
 
