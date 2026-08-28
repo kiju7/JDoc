@@ -442,6 +442,30 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    // Test 14: a page whose /Resources has no /Font but draws all of its text
+    // through a Form XObject that carries its own /Font. With image extraction
+    // disabled the page-level "no fonts, no images" shortcut used to skip the
+    // page entirely (134 blank pages on an imposition-produced report).
+    std::cout << "[14] Testing text behind a Form XObject with images off...\n";
+    {
+        std::ifstream f("test/fixtures/pdf/form_only_fonts.pdf");
+        if (!f.good()) {
+            std::cout << "    SKIP: fixture not found\n";
+        } else {
+            f.close();
+            jdoc::ConvertOptions off;
+            off.images = false;
+            auto md_off = jdoc::pdf_to_markdown(
+                "test/fixtures/pdf/form_only_fonts.pdf", off);
+            CHECK(md_off.find("Form only text line") != std::string::npos);
+            CHECK(md_off.find("Second line inside the form") != std::string::npos);
+            auto md_on = jdoc::pdf_to_markdown(
+                "test/fixtures/pdf/form_only_fonts.pdf");
+            CHECK(md_on.find("Form only text line") != std::string::npos);
+            std::cout << "    form-only text present with images off and on OK\n";
+        }
+    }
+
     std::cout << "\n=== All tests passed ===\n";
     return 0;
 }

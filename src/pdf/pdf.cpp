@@ -374,16 +374,27 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
         result.page_widths[p] = page_w;
         result.page_heights[p] = page_h;
 
-        // Quick check: skip pages with no fonts and no extractable images
+        // Quick check: skip pages with no fonts and no extractable images.
+        // A page-level /Font dictionary is not the only place text can come
+        // from: imposition and print pipelines wrap every page in a Form
+        // XObject that carries its own /Resources, so a page whose /Font is
+        // empty may still draw text through /XObject. Only skip when neither
+        // exists (a bare, empty page).
         bool has_fonts = false;
+        bool has_xobjects = false;
         {
             auto& font_res = resources.get("Font");
             if (!font_res.is_none()) {
                 auto fd = doc.resolve(font_res);
                 has_fonts = fd.is_dict() && !fd.dict.empty();
             }
+            auto& xobj_res = resources.get("XObject");
+            if (!xobj_res.is_none()) {
+                auto xd = doc.resolve(xobj_res);
+                has_xobjects = xd.is_dict() && !xd.dict.empty();
+            }
         }
-        if (!has_fonts && !opts.images) return;
+        if (!has_fonts && !has_xobjects && !opts.images) return;
 
         // Parse content stream
         auto content_data = get_page_content(doc, page_obj);
