@@ -1170,7 +1170,7 @@ std::vector<TableData> detect_tables(const std::vector<PdfLineSegment>& lines,
                                       double page_width, double page_height) {
     if (lines.size() < 4) return {};
 
-    std::vector<PdfLineSegment> h_lines, v_lines;
+    std::vector<PdfLineSegment> h_lines, v_lines, h_frags;
     for (auto& l : lines) {
         if (l.is_horizontal()) {
             double y = (l.y0 + l.y1) / 2.0;
@@ -1178,7 +1178,10 @@ std::vector<TableData> detect_tables(const std::vector<PdfLineSegment>& lines,
             double lx = std::min((double)l.x0, (double)l.x1);
             double rx = std::max((double)l.x0, (double)l.x1);
             if (lx < -10 || rx > page_width + 10) continue;
-            if (rx - lx < 50.0) continue;
+            // Too short to be a rule on its own, but per-cell borders and
+            // dashed rules arrive as exactly such fragments: hold them for
+            // the collinear merge below instead of dropping them outright.
+            if (rx - lx < 50.0) { h_frags.push_back(l); continue; }
             h_lines.push_back(l);
         } else if (l.is_vertical()) {
             double x = (l.x0 + l.x1) / 2.0;
@@ -1187,6 +1190,42 @@ std::vector<TableData> detect_tables(const std::vector<PdfLineSegment>& lines,
             double ry = std::max((double)l.y0, (double)l.y1);
             if (ly < -10 || ry > page_height + 10) continue;
             v_lines.push_back(l);
+        }
+    }
+
+    // Rules drawn per cell (each border segment one column wide) or dashed
+    // fall under the length cut fragment by fragment. Touching fragments on
+    // one y level merge into a run, and a run of rule length is a rule.
+    if (!h_frags.empty()) {
+        std::vector<double> frag_ys;
+        for (auto& l : h_frags) frag_ys.push_back((l.y0 + l.y1) / 2.0);
+        constexpr double kFragJoinTol = 3.0;
+        for (double ly : cluster_values(frag_ys, 3.0)) {
+            std::vector<std::pair<double, double>> iv;
+            for (auto& l : h_frags) {
+                if (std::abs((l.y0 + l.y1) / 2.0 - ly) > 3.0) continue;
+                iv.push_back({std::min((double)l.x0, (double)l.x1),
+                              std::max((double)l.x0, (double)l.x1)});
+            }
+            std::sort(iv.begin(), iv.end());
+            double lo = iv[0].first, hi = iv[0].second;
+            auto flush = [&]() {
+                if (hi - lo >= 50.0)
+                    h_lines.push_back({static_cast<float>(lo),
+                                       static_cast<float>(ly),
+                                       static_cast<float>(hi),
+                                       static_cast<float>(ly)});
+            };
+            for (size_t i = 1; i < iv.size(); i++) {
+                if (iv[i].first <= hi + kFragJoinTol) {
+                    hi = std::max(hi, iv[i].second);
+                } else {
+                    flush();
+                    lo = iv[i].first;
+                    hi = iv[i].second;
+                }
+            }
+            flush();
         }
     }
 

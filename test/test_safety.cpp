@@ -1041,6 +1041,46 @@ void test_pdf_side_by_side_tables_split_at_gutter() {
     }
 }
 
+void test_pdf_per_cell_border_fragments_merge_into_rules() {
+    using namespace jdoc::pdf_detail;
+
+    // Every horizontal border is drawn per cell: three 48pt segments per
+    // level, each alone under the 50pt rule-length cut.
+    std::vector<PdfLineSegment> lines;
+    for (double y : {0.0, 20.0, 40.0, 60.0})
+        for (int c = 0; c < 3; c++)
+            lines.push_back({static_cast<float>(50 + c * 48),
+                             static_cast<float>(y),
+                             static_cast<float>(50 + (c + 1) * 48),
+                             static_cast<float>(y)});
+    for (int c = 0; c <= 3; c++)
+        lines.push_back({static_cast<float>(50 + c * 48), 0,
+                         static_cast<float>(50 + c * 48), 60});
+
+    std::vector<TextChar> chars;
+    for (int r = 0; r < 3; r++) {
+        for (int c = 0; c < 3; c++) {
+            TextChar ch{};
+            ch.left = 50 + c * 48 + 20;
+            ch.right = ch.left + 6;
+            ch.x = ch.left + 3;
+            ch.y = 10 + r * 20;
+            ch.top = ch.y + 4;
+            ch.bot = ch.y - 4;
+            ch.font_size = 10;
+            ch.unicode = 'A' + r * 3 + c;
+            chars.push_back(ch);
+        }
+    }
+    PageCharCache cache;
+    cache.build(chars);
+
+    auto tables = detect_tables(lines, cache, 400, 200);
+    CHECK(tables.size() == 1);
+    CHECK(tables[0].rows.size() == 3);
+    CHECK(tables[0].rows[0].size() == 3);
+}
+
 void test_pdf_shading_grid_extends_to_aligned_unshaded_columns() {
     using namespace jdoc::pdf_detail;
 
@@ -1530,6 +1570,7 @@ int main() {
     RUN_TEST(test_pdf_wide_ruled_table_keeps_strong_columns);
     RUN_TEST(test_pdf_dense_grid_outweighs_glyph_crossing);
     RUN_TEST(test_pdf_side_by_side_tables_split_at_gutter);
+    RUN_TEST(test_pdf_per_cell_border_fragments_merge_into_rules);
     RUN_TEST(test_pdf_shading_grid_extends_to_aligned_unshaded_columns);
     RUN_TEST(test_pdf_lists_attachments);
     RUN_TEST(test_pdf_preserves_same_named_attachments);
