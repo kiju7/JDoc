@@ -1052,6 +1052,119 @@ static bool is_caption_start(const std::vector<uint32_t>& cps) {
     return false;
 }
 
+// One y-level group can hold two side-by-side independent tables (the left
+// and right columns of a two-column page): grouping keys on the bounding
+// x-span per level, so a level holding "left segment + right segment" looks
+// like one wide rule. When every rule of the group stays clear of a tall
+// vertical band that no v-line or text crosses either, that band is a page
+// gutter, not a wide cell: split the group's lines there and build each
+// side as its own table.
+struct TableLineSet {
+    std::vector<double> levels;
+    std::vector<PdfLineSegment> h_lines, v_lines;
+};
+
+static std::vector<TableLineSet> split_group_at_gutter(
+        const std::vector<double>& group,
+        const std::vector<PdfLineSegment>& h_lines,
+        const std::vector<PdfLineSegment>& v_lines,
+        const PageCharCache& cache) {
+    std::vector<TableLineSet> whole;
+    whole.push_back({group, h_lines, v_lines});
+
+    std::vector<std::pair<double, double>> iv;
+    for (auto& hl : h_lines) {
+        double hy = (hl.y0 + hl.y1) / 2.0;
+        for (auto& ry : group)
+            if (std::abs(hy - ry) < 4.0) {
+                iv.push_back({std::min((double)hl.x0, (double)hl.x1),
+                              std::max((double)hl.x0, (double)hl.x1)});
+                break;
+            }
+    }
+    if (iv.size() < 2) return whole;
+    std::sort(iv.begin(), iv.end());
+    // Dashed rules and per-cell borders arrive as fragments: join across
+    // small stroke gaps so only genuine voids remain.
+    constexpr double kStrokeJoinTol = 12.0;
+    std::vector<std::pair<double, double>> runs{iv[0]};
+    for (size_t i = 1; i < iv.size(); i++) {
+        if (iv[i].first <= runs.back().second + kStrokeJoinTol)
+            runs.back().second = std::max(runs.back().second, iv[i].second);
+        else
+            runs.push_back(iv[i]);
+    }
+    if (runs.size() < 2) return whole;
+
+    double y_lo = group.front() - 2.0, y_hi = group.back() + 2.0;
+    constexpr double kMinGutterWidth = 18.0;
+    std::vector<double> cuts;
+    for (size_t g = 1; g < runs.size(); g++) {
+        double gap_l = runs[g - 1].second, gap_r = runs[g].first;
+        if (gap_r - gap_l < kMinGutterWidth) continue;
+        bool blocked = false;
+        for (auto& vl : v_lines) {
+            double vx = (vl.x0 + vl.x1) / 2.0;
+            if (vx <= gap_l + 2.0 || vx >= gap_r - 2.0) continue;
+            double vy_lo = std::min((double)vl.y0, (double)vl.y1);
+            double vy_hi = std::max((double)vl.y0, (double)vl.y1);
+            if (std::min(vy_hi, y_hi) - std::max(vy_lo, y_lo) > 2.0) {
+                blocked = true;
+                break;
+            }
+        }
+        for (auto& ch : cache.chars) {
+            if (blocked) break;
+            if (ch.unicode == ' ' || ch.unicode == 0xA0 ||
+                ch.unicode == '\t')
+                continue;
+            if (ch.y <= y_lo || ch.y >= y_hi) continue;
+            if (ch.x > gap_l + 1.0 && ch.x < gap_r - 1.0) blocked = true;
+        }
+        if (!blocked) cuts.push_back((gap_l + gap_r) / 2.0);
+    }
+    if (cuts.empty()) return whole;
+
+    cuts.insert(cuts.begin(), -1e9);
+    cuts.push_back(1e9);
+    std::vector<TableLineSet> parts;
+    for (size_t s = 1; s < cuts.size(); s++) {
+        TableLineSet part;
+        double w_lo = cuts[s - 1], w_hi = cuts[s];
+        for (auto& hl : h_lines) {
+            double mx = (hl.x0 + hl.x1) / 2.0;
+            if (mx > w_lo && mx < w_hi) part.h_lines.push_back(hl);
+        }
+        for (auto& vl : v_lines) {
+            double vx = (vl.x0 + vl.x1) / 2.0;
+            if (vx > w_lo && vx < w_hi) part.v_lines.push_back(vl);
+        }
+        // Keep only the levels this side actually rules: the other side's
+        // row boundaries would otherwise split rows that have no rule here.
+        for (double ry : group) {
+            bool present = false;
+            for (auto& hl : part.h_lines) {
+                double hy = (hl.y0 + hl.y1) / 2.0;
+                if (std::abs(hy - ry) < 4.0) { present = true; break; }
+            }
+            for (auto& vl : part.v_lines) {
+                if (present) break;
+                double vy_lo = std::min((double)vl.y0, (double)vl.y1);
+                double vy_hi = std::max((double)vl.y0, (double)vl.y1);
+                if (vy_hi - vy_lo < 6.0) continue;
+                if (std::abs(vy_lo - ry) < 3.5 || std::abs(vy_hi - ry) < 3.5)
+                    present = true;
+            }
+            if (present) part.levels.push_back(ry);
+        }
+        if (part.levels.size() >= 3) parts.push_back(std::move(part));
+    }
+    // Even a single surviving side beats the welded whole; the dropped
+    // side's text stays in the prose flow.
+    if (parts.empty()) return whole;
+    return parts;
+}
+
 std::vector<TableData> detect_tables(const std::vector<PdfLineSegment>& lines,
                                       const PageCharCache& cache,
                                       double page_width, double page_height) {
@@ -1376,17 +1489,21 @@ std::vector<TableData> detect_tables(const std::vector<PdfLineSegment>& lines,
 
     std::vector<TableData> result;
     for (auto& group : final_groups) {
-        TableData t = build_table(group, h_lines, v_lines, cache);
-        if (t.rows.empty()) continue;
-        // Reject grids that swallowed page prose (stacked separate tables
-        // bridged across body text): no real cell holds a whole paragraph.
-        // Rejecting lets the band's lines flow back as normal text.
-        size_t max_cell = 0;
-        for (auto& row : t.rows)
-            for (auto& c : row)
-                if (c.size() > max_cell) max_cell = c.size();
-        if (max_cell > 300) continue;
-        result.push_back(std::move(t));
+        for (auto& part : split_group_at_gutter(group, h_lines, v_lines,
+                                                cache)) {
+            TableData t = build_table(part.levels, part.h_lines,
+                                      part.v_lines, cache);
+            if (t.rows.empty()) continue;
+            // Reject grids that swallowed page prose (stacked separate
+            // tables bridged across body text): no real cell holds a whole
+            // paragraph. Rejecting lets the band's lines flow back as text.
+            size_t max_cell = 0;
+            for (auto& row : t.rows)
+                for (auto& c : row)
+                    if (c.size() > max_cell) max_cell = c.size();
+            if (max_cell > 300) continue;
+            result.push_back(std::move(t));
+        }
     }
 
     // Detach a trailing caption row ("표 4.2 ...", "그림 ...") that was

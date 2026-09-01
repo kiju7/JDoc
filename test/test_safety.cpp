@@ -998,6 +998,49 @@ void test_pdf_dense_grid_outweighs_glyph_crossing() {
     }
 }
 
+void test_pdf_side_by_side_tables_split_at_gutter() {
+    using namespace jdoc::pdf_detail;
+
+    // Two independent closed grids at the same y levels, one per page
+    // column, with an empty gutter between them.
+    std::vector<PdfLineSegment> lines;
+    for (double x0 : {50.0, 300.0}) {
+        for (double y : {0.0, 20.0, 40.0, 60.0})
+            lines.push_back({static_cast<float>(x0), static_cast<float>(y),
+                             static_cast<float>(x0 + 150), static_cast<float>(y)});
+        for (int c = 0; c <= 3; c++)
+            lines.push_back({static_cast<float>(x0 + c * 50), 0,
+                             static_cast<float>(x0 + c * 50), 60});
+    }
+
+    std::vector<TextChar> chars;
+    for (double x0 : {50.0, 300.0}) {
+        for (int r = 0; r < 3; r++) {
+            for (int c = 0; c < 3; c++) {
+                TextChar ch{};
+                ch.left = x0 + c * 50 + 20;
+                ch.right = ch.left + 6;
+                ch.x = ch.left + 3;
+                ch.y = 10 + r * 20;
+                ch.top = ch.y + 4;
+                ch.bot = ch.y - 4;
+                ch.font_size = 10;
+                ch.unicode = 'A' + r * 3 + c;
+                chars.push_back(ch);
+            }
+        }
+    }
+    PageCharCache cache;
+    cache.build(chars);
+
+    auto tables = detect_tables(lines, cache, 500, 200);
+    CHECK(tables.size() == 2);
+    for (auto& t : tables) {
+        CHECK(t.rows.size() == 3);
+        CHECK(t.rows[0].size() == 3);
+    }
+}
+
 void test_pdf_shading_grid_extends_to_aligned_unshaded_columns() {
     using namespace jdoc::pdf_detail;
 
@@ -1486,6 +1529,7 @@ int main() {
     RUN_TEST(test_pdf_cell_assembly_reading_order);
     RUN_TEST(test_pdf_wide_ruled_table_keeps_strong_columns);
     RUN_TEST(test_pdf_dense_grid_outweighs_glyph_crossing);
+    RUN_TEST(test_pdf_side_by_side_tables_split_at_gutter);
     RUN_TEST(test_pdf_shading_grid_extends_to_aligned_unshaded_columns);
     RUN_TEST(test_pdf_lists_attachments);
     RUN_TEST(test_pdf_preserves_same_named_attachments);
