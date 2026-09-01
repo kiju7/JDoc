@@ -588,6 +588,11 @@ TableData build_table(const std::vector<double>& row_ys,
     if (vline_total > 0 && vline_present < vline_total && vline_present >= vline_total * 0.4)
         has_merged_cells = true;
 
+    // Merged-cell spans are keyed on missing v-lines, but a grid whose
+    // columns came from text alignment has no v-lines anywhere — every span
+    // would swallow the whole row. Such grids keep one cell per column.
+    const bool spans_from_vlines = internal_vline_count > 0;
+
     table.rows.resize(n_rows);
     for (int r = 0; r < n_rows; r++) {
         table.rows[r].resize(total_cols);
@@ -595,7 +600,8 @@ TableData build_table(const std::vector<double>& row_ys,
         while (c < n_cols) {
             // Determine span: extend while no v-line at next boundary
             int span = 1;
-            while (c + span < n_cols && !has_vline[r][c + span])
+            while (spans_from_vlines && c + span < n_cols &&
+                   !has_vline[r][c + span])
                 span++;
 
             double left   = col_xs[c];
@@ -761,8 +767,11 @@ TableData build_table(const std::vector<double>& row_ys,
 
     // Reject tables where text continues across column boundaries
     // (body text split by vertical lines — not real tabular data)
-    // SKIP when merged cells detected: v-line grid confirms real table structure.
-    if (!table.rows.empty() && !has_merged_cells && !dense_closed_grid) {
+    // SKIP when merged cells detected: v-line grid confirms real table
+    // structure. Grids without any v-line cannot have split body text this
+    // way — their columns came from whitespace alignment instead.
+    if (!table.rows.empty() && !has_merged_cells && !dense_closed_grid &&
+        spans_from_vlines) {
         int n_cols_t = (int)table.rows[0].size();
         // Detect word continuation: Latin alphanumeric at both boundaries.
         // CJK characters are self-contained units (not word fragments),
