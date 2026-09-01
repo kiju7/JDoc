@@ -1249,10 +1249,12 @@ PdfFont load_font(PdfDoc& doc, const PdfObj& font_ref) {
     {
         std::string lower;
         for (char c : font.name) lower += std::tolower(static_cast<unsigned char>(c));
+        // "medium" also matches names without a weight separator
+        // (KoPubWorldDotumMedium); Korean heading faces are named that way.
         font.is_bold = lower.find("bold") != std::string::npos ||
                        lower.find("heavy") != std::string::npos ||
                        lower.find("black") != std::string::npos ||
-                       lower.find("-medi") != std::string::npos;
+                       lower.find("medium") != std::string::npos;
         font.is_italic = lower.find("italic") != std::string::npos ||
                          lower.find("oblique") != std::string::npos;
         font.is_dingbat = lower.find("wingdings") != std::string::npos ||
