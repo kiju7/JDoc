@@ -2849,7 +2849,8 @@ static std::vector<TableData> detect_text_tables_range(
         const PageCharCache& cache,
         const std::vector<TableData>& existing_tables,
         double page_width, double page_height,
-        double x_lo, double x_hi) {
+        double x_lo, double x_hi,
+        double gutter_x = 0.0) {
     using namespace text_tables;
     if (cache.chars.size() < 10) return {};
 
@@ -2995,6 +2996,33 @@ static std::vector<TableData> detect_text_tables_range(
         auto bounds = infer_columns_in_band(rows, band, median_fs);
         if (bounds.size() < 3) continue;        // need ≥1 inner boundary
 
+        // On a two-column page a full-width band whose inferred columns
+        // split right at the page gutter is usually the two columns'
+        // unrelated content welded side by side; the per-column retries see
+        // each half on its own. A genuine page-wide table also straddles
+        // the gutter, but then nearly every row holds cells on both sides,
+        // while welded content pairs rows only where the sides happen to
+        // overlap — so only sparse straddling skips the band.
+        if (gutter_x > 0) {
+            bool at_gutter = false;
+            for (size_t b = 1; b + 1 < bounds.size(); b++)
+                if (std::abs(bounds[b] - gutter_x) < 20.0) at_gutter = true;
+            if (at_gutter) {
+                int band_rows = 0, both_sides = 0;
+                for (size_t k = band.first_row; k <= band.last_row; k++) {
+                    if (rows[k].char_ranges.empty()) continue;
+                    band_rows++;
+                    bool left = false, right = false;
+                    for (auto& cr : rows[k].char_ranges) {
+                        if (cr.second < gutter_x - 10.0) left = true;
+                        if (cr.first > gutter_x + 10.0) right = true;
+                    }
+                    if (left && right) both_sides++;
+                }
+                if (both_sides * 10 < band_rows * 7) continue;
+            }
+        }
+
         // S2.5: absorb trailing wrapped cell lines — single-cell rows just
         // below the band whose text lies entirely inside one inferred column
         // (the last row's wrap continuation). Captions and prose span wider
@@ -3045,7 +3073,7 @@ std::vector<TableData> detect_text_tables(const PageCharCache& cache,
                                            double col_boundary) {
     auto result = detect_text_tables_range(cache, existing_tables,
                                            page_width, page_height,
-                                           0.0, page_width);
+                                           0.0, page_width, col_boundary);
 
     // Two-column pages: rows built across the gutter glue a column's table
     // to the prose beside it, so the full-width pass misses column-local
