@@ -2539,6 +2539,42 @@ static bool accept_table(TableData& table) {
         if (total >= 4 && junk >= total * 0.4) return false;
     }
 
+    // Author/affiliation blocks on title pages align into phantom columns:
+    // superscript affiliation digits and daggers form their own visual row
+    // ("1 | 2* | 1", "† | †† | †††") beside the author names. A row whose
+    // cells are all such markers never occurs in a real data table, and
+    // sinks the candidate.
+    {
+        int marker_rows = 0;
+        for (auto& row : table.rows) {
+            int filled = 0;
+            bool all_marker = true, has_sym = false;
+            for (auto& cell : row) {
+                if (cell.empty()) continue;
+                filled++;
+                int units = 0;
+                bool ok = true;
+                for (size_t i = 0; i < cell.size(); ) {
+                    unsigned char c = cell[i];
+                    if (c == ' ') { i++; continue; }
+                    if (c >= '0' && c <= '9') { units++; i++; continue; }
+                    if (c == '*') { units++; has_sym = true; i++; continue; }
+                    if (c == 0xE2 && i + 2 < cell.size() &&
+                        (unsigned char)cell[i+1] == 0x80 &&
+                        ((unsigned char)cell[i+2] == 0xA0 ||    // dagger
+                         (unsigned char)cell[i+2] == 0xA1)) {   // double dagger
+                        units++; has_sym = true; i += 3; continue;
+                    }
+                    ok = false;
+                    break;
+                }
+                if (!ok || units == 0 || units > 4) all_marker = false;
+            }
+            if (filled >= 2 && all_marker && has_sym) marker_rows++;
+        }
+        if (marker_rows >= 1) return false;
+    }
+
     // --- list / prose rejection heuristics (mirrored from v1, tightened) ---
     // Lowercase only: digit-to-digit boundaries are normal in data tables
     // (binary/hex value columns), not word fragments.
