@@ -1290,7 +1290,7 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
         }
     }
 
-    result.stats.compute(result.all_lines);
+    result.stats.compute(result.all_lines, result.all_tables);
     return result;
 }
 
