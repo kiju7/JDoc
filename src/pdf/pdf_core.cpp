@@ -1098,6 +1098,38 @@ void parse_tounicode_cmap(PdfDoc& doc, const PdfObj& tu_obj, PdfFont& font) {
         return 0x10000 + ((high - 0xD800) << 10) + (low - 0xDC00);
     };
 
+    // A destination may be several UTF-16 units: an unencoded ligature glyph
+    // maps to its letters (<00660069> = "fi"). Decode the whole sequence so
+    // the letters past the first are not lost.
+    auto parse_unicode_seq = [&](const std::string& hex) -> std::vector<uint32_t> {
+        std::vector<uint32_t> out;
+        if (hex.size() < 4) {
+            out.push_back(parse_hex(hex));
+            return out;
+        }
+        size_t i = 0;
+        while (i + 4 <= hex.size()) {
+            uint32_t high = parse_hex(hex.substr(i, 4));
+            i += 4;
+            if (high < 0xD800 || high > 0xDFFF) {
+                out.push_back(high);
+                continue;
+            }
+            if (high > 0xDBFF || i + 4 > hex.size()) {
+                out.push_back(0xFFFD);
+                continue;
+            }
+            uint32_t low = parse_hex(hex.substr(i, 4));
+            if (low < 0xDC00 || low > 0xDFFF) {
+                out.push_back(0xFFFD);
+                continue;
+            }
+            i += 4;
+            out.push_back(0x10000 + ((high - 0xD800) << 10) + (low - 0xDC00));
+        }
+        return out;
+    };
+
     auto extract_hex = [](const std::string& s, size_t start, size_t end) -> std::string {
         std::string h;
         for (size_t i = start; i < end; i++) {
@@ -1131,7 +1163,10 @@ void parse_tounicode_cmap(PdfDoc& doc, const PdfObj& tu_obj, PdfFont& font) {
             std::string dst_hex = extract_hex(cmap, s2 + 1, e2);
 
             uint32_t src = parse_hex(src_hex);
-            font.to_unicode[src] = parse_unicode(dst_hex);
+            auto seq = parse_unicode_seq(dst_hex);
+            font.to_unicode[src] = seq.empty() ? 0xFFFD : seq[0];
+            if (seq.size() > 1)
+                font.to_unicode_multi[src] = std::move(seq);
             cp = e2 + 1;
         }
         p = ebc + 9;
@@ -1177,7 +1212,10 @@ void parse_tounicode_cmap(PdfDoc& doc, const PdfObj& tu_obj, PdfFont& font) {
                     auto ae = cmap.find('>', as);
                     if (ae >= arr_end) break;
                     std::string dh = extract_hex(cmap, as + 1, ae);
-                    font.to_unicode[code] = parse_unicode(dh);
+                    auto seq = parse_unicode_seq(dh);
+                    font.to_unicode[code] = seq.empty() ? 0xFFFD : seq[0];
+                    if (seq.size() > 1)
+                        font.to_unicode_multi[code] = std::move(seq);
                     code++;
                     ap = ae + 1;
                 }

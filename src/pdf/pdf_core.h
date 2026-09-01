@@ -472,6 +472,10 @@ struct PdfFont {
     bool is_dingbat = false;     // symbol font (Wingdings etc.) — letters are glyph codes, not text
     double glyph_space_scale = 0.001; // glyph-space→text-space width factor (FontMatrix[0] for Type3)
     std::unordered_map<uint32_t, uint32_t> to_unicode;  // char code → Unicode
+    // Codes whose ToUnicode target is several characters (an unencoded "fi"
+    // ligature glyph mapping to "f","i"). to_unicode keeps the first one so
+    // single-char consumers still work; text extraction emits the full run.
+    std::unordered_map<uint32_t, std::vector<uint32_t>> to_unicode_multi;
     std::unordered_map<uint32_t, uint32_t> cid_to_unicode; // CID → Unicode from ToUnicode
     const uint32_t* encoding_table = nullptr; // WinAnsi, MacRoman, etc.
     std::unordered_map<int, std::string> differences; // /Differences array

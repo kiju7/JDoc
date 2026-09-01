@@ -1048,6 +1048,14 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
 
             uint32_t unicode = gs.font ? gs.font->decode_char(code) : code;
             if (unicode == 0 || unicode == 0xFFFD) continue;
+            // Ligature glyphs mapped to several characters ("fi", "ffl"):
+            // every letter is emitted, not just the first. Dingbat fonts are
+            // excluded — decode_char already rewrote their value.
+            const std::vector<uint32_t>* multi = nullptr;
+            if (gs.font && !gs.font->is_dingbat) {
+                auto mu = gs.font->to_unicode_multi.find(code);
+                if (mu != gs.font->to_unicode_multi.end()) multi = &mu->second;
+            }
             // Private-use glyphs have no portable text value. Skip Unicode
             // noncharacters too, but retain valid supplementary characters
             // such as mathematical alphanumerics above U+FFFF.
@@ -1146,7 +1154,26 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
             // for visible body text.
             if (gs.render_mode != 3 && gs.render_mode != 7)
                 result.visible_text_chars++;
-            result.chars.push_back(tc);
+            if (multi) {
+                // Split the glyph's box across its letters so word gaps and
+                // column assignment stay glyph-accurate; a rotated run keeps
+                // the shared box (nothing downstream splits those further).
+                double step = (tc.rot == 0)
+                    ? (tc.right - tc.left) / (double)multi->size() : 0.0;
+                for (size_t mi = 0; mi < multi->size(); mi++) {
+                    TextChar part = tc;
+                    part.unicode = (*multi)[mi];
+                    if (tc.rot == 0) {
+                        part.left = tc.left + step * mi;
+                        part.right = (mi + 1 == multi->size())
+                            ? tc.right : tc.left + step * (mi + 1);
+                        part.x = part.left;
+                    }
+                    result.chars.push_back(part);
+                }
+            } else {
+                result.chars.push_back(tc);
+            }
         }
     };
 
