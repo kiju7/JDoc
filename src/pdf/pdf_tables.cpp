@@ -2090,6 +2090,7 @@ static TableData build_table_from_band(
     std::vector<int> near_cnt(n_cols + 1, 0), torn_cnt(n_cols + 1, 0);
     double torn_gap = std::max(median_fs * 0.2, 1.2);
     double near_win = median_fs * 3.0;
+    std::vector<bool> row_has_tear;   // parallel to table.rows
 
     for (size_t k = band.first_row; k <= band.last_row; k++) {
         const auto& tr = rows[k];
@@ -2234,6 +2235,7 @@ static TableData build_table_from_band(
 
         for (auto& c : cells) c = util::trim(c);
         table.rows.push_back(std::move(cells));
+        row_has_tear.push_back(row_torn > 0);
     }
 
     // A boundary that cuts through touching glyphs on 30%+ of its populated
@@ -2241,18 +2243,37 @@ static TableData build_table_from_band(
     // bands (diagram labels) rarely repeat a tear on one boundary, so tears
     // are also summed across boundaries: real cells have padding, and any
     // substantial overall tear rate marks a non-table.
+    bool tear_rate_bad = false;
     int total_torn = 0, total_near = 0;
     for (int c = 1; c < n_cols; c++) {
         total_torn += torn_cnt[c];
         total_near += near_cnt[c];
-        if (torn_cnt[c] >= 2 && torn_cnt[c] * 10 >= near_cnt[c] * 3) {
+        if (torn_cnt[c] >= 2 && torn_cnt[c] * 10 >= near_cnt[c] * 3)
+            tear_rate_bad = true;
+    }
+    if (total_torn >= 1 && total_torn * 20 >= total_near * 7)
+        tear_rate_bad = true;
+    if (tear_rate_bad) {
+        // The tears often come from a wrapped caption or a stray prose line
+        // lying inside the band, not from a phantom boundary: several visual
+        // lines of one caption tear the same boundary and dominate the rate.
+        // When an untorn majority still fills the band, evict the torn rows
+        // to the prose flow and keep the table; the band is prose only when
+        // torn rows rival the clean ones.
+        int clean = 0, torn_rows = 0;
+        for (bool t : row_has_tear) t ? torn_rows++ : clean++;
+        if (clean >= 3 && torn_rows * 2 <= clean) {
+            size_t w = 0;
+            for (size_t r = 0; r < table.rows.size(); r++) {
+                if (row_has_tear[r]) continue;
+                if (w != r) table.rows[w] = std::move(table.rows[r]);
+                w++;
+            }
+            table.rows.resize(w);
+        } else {
             table.rows.clear();
             return table;
         }
-    }
-    if (total_torn >= 1 && total_torn * 20 >= total_near * 7) {
-        table.rows.clear();
-        return table;
     }
     return table;
 }
