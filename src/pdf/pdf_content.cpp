@@ -1048,6 +1048,14 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
 
             uint32_t unicode = gs.font ? gs.font->decode_char(code) : code;
             if (unicode == 0 || unicode == 0xFFFD) continue;
+            // Ligature glyphs mapped to several characters ("fi", "ffl"):
+            // every letter is emitted, not just the first. Dingbat fonts are
+            // excluded — decode_char already rewrote their value.
+            const std::vector<uint32_t>* multi = nullptr;
+            if (gs.font && !gs.font->is_dingbat) {
+                auto mu = gs.font->to_unicode_multi.find(code);
+                if (mu != gs.font->to_unicode_multi.end()) multi = &mu->second;
+            }
             // Private-use glyphs have no portable text value. Skip Unicode
             // noncharacters too, but retain valid supplementary characters
             // such as mathematical alphanumerics above U+FFFF.
@@ -1146,7 +1154,26 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
             // for visible body text.
             if (gs.render_mode != 3 && gs.render_mode != 7)
                 result.visible_text_chars++;
-            result.chars.push_back(tc);
+            if (multi) {
+                // Split the glyph's box across its letters so word gaps and
+                // column assignment stay glyph-accurate; a rotated run keeps
+                // the shared box (nothing downstream splits those further).
+                double step = (tc.rot == 0)
+                    ? (tc.right - tc.left) / (double)multi->size() : 0.0;
+                for (size_t mi = 0; mi < multi->size(); mi++) {
+                    TextChar part = tc;
+                    part.unicode = (*multi)[mi];
+                    if (tc.rot == 0) {
+                        part.left = tc.left + step * mi;
+                        part.right = (mi + 1 == multi->size())
+                            ? tc.right : tc.left + step * (mi + 1);
+                        part.x = part.left;
+                    }
+                    result.chars.push_back(part);
+                }
+            } else {
+                result.chars.push_back(tc);
+            }
         }
     };
 
@@ -2024,57 +2051,73 @@ double detect_column_boundary(const std::vector<TextChar>& chars,
         return chars[a].y > chars[b].y;
     });
 
-    constexpr int NUM_BINS = 200;
-    int row_count[NUM_BINS] = {};
-    int total_rows = 0;
+    // Two passes: the first counts every row. On a mixed page (full-width
+    // title and abstract over a two-column body) those wide rows fill the
+    // gutter bins and hide the dip, so a failed first pass retries with
+    // only rows narrow enough to live inside one column. The retry cannot
+    // run first: aligned column pairs share a y and group into one wide
+    // row, which would starve exactly the cleanest two-column pages.
+    for (int narrow_only = 0; narrow_only < 2; narrow_only++) {
+        constexpr int NUM_BINS = 200;
+        int row_count[NUM_BINS] = {};
+        int total_rows = 0;
 
-    size_t ri = 0;
-    while (ri < y_sorted.size()) {
-        double row_y = chars[y_sorted[ri]].y;
-        bool bins_hit[NUM_BINS] = {};
-        while (ri < y_sorted.size() && std::abs(chars[y_sorted[ri]].y - row_y) <= y_tol) {
-            auto& ch = chars[y_sorted[ri]];
-            if (ch.unicode != ' ' && ch.unicode != 0xA0) {
-                int b0 = static_cast<int>((ch.left - page_left) / page_width * NUM_BINS);
-                int b1 = static_cast<int>((ch.right - page_left) / page_width * NUM_BINS);
-                if (b0 < 0) b0 = 0;
-                if (b1 >= NUM_BINS) b1 = NUM_BINS - 1;
-                for (int b = b0; b <= b1; b++) bins_hit[b] = true;
+        size_t ri = 0;
+        while (ri < y_sorted.size()) {
+            double row_y = chars[y_sorted[ri]].y;
+            bool bins_hit[NUM_BINS] = {};
+            double row_l = 1e9, row_r = 0;
+            while (ri < y_sorted.size() &&
+                   std::abs(chars[y_sorted[ri]].y - row_y) <= y_tol) {
+                auto& ch = chars[y_sorted[ri]];
+                if (ch.unicode != ' ' && ch.unicode != 0xA0) {
+                    int b0 = static_cast<int>((ch.left - page_left) / page_width * NUM_BINS);
+                    int b1 = static_cast<int>((ch.right - page_left) / page_width * NUM_BINS);
+                    if (b0 < 0) b0 = 0;
+                    if (b1 >= NUM_BINS) b1 = NUM_BINS - 1;
+                    for (int b = b0; b <= b1; b++) bins_hit[b] = true;
+                    row_l = std::min(row_l, (double)ch.left);
+                    row_r = std::max(row_r, (double)ch.right);
+                }
+                ri++;
             }
-            ri++;
+            if (narrow_only && row_r > row_l &&
+                row_r - row_l >= page_width * 0.82)
+                continue;
+            for (int b = 0; b < NUM_BINS; b++)
+                if (bins_hit[b]) row_count[b]++;
+            total_rows++;
         }
-        for (int b = 0; b < NUM_BINS; b++)
-            if (bins_hit[b]) row_count[b]++;
-        total_rows++;
+
+        if (total_rows < 10) continue;
+
+        // Find the deepest dip in row_count within center 50% of page
+        int center_start = NUM_BINS / 4;
+        int center_end = NUM_BINS * 3 / 4;
+
+        double left_avg = 0, right_avg = 0;
+        int lc = 0, rc = 0;
+        for (int b = NUM_BINS / 10; b < center_start; b++) { left_avg += row_count[b]; lc++; }
+        for (int b = center_end; b < NUM_BINS * 9 / 10; b++) { right_avg += row_count[b]; rc++; }
+        if (lc > 0) left_avg /= lc;
+        if (rc > 0) right_avg /= rc;
+        double body_avg = (left_avg + right_avg) / 2.0;
+        if (body_avg < 5) continue;
+
+        // Find the minimum row_count in center region (smoothed over 3 bins)
+        int best_bin = -1;
+        double best_val = 1e9;
+        for (int b = center_start + 1; b < center_end - 1; b++) {
+            double val = (row_count[b - 1] + row_count[b] + row_count[b + 1]) / 3.0;
+            if (val < best_val) { best_val = val; best_bin = b; }
+        }
+
+        // The dip must be significantly lower than body average (at least 30% lower)
+        if (best_val > body_avg * 0.7) continue;
+
+        return page_left + (best_bin + 0.5) / NUM_BINS * page_width;
     }
-
-    if (total_rows < 10) return 0;
-
-    // Find the deepest dip in row_count within center 50% of page
-    int center_start = NUM_BINS / 4;
-    int center_end = NUM_BINS * 3 / 4;
-
-    double left_avg = 0, right_avg = 0;
-    int lc = 0, rc = 0;
-    for (int b = NUM_BINS / 10; b < center_start; b++) { left_avg += row_count[b]; lc++; }
-    for (int b = center_end; b < NUM_BINS * 9 / 10; b++) { right_avg += row_count[b]; rc++; }
-    if (lc > 0) left_avg /= lc;
-    if (rc > 0) right_avg /= rc;
-    double body_avg = (left_avg + right_avg) / 2.0;
-    if (body_avg < 5) return 0;
-
-    // Find the minimum row_count in center region (smoothed over 3 bins)
-    int best_bin = -1;
-    double best_val = 1e9;
-    for (int b = center_start + 1; b < center_end - 1; b++) {
-        double val = (row_count[b - 1] + row_count[b] + row_count[b + 1]) / 3.0;
-        if (val < best_val) { best_val = val; best_bin = b; }
-    }
-
-    // The dip must be significantly lower than body average (at least 30% lower)
-    if (best_val > body_avg * 0.7) return 0;
-
-    return page_left + (best_bin + 0.5) / NUM_BINS * page_width;
+    return 0;
 }
 
 // Reorder lines so that within each column band, left-column lines

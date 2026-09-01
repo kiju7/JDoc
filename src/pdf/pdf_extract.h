@@ -15,15 +15,68 @@ struct TableData {
     enum Kind { RULED, SHADING, TEXT } kind = RULED;
 };
 
+// Ruled-table assembly helpers are exposed in the internal header so geometry
+// regressions can be tested without manufacturing a complete PDF document.
+std::vector<double> find_column_boundaries(
+    const std::vector<PdfLineSegment>& v_lines,
+    const std::vector<PdfLineSegment>& h_lines,
+    double table_left, double table_right,
+    double table_bot, double table_top,
+    const std::vector<double>& row_ys);
+TableData build_table(const std::vector<double>& row_ys,
+                      const std::vector<PdfLineSegment>& h_lines,
+                      const std::vector<PdfLineSegment>& v_lines,
+                      const PageCharCache& cache);
+
+// Heading-classification helpers (pdf_markdown.cpp), exposed the same way
+// so the section-number and keyword rules can be tested directly.
+struct SectionNumber {
+    int depth = 0;        // numeric segments; 0 = no section number
+    size_t text_pos = 0;  // first byte of the title text
+    bool closed = false;  // '.' closed the number
+};
+SectionNumber parse_section_number(const std::string& text);
+size_t glued_mark_offset(const std::string& text);
+bool is_section_keyword(const std::string& text);
+
 struct FontStats {
     double body_size = 12.0;
 
-    void compute(const std::vector<std::vector<TextLine>>& all_lines) {
-        std::map<int, int> counts;
-        for (auto& pl : all_lines)
-            for (auto& l : pl)
-                if (l.font_size > 1.0)
-                    counts[static_cast<int>(l.font_size * 10)]++;
+    void compute(const std::vector<std::vector<TextLine>>& all_lines,
+                 const std::vector<std::vector<TableData>>& all_tables = {}) {
+        // Table interiors skew the mode toward cell type (dense parameter
+        // grids, chart labels): the body size is the most common size of
+        // the text OUTSIDE tables. When everything sits in tables, fall
+        // back to counting every line.
+        std::map<int, int> counts, counts_all;
+        for (size_t p = 0; p < all_lines.size(); p++) {
+            const std::vector<TableData>* tabs =
+                p < all_tables.size() ? &all_tables[p] : nullptr;
+            for (auto& l : all_lines[p]) {
+                if (l.font_size <= 1.0) continue;
+                int key = static_cast<int>(l.font_size * 10);
+                counts_all[key]++;
+                bool in_table = false;
+                if (tabs) {
+                    double mid_x = (l.x_left + l.x_right) / 2.0;
+                    for (auto& t : *tabs) {
+                        if (l.y_center >= std::min(t.y0, t.y1) - 2.0 &&
+                            l.y_center <= std::max(t.y0, t.y1) + 2.0 &&
+                            mid_x >= std::min(t.x0, t.x1) - 2.0 &&
+                            mid_x <= std::max(t.x0, t.x1) + 2.0) {
+                            in_table = true;
+                            break;
+                        }
+                    }
+                }
+                if (!in_table) counts[key]++;
+            }
+        }
+        int kept = 0;
+        for (auto& [k, c] : counts) kept += c;
+        // A table-dominated page leaves too few free lines to vote (a page
+        // that is one big table plus its caption): fall back to all lines.
+        if (kept < 8) counts = std::move(counts_all);
 
         int max_c = 0, max_k = 120;
         for (auto& [k, c] : counts)

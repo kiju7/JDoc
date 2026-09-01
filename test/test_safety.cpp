@@ -937,6 +937,217 @@ void test_pdf_cell_assembly_reading_order() {
     CHECK(up.get_text_in_rect(100, 170, 200, 130) == "ABC");
 }
 
+void test_pdf_wide_ruled_table_keeps_strong_columns() {
+    using namespace jdoc::pdf_detail;
+
+    std::vector<double> row_ys = {0, 20, 40, 60, 80, 100};
+    std::vector<PdfLineSegment> h_lines, v_lines;
+    for (double y : row_ys)
+        h_lines.push_back({50, static_cast<float>(y), 650,
+                           static_cast<float>(y)});
+    for (int c = 0; c <= 12; c++) {
+        float x = static_cast<float>(50 + c * 50);
+        v_lines.push_back({x, 0, x, 100});
+    }
+
+    auto columns = find_column_boundaries(v_lines, h_lines, 50, 650,
+                                           0, 100, row_ys);
+    CHECK(columns.size() == 13);
+}
+
+void test_pdf_dense_grid_outweighs_glyph_crossing() {
+    using namespace jdoc::pdf_detail;
+
+    std::vector<double> row_ys = {0, 20, 40, 60, 80, 100, 120};
+    std::vector<PdfLineSegment> h_lines, v_lines;
+    for (double y : row_ys)
+        h_lines.push_back({50, static_cast<float>(y), 200,
+                           static_cast<float>(y)});
+    for (float x : {50.0f, 100.0f, 150.0f, 200.0f})
+        v_lines.push_back({x, 0, x, 120});
+
+    std::vector<TextChar> chars;
+    for (int r = 0; r < 6; r++) {
+        double y = 10 + r * 20;
+        auto glyph = [&](uint32_t cp, double left, double right) {
+            TextChar ch{};
+            ch.x = (left + right) / 2.0;
+            ch.y = y;
+            ch.left = left;
+            ch.right = right;
+            ch.top = y + 4;
+            ch.bot = y - 4;
+            ch.font_size = 10;
+            ch.unicode = cp;
+            return ch;
+        };
+        chars.push_back(glyph('A' + r, 98.8, 99.8));
+        chars.push_back(glyph('a' + r, 100.2, 101.2));
+        chars.push_back(glyph('0' + r, 170.0, 175.0));
+    }
+    PageCharCache cache;
+    cache.build(chars);
+
+    TableData table = build_table(row_ys, h_lines, v_lines, cache);
+    CHECK(table.rows.size() == 6);
+    for (auto& row : table.rows) {
+        CHECK(row.size() == 3);
+        CHECK(!row[0].empty());
+        CHECK(!row[1].empty());
+        CHECK(!row[2].empty());
+    }
+}
+
+void test_pdf_heading_section_number_rules() {
+    using namespace jdoc::pdf_detail;
+
+    CHECK(parse_section_number("1. \xec\x84\x9c\xeb\xa1\xa0").depth == 1);      // "1. 서론"
+    CHECK(parse_section_number("1 Introduction").depth == 1);
+    CHECK(parse_section_number("2.1 Experimental Setup").depth == 2);
+    CHECK(parse_section_number("4.1.2 \xed\x8f\x89\xea\xb0\x80").depth == 3);   // "4.1.2 평가"
+    // Full-width space after the number ("1.<U+3000>서론")
+    CHECK(parse_section_number("1.\xe3\x80\x80\xec\x84\x9c\xeb\xa1\xa0").depth == 1);
+    CHECK(parse_section_number("2024. 3. 1.").depth == 0);   // date, not section
+    CHECK(parse_section_number("0.3 Consumption").depth == 0);  // chart value
+    CHECK(parse_section_number("1) Human Labeling").depth == 0); // list item
+    CHECK(parse_section_number("512 x 512 x 1").depth == 0);
+
+    // Affiliation mark glued ahead of the number: "1)1. 서론"
+    CHECK(glued_mark_offset("1)1. \xec\x84\x9c\xeb\xa1\xa0") == 2);
+    CHECK(glued_mark_offset("1. \xec\x84\x9c\xeb\xa1\xa0") == 0);
+
+    CHECK(is_section_keyword("ABSTRACT"));
+    CHECK(is_section_keyword("References"));
+    // "요<U+3000>약"
+    CHECK(is_section_keyword("\xec\x9a\x94\xe3\x80\x80\xec\x95\xbd"));
+    CHECK(!is_section_keyword("Abstract painting methods"));
+}
+
+void test_pdf_side_by_side_tables_split_at_gutter() {
+    using namespace jdoc::pdf_detail;
+
+    // Two independent closed grids at the same y levels, one per page
+    // column, with an empty gutter between them.
+    std::vector<PdfLineSegment> lines;
+    for (double x0 : {50.0, 300.0}) {
+        for (double y : {0.0, 20.0, 40.0, 60.0})
+            lines.push_back({static_cast<float>(x0), static_cast<float>(y),
+                             static_cast<float>(x0 + 150), static_cast<float>(y)});
+        for (int c = 0; c <= 3; c++)
+            lines.push_back({static_cast<float>(x0 + c * 50), 0,
+                             static_cast<float>(x0 + c * 50), 60});
+    }
+
+    std::vector<TextChar> chars;
+    for (double x0 : {50.0, 300.0}) {
+        for (int r = 0; r < 3; r++) {
+            for (int c = 0; c < 3; c++) {
+                TextChar ch{};
+                ch.left = x0 + c * 50 + 20;
+                ch.right = ch.left + 6;
+                ch.x = ch.left + 3;
+                ch.y = 10 + r * 20;
+                ch.top = ch.y + 4;
+                ch.bot = ch.y - 4;
+                ch.font_size = 10;
+                ch.unicode = 'A' + r * 3 + c;
+                chars.push_back(ch);
+            }
+        }
+    }
+    PageCharCache cache;
+    cache.build(chars);
+
+    auto tables = detect_tables(lines, cache, 500, 200);
+    CHECK(tables.size() == 2);
+    for (auto& t : tables) {
+        CHECK(t.rows.size() == 3);
+        CHECK(t.rows[0].size() == 3);
+    }
+}
+
+void test_pdf_per_cell_border_fragments_merge_into_rules() {
+    using namespace jdoc::pdf_detail;
+
+    // Every horizontal border is drawn per cell: three 48pt segments per
+    // level, each alone under the 50pt rule-length cut.
+    std::vector<PdfLineSegment> lines;
+    for (double y : {0.0, 20.0, 40.0, 60.0})
+        for (int c = 0; c < 3; c++)
+            lines.push_back({static_cast<float>(50 + c * 48),
+                             static_cast<float>(y),
+                             static_cast<float>(50 + (c + 1) * 48),
+                             static_cast<float>(y)});
+    for (int c = 0; c <= 3; c++)
+        lines.push_back({static_cast<float>(50 + c * 48), 0,
+                         static_cast<float>(50 + c * 48), 60});
+
+    std::vector<TextChar> chars;
+    for (int r = 0; r < 3; r++) {
+        for (int c = 0; c < 3; c++) {
+            TextChar ch{};
+            ch.left = 50 + c * 48 + 20;
+            ch.right = ch.left + 6;
+            ch.x = ch.left + 3;
+            ch.y = 10 + r * 20;
+            ch.top = ch.y + 4;
+            ch.bot = ch.y - 4;
+            ch.font_size = 10;
+            ch.unicode = 'A' + r * 3 + c;
+            chars.push_back(ch);
+        }
+    }
+    PageCharCache cache;
+    cache.build(chars);
+
+    auto tables = detect_tables(lines, cache, 400, 200);
+    CHECK(tables.size() == 1);
+    CHECK(tables[0].rows.size() == 3);
+    CHECK(tables[0].rows[0].size() == 3);
+}
+
+void test_pdf_shading_grid_extends_to_aligned_unshaded_columns() {
+    using namespace jdoc::pdf_detail;
+
+    std::vector<TextChar> chars;
+    std::vector<PdfFillRect> fills;
+    for (int r = 0; r < 8; r++) {
+        double y = 10 + r * 20;
+        for (int c = 0; c < 5; c++) {
+            std::string value = std::string(1, static_cast<char>('A' + c)) +
+                                std::to_string(r);
+            for (size_t k = 0; k < value.size(); k++) {
+                TextChar ch{};
+                ch.left = 65 + c * 50 + k * 5;
+                ch.right = ch.left + 4;
+                ch.x = (ch.left + ch.right) / 2.0;
+                ch.y = y;
+                ch.top = y + 4;
+                ch.bot = y - 4;
+                ch.font_size = 10;
+                ch.unicode = static_cast<unsigned char>(value[k]);
+                chars.push_back(ch);
+            }
+        }
+        for (int c = 2; c < 5; c++) {
+            float x0 = static_cast<float>(50 + c * 50);
+            fills.push_back({x0, static_cast<float>(r * 20), x0 + 50,
+                             static_cast<float>((r + 1) * 20),
+                             0.8f, 0.8f, 0.8f});
+        }
+    }
+    PageCharCache cache;
+    cache.build(chars);
+
+    auto tables = detect_shading_tables(fills, cache, {}, 400, 300);
+    CHECK(tables.size() == 1);
+    CHECK(tables[0].rows.size() == 8);
+    for (auto& row : tables[0].rows) {
+        CHECK(row.size() == 5);
+        for (auto& cell : row) CHECK(!cell.empty());
+    }
+}
+
 void test_pdf_line_width_follows_ctm() {
     using namespace jdoc::pdf_detail;
     const std::string ops =
@@ -1381,6 +1592,12 @@ int main() {
     RUN_TEST(test_pdf_table_cell_rotated_text);
     RUN_TEST(test_pdf_line_width_follows_ctm);
     RUN_TEST(test_pdf_cell_assembly_reading_order);
+    RUN_TEST(test_pdf_wide_ruled_table_keeps_strong_columns);
+    RUN_TEST(test_pdf_dense_grid_outweighs_glyph_crossing);
+    RUN_TEST(test_pdf_heading_section_number_rules);
+    RUN_TEST(test_pdf_side_by_side_tables_split_at_gutter);
+    RUN_TEST(test_pdf_per_cell_border_fragments_merge_into_rules);
+    RUN_TEST(test_pdf_shading_grid_extends_to_aligned_unshaded_columns);
     RUN_TEST(test_pdf_lists_attachments);
     RUN_TEST(test_pdf_preserves_same_named_attachments);
     RUN_TEST(test_pdf_attachment_name_cannot_forge_structure);
