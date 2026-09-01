@@ -397,6 +397,53 @@ TableData build_table(const std::vector<double>& row_ys,
         col_xs = infer_columns_from_text(cache, table_left, table_right, row_ys);
     }
 
+    // A drawn grid may omit single rules (a subdivided header cell whose
+    // data columns are separated by whitespace only).  When text alignment
+    // independently reproduces most drawn boundaries, its extra boundaries
+    // inside unusually wide columns are trusted as the omitted rules.  The
+    // added boundaries carry no v-lines, so they are exempted from the
+    // v-line colspan logic below.
+    std::vector<double> text_boundaries;
+    if (col_xs.size() >= 4 && internal_vline_count > 0) {
+        auto inferred = infer_columns_from_text(cache, table_left,
+                                                table_right, row_ys);
+        std::vector<double> widths;
+        for (size_t i = 1; i < col_xs.size(); i++)
+            widths.push_back(col_xs[i] - col_xs[i - 1]);
+        std::nth_element(widths.begin(), widths.begin() + widths.size() / 2,
+                         widths.end());
+        double median_w = widths[widths.size() / 2];
+        // Right-aligned values shift a whitespace gap's center away from
+        // the drawn rule, so alignment is judged at column scale.
+        double align_tol = std::max(12.0, median_w * 0.4);
+        size_t internal_n = col_xs.size() - 2;
+        int aligned = 0;
+        for (size_t i = 1; i + 1 < col_xs.size(); i++)
+            for (double tx : inferred)
+                if (std::abs(tx - col_xs[i]) < align_tol) { aligned++; break; }
+        if (internal_n > 0 && aligned * 10 >= (int)internal_n * 7) {
+            for (size_t j = 1; j + 1 < inferred.size(); j++) {
+                double tx = inferred[j];
+                // The offset twin of a drawn rule is not a new boundary.
+                bool near_drawn = false;
+                for (double cx : col_xs)
+                    if (std::abs(cx - tx) < align_tol) { near_drawn = true; break; }
+                if (near_drawn) continue;
+                auto it = std::upper_bound(col_xs.begin(), col_xs.end(), tx);
+                if (it == col_xs.begin() || it == col_xs.end()) continue;
+                double lo = *(it - 1), hi = *it;
+                if (hi - lo < median_w * 1.5) continue;    // not a wide column
+                if (tx - lo < 15.0 || hi - tx < 15.0) continue;
+                text_boundaries.push_back(tx);
+            }
+            if (!text_boundaries.empty()) {
+                col_xs.insert(col_xs.end(), text_boundaries.begin(),
+                              text_boundaries.end());
+                std::sort(col_xs.begin(), col_xs.end());
+            }
+        }
+    }
+
     if (col_xs.size() < 3) {
         table.rows.clear();
         return table;
@@ -564,6 +611,13 @@ TableData build_table(const std::vector<double>& row_ys,
             has_vline[r][b] = found;
         }
     }
+    // Boundaries taken from text alignment have no rule to find: they
+    // separate columns by definition, in every row.
+    for (double tx : text_boundaries)
+        for (int b = 1; b < n_cols; b++)
+            if (std::abs(col_xs[b] - tx) < 1.0)
+                for (int r = 0; r < n_rows; r++)
+                    has_vline[r][b] = true;
 
     // A dense closed grid is stronger table evidence than small glyph/rule
     // overlaps.  Some producers place long labels almost flush with borders,
