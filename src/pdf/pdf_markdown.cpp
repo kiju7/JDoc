@@ -286,6 +286,33 @@ std::vector<AnnotEntry> extract_annotations(PdfDoc& doc, const PdfObj& page_obj,
 
 // ── Markdown Formatting ──────────────────────────────────
 
+// Whitespace-stripped copy, for order-preserving containment checks.
+static std::string squash_ws(const std::string& s) {
+    std::string out;
+    out.reserve(s.size());
+    for (char c : s)
+        if (c != ' ' && c != '\t' && c != '\n' && c != '\r') out += c;
+    return out;
+}
+
+// Per-table concatenation of all cell text (row-major, whitespace stripped).
+// A line that geometrically falls inside a table region is only dropped from
+// the prose flow when its characters actually made it into the table's cells;
+// otherwise a detector that claimed a region but captured a subset of its
+// text would silently delete the rest (an author block swallowed by a phantom
+// column once lost six of eight names this way).
+std::vector<std::string> table_captured_text(const std::vector<TableData>& tables) {
+    std::vector<std::string> joined;
+    joined.reserve(tables.size());
+    for (auto& t : tables) {
+        std::string j;
+        for (auto& row : t.rows)
+            for (auto& cell : row) j += cell;
+        joined.push_back(squash_ws(j));
+    }
+    return joined;
+}
+
 bool line_in_table(const TextLine& line, const std::vector<TableData>& tables) {
     for (auto& t : tables) {
         double t_bottom = std::min(t.y0, t.y1) - 10.0;
@@ -306,6 +333,45 @@ bool line_in_table(const TextLine& line, const std::vector<TableData>& tables) {
                 }
             }
         }
+    }
+    return false;
+}
+
+// line_in_table plus capture check: true only when the line lies in a table
+// region AND its text is present in that table's cells (see
+// table_captured_text). A geometric hit whose text was not captured keeps the
+// line in the prose flow instead of losing it.
+bool line_swallowed_by_table(const TextLine& line,
+                             const std::vector<TableData>& tables,
+                             const std::vector<std::string>& captured) {
+    std::string lt = squash_ws(line.text);
+    for (size_t ti = 0; ti < tables.size(); ti++) {
+        auto& t = tables[ti];
+        double t_bottom = std::min(t.y0, t.y1) - 10.0;
+        double t_top = std::max(t.y0, t.y1) + 5.0;
+        double t_left = std::min(t.x0, t.x1) - 15.0;
+        double t_right = std::max(t.x0, t.x1) + 15.0;
+        if (line.y_center < t_bottom || line.y_center > t_top) continue;
+        bool geo = false;
+        if (line.x_left >= t_left && line.x_right <= t_right) {
+            geo = true;
+        } else {
+            double overlap_l = std::max(line.x_left, t_left);
+            double overlap_r = std::min(line.x_right, t_right);
+            if (overlap_r > overlap_l) {
+                double overlap = overlap_r - overlap_l;
+                double line_width = line.x_right - line.x_left;
+                if (line_width > 0 && overlap >= line_width * 0.6) geo = true;
+            }
+        }
+        if (!geo) continue;
+        // Fully-filler lines ('|', spaces) carry no text to preserve.
+        if (lt.empty()) return true;
+        if (ti < captured.size() &&
+            captured[ti].find(lt) != std::string::npos)
+            return true;
+        // geometric hit but text not captured: check other tables too before
+        // deciding to keep the line.
     }
     return false;
 }
@@ -454,6 +520,7 @@ std::string page_to_markdown(const std::vector<TextLine>& raw_lines,
                               double col_boundary = 0,
                               const std::string& img_ref_prefix = "") {
     auto lines = merge_colinear_lines(raw_lines);
+    auto captured_cells = table_captured_text(tables);
 
     // Detect if page has column-split lines (for image placement)
     bool has_columns = false;
@@ -547,7 +614,7 @@ std::string page_to_markdown(const std::vector<TextLine>& raw_lines,
             }
         }
 
-        if (line_in_table(l, tables)) continue;
+        if (line_swallowed_by_table(l, tables, captured_cells)) continue;
 
         {
             bool only_filler = true;
@@ -615,7 +682,9 @@ std::string page_to_markdown(const std::vector<TextLine>& raw_lines,
                 double gap = std::fabs(nx.y_center - lines[i].y_center);
                 double ratio = std::min(nx.font_size, l.font_size) /
                                std::max(nx.font_size, l.font_size);
-                if (nx_level == 0 || line_in_table(nx, tables) || !same_col ||
+                if (nx_level == 0 ||
+                    line_swallowed_by_table(nx, tables, captured_cells) ||
+                    !same_col ||
                     nx.is_bold != l.is_bold || ratio < 0.75 ||
                     is_cjk_line(nx.text) != head_cjk ||
                     gap > l.font_size * 1.5)

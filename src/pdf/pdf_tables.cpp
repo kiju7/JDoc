@@ -1817,6 +1817,7 @@ static TableData build_table_from_band(
                 row_bounds[c] = row_bounds[c-1] + 0.1;
         }
 
+        int row_torn = 0;
         for (int c = 1; c < (int)row_bounds.size() - 1; c++) {
             double b = row_bounds[c];
             const CharInfo* prev = nullptr;
@@ -1830,8 +1831,16 @@ static TableData build_table_from_band(
             if (b - prev->right > near_win || next->left - b > near_win)
                 continue;
             near_cnt[c]++;
-            if (next->left - prev->right < torn_gap) torn_cnt[c]++;
+            if (next->left - prev->right < torn_gap) {
+                torn_cnt[c]++;
+                row_torn++;
+            }
         }
+        // A row whose glyphs are cut mid-word by two or more boundaries is
+        // prose that drifted into the band (a paragraph line right below a
+        // table): evict it. The capture check in the markdown pass returns
+        // the line to the prose flow.
+        if (row_torn >= 2) continue;
 
         std::vector<std::string> cells(n_cols);
         std::vector<double> last_right(n_cols, -1e9);
@@ -1865,6 +1874,12 @@ static TableData build_table_from_band(
         for (size_t idx : *order) {
             const auto& ch = chars[idx];
             double cmid = (ch.left + ch.right) / 2.0;
+            // A char well outside the inferred column span never belongs to a
+            // cell (margin stamp grouped into the row by y); leave it to the
+            // prose flow instead of prepending it to an edge cell.
+            if (cmid < table.x0 - median_fs * 2.0 ||
+                cmid > table.x1 + median_fs * 2.0)
+                continue;
             int col = -1;
             for (int c = 0; c < n_cols; c++) {
                 // Use strict less-than-or-equal on the right edge so chars that
@@ -2411,12 +2426,22 @@ static std::vector<TableData> detect_text_tables_range(
     // build TextRows
     std::vector<TextRow> rows;
     {
+        // Rotated runs (a vertical arXiv stamp in the margin, CAD labels)
+        // contribute cell TEXT if a table stands, but must not act as column
+        // evidence: a margin stamp beside a prose block otherwise fabricates
+        // a phantom first column and the "table" swallows the block. Only
+        // upright chars enter char_ranges (multi-cell + histogram evidence);
+        // rotated chars still ride along in char_indices.
+        auto push_char = [&](TextRow& r, size_t idx) {
+            if (chars[idx].rot == 0)
+                r.char_ranges.push_back({chars[idx].left, chars[idx].right});
+            r.char_indices.push_back(idx);
+        };
         TextRow cur;
         cur.y_center = chars[0].y;
         cur.y_top = chars[0].top;
         cur.y_bot = chars[0].bot;
-        cur.char_ranges.push_back({chars[0].left, chars[0].right});
-        cur.char_indices.push_back(0);
+        push_char(cur, 0);
         auto finalize_row = [](TextRow& r) {
             r.x_min = 1e18;
             r.x_max = -1e18;
@@ -2427,12 +2452,11 @@ static std::vector<TableData> detect_text_tables_range(
         };
         for (size_t i = 1; i < chars.size(); i++) {
             if (std::abs(chars[i].y - cur.y_center) < std::max(median_fs * 0.4, 3.0)) {
-                cur.char_ranges.push_back({chars[i].left, chars[i].right});
-                cur.char_indices.push_back(i);
+                push_char(cur, i);
                 cur.y_top = std::max(cur.y_top, chars[i].top);
                 cur.y_bot = std::min(cur.y_bot, chars[i].bot);
-                cur.y_center = (cur.y_center * (cur.char_ranges.size() - 1) +
-                                chars[i].y) / cur.char_ranges.size();
+                cur.y_center = (cur.y_center * (cur.char_indices.size() - 1) +
+                                chars[i].y) / cur.char_indices.size();
             } else {
                 if (!cur.char_ranges.empty()) {
                     finalize_row(cur);
@@ -2442,8 +2466,7 @@ static std::vector<TableData> detect_text_tables_range(
                 cur.y_center = chars[i].y;
                 cur.y_top = chars[i].top;
                 cur.y_bot = chars[i].bot;
-                cur.char_ranges.push_back({chars[i].left, chars[i].right});
-                cur.char_indices.push_back(i);
+                push_char(cur, i);
             }
         }
         if (!cur.char_ranges.empty()) {
