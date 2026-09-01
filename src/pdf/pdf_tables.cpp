@@ -523,6 +523,59 @@ TableData build_table(const std::vector<double>& row_ys,
         }
     }
 
+    // A dense closed grid is stronger table evidence than small glyph/rule
+    // overlaps.  Some producers place long labels almost flush with borders,
+    // which makes the crossing heuristic below reject otherwise complete
+    // rectangular tables.  Require both horizontal and vertical coverage so
+    // diagram boxes do not receive the exemption.
+    bool dense_closed_grid = n_rows >= 3 && n_cols >= 2;
+    if (dense_closed_grid) {
+        int ruled_levels = 0;
+        const double grid_width = table_right - table_left;
+        // Use the drawn row levels here, not text-derived row splits.  A
+        // ruled section may contain several wrapped logical rows between two
+        // horizontal borders while remaining a closed grid.
+        for (double ry : row_ys) {
+            std::vector<std::pair<double,double>> intervals;
+            for (auto& hl : h_lines) {
+                double hy = (hl.y0 + hl.y1) / 2.0;
+                if (std::abs(hy - ry) > 4.0) continue;
+                double lo = std::max(table_left,
+                                     std::min((double)hl.x0, (double)hl.x1));
+                double hi = std::min(table_right,
+                                     std::max((double)hl.x0, (double)hl.x1));
+                if (hi > lo) intervals.push_back({lo, hi});
+            }
+            std::sort(intervals.begin(), intervals.end());
+            double coverage = 0;
+            if (!intervals.empty()) {
+                double lo = intervals[0].first, hi = intervals[0].second;
+                for (size_t i = 1; i < intervals.size(); i++) {
+                    if (intervals[i].first <= hi + 2.0)
+                        hi = std::max(hi, intervals[i].second);
+                    else {
+                        coverage += hi - lo;
+                        lo = intervals[i].first;
+                        hi = intervals[i].second;
+                    }
+                }
+                coverage += hi - lo;
+            }
+            if (grid_width > 0 && coverage >= grid_width * 0.8)
+                ruled_levels++;
+        }
+        int min_ruled_levels = std::max(3, static_cast<int>(
+            std::ceil(row_ys.size() * 0.8)));
+        dense_closed_grid = ruled_levels >= min_ruled_levels;
+        for (int b = 1; dense_closed_grid && b < n_cols; b++) {
+            int covered_rows = 0;
+            for (int r = 0; r < n_rows; r++)
+                if (has_vline[r][b]) covered_rows++;
+            if (covered_rows * 5 < n_rows * 4)
+                dense_closed_grid = false;
+        }
+    }
+
     // Check v-line grid density: a real table has v-lines in most row/boundary positions.
     // Stray v-lines from body text have sparse coverage.
     // Only skip text continuation rejection for dense grids (real tables with merged cells).
@@ -656,7 +709,7 @@ TableData build_table(const std::vector<double>& row_ys,
                     crossed++;
             }
         }
-        if (crossed >= 2 && crossed * 10 >= near_n * 3) {
+        if (!dense_closed_grid && crossed >= 2 && crossed * 10 >= near_n * 3) {
             table.rows.clear();
             return table;
         }
@@ -709,7 +762,7 @@ TableData build_table(const std::vector<double>& row_ys,
     // Reject tables where text continues across column boundaries
     // (body text split by vertical lines — not real tabular data)
     // SKIP when merged cells detected: v-line grid confirms real table structure.
-    if (!table.rows.empty() && !has_merged_cells) {
+    if (!table.rows.empty() && !has_merged_cells && !dense_closed_grid) {
         int n_cols_t = (int)table.rows[0].size();
         // Detect word continuation: Latin alphanumeric at both boundaries.
         // CJK characters are self-contained units (not word fragments),
@@ -773,7 +826,8 @@ TableData build_table(const std::vector<double>& row_ys,
 
     // Reject tables where most content concentrates in one column
     // while others are mostly empty — body text split by stray vertical lines.
-    if (!table.rows.empty() && (int)table.rows.size() >= 3) {
+    if (!table.rows.empty() && !dense_closed_grid &&
+        (int)table.rows.size() >= 3) {
         int n_cols_t = (int)table.rows[0].size();
         int nr = (int)table.rows.size();
         // Find the column with most content

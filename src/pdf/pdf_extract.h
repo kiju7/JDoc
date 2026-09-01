@@ -23,6 +23,10 @@ std::vector<double> find_column_boundaries(
     double table_left, double table_right,
     double table_bot, double table_top,
     const std::vector<double>& row_ys);
+TableData build_table(const std::vector<double>& row_ys,
+                      const std::vector<PdfLineSegment>& h_lines,
+                      const std::vector<PdfLineSegment>& v_lines,
+                      const PageCharCache& cache);
 
 struct FontStats {
     double body_size = 12.0;

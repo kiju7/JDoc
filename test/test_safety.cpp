@@ -955,6 +955,49 @@ void test_pdf_wide_ruled_table_keeps_strong_columns() {
     CHECK(columns.size() == 13);
 }
 
+void test_pdf_dense_grid_outweighs_glyph_crossing() {
+    using namespace jdoc::pdf_detail;
+
+    std::vector<double> row_ys = {0, 20, 40, 60, 80, 100, 120};
+    std::vector<PdfLineSegment> h_lines, v_lines;
+    for (double y : row_ys)
+        h_lines.push_back({50, static_cast<float>(y), 200,
+                           static_cast<float>(y)});
+    for (float x : {50.0f, 100.0f, 150.0f, 200.0f})
+        v_lines.push_back({x, 0, x, 120});
+
+    std::vector<TextChar> chars;
+    for (int r = 0; r < 6; r++) {
+        double y = 10 + r * 20;
+        auto glyph = [&](uint32_t cp, double left, double right) {
+            TextChar ch{};
+            ch.x = (left + right) / 2.0;
+            ch.y = y;
+            ch.left = left;
+            ch.right = right;
+            ch.top = y + 4;
+            ch.bot = y - 4;
+            ch.font_size = 10;
+            ch.unicode = cp;
+            return ch;
+        };
+        chars.push_back(glyph('A' + r, 98.8, 99.8));
+        chars.push_back(glyph('a' + r, 100.2, 101.2));
+        chars.push_back(glyph('0' + r, 170.0, 175.0));
+    }
+    PageCharCache cache;
+    cache.build(chars);
+
+    TableData table = build_table(row_ys, h_lines, v_lines, cache);
+    CHECK(table.rows.size() == 6);
+    for (auto& row : table.rows) {
+        CHECK(row.size() == 3);
+        CHECK(!row[0].empty());
+        CHECK(!row[1].empty());
+        CHECK(!row[2].empty());
+    }
+}
+
 void test_pdf_line_width_follows_ctm() {
     using namespace jdoc::pdf_detail;
     const std::string ops =
@@ -1400,6 +1443,7 @@ int main() {
     RUN_TEST(test_pdf_line_width_follows_ctm);
     RUN_TEST(test_pdf_cell_assembly_reading_order);
     RUN_TEST(test_pdf_wide_ruled_table_keeps_strong_columns);
+    RUN_TEST(test_pdf_dense_grid_outweighs_glyph_crossing);
     RUN_TEST(test_pdf_lists_attachments);
     RUN_TEST(test_pdf_preserves_same_named_attachments);
     RUN_TEST(test_pdf_attachment_name_cannot_forge_structure);
