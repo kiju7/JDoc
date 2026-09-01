@@ -15,6 +15,15 @@ struct TableData {
     enum Kind { RULED, SHADING, TEXT } kind = RULED;
 };
 
+// Ruled-table assembly helpers are exposed in the internal header so geometry
+// regressions can be tested without manufacturing a complete PDF document.
+std::vector<double> find_column_boundaries(
+    const std::vector<PdfLineSegment>& v_lines,
+    const std::vector<PdfLineSegment>& h_lines,
+    double table_left, double table_right,
+    double table_bot, double table_top,
+    const std::vector<double>& row_ys);
+
 struct FontStats {
     double body_size = 12.0;
 

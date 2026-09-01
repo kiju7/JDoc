@@ -287,7 +287,11 @@ std::vector<double> find_column_boundaries(
         col_xs = std::move(merged);
     }
 
-    while (col_xs.size() > 9) {
+    // Accepted boundaries already have repeated rule evidence.  Keep wide
+    // grids intact (survey/result tables commonly exceed eight columns) and
+    // retain only a generous safety cap for pathological vector drawings.
+    constexpr size_t kMaxStrongGridColumns = 64;
+    while (col_xs.size() > kMaxStrongGridColumns + 1) {
         double min_gap = 1e9;
         size_t min_idx = 1;
         for (size_t i = 1; i < col_xs.size() - 1; i++) {

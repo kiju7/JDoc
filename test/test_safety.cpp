@@ -937,6 +937,24 @@ void test_pdf_cell_assembly_reading_order() {
     CHECK(up.get_text_in_rect(100, 170, 200, 130) == "ABC");
 }
 
+void test_pdf_wide_ruled_table_keeps_strong_columns() {
+    using namespace jdoc::pdf_detail;
+
+    std::vector<double> row_ys = {0, 20, 40, 60, 80, 100};
+    std::vector<PdfLineSegment> h_lines, v_lines;
+    for (double y : row_ys)
+        h_lines.push_back({50, static_cast<float>(y), 650,
+                           static_cast<float>(y)});
+    for (int c = 0; c <= 12; c++) {
+        float x = static_cast<float>(50 + c * 50);
+        v_lines.push_back({x, 0, x, 100});
+    }
+
+    auto columns = find_column_boundaries(v_lines, h_lines, 50, 650,
+                                           0, 100, row_ys);
+    CHECK(columns.size() == 13);
+}
+
 void test_pdf_line_width_follows_ctm() {
     using namespace jdoc::pdf_detail;
     const std::string ops =
@@ -1381,6 +1399,7 @@ int main() {
     RUN_TEST(test_pdf_table_cell_rotated_text);
     RUN_TEST(test_pdf_line_width_follows_ctm);
     RUN_TEST(test_pdf_cell_assembly_reading_order);
+    RUN_TEST(test_pdf_wide_ruled_table_keeps_strong_columns);
     RUN_TEST(test_pdf_lists_attachments);
     RUN_TEST(test_pdf_preserves_same_named_attachments);
     RUN_TEST(test_pdf_attachment_name_cannot_forge_structure);
