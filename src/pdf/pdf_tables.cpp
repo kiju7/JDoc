@@ -402,6 +402,42 @@ TableData build_table(const std::vector<double>& row_ys,
         return table;
     }
 
+    // Per-level h-rule coverage (fraction of the grid width that carries a
+    // rule) feeds the edge tolerance below and both closed-grid tests
+    // further down.  Use the drawn row levels here, not text-derived row
+    // splits: a ruled section may contain several wrapped logical rows
+    // between two horizontal borders while remaining a closed grid.
+    const double grid_width = table_right - table_left;
+    std::vector<double> level_coverage;
+    for (double ry : row_ys) {
+        std::vector<std::pair<double,double>> intervals;
+        for (auto& hl : h_lines) {
+            double hy = (hl.y0 + hl.y1) / 2.0;
+            if (std::abs(hy - ry) > 4.0) continue;
+            double lo = std::max(table_left,
+                                 std::min((double)hl.x0, (double)hl.x1));
+            double hi = std::min(table_right,
+                                 std::max((double)hl.x0, (double)hl.x1));
+            if (hi > lo) intervals.push_back({lo, hi});
+        }
+        std::sort(intervals.begin(), intervals.end());
+        double coverage = 0;
+        if (!intervals.empty()) {
+            double lo = intervals[0].first, hi = intervals[0].second;
+            for (size_t i = 1; i < intervals.size(); i++) {
+                if (intervals[i].first <= hi + 2.0)
+                    hi = std::max(hi, intervals[i].second);
+                else {
+                    coverage += hi - lo;
+                    lo = intervals[i].first;
+                    hi = intervals[i].second;
+                }
+            }
+            coverage += hi - lo;
+        }
+        level_coverage.push_back(grid_width > 0 ? coverage / grid_width : 0.0);
+    }
+
     std::vector<double> actual_ys;
     bool merge_wrap_rows = false;
     {
@@ -450,10 +486,16 @@ TableData build_table(const std::vector<double>& row_ys,
         double tb = row_ys.front(), tt = row_ys.back();
         // Only centers inside the grid count: a page heading sharing the
         // table's x-band would otherwise inject a phantom row boundary and
-        // break the monotonic row order.
+        // break the monotonic row order. A fully drawn outer rule closes
+        // its edge — a caption or unit note hugging the border stays out —
+        // while an open edge keeps the half-row margin for rule-less rows.
+        double top_tol = (!level_coverage.empty() &&
+                          level_coverage.back() >= 0.7) ? 2.0 : row_h * 0.5;
+        double bot_tol = (!level_coverage.empty() &&
+                          level_coverage.front() >= 0.7) ? 2.0 : row_h * 0.5;
         std::vector<double> grid_centers;
         for (double tc : table_row_centers)
-            if (tc >= tb - row_h * 0.5 && tc <= tt + row_h * 0.5)
+            if (tc >= tb - bot_tol && tc <= tt + top_tol)
                 grid_centers.push_back(tc);
         int rows_in_grid = (int)grid_centers.size();
 
@@ -531,39 +573,8 @@ TableData build_table(const std::vector<double>& row_ys,
     bool dense_closed_grid = n_rows >= 3 && n_cols >= 2;
     if (dense_closed_grid) {
         int ruled_levels = 0;
-        const double grid_width = table_right - table_left;
-        // Use the drawn row levels here, not text-derived row splits.  A
-        // ruled section may contain several wrapped logical rows between two
-        // horizontal borders while remaining a closed grid.
-        for (double ry : row_ys) {
-            std::vector<std::pair<double,double>> intervals;
-            for (auto& hl : h_lines) {
-                double hy = (hl.y0 + hl.y1) / 2.0;
-                if (std::abs(hy - ry) > 4.0) continue;
-                double lo = std::max(table_left,
-                                     std::min((double)hl.x0, (double)hl.x1));
-                double hi = std::min(table_right,
-                                     std::max((double)hl.x0, (double)hl.x1));
-                if (hi > lo) intervals.push_back({lo, hi});
-            }
-            std::sort(intervals.begin(), intervals.end());
-            double coverage = 0;
-            if (!intervals.empty()) {
-                double lo = intervals[0].first, hi = intervals[0].second;
-                for (size_t i = 1; i < intervals.size(); i++) {
-                    if (intervals[i].first <= hi + 2.0)
-                        hi = std::max(hi, intervals[i].second);
-                    else {
-                        coverage += hi - lo;
-                        lo = intervals[i].first;
-                        hi = intervals[i].second;
-                    }
-                }
-                coverage += hi - lo;
-            }
-            if (grid_width > 0 && coverage >= grid_width * 0.8)
-                ruled_levels++;
-        }
+        for (double c : level_coverage)
+            if (c >= 0.8) ruled_levels++;
         int min_ruled_levels = std::max(3, static_cast<int>(
             std::ceil(row_ys.size() * 0.8)));
         dense_closed_grid = ruled_levels >= min_ruled_levels;
@@ -678,7 +689,19 @@ TableData build_table(const std::vector<double>& row_ys,
         for (auto& cell : row) if (!cell.empty()) filled_cols++;
         if (filled_cols >= 2) meaningful_rows++;
     }
-    if (meaningful_rows < 3) table.rows.clear();
+    // A fully boxed small grid (header plus one data row, common for compact
+    // result tables) is real even with only two content rows.  Demand rules
+    // at every drawn level and v-lines on most boundary cells so a pair of
+    // stacked diagram boxes does not qualify.
+    bool small_closed_grid = false;
+    if (n_cols >= 3 && (int)row_ys.size() >= 3) {
+        bool all_ruled = !level_coverage.empty();
+        for (double c : level_coverage)
+            if (c < 0.7) all_ruled = false;
+        small_closed_grid = all_ruled && vline_total > 0 &&
+                            vline_present * 3 >= vline_total * 2;
+    }
+    if (meaningful_rows < (small_closed_grid ? 2 : 3)) table.rows.clear();
 
     // Text running THROUGH a drawn v-line marks a drawing, not a table: a
     // table author never lays text across a rule, while diagram boxes (ERD
