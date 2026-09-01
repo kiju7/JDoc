@@ -1013,6 +1013,45 @@ std::vector<double> infer_columns_from_text(const PageCharCache& cache,
     return boundaries;
 }
 
+// True when the codepoints (one text line, x-sorted, spaces removed) start
+// like a table/figure caption: "Table 3", "TABLE 2.6", "Fig. 5", "표 4.2",
+// "그림 3", optionally wrapped in <>, 〈〉 or []. A caption between two rule
+// levels marks the boundary between stacked tables, never a data row.
+static bool is_caption_start(const std::vector<uint32_t>& cps) {
+    size_t i = 0;
+    if (i < cps.size() && (cps[i] == '<' || cps[i] == '[' ||
+                           cps[i] == 0x3008 || cps[i] == 0xFF1C))
+        i++;
+    auto lower = [](uint32_t c) -> uint32_t {
+        return (c >= 'A' && c <= 'Z') ? c + 32 : c;
+    };
+    auto match = [&](const char* w) {
+        size_t j = i, k = 0;
+        while (w[k] && j < cps.size() && lower(cps[j]) == (uint32_t)w[k]) {
+            j++; k++;
+        }
+        if (w[k]) return false;
+        i = j;
+        return true;
+    };
+    bool head = match("tables") || match("table") ||
+                match("figures") || match("figure") || match("fig");
+    if (!head && i < cps.size() && cps[i] == 0xD45C) { i++; head = true; }
+    if (!head && i + 1 < cps.size() &&
+        cps[i] == 0xADF8 && cps[i + 1] == 0xB9BC) { i += 2; head = true; }
+    if (!head) return false;
+    // The caption number follows immediately, past at most light
+    // punctuation ("Fig. 5", "표: 3"). Roman numerals cover IEEE style;
+    // a letter here means an ordinary word ("Tablet") — not a caption.
+    for (int steps = 0; i < cps.size() && steps < 4; i++, steps++) {
+        uint32_t c = cps[i];
+        if (c >= '0' && c <= '9') return true;
+        if (c == 'I' || c == 'V' || c == 'X') return true;
+        if (c != '.' && c != ':') return false;
+    }
+    return false;
+}
+
 std::vector<TableData> detect_tables(const std::vector<PdfLineSegment>& lines,
                                       const PageCharCache& cache,
                                       double page_width, double page_height) {
@@ -1099,15 +1138,29 @@ std::vector<TableData> detect_tables(const std::vector<PdfLineSegment>& lines,
         double x_lo = std::max(lo_l, hi_l), x_hi = std::min(lo_r, hi_r);
         if (x_hi <= x_lo) { x_lo = std::min(lo_l, hi_l); x_hi = std::max(lo_r, hi_r); }
         if (x_hi <= x_lo) return allow_empty && gap < 60.0;
+        struct GapChar { double x, y; uint32_t cp; };
+        std::vector<GapChar> gap_chars;
         std::vector<double> ys;
         for (auto& ch : cache.chars) {
             if (ch.unicode == ' ' || ch.unicode == 0xA0 || ch.unicode == '\t') continue;
             if (ch.x < x_lo + 1 || ch.x > x_hi - 1) continue;
             if (ch.y <= y_lo + 2 || ch.y >= y_hi - 2) continue;
+            gap_chars.push_back({ch.x, ch.y, ch.unicode});
             ys.push_back(ch.y);
         }
         if (ys.empty()) return allow_empty && gap < 60.0;
         auto centers = cluster_values(ys, 3.0);
+        // A caption line anywhere in the gap separates stacked tables.
+        for (double cy : centers) {
+            std::vector<GapChar> line;
+            for (auto& gc : gap_chars)
+                if (std::abs(gc.y - cy) < 3.0) line.push_back(gc);
+            std::sort(line.begin(), line.end(),
+                      [](const GapChar& a, const GapChar& b) { return a.x < b.x; });
+            std::vector<uint32_t> cps;
+            for (auto& gc : line) cps.push_back(gc.cp);
+            if (is_caption_start(cps)) return false;
+        }
         double pitch = 14.0;
         if (centers.size() >= 2) {
             std::vector<double> diffs;
