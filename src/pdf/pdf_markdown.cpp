@@ -494,20 +494,192 @@ static bool is_page_number_footer(const std::string& text) {
     return false;
 }
 
-// Depth of a leading section number: "2.1 ..." → 2, "4.2.1 ..." → 3, else 0
-static int section_number_depth(const std::string& text) {
+// Section-number prefix "1", "1.", "2.1", "4.1.2)": numeric segments, an
+// optional closing '.' or ')' and required whitespace (ASCII or U+3000)
+// before the title text. A large first segment is a year or a data value,
+// never a section number.
+SectionNumber parse_section_number(const std::string& text) {
+    SectionNumber none;
     size_t i = 0;
     int depth = 0;
-    while (i < text.size()) {
+    long first = 0;
+    for (;;) {
         size_t start = i;
-        while (i < text.size() && std::isdigit(static_cast<unsigned char>(text[i]))) i++;
-        if (i == start) return 0;
+        long val = 0;
+        while (i < text.size() &&
+               std::isdigit(static_cast<unsigned char>(text[i]))) {
+            val = val * 10 + (text[i] - '0');
+            i++;
+        }
+        if (i == start) return none;
+        if (depth == 0) first = val;
         depth++;
-        if (i < text.size() && text[i] == '.') { i++; continue; }
+        if (i + 1 < text.size() && text[i] == '.' &&
+            std::isdigit(static_cast<unsigned char>(text[i + 1]))) {
+            i++;
+            continue;
+        }
         break;
     }
-    if (i >= text.size() || (text[i] != ' ' && text[i] != '\t')) return 0;
-    return depth;
+    // Sections count from 1 ("0.3" is a chart value); paren enumerations
+    // ("1) 항목") are list items, not sections, in this corpus.
+    if (first < 1 || first > 99 || depth > 4) return none;
+    SectionNumber sn;
+    if (i < text.size() && text[i] == '.') {
+        sn.closed = true;
+        i++;
+    }
+    size_t ws = 0;
+    while (i < text.size()) {
+        unsigned char c = text[i];
+        if (c == ' ' || c == '\t') { i++; ws++; continue; }
+        if (c == 0xE3 && i + 2 < text.size() &&
+            static_cast<unsigned char>(text[i + 1]) == 0x80 &&
+            static_cast<unsigned char>(text[i + 2]) == 0x80) {
+            i += 3;
+            ws++;
+            continue;
+        }
+        break;
+    }
+    if (ws == 0 || i >= text.size()) return none;
+    sn.depth = depth;
+    sn.text_pos = i;
+    return sn;
+}
+
+// Offset past a superscript footnote marker glued ahead of a section
+// number ("1)1. 서론"): an affiliation mark that merged into the heading
+// line in x order. Zero when the line has no such prefix.
+size_t glued_mark_offset(const std::string& text) {
+    size_t d = 0;
+    while (d < text.size() && std::isdigit(static_cast<unsigned char>(text[d]))) d++;
+    if (d >= 1 && d <= 2 && d < text.size() && text[d] == ')' &&
+        parse_section_number(text.substr(d + 1)).depth > 0)
+        return d + 1;
+    return 0;
+}
+
+// "TABLE 2.6.2 ..." / "그림 3 ..." caption headings never wrap onto a
+// following line — what follows a caption is its subtitle or the table.
+static bool is_caption_heading(const std::string& text) {
+    size_t i = 0;
+    auto match = [&](const char* w) {
+        size_t j = i, k = 0;
+        while (w[k] && j < text.size() &&
+               std::tolower(static_cast<unsigned char>(text[j])) == w[k]) {
+            j++; k++;
+        }
+        if (w[k]) return false;
+        i = j;
+        return true;
+    };
+    bool head = match("table") || match("figure") || match("fig");
+    if (!head) {
+        if (text.compare(0, 3, "\xed\x91\x9c") == 0) { i = 3; head = true; }
+        else if (text.compare(0, 6, "\xea\xb7\xb8\xeb\xa6\xbc") == 0) {
+            i = 6;
+            head = true;
+        }
+    }
+    if (!head) return false;
+    while (i < text.size() && (text[i] == ' ' || text[i] == '.')) i++;
+    return i < text.size() && std::isdigit(static_cast<unsigned char>(text[i]));
+}
+
+static size_t utf8_length(const std::string& s) {
+    size_t n = 0;
+    for (char c : s)
+        if ((static_cast<unsigned char>(c) & 0xC0) != 0x80) n++;
+    return n;
+}
+
+// Standalone structural keywords the corpus ground truth treats as
+// top-level sections regardless of their type size.
+bool is_section_keyword(const std::string& text) {
+    std::string key;
+    for (size_t i = 0; i < text.size();) {
+        unsigned char c = text[i];
+        if (c == ' ' || c == '\t') { i++; continue; }
+        if (c == 0xE3 && i + 2 < text.size() &&
+            static_cast<unsigned char>(text[i + 1]) == 0x80 &&
+            static_cast<unsigned char>(text[i + 2]) == 0x80) {
+            i += 3;
+            continue;
+        }
+        key += (c >= 'A' && c <= 'Z') ? static_cast<char>(c + 32) : text[i];
+        i++;
+    }
+    while (!key.empty() && (key.back() == ':' || key.back() == '.'))
+        key.pop_back();
+    return key == "abstract" || key == "references" ||
+           key == "acknowledgments" || key == "acknowledgements" ||
+           key == "appendix" ||
+           key == "\xec\x9a\x94\xec\x95\xbd" ||                           // 요약
+           key == "\xec\xb4\x88\xeb\xa1\x9d" ||                           // 초록
+           key == "\xea\xb5\xad\xeb\xac\xb8\xec\x9a\x94\xec\x95\xbd" ||   // 국문요약
+           key == "\xec\xb0\xb8\xea\xb3\xa0\xeb\xac\xb8\xed\x97\x8c";     // 참고문헌
+}
+
+// Name-list punctuation that betrays an author line under the title:
+// interpunct-joined Korean names, affiliation daggers and asterisks, mail
+// addresses, a trailing comma continuing the author list.
+static bool looks_like_author_line(const std::string& s) {
+    std::string t = s;
+    while (!t.empty() && (t.back() == ' ' || t.back() == '\t')) t.pop_back();
+    if (!t.empty() && t.back() == ',') return true;
+    for (size_t i = 0; i < s.size(); i++) {
+        unsigned char c = s[i];
+        if (c == '@' || c == '*') return true;
+        if (c == 0xE2 && i + 2 < s.size()) {
+            unsigned char c1 = s[i + 1], c2 = s[i + 2];
+            if (c1 == 0x80 && (c2 == 0xA0 || c2 == 0xA1)) return true;  // dagger
+            if (c1 == 0x8B && c2 == 0x85) return true;                  // U+22C5
+            if (c1 == 0x88 && c2 == 0x97) return true;                  // U+2217
+        }
+    }
+    return false;
+}
+
+// Whether a line is written mostly in CJK script. A Korean title stacked
+// above its English translation is two headings, not one wrapped heading.
+static bool line_is_mostly_cjk(const std::string& s) {
+    size_t cjk = 0, letters = 0;
+    for (size_t k = 0; k < s.size();) {
+        unsigned char c = s[k];
+        uint32_t cp;
+        int n;
+        if (c < 0x80)      { cp = c; n = 1; }
+        else if (c < 0xE0) { cp = c & 0x1F; n = 2; }
+        else if (c < 0xF0) { cp = c & 0x0F; n = 3; }
+        else               { cp = c & 0x07; n = 4; }
+        for (int b = 1; b < n && k + b < s.size(); b++)
+            cp = (cp << 6) | (static_cast<unsigned char>(s[k + b]) & 0x3F);
+        k += n;
+        if (cp > 0x3040) { letters++; if (cp >= 0xAC00 && cp <= 0xD7A3) cjk++; }
+        else if ((cp | 0x20) - 'a' < 26u) letters++;
+    }
+    return letters > 0 && cjk * 2 >= letters;
+}
+
+// Whether the text holds at least one letter (Latin, Hangul, CJK) — a line
+// of digits and punctuation (a page number, a lone value) is never a
+// heading whatever its size.
+static bool has_letter_codepoint(const std::string& s) {
+    for (size_t i = 0; i < s.size();) {
+        unsigned char c = s[i];
+        uint32_t cp;
+        int n;
+        if (c < 0x80)      { cp = c; n = 1; }
+        else if (c < 0xE0) { cp = c & 0x1F; n = 2; }
+        else if (c < 0xF0) { cp = c & 0x0F; n = 3; }
+        else               { cp = c & 0x07; n = 4; }
+        for (int b = 1; b < n && i + b < s.size(); b++)
+            cp = (cp << 6) | (static_cast<unsigned char>(s[i + b]) & 0x3F);
+        i += n;
+        if ((cp | 0x20) - 'a' < 26u || cp >= 0x3040) return true;
+    }
+    return false;
 }
 
 std::string page_to_markdown(const std::vector<TextLine>& raw_lines,
@@ -531,6 +703,168 @@ std::string page_to_markdown(const std::vector<TextLine>& raw_lines,
     double bottom_y = 1e9;
     for (auto& l : lines)
         if (l.y_center < bottom_y) bottom_y = l.y_center;
+
+    // ── Heading classification (pre-pass) ──
+    // Decide every line's heading level up front; the emit loop and the
+    // wrap-merge inside it both need the neighbour's verdict. Levels follow
+    // the corpus-wide convention — document title → H1; top-level sections
+    // (depth-1 numbers, structural keywords, other prominent text) → H2;
+    // numbered subsections → H3 — because size ratios alone systematically
+    // shifted every level one to two steps down.
+    std::vector<int> line_level(lines.size(), 0);
+    {
+        auto side_of = [&](const TextLine& t) -> int {
+            if (!t.is_column_split) return 0;
+            return ((t.x_left + t.x_right) / 2.0 < col_boundary) ? 1 : 2;
+        };
+        double top_y = -1e9, bot_y = 1e9, page_l = 1e9, page_r = 0;
+        for (auto& t : lines) {
+            top_y = std::max(top_y, t.y_center);
+            bot_y = std::min(bot_y, t.y_center);
+            page_l = std::min(page_l, t.x_left);
+            page_r = std::max(page_r, t.x_right);
+        }
+        // Typical line pitch: median of same-side consecutive gaps.
+        std::vector<double> gap_samples;
+        for (size_t i = 1; i < lines.size(); i++) {
+            if (side_of(lines[i]) != side_of(lines[i - 1])) continue;
+            double g = lines[i - 1].y_center - lines[i].y_center;
+            if (g > 0.5 && g < stats.body_size * 4.0) gap_samples.push_back(g);
+        }
+        double median_gap = stats.body_size * 1.4;
+        if (!gap_samples.empty()) {
+            std::nth_element(gap_samples.begin(),
+                             gap_samples.begin() + gap_samples.size() / 2,
+                             gap_samples.end());
+            median_gap = gap_samples[gap_samples.size() / 2];
+        }
+        auto gap_above = [&](size_t i) -> double {
+            int side = side_of(lines[i]);
+            for (size_t j = i; j-- > 0;) {
+                if (side_of(lines[j]) != side) continue;
+                return lines[j].y_center - lines[i].y_center;
+            }
+            return 1e9;   // first line of its column
+        };
+        // The page's document-title size: the largest heading-tier type in
+        // the top region. Only its lines may become H1.
+        double h1_size = 0;
+        bool has_display = false;
+        double max_bold_fs = 0;
+        for (auto& t : lines) {
+            if (t.rot != 0) continue;
+            if (t.font_size >= stats.body_size * 1.3) {
+                has_display = true;
+                if (t.y_center >= bot_y + (top_y - bot_y) * 0.70)
+                    h1_size = std::max(h1_size, t.font_size);
+            }
+            if (t.is_bold) max_bold_fs = std::max(max_bold_fs, t.font_size);
+        }
+
+        // Author lines run in blocks under the title; once one is
+        // recognized, its same-size neighbours directly below are authors
+        // too even without their own affiliation marks.
+        double auth_y = -1e9, auth_fs = 0;
+        int auth_side = -1, cover_script = -1;
+
+        for (size_t i = 0; i < lines.size(); i++) {
+            const auto& l = lines[i];
+            if (l.rot != 0) continue;   // margin banners, rotated stamps
+            if (!has_letter_codepoint(l.text)) continue;
+            // Pipes come from running heads and table fragments, never from
+            // a heading (they would break the markdown line anyway).
+            if (l.text.find('|') != std::string::npos) continue;
+            size_t cp_len = utf8_length(l.text);
+            int base = stats.heading_level(l.font_size, l.is_bold);
+
+            if (is_section_keyword(l.text) && cp_len <= 24) {
+                line_level[i] = 2;
+                continue;
+            }
+
+            SectionNumber sn = parse_section_number(l.text);
+            size_t sn_off = 0;
+            if (sn.depth == 0) {
+                sn_off = glued_mark_offset(l.text);
+                if (sn_off) sn = parse_section_number(l.text.substr(sn_off));
+            }
+            if (sn.depth > 0 && cp_len <= 60 &&
+                l.y_center > bot_y + stats.body_size * 2.0) {
+                const std::string title = l.text.substr(sn_off + sn.text_pos);
+                char lastc = l.text.back();
+                bool ok = has_letter_codepoint(title) &&
+                          lastc != '.' && lastc != ',' && lastc != ';';
+                if (ok && !sn.closed) {
+                    // A bare number ("1 Introduction") is weaker evidence:
+                    // demand a capitalized or CJK title word.
+                    unsigned char c0 = title[0];
+                    ok = (c0 >= 'A' && c0 <= 'Z') || c0 >= 0xE0;
+                }
+                if (ok && base == 0 && !l.is_bold) {
+                    // Body-type numbered heading: isolation is the only
+                    // signal left — extra space above, and no same-depth
+                    // numbered line at normal pitch below (that is a list).
+                    ok = gap_above(i) >= median_gap * 1.25;
+                    if (ok && i + 1 < lines.size() &&
+                        side_of(lines[i + 1]) == side_of(l) &&
+                        l.y_center - lines[i + 1].y_center < median_gap * 1.2 &&
+                        parse_section_number(lines[i + 1].text).depth ==
+                            sn.depth)
+                        ok = false;
+                }
+                if (ok) {
+                    line_level[i] = (sn.depth == 1) ? 2 : 3;
+                    continue;
+                }
+            }
+
+            // Author lines are tracked whether or not they reach heading
+            // size: the marked names ("Colin Raffel∗") are often set in a
+            // different face from their unmarked neighbours, and the chain
+            // must not restart between them.
+            if (looks_like_author_line(l.text) ||
+                (auth_side == side_of(l) &&
+                 std::fabs(l.font_size - auth_fs) <= 0.6 &&
+                 auth_y - l.y_center > -1.0 &&
+                 auth_y - l.y_center <= median_gap * 2.5)) {
+                auth_side = side_of(l);
+                auth_fs = l.font_size;
+                auth_y = l.y_center;
+                continue;
+            }
+            if (base == 0) {
+                // Cover pages set the title at the page's own body size, so
+                // no size tier exists at all: the largest bold centered
+                // block near the top is the document title; a second block
+                // in the other script is its translation, one level down.
+                if (!has_display && lines.size() <= 30 && l.is_bold &&
+                    cp_len <= 40 && l.font_size >= max_bold_fs - 0.1 &&
+                    l.y_center >= bot_y + (top_y - bot_y) * 0.55) {
+                    double lm = l.x_left - page_l, rm = page_r - l.x_right;
+                    if (std::fabs(lm - rm) < (page_r - page_l) * 0.15) {
+                        int script = line_is_mostly_cjk(l.text) ? 1 : 0;
+                        if (cover_script < 0) cover_script = script;
+                        line_level[i] = (script == cover_script) ? 1 : 2;
+                    }
+                }
+                continue;
+            }
+            if (cp_len > 80 && !l.is_bold) continue;
+            bool is_h1 = h1_size > 0 && l.font_size >= h1_size - 0.1 &&
+                         l.y_center >= bot_y + (top_y - bot_y) * 0.70;
+            if (is_h1) {
+                // Titles are set centered (or unmistakably large); a
+                // left-aligned top section heading stays H2.
+                double lmarg = l.x_left - page_l, rmarg = page_r - l.x_right;
+                bool centered =
+                    std::fabs(lmarg - rmarg) < (page_r - page_l) * 0.15 &&
+                    l.x_right - l.x_left < (page_r - page_l) * 0.95;
+                if (!centered && l.font_size < stats.body_size * 1.6)
+                    is_h1 = false;
+            }
+            line_level[i] = is_h1 ? 1 : 2;
+        }
+    }
 
     std::string md;
     md.reserve(lines.size() * 80);
@@ -631,67 +965,39 @@ std::string page_to_markdown(const std::vector<TextLine>& raw_lines,
         if ((i + 2 >= lines.size() || l.y_center <= bottom_y + 5.0) &&
             is_page_number_footer(l.text)) continue;
 
-        int hlevel = stats.heading_level(l.font_size, l.is_bold);
-
-        if (hlevel >= 3 && !l.is_bold && l.text.size() > 60)
-            hlevel = 0;
-
-        // Bold numbered section headings at body size ("2.1 ...", "4.2.1 ...")
-        if (hlevel == 0 && l.is_bold && l.text.size() < 120) {
-            int depth = section_number_depth(l.text);
-            if (depth >= 2) hlevel = std::min(depth + 2, 6);
-        }
+        int hlevel = line_level[i];
 
         if (hlevel > 0) {
             // A heading that wraps onto several visual lines is one heading.
-            // Fold in immediately following heading lines in the same column
-            // whose vertical gap is a single line height — a wrapped
-            // continuation, never a separate heading (those have body text, and
-            // thus a larger gap, between them). Font size need only be close,
-            // not identical, so a small-caps title (whose lines measure at two
-            // sizes) still merges; the merged heading takes the strongest level.
-            // Whether a line is written mostly in CJK script. Two heading lines
-            // in different scripts (a Korean title stacked above its English
-            // translation) are separate headings, not a wrapped one.
-            auto is_cjk_line = [](const std::string& s) {
-                size_t cjk = 0, letters = 0;
-                for (size_t k = 0; k < s.size();) {
-                    unsigned char c = s[k];
-                    uint32_t cp;
-                    int n;
-                    if (c < 0x80)      { cp = c; n = 1; }
-                    else if (c < 0xE0) { cp = c & 0x1F; n = 2; }
-                    else if (c < 0xF0) { cp = c & 0x0F; n = 3; }
-                    else               { cp = c & 0x07; n = 4; }
-                    for (int b = 1; b < n && k + b < s.size(); b++)
-                        cp = (cp << 6) | (s[k + b] & 0x3F);
-                    k += n;
-                    if (cp > 0x3040) { letters++; if (cp >= 0xAC00 && cp <= 0xD7A3) cjk++; }
-                    else if ((cp | 0x20) - 'a' < 26u) letters++;
-                }
-                return letters > 0 && cjk * 2 >= letters;
-            };
-            std::string heading = l.text;
-            bool head_cjk = is_cjk_line(l.text);
-            while (i + 1 < lines.size()) {
+            // Fold in immediately following lines of the SAME level in the
+            // same column whose vertical gap is about a line height — a
+            // wrapped continuation, never a separate heading. Numbered and
+            // keyword lines always start their own heading; two scripts (a
+            // Korean title over its English translation) stay separate.
+            // Font size need only be close, not identical, so a small-caps
+            // title (whose lines measure at two sizes) still merges.
+            std::string heading = l.text.substr(glued_mark_offset(l.text));
+            bool head_cjk = line_is_mostly_cjk(l.text);
+            while (!is_caption_heading(heading) && i + 1 < lines.size()) {
                 const auto& nx = lines[i + 1];
-                int nx_level = stats.heading_level(nx.font_size, nx.is_bold);
                 bool same_col = nx.is_column_split == l.is_column_split &&
                     ((nx.x_left + nx.x_right) / 2.0 < col_boundary) ==
                     ((l.x_left + l.x_right) / 2.0 < col_boundary);
                 double gap = std::fabs(nx.y_center - lines[i].y_center);
                 double ratio = std::min(nx.font_size, l.font_size) /
                                std::max(nx.font_size, l.font_size);
-                if (nx_level == 0 ||
+                if (line_level[i + 1] == 0 ||
+                    parse_section_number(nx.text).depth > 0 ||
+                    is_section_keyword(nx.text) ||
                     line_swallowed_by_table(nx, tables, captured_cells) ||
                     !same_col ||
                     nx.is_bold != l.is_bold || ratio < 0.75 ||
-                    is_cjk_line(nx.text) != head_cjk ||
-                    gap > l.font_size * 1.5)
+                    line_is_mostly_cjk(nx.text) != head_cjk ||
+                    gap > l.font_size * 1.9)
                     break;
                 heading += ' ';
                 heading += nx.text;
-                hlevel = std::min(hlevel, nx_level);
+                hlevel = std::min(hlevel, line_level[i + 1]);
                 i++;
             }
             if (i > 0) md += '\n';

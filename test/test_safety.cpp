@@ -998,6 +998,31 @@ void test_pdf_dense_grid_outweighs_glyph_crossing() {
     }
 }
 
+void test_pdf_heading_section_number_rules() {
+    using namespace jdoc::pdf_detail;
+
+    CHECK(parse_section_number("1. \xec\x84\x9c\xeb\xa1\xa0").depth == 1);      // "1. 서론"
+    CHECK(parse_section_number("1 Introduction").depth == 1);
+    CHECK(parse_section_number("2.1 Experimental Setup").depth == 2);
+    CHECK(parse_section_number("4.1.2 \xed\x8f\x89\xea\xb0\x80").depth == 3);   // "4.1.2 평가"
+    // Full-width space after the number ("1.<U+3000>서론")
+    CHECK(parse_section_number("1.\xe3\x80\x80\xec\x84\x9c\xeb\xa1\xa0").depth == 1);
+    CHECK(parse_section_number("2024. 3. 1.").depth == 0);   // date, not section
+    CHECK(parse_section_number("0.3 Consumption").depth == 0);  // chart value
+    CHECK(parse_section_number("1) Human Labeling").depth == 0); // list item
+    CHECK(parse_section_number("512 x 512 x 1").depth == 0);
+
+    // Affiliation mark glued ahead of the number: "1)1. 서론"
+    CHECK(glued_mark_offset("1)1. \xec\x84\x9c\xeb\xa1\xa0") == 2);
+    CHECK(glued_mark_offset("1. \xec\x84\x9c\xeb\xa1\xa0") == 0);
+
+    CHECK(is_section_keyword("ABSTRACT"));
+    CHECK(is_section_keyword("References"));
+    // "요<U+3000>약"
+    CHECK(is_section_keyword("\xec\x9a\x94\xe3\x80\x80\xec\x95\xbd"));
+    CHECK(!is_section_keyword("Abstract painting methods"));
+}
+
 void test_pdf_side_by_side_tables_split_at_gutter() {
     using namespace jdoc::pdf_detail;
 
@@ -1569,6 +1594,7 @@ int main() {
     RUN_TEST(test_pdf_cell_assembly_reading_order);
     RUN_TEST(test_pdf_wide_ruled_table_keeps_strong_columns);
     RUN_TEST(test_pdf_dense_grid_outweighs_glyph_crossing);
+    RUN_TEST(test_pdf_heading_section_number_rules);
     RUN_TEST(test_pdf_side_by_side_tables_split_at_gutter);
     RUN_TEST(test_pdf_per_cell_border_fragments_merge_into_rules);
     RUN_TEST(test_pdf_shading_grid_extends_to_aligned_unshaded_columns);

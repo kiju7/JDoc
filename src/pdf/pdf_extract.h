@@ -28,6 +28,17 @@ TableData build_table(const std::vector<double>& row_ys,
                       const std::vector<PdfLineSegment>& v_lines,
                       const PageCharCache& cache);
 
+// Heading-classification helpers (pdf_markdown.cpp), exposed the same way
+// so the section-number and keyword rules can be tested directly.
+struct SectionNumber {
+    int depth = 0;        // numeric segments; 0 = no section number
+    size_t text_pos = 0;  // first byte of the title text
+    bool closed = false;  // '.' closed the number
+};
+SectionNumber parse_section_number(const std::string& text);
+size_t glued_mark_offset(const std::string& text);
+bool is_section_keyword(const std::string& text);
+
 struct FontStats {
     double body_size = 12.0;
 
