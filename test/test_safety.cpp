@@ -998,6 +998,48 @@ void test_pdf_dense_grid_outweighs_glyph_crossing() {
     }
 }
 
+void test_pdf_shading_grid_extends_to_aligned_unshaded_columns() {
+    using namespace jdoc::pdf_detail;
+
+    std::vector<TextChar> chars;
+    std::vector<PdfFillRect> fills;
+    for (int r = 0; r < 8; r++) {
+        double y = 10 + r * 20;
+        for (int c = 0; c < 5; c++) {
+            std::string value = std::string(1, static_cast<char>('A' + c)) +
+                                std::to_string(r);
+            for (size_t k = 0; k < value.size(); k++) {
+                TextChar ch{};
+                ch.left = 65 + c * 50 + k * 5;
+                ch.right = ch.left + 4;
+                ch.x = (ch.left + ch.right) / 2.0;
+                ch.y = y;
+                ch.top = y + 4;
+                ch.bot = y - 4;
+                ch.font_size = 10;
+                ch.unicode = static_cast<unsigned char>(value[k]);
+                chars.push_back(ch);
+            }
+        }
+        for (int c = 2; c < 5; c++) {
+            float x0 = static_cast<float>(50 + c * 50);
+            fills.push_back({x0, static_cast<float>(r * 20), x0 + 50,
+                             static_cast<float>((r + 1) * 20),
+                             0.8f, 0.8f, 0.8f});
+        }
+    }
+    PageCharCache cache;
+    cache.build(chars);
+
+    auto tables = detect_shading_tables(fills, cache, {}, 400, 300);
+    CHECK(tables.size() == 1);
+    CHECK(tables[0].rows.size() == 8);
+    for (auto& row : tables[0].rows) {
+        CHECK(row.size() == 5);
+        for (auto& cell : row) CHECK(!cell.empty());
+    }
+}
+
 void test_pdf_line_width_follows_ctm() {
     using namespace jdoc::pdf_detail;
     const std::string ops =
@@ -1444,6 +1486,7 @@ int main() {
     RUN_TEST(test_pdf_cell_assembly_reading_order);
     RUN_TEST(test_pdf_wide_ruled_table_keeps_strong_columns);
     RUN_TEST(test_pdf_dense_grid_outweighs_glyph_crossing);
+    RUN_TEST(test_pdf_shading_grid_extends_to_aligned_unshaded_columns);
     RUN_TEST(test_pdf_lists_attachments);
     RUN_TEST(test_pdf_preserves_same_named_attachments);
     RUN_TEST(test_pdf_attachment_name_cannot_forge_structure);

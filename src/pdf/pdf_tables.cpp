@@ -1539,6 +1539,49 @@ std::vector<TableData> detect_shading_tables(
         for (auto& r : grid)
             if (r.y0 >= y_min - 3.0 && r.y1 <= y_max + 3.0) rrects.push_back(&r);
 
+        // Shading often starts several columns into a table (for example,
+        // forecast columns are tinted while row labels and historical values
+        // stay white).  Extend a long, coherent shading run to text-inferred
+        // boundaries outside its painted span.  When the inferred grid agrees
+        // with most painted edges, use it as one coherent grid so an
+        // unpainted historical column is not merged into its shaded neighbor.
+        std::vector<double> run_x_levels = x_levels;
+        double synth_left = x_levels.front(), synth_right = x_levels.back();
+        bool text_extended_grid = false;
+        if (run.size() >= 8) {
+            double text_left = 1e9, text_right = -1e9;
+            for (auto& ch : cache.chars) {
+                if (ch.unicode == ' ' || ch.unicode == 0xA0 ||
+                    ch.unicode == '\t') continue;
+                if (ch.y <= y_min + 1.0 || ch.y >= y_max - 1.0) continue;
+                text_left = std::min(text_left, ch.left);
+                text_right = std::max(text_right, ch.right);
+            }
+            if (text_right > text_left) {
+                auto inferred = infer_columns_from_text(
+                    cache, text_left - 2.0, text_right + 2.0, run);
+                int aligned = 0;
+                for (double sx : x_levels) {
+                    for (double tx : inferred) {
+                        if (std::abs(sx - tx) < 12.0) {
+                            aligned++;
+                            break;
+                        }
+                    }
+                }
+                bool expands = !inferred.empty() &&
+                    (inferred.front() < x_levels.front() - 8.0 ||
+                     inferred.back() > x_levels.back() + 8.0);
+                if (inferred.size() >= 4 && expands &&
+                    aligned * 10 >= (int)x_levels.size() * 7) {
+                    run_x_levels = std::move(inferred);
+                    synth_left = run_x_levels.front();
+                    synth_right = run_x_levels.back();
+                    text_extended_grid = true;
+                }
+            }
+        }
+
         std::vector<PdfLineSegment> h_synth, v_synth;
         for (double ry : run) {
             double lo = 1e9, hi = -1e9;
@@ -1548,17 +1591,24 @@ std::vector<TableData> detect_shading_tables(
                     hi = std::max(hi, (double)r->x1);
                 }
             }
-            if (hi > lo)
+            if (hi > lo) {
+                lo = std::min(lo, synth_left);
+                hi = std::max(hi, synth_right);
                 h_synth.push_back({static_cast<float>(lo), static_cast<float>(ry),
                                    static_cast<float>(hi), static_cast<float>(ry)});
+            }
         }
-        for (double cx : x_levels) {
+        for (double cx : run_x_levels) {
             double lo = 1e9, hi = -1e9;
             for (auto* r : rrects) {
                 if (std::abs(r->x0 - cx) < 3.0 || std::abs(r->x1 - cx) < 3.0) {
                     lo = std::min(lo, (double)r->y0);
                     hi = std::max(hi, (double)r->y1);
                 }
+            }
+            if (text_extended_grid) {
+                lo = y_min;
+                hi = y_max;
             }
             if (hi > lo)
                 v_synth.push_back({static_cast<float>(cx), static_cast<float>(lo),
