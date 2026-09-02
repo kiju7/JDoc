@@ -313,6 +313,61 @@ std::vector<std::string> table_captured_text(const std::vector<TableData>& table
     return joined;
 }
 
+// Letters and digits only. ASCII punctuation goes, and so does the U+2000–
+// U+2FFF block (daggers, math operators, arrows) that a marker or symbol
+// glyph contributes; Hangul and CJK (0xE3–0xED lead bytes) stay.
+static std::string alnum_only(const std::string& s) {
+    std::string out;
+    out.reserve(s.size());
+    for (size_t i = 0; i < s.size();) {
+        unsigned char c = s[i];
+        if (c < 0x80) {
+            if ((c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z'))
+                out += static_cast<char>(c);
+            i++;
+            continue;
+        }
+        size_t n = (c < 0xE0) ? 2 : (c < 0xF0) ? 3 : 4;
+        if (c != 0xE2) out.append(s, i, n);
+        i += n;
+    }
+    return out;
+}
+
+// Whether the line's words are (nearly) all present in a table's cell text,
+// alphanumerics only. Tokens under two characters carry no evidence either
+// way; the rest must be found by 75% of their length, with at least one
+// word of three or more characters among the found.
+static bool line_words_in_cells(const std::string& line_text,
+                                const std::string& captured_ws_stripped) {
+    const std::string cap = alnum_only(captured_ws_stripped);
+    if (cap.empty()) return false;
+    size_t total = 0, found = 0;
+    bool found_word = false;
+    size_t i = 0;
+    while (i < line_text.size()) {
+        while (i < line_text.size() &&
+               (line_text[i] == ' ' || line_text[i] == '\t' || line_text[i] == '\n'))
+            i++;
+        size_t j = i;
+        while (j < line_text.size() &&
+               line_text[j] != ' ' && line_text[j] != '\t' && line_text[j] != '\n')
+            j++;
+        if (j > i) {
+            std::string tok = alnum_only(line_text.substr(i, j - i));
+            if (tok.size() >= 2) {
+                total += tok.size();
+                if (cap.find(tok) != std::string::npos) {
+                    found += tok.size();
+                    if (tok.size() >= 3) found_word = true;
+                }
+            }
+        }
+        i = j;
+    }
+    return total >= 3 && found_word && found * 100 >= total * 75;
+}
+
 bool line_in_table(const TextLine& line, const std::vector<TableData>& tables) {
     for (auto& t : tables) {
         double t_bottom = std::min(t.y0, t.y1) - 10.0;
@@ -369,6 +424,13 @@ bool line_swallowed_by_table(const TextLine& line,
         if (lt.empty()) return true;
         if (ti < captured.size() &&
             captured[ti].find(lt) != std::string::npos)
+            return true;
+        // The cells and the line spell the same glyphs differently when a
+        // superscript marker joined a neighbouring row ("8.43†" vs "8.43")
+        // or a bold run lost its word gap, so the exact match fails and the
+        // row is printed twice. Compare alphanumerics only, token by token:
+        // a line whose words are nearly all in the cells was captured.
+        if (ti < captured.size() && line_words_in_cells(line.text, captured[ti]))
             return true;
         // geometric hit but text not captured: check other tables too before
         // deciding to keep the line.

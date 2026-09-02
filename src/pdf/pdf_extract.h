@@ -13,7 +13,21 @@ struct TableData {
     // (their paths must not be mistaken for a vector figure); text tables
     // are alignment-only and own no paths.
     enum Kind { RULED, SHADING, TEXT } kind = RULED;
+    // Header labels that straddle several columns ("BLEU" over EN-DE|EN-FR):
+    // per column of rows[0], how many columns the label starting there
+    // covers (0 = an ordinary cell). Consumed by merge_header_rows.
+    std::vector<int> header_spans;
+    // Per cell, whether every glyph is in a bold face; parallel to rows.
+    // Kept out of the cell text so the shape heuristics (a marker row of
+    // "1 | 2*", a numeric column) still see the bare text; format_table
+    // applies it, and ignores a mask that has fallen out of step with rows.
+    std::vector<std::vector<uint8_t>> cell_bold;
 };
+
+// Fold physical header rows into one: a second row whose first cell is
+// blank (a units row: "(Acc)") or that fills the columns the first row left
+// empty completes the header rather than opening the data.
+void merge_header_rows(TableData& table);
 
 // Ruled-table assembly helpers are exposed in the internal header so geometry
 // regressions can be tested without manufacturing a complete PDF document.

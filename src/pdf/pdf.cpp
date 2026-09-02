@@ -437,6 +437,20 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
                 page_w, page_h, result.col_boundaries[p]);
             for (auto& tt : text_tables)
                 result.all_tables[p].push_back(std::move(tt));
+            for (auto& t : result.all_tables[p])
+                merge_header_rows(t);
+            // JDOC_TABLE_DEBUG: dump every table as detected, to stderr.
+            if (std::getenv("JDOC_TABLE_DEBUG")) {
+                for (auto& t : result.all_tables[p]) {
+                    fprintf(stderr, "[table] page %d kind %d x %.1f..%.1f y %.1f..%.1f rows %zu\n",
+                            p + 1, (int)t.kind, t.x0, t.x1, t.y0, t.y1, t.rows.size());
+                    for (auto& row : t.rows) {
+                        std::string line;
+                        for (auto& c : row) line += "|" + c;
+                        fprintf(stderr, "    %s|\n", line.c_str());
+                    }
+                }
+            }
         }
 
         // Image extraction
