@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <functional>
@@ -303,22 +304,43 @@ std::vector<double> find_column_boundaries(
     return col_xs;
 }
 
+// cell_bold rides along with rows: every site that reshapes rows moves the
+// mask the same way (no-ops when the table carries no mask).
+static void mask_erase_row(TableData& t, size_t r) {
+    if (r < t.cell_bold.size()) t.cell_bold.erase(t.cell_bold.begin() + r);
+}
+static void mask_erase_col(TableData& t, size_t c) {
+    for (auto& m : t.cell_bold)
+        if (c < m.size()) m.erase(m.begin() + c);
+}
+static void mask_pop_col(TableData& t) {
+    for (auto& m : t.cell_bold)
+        if (!m.empty()) m.pop_back();
+}
+
 void trim_table(TableData& table) {
     auto row_empty = [](const std::vector<std::string>& row) {
         for (auto& c : row) if (!c.empty()) return false;
         return true;
     };
-    while (!table.rows.empty() && row_empty(table.rows.back()))
+    while (!table.rows.empty() && row_empty(table.rows.back())) {
         table.rows.pop_back();
-    while (!table.rows.empty() && row_empty(table.rows.front()))
+        mask_erase_row(table, table.rows.size());
+    }
+    while (!table.rows.empty() && row_empty(table.rows.front())) {
         table.rows.erase(table.rows.begin());
+        mask_erase_row(table, 0);
+    }
 
     while (!table.rows.empty() && !table.rows[0].empty()) {
         int last = (int)table.rows[0].size() - 1;
         bool empty = true;
         for (auto& row : table.rows)
             if (last < (int)row.size() && !row[last].empty()) { empty = false; break; }
-        if (empty) { for (auto& row : table.rows) if (!row.empty()) row.pop_back(); }
+        if (empty) {
+            for (auto& row : table.rows) if (!row.empty()) row.pop_back();
+            mask_pop_col(table);
+        }
         else break;
     }
 }
@@ -659,8 +681,10 @@ TableData build_table(const std::vector<double>& row_ys,
     const bool spans_from_vlines = internal_vline_count > 0;
 
     table.rows.resize(n_rows);
+    table.cell_bold.assign(n_rows, {});
     for (int r = 0; r < n_rows; r++) {
         table.rows[r].resize(total_cols);
+        table.cell_bold[r].assign(total_cols, 0);
         int c = 0;
         while (c < n_cols) {
             // Determine span: extend while no v-line at next boundary
@@ -674,23 +698,31 @@ TableData build_table(const std::vector<double>& row_ys,
             double bottom = actual_ys[r];
             double top    = actual_ys[r + 1];
 
+            // A cell set entirely in a bold face keeps the emphasis (mask
+            // only; the text stays bare for the shape heuristics below).
+            auto fill_cell = [&](int col, double l, double t, double rt, double b) {
+                bool bold = false;
+                table.rows[r][col] = cache.get_text_in_rect(l, t, rt, b, &bold);
+                table.cell_bold[r][col] = bold && !table.rows[r][col].empty();
+            };
             if (c + span - 1 == last_col_idx && n_sub > 1 && span == 1) {
                 if (is_scale_row(cache, left, right, bottom, top, sub_boundaries)) {
                     for (int sc = 0; sc < n_sub; sc++) {
-                        table.rows[r][n_cols - 1 + sc] = cache.get_text_in_rect(
+                        fill_cell(n_cols - 1 + sc,
                             sub_boundaries[sc], top, sub_boundaries[sc+1], bottom);
                     }
                 } else {
-                    table.rows[r][c] = cache.get_text_in_rect(left, top, right, bottom);
+                    fill_cell(c, left, top, right, bottom);
                 }
             } else {
-                table.rows[r][c] = cache.get_text_in_rect(left, top, right, bottom);
+                fill_cell(c, left, top, right, bottom);
             }
             c += span;
         }
     }
 
     std::reverse(table.rows.begin(), table.rows.end());
+    std::reverse(table.cell_bold.begin(), table.cell_bold.end());
 
     // Text-row splitting of an under-segmented grid separates the wrap
     // lines of multi-line cells into their own rows; a row with a single
@@ -711,6 +743,7 @@ TableData build_table(const std::vector<double>& row_ys,
                 if (!digit_wrap) prev[fc] += " ";
                 prev[fc] += row[fc];
                 table.rows.erase(table.rows.begin() + r);
+                mask_erase_row(table, r);
             } else {
                 r++;
             }
@@ -734,6 +767,7 @@ TableData build_table(const std::vector<double>& row_ys,
             if (!table.title.empty()) table.title += " ";
             table.title += row[0];
             table.rows.erase(table.rows.begin());
+            mask_erase_row(table, 0);
         }
     }
 
@@ -1657,6 +1691,7 @@ std::vector<TableData> detect_tables(const std::vector<PdfLineSegment>& lines,
         if (below && below->title.empty()) {
             below->title = text;
             t.rows.pop_back();
+            mask_erase_row(t, t.rows.size());
         }
     }
     return result;
@@ -1936,7 +1971,7 @@ std::vector<TableData> detect_shading_tables(
 namespace text_tables {
 
 struct CharInfo { double x, y, left, right, top, bot; unsigned int unicode;
-                  int16_t rot; };
+                  int16_t rot; bool is_bold; };
 
 struct TextRow {
     double y_center;
@@ -2146,6 +2181,63 @@ static std::vector<double> infer_columns_in_band(
     return bounds;
 }
 
+// A torn top row may be a spanning header ("BLEU" centred over EN-DE and
+// EN-FR) rather than drifted prose: each of its glyph runs sits centred over
+// a run of whole columns instead of being cut mid-word by a boundary the
+// rows below agree on. Fills the header cells (each run in its leftmost
+// column) and the span per column; false when the row is not that shape.
+static bool spanning_header_cells(const std::vector<size_t>& ci,
+                                  const std::vector<CharInfo>& chars,
+                                  const std::vector<double>& row_bounds,
+                                  double min_split_gap, double word_gap,
+                                  std::vector<std::string>& cells,
+                                  std::vector<int>& spans) {
+    int n_cols = (int)row_bounds.size() - 1;
+    struct Run { std::string text; double left, right; };
+    std::vector<Run> runs;
+    double prev_right = -1e9;
+    for (size_t idx : ci) {
+        const auto& ch = chars[idx];
+        if (ch.rot != 0) return false;
+        if (runs.empty() || ch.left - prev_right >= min_split_gap)
+            runs.push_back({"", ch.left, ch.right});
+        else if (ch.left - prev_right >= word_gap)
+            runs.back().text += ' ';
+        util::append_utf8(runs.back().text, ch.unicode);
+        runs.back().right = std::max(runs.back().right, ch.right);
+        prev_right = std::max(prev_right, ch.right);
+    }
+    if (runs.empty() || (int)runs.size() > n_cols) return false;
+    auto col_of = [&](double x) {
+        for (int c = 0; c < n_cols; c++)
+            if (x < row_bounds[c + 1]) return c;
+        return n_cols - 1;
+    };
+    cells.assign(n_cols, "");
+    spans.assign(n_cols, 0);
+    bool any_span = false, any_letter = false;
+    for (auto& r : runs) {
+        // A header names something; a row of affiliation marks ("1 2* 1")
+        // over an author block has no letter in it.
+        for (unsigned char ch : r.text)
+            if ((ch | 0x20) - 'a' < 26u || ch >= 0x80) { any_letter = true; break; }
+        int lo = col_of(r.left), hi = col_of(r.right);
+        int span = hi - lo + 1;
+        // A run across every column is a caption line, and a long one is
+        // prose; a second run landing in a taken column is ordinary text.
+        if (span >= n_cols || r.text.size() > 60 || !cells[lo].empty()) return false;
+        if (span >= 2) {
+            double span_l = row_bounds[lo], span_r = row_bounds[hi + 1];
+            double off = std::fabs((r.left + r.right) / 2.0 - (span_l + span_r) / 2.0);
+            if (off > (span_r - span_l) * 0.3) return false;
+            any_span = true;
+        }
+        cells[lo] = r.text;
+        spans[lo] = span;
+    }
+    return any_span && any_letter;
+}
+
 // S3: build the table from a band + columns.
 // For each row, snap each inner column boundary to the nearest natural gap
 // in that row (so we don't split words). Falls back to the global boundary if
@@ -2177,6 +2269,13 @@ static TableData build_table_from_band(
     double torn_gap = std::max(median_fs * 0.2, 1.2);
     double near_win = median_fs * 3.0;
     std::vector<bool> row_has_tear;   // parallel to table.rows
+    // A spanning header found at the top waits until the body is built: it
+    // only joins a table that stands on three data rows of its own, so an
+    // author block (marker row over two name rows) cannot reach the row
+    // minimum by counting its markers as a header.
+    bool have_pending_header = false;
+    std::vector<std::string> pending_header;
+    std::vector<int> pending_spans, pending_near, pending_torn;
 
     for (size_t k = band.first_row; k <= band.last_row; k++) {
         const auto& tr = rows[k];
@@ -2221,7 +2320,13 @@ static TableData build_table_from_band(
                 row_bounds[c] = row_bounds[c-1] + 0.1;
         }
 
-        int row_torn = 0;
+        int row_torn = 0, row_overflow = 0;
+        std::vector<int> row_near(n_cols + 1, 0), row_torn_at(n_cols + 1, 0);
+        // The row's own type size: a display title's word spaces scale with
+        // it, so the gap that separates an overflowing label from the next
+        // cell is measured against the row, not the page median.
+        double row_fs = 0;
+        for (size_t idx : ci) row_fs = std::max(row_fs, chars[idx].top - chars[idx].bot);
         for (int c = 1; c < (int)row_bounds.size() - 1; c++) {
             double b = row_bounds[c];
             const CharInfo* prev = nullptr;
@@ -2235,20 +2340,79 @@ static TableData build_table_from_band(
             if (b - prev->right > near_win || next->left - b > near_win)
                 continue;
             near_cnt[c]++;
+            row_near[c]++;
             if (next->left - prev->right < torn_gap) {
-                torn_cnt[c]++;
-                row_torn++;
+                // A label longer than its column overflows into the
+                // neighbour's whitespace but still ends in a real gap before
+                // the neighbour's own text ("GoogLeNet [44] (ILSVRC'14)"
+                // beside "-"); a prose line torn by a phantom boundary runs
+                // on with word spaces only. Overflow is not a tear.
+                // The gap that ends an overflowing label is cell padding, a
+                // font size or more; a word space in a large title (which
+                // can exceed the split gap) is not.
+                const double overflow_gap = std::max({median_fs, row_fs, 8.0});
+                bool overflow = false;
+                double run_end = next->right;
+                for (size_t idx : ci) {
+                    const auto& ch = chars[idx];
+                    if (ch.left < next->left) continue;
+                    if (ch.left - run_end >= overflow_gap) {
+                        overflow = run_end <= row_bounds[c + 1];
+                        break;
+                    }
+                    run_end = std::max(run_end, ch.right);
+                }
+                if (!overflow) {
+                    torn_cnt[c]++;
+                    row_torn_at[c]++;
+                    row_torn++;
+                } else {
+                    row_overflow++;
+                }
             }
         }
         // A row whose glyphs are cut mid-word by two or more boundaries is
         // prose that drifted into the band (a paragraph line right below a
         // table): evict it. The capture check in the markdown pass returns
-        // the line to the prose flow.
+        // the line to the prose flow. Above the first data row the same
+        // shape is a spanning header, which tears by construction; it is
+        // kept, and its tears are not evidence against the boundaries.
+        if (std::getenv("JDOC_TABLE_DEBUG")) {
+            std::string dbg;
+            for (size_t idx : ci) util::append_utf8(dbg, chars[idx].unicode);
+            fprintf(stderr, "[text-row] y %.1f torn %d n %zu: %s\n",
+                    tr.y_center, row_torn, ci.size(), dbg.c_str());
+        }
+        // A header needs a body: three or more rows below it, or the band
+        // is a display equation whose aligned pieces line up. Any glyph run
+        // across a boundary (torn or overflowing) qualifies the top row.
+        if (table.rows.empty() && band.last_row - k >= 3 &&
+            row_torn + row_overflow >= 1) {
+            std::vector<std::string> hcells;
+            std::vector<int> hspans;
+            if (!have_pending_header &&
+                spanning_header_cells(ci, chars, row_bounds, min_split_gap,
+                                      word_gap, hcells, hspans)) {
+                for (int c = 1; c < n_cols; c++) {
+                    near_cnt[c] -= row_near[c];
+                    torn_cnt[c] -= row_torn_at[c];
+                }
+                have_pending_header = true;
+                pending_header = std::move(hcells);
+                pending_spans = std::move(hspans);
+                pending_near = row_near;
+                pending_torn = row_torn_at;
+                continue;
+            }
+        }
         if (row_torn >= 2) continue;
 
         std::vector<std::string> cells(n_cols);
         std::vector<double> last_right(n_cols, -1e9);
         std::vector<int16_t> last_rot(n_cols, 0);
+        std::vector<int> glyphs(n_cols, 0), bold_glyphs(n_cols, 0);
+        int run_col = 0;
+        double run_right = -1e9;
 
         // Column assignment above works in page space, but the text of a cell
         // has to be emitted in the run's own reading order — a 180° run
@@ -2303,6 +2467,18 @@ static TableData build_table_from_band(
                 if (cmid < row_bounds.front()) col = 0;
                 else col = n_cols - 1;
             }
+            // A run of glyphs with no cell-sized gap inside it is one cell's
+            // text even where a boundary (placed by the other rows) cuts it:
+            // a label wider than its column keeps its tail rather than
+            // dropping "’14)" into the neighbour. Upright rows only — a
+            // rotated run's page-space gaps do not measure its advance.
+            if (!rotated) {
+                if (run_right > -1e8 && ch.left - run_right < min_split_gap)
+                    col = run_col;
+                else
+                    run_col = col;
+                run_right = std::max(run_right, ch.right);
+            }
             // Word gaps are measured along the advance too, so a rotated run
             // does not read as one gapless word (its page-space gaps run
             // backwards and never clear the threshold). Across a direction
@@ -2317,11 +2493,45 @@ static TableData build_table_from_band(
             util::append_utf8(cells[col], ch.unicode);
             last_right[col] = hi;
             last_rot[col] = ch.rot;
+            glyphs[col]++;
+            if (ch.is_bold) bold_glyphs[col]++;
         }
 
-        for (auto& c : cells) c = util::trim(c);
+        std::vector<uint8_t> bold_mask(n_cols, 0);
+        for (int c = 0; c < n_cols; c++) {
+            cells[c] = util::trim(cells[c]);
+            // A cell set entirely in a bold face keeps the emphasis (the
+            // best value in a results table); a mixed cell stays plain.
+            bold_mask[c] = !cells[c].empty() && glyphs[c] > 0 && bold_glyphs[c] == glyphs[c];
+        }
         table.rows.push_back(std::move(cells));
+        table.cell_bold.push_back(std::move(bold_mask));
         row_has_tear.push_back(row_torn > 0);
+    }
+
+    if (have_pending_header) {
+        // The header stands only on a body of three rows that each fill two
+        // or more cells; an author block (a marker row, a name row, a lone
+        // keyword) does not reach that by having a title above it.
+        int body_rows = 0;
+        for (auto& row : table.rows) {
+            int filled = 0;
+            for (auto& c : row) if (!c.empty()) filled++;
+            if (filled >= 2) body_rows++;
+        }
+        if (body_rows >= 3) {
+            table.rows.insert(table.rows.begin(), std::move(pending_header));
+            table.cell_bold.insert(table.cell_bold.begin(), std::vector<uint8_t>(n_cols, 0));
+            row_has_tear.insert(row_has_tear.begin(), false);
+            table.header_spans = std::move(pending_spans);
+        } else {
+            // Not a header after all: its tears count against the boundaries
+            // like any other row's.
+            for (int c = 1; c < n_cols; c++) {
+                near_cnt[c] += pending_near[c];
+                torn_cnt[c] += pending_torn[c];
+            }
+        }
     }
 
     // A boundary that cuts through touching glyphs on 30%+ of its populated
@@ -2352,10 +2562,14 @@ static TableData build_table_from_band(
             size_t w = 0;
             for (size_t r = 0; r < table.rows.size(); r++) {
                 if (row_has_tear[r]) continue;
-                if (w != r) table.rows[w] = std::move(table.rows[r]);
+                if (w != r) {
+                    table.rows[w] = std::move(table.rows[r]);
+                    table.cell_bold[w] = std::move(table.cell_bold[r]);
+                }
                 w++;
             }
             table.rows.resize(w);
+            table.cell_bold.resize(w);
         } else {
             table.rows.clear();
             return table;
@@ -2409,6 +2623,9 @@ static void strip_prose_columns(TableData& table) {
                     stripped_bytes += row.front().size();
                     row.erase(row.begin());
                 }
+            if (!table.header_spans.empty())
+                table.header_spans.erase(table.header_spans.begin());
+            mask_erase_col(table, 0);
             stripped = true;
         }
         // Right edge prose (recompute n_cols if changed)
@@ -2419,6 +2636,8 @@ static void strip_prose_columns(TableData& table) {
                     stripped_bytes += row.back().size();
                     row.pop_back();
                 }
+            if (!table.header_spans.empty()) table.header_spans.pop_back();
+            mask_pop_col(table);
             stripped = true;
         }
         if (!stripped) break;
@@ -2442,6 +2661,20 @@ static bool accept_table(TableData& table) {
     // pre-step: strip body-text columns adjacent to the table
     strip_prose_columns(table);
     if (table.rows.empty()) return false;
+
+    // A display equation: the pieces of a fraction align into short rows,
+    // with the equation number "(5)" alone in the last column. Rows of a
+    // real table never end in a bare parenthesised number.
+    if (table.rows.size() <= 5) {
+        auto eq_label = [](const std::string& s) {
+            if (s.size() < 3 || s.size() > 6 || s.front() != '(' || s.back() != ')') return false;
+            for (size_t i = 1; i + 1 < s.size(); i++)
+                if (s[i] < '0' || s[i] > '9') return false;
+            return true;
+        };
+        for (auto& row : table.rows)
+            if (!row.empty() && eq_label(row.back())) return false;
+    }
     int n_cols = (int)table.rows[0].size();
     if (n_cols < 2) return false;
 
@@ -2480,6 +2713,7 @@ static bool accept_table(TableData& table) {
             if (!digit_wrap) prev += " ";
             prev += next;
             table.rows.erase(table.rows.begin() + r);
+            mask_erase_row(table, r);
             r--;
         }
     }
@@ -2564,6 +2798,18 @@ static bool accept_table(TableData& table) {
                         ((unsigned char)cell[i+2] == 0xA0 ||    // dagger
                          (unsigned char)cell[i+2] == 0xA1)) {   // double dagger
                         units++; has_sym = true; i += 3; continue;
+                    }
+                    // The interpunct that joins Korean author names ("권석재⋅
+                    // 이정호") rides along in the marker row; it separates
+                    // marks, it is not one.
+                    if (c == 0xE2 && i + 2 < cell.size() &&
+                        (unsigned char)cell[i+1] == 0x8B &&
+                        (unsigned char)cell[i+2] == 0x85) {     // U+22C5
+                        i += 3; continue;
+                    }
+                    if (c == 0xC2 && i + 1 < cell.size() &&
+                        (unsigned char)cell[i+1] == 0xB7) {     // U+00B7
+                        i += 2; continue;
                     }
                     ok = false;
                     break;
@@ -2861,7 +3107,7 @@ static std::vector<TableData> detect_text_tables_range(
         if (ch.x < 0 || ch.x > page_width || ch.y < 0 || ch.y > page_height) continue;
         if (ch.x < x_lo || ch.x >= x_hi) continue;
         chars.push_back({ch.x, ch.y, ch.left, ch.right, ch.top, ch.bot,
-                         ch.unicode, ch.rot});
+                         ch.unicode, ch.rot, ch.is_bold});
     }
     if (chars.size() < 10) return {};
 
@@ -3097,16 +3343,96 @@ std::vector<TableData> detect_text_tables(const PageCharCache& cache,
     return result;
 }
 
+// Whether a cell reads as a header label: short and holding a letter. A
+// number, a reference mark ("[39]") or a dash is what a data row is made of.
+static bool header_like_cell(const std::string& s, size_t max_len) {
+    if (s.empty()) return true;
+    if (s.size() > max_len) return false;
+    for (unsigned char c : s)
+        if ((c | 0x20) - 'a' < 26u || c >= 0x80) return true;
+    return false;
+}
+
+static bool header_like_row(const std::vector<std::string>& row, size_t max_len) {
+    int filled = 0;
+    for (auto& c : row) {
+        if (!header_like_cell(c, max_len)) return false;
+        if (!c.empty()) filled++;
+    }
+    return filled > 0;
+}
+
+void merge_header_rows(TableData& table) {
+    for (int pass = 0; pass < 2; pass++) {
+        if (table.rows.size() < 3) break;
+        auto& r0 = table.rows[0];
+        auto& r1 = table.rows[1];
+        size_t n = std::min(r0.size(), r1.size());
+        if (n == 0 || !header_like_row(r0, 48) || !header_like_row(r1, 30)) break;
+        // r1 completes r0 when it is a units row (every cell under a label:
+        // "(Acc)" under "MNLI-m"), when its few cells fill columns r0 left
+        // empty ("Model" set between the header lines), or when r0's labels
+        // are known spans over it. A wide sub-label row under two sparse
+        // labels with no span information ("Consonant … Vowel" over 35
+        // jamo) stays a row of its own: folding it would lose both labels.
+        int r0_filled = 0, r1_filled = 0, overlap = 0;
+        for (size_t c = 0; c < n; c++) {
+            if (!r0[c].empty()) r0_filled++;
+            if (!r1[c].empty()) r1_filled++;
+            if (!r0[c].empty() && !r1[c].empty()) overlap++;
+        }
+        const bool units_row = r1[0].empty() && overlap == r1_filled;
+        const bool sparse_fill = overlap == 0 && r1_filled <= r0_filled;
+        if (!units_row && !sparse_fill && table.header_spans.empty()) break;
+
+        const auto& spans = table.header_spans;
+        bool spans_used = false;
+        std::vector<std::string> merged(r0.size());
+        for (size_t c = 0; c < r0.size(); c++) {
+            std::string top = r0[c];
+            if (top.empty() && c < n && !r1[c].empty() && !spans.empty()) {
+                // Inherit the spanning label whose columns cover c.
+                for (size_t s = c + 1; s-- > 0;) {
+                    if (s < spans.size() && spans[s] > 0) {
+                        if (c < s + (size_t)spans[s]) { top = r0[s]; spans_used = true; }
+                        break;
+                    }
+                }
+            }
+            std::string below = (c < n) ? r1[c] : "";
+            if (top.empty()) merged[c] = below;
+            else if (below.empty()) merged[c] = top;
+            else merged[c] = top + " " + below;
+        }
+        table.rows[0] = std::move(merged);
+        table.rows.erase(table.rows.begin() + 1);
+        mask_erase_row(table, 1);
+        if (!table.cell_bold.empty())
+            std::fill(table.cell_bold[0].begin(), table.cell_bold[0].end(), 0);
+        if (spans_used) table.header_spans.clear();
+    }
+}
+
 std::string format_table(const TableData& table) {
     if (table.rows.empty()) return "";
 
+    // The bold mask is applied here, at the end, and only while it still
+    // matches the rows it was built for.
+    const bool use_mask = table.cell_bold.size() == table.rows.size();
     std::vector<std::vector<std::string>> filtered;
     for (size_t r = 0; r < table.rows.size(); r++) {
         bool all_empty = true;
         for (auto& cell : table.rows[r])
             if (!cell.empty()) { all_empty = false; break; }
-        if (!all_empty || r == 0)
+        if (!all_empty || r == 0) {
             filtered.push_back(table.rows[r]);
+            if (use_mask) {
+                auto& row = filtered.back();
+                const auto& m = table.cell_bold[r];
+                for (size_t c = 0; c < row.size() && c < m.size(); c++)
+                    if (m[c] && !row[c].empty()) row[c] = "**" + row[c] + "**";
+            }
+        }
     }
     if (filtered.empty()) return "";
 

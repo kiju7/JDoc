@@ -235,6 +235,7 @@ struct PageCharCache {
         double font_size;
         unsigned int unicode;
         int16_t rot;   // writing direction, as TextChar::rot
+        bool is_bold;  // a cell set entirely in a bold face is emitted bold
     };
     std::vector<CharInfo> chars;
     std::vector<size_t> y_sorted;
@@ -243,7 +244,8 @@ struct PageCharCache {
         chars.reserve(text_chars.size());
         for (auto& tc : text_chars) {
             if (tc.unicode == 0 || tc.unicode == '\r' || tc.unicode == '\n' || tc.unicode == 0xFFFD) continue;
-            chars.push_back({tc.x, tc.y, tc.left, tc.right, tc.top, tc.bot, tc.font_size, tc.unicode, tc.rot});
+            chars.push_back({tc.x, tc.y, tc.left, tc.right, tc.top, tc.bot, tc.font_size, tc.unicode, tc.rot,
+                             tc.is_bold});
         }
         y_sorted.resize(chars.size());
         for (size_t i = 0; i < chars.size(); i++) y_sorted[i] = i;
@@ -251,7 +253,10 @@ struct PageCharCache {
             [this](size_t a, size_t b) { return chars[a].y < chars[b].y; });
     }
 
-    std::string get_text_in_rect(double left, double top, double right, double bottom) const {
+    // all_bold, when given, reports whether every glyph in the rect is bold
+    // (false for an empty rect) so a ruled cell can keep its emphasis.
+    std::string get_text_in_rect(double left, double top, double right, double bottom,
+                                 bool* all_bold = nullptr) const {
         double rect_top = std::max(top, bottom);
         double rect_bot = std::min(top, bottom);
         double y_lo = rect_bot + 0.5, y_hi = rect_top - 0.5;
@@ -295,6 +300,7 @@ struct PageCharCache {
         double prev_fs = 12.0;
         int16_t prev_rot = 0;
         bool first = true;
+        int glyphs = 0, bold_glyphs = 0;
         for (size_t idx : matches) {
             auto& ch = chars[idx];
             double fs = ch.font_size > 1.0 ? ch.font_size : 12.0;
@@ -341,7 +347,12 @@ struct PageCharCache {
             prev_fs = fs;
             prev_rot = ch.rot;
             first = false;
+            if (ch.unicode != ' ' && ch.unicode != 0xA0) {
+                glyphs++;
+                if (ch.is_bold) bold_glyphs++;
+            }
         }
+        if (all_bold) *all_bold = glyphs > 0 && bold_glyphs == glyphs;
         size_t s = text.find_first_not_of(" ");
         size_t e = text.find_last_not_of(" ");
         if (s != std::string::npos) return text.substr(s, e - s + 1);

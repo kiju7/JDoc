@@ -479,6 +479,9 @@ struct PdfFont {
     std::unordered_map<uint32_t, uint32_t> cid_to_unicode; // CID → Unicode from ToUnicode
     const uint32_t* encoding_table = nullptr; // WinAnsi, MacRoman, etc.
     std::unordered_map<int, std::string> differences; // /Differences array
+    // Glyph names of the encoding built into the embedded Type1 program, read
+    // when the PDF names no base encoding (Computer Modern math fonts).
+    std::unordered_map<int, std::string> builtin_names;
     std::unordered_map<uint32_t, double> widths; // char code → width in 1/1000 of text space
     double default_width = 1000; // default glyph width in 1/1000 units
     double missing_width = 0;    // /MissingWidth from FontDescriptor
@@ -526,11 +529,20 @@ struct PdfFont {
             if (u) return u;
         }
 
-        // 4. Encoding table
+        // 4. The program's own encoding, by glyph name
+        if (!builtin_names.empty()) {
+            auto bn = builtin_names.find(static_cast<int>(code));
+            if (bn != builtin_names.end()) {
+                uint32_t u = glyph_name_to_unicode(bn->second);
+                if (u) return u;
+            }
+        }
+
+        // 5. Encoding table
         if (encoding_table && code < 256)
             return encoding_table[code];
 
-        // 5. Fallback
+        // 6. Fallback
         return (code < 128) ? code : 0xFFFD;
     }
 };

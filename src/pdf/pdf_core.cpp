@@ -7,6 +7,7 @@
 #include <fstream>
 #include <zlib.h>
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <cmath>
 #include <cstdlib>
@@ -17,6 +18,7 @@
 #include <numeric>
 #include <sstream>
 #include <stdexcept>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -1000,11 +1002,82 @@ uint32_t glyph_name_to_unicode(const std::string& name) {
         {"hungarumlaut", 0x2DD}, {"cedilla", 0xB8}, {"acute", 0xB4},
         {"dieresis", 0xA8}, {"macron", 0xAF}, {"breve", 0x2D8},
     };
+    // The names TeX's Computer Modern and AMS fonts use for math symbols and
+    // Greek. Their glyphs sit at control codes and letter codes in the
+    // program's own encoding, so without the name a minus sign is lost and
+    // a dagger reads as 'y'.
+    static const std::unordered_map<std::string, uint32_t> math_table = {
+        {"asteriskmath", 0x2217}, {"periodcentered", 0x00B7}, {"similar", 0x223C},
+        {"bardbl", 0x2016}, {"minusplus", 0x2213}, {"diamondmath", 0x22C4},
+        {"circleplus", 0x2295}, {"circleminus", 0x2296}, {"circlemultiply", 0x2297},
+        {"circledivide", 0x2298}, {"circledot", 0x2299}, {"circlecopyrt", 0x00A9},
+        {"openbullet", 0x25E6}, {"equivasymptotic", 0x224D}, {"equivalence", 0x2261},
+        {"reflexsubset", 0x2286}, {"reflexsuperset", 0x2287},
+        {"precedesequal", 0x2AAF}, {"followsequal", 0x2AB0},
+        {"propersubset", 0x2282}, {"propersuperset", 0x2283},
+        {"lessmuch", 0x226A}, {"greatermuch", 0x226B}, {"precedes", 0x227A},
+        {"follows", 0x227B}, {"arrowleft", 0x2190}, {"arrowright", 0x2192},
+        {"arrowup", 0x2191}, {"arrowdown", 0x2193}, {"arrowboth", 0x2194},
+        {"arrownortheast", 0x2197}, {"arrowsoutheast", 0x2198},
+        {"arrownorthwest", 0x2196}, {"arrowsouthwest", 0x2199},
+        {"similarequal", 0x2243}, {"arrowdblleft", 0x21D0}, {"arrowdblright", 0x21D2},
+        {"arrowdblup", 0x21D1}, {"arrowdbldown", 0x21D3}, {"arrowdblboth", 0x21D4},
+        {"proportional", 0x221D}, {"prime", 0x2032}, {"element", 0x2208},
+        {"owner", 0x220B}, {"triangle", 0x25B3}, {"triangleinv", 0x25BD},
+        {"negationslash", 0x0338}, {"mapsto", 0x21A6}, {"universal", 0x2200},
+        {"existential", 0x2203}, {"logicalnot", 0x00AC}, {"emptyset", 0x2205},
+        {"Rfractur", 0x211C}, {"Ifractur", 0x2111}, {"latticetop", 0x22A4},
+        {"perpendicular", 0x22A5}, {"aleph", 0x2135}, {"union", 0x222A},
+        {"intersection", 0x2229}, {"unionmulti", 0x228E}, {"logicaland", 0x2227},
+        {"logicalor", 0x2228}, {"turnstileleft", 0x22A2}, {"turnstileright", 0x22A3},
+        {"floorleft", 0x230A}, {"floorright", 0x230B}, {"ceilingleft", 0x2308},
+        {"ceilingright", 0x2309}, {"angbracketleft", 0x27E8}, {"angbracketright", 0x27E9},
+        {"arrowbothv", 0x2195}, {"arrowdblbothv", 0x21D5}, {"wreathproduct", 0x2240},
+        {"coproduct", 0x2210}, {"nabla", 0x2207}, {"unionsq", 0x2294},
+        {"intersectionsq", 0x2293}, {"subsetsqequal", 0x2291}, {"supersetsqequal", 0x2292},
+        {"club", 0x2663}, {"diamond", 0x25C7}, {"heart", 0x2661}, {"spade", 0x2660},
+        {"partialdiff", 0x2202}, {"flat", 0x266D}, {"natural", 0x266E}, {"sharp", 0x266F},
+        {"weierstrass", 0x2118}, {"vector", 0x20D7}, {"tie", 0x2040}, {"lscript", 0x2113},
+        {"star", 0x22C6}, {"triangleright", 0x25B7}, {"triangleleft", 0x25C1},
+        {"dotlessi", 0x0131}, {"dotlessj", 0x0237}, {"suppress", 0},
+        {"Gamma", 0x0393}, {"Delta", 0x0394}, {"Theta", 0x0398}, {"Lambda", 0x039B},
+        {"Xi", 0x039E}, {"Pi", 0x03A0}, {"Sigma", 0x03A3}, {"Upsilon", 0x03A5},
+        {"Phi", 0x03A6}, {"Psi", 0x03A8}, {"Omega", 0x03A9},
+        {"alpha", 0x03B1}, {"beta", 0x03B2}, {"gamma", 0x03B3}, {"delta", 0x03B4},
+        {"epsilon", 0x03B5}, {"zeta", 0x03B6}, {"eta", 0x03B7}, {"theta", 0x03B8},
+        {"iota", 0x03B9}, {"kappa", 0x03BA}, {"lambda", 0x03BB}, {"nu", 0x03BD},
+        {"xi", 0x03BE}, {"omicron", 0x03BF}, {"pi", 0x03C0}, {"rho", 0x03C1},
+        {"sigma", 0x03C3}, {"tau", 0x03C4}, {"upsilon", 0x03C5}, {"phi", 0x03C6},
+        {"chi", 0x03C7}, {"psi", 0x03C8}, {"omega", 0x03C9},
+        {"epsilon1", 0x03F5}, {"theta1", 0x03D1}, {"pi1", 0x03D6}, {"rho1", 0x03F1},
+        {"sigma1", 0x03C2}, {"phi1", 0x03D5},
+        {"quotedblbase", 0x201E}, {"quotesinglbase", 0x201A}, {"perthousand", 0x2030},
+        {"fraction", 0x2044}, {"florin", 0x0192}, {"guilsinglleft", 0x2039},
+        {"guilsinglright", 0x203A}, {"periodcentered", 0x00B7},
+    };
     // Single letter names: A-Z, a-z
     if (name.size() == 1 && ((name[0] >= 'A' && name[0] <= 'Z') || (name[0] >= 'a' && name[0] <= 'z')))
         return static_cast<uint32_t>(name[0]);
     auto it = table.find(name);
-    return (it != table.end()) ? it->second : 0;
+    if (it != table.end()) return it->second;
+    auto mt = math_table.find(name);
+    if (mt != math_table.end()) return mt->second;
+    // "uni20AC" / "u1F600": the code point spelled in the name (AGL §6).
+    auto hex_at = [&](size_t off, size_t len) -> uint32_t {
+        if (name.size() < off + len) return 0;
+        uint32_t v = 0;
+        for (size_t i = off; i < off + len; i++) {
+            char c = name[i];
+            int d = (c >= '0' && c <= '9') ? c - '0'
+                  : (c >= 'A' && c <= 'F') ? c - 'A' + 10 : -1;
+            if (d < 0) return 0;
+            v = v * 16 + static_cast<uint32_t>(d);
+        }
+        return v;
+    };
+    if (name.compare(0, 3, "uni") == 0 && name.size() >= 7) return hex_at(3, 4);
+    if (name[0] == 'u' && name.size() >= 5 && name.size() <= 7) return hex_at(1, name.size() - 1);
+    return 0;
 }
 
 // WinAnsiEncoding (PDF spec, Appendix D)
@@ -1236,6 +1309,81 @@ void parse_tounicode_cmap(PdfDoc& doc, const PdfObj& tu_obj, PdfFont& font) {
     }
 }
 
+// StandardEncoding (PDF 32000 Annex D): the base encoding of a Type1 program
+// that declares "/Encoding StandardEncoding def". Differs from WinAnsi in the
+// quotes (0x27 is quoteright, 0x60 quoteleft) and everywhere above 0x7F.
+static const uint32_t* standard_encoding() {
+    static const std::array<uint32_t, 256> t = [] {
+        std::array<uint32_t, 256> a{};
+        for (uint32_t i = 0x20; i < 0x7F; i++) a[i] = i;
+        a[0x27] = 0x2019; a[0x60] = 0x2018;
+        static const struct { int code; uint32_t u; } hi[] = {
+            {0xA1, 0xA1}, {0xA2, 0xA2}, {0xA3, 0xA3}, {0xA4, 0x2044}, {0xA5, 0xA5},
+            {0xA6, 0x192}, {0xA7, 0xA7}, {0xA8, 0xA4}, {0xA9, 0x27}, {0xAA, 0x201C},
+            {0xAB, 0xAB}, {0xAC, 0x2039}, {0xAD, 0x203A}, {0xAE, 0xFB01}, {0xAF, 0xFB02},
+            {0xB1, 0x2013}, {0xB2, 0x2020}, {0xB3, 0x2021}, {0xB4, 0xB7}, {0xB6, 0xB6},
+            {0xB7, 0x2022}, {0xB8, 0x201A}, {0xB9, 0x201E}, {0xBA, 0x201D}, {0xBB, 0xBB},
+            {0xBC, 0x2026}, {0xBD, 0x2030}, {0xBF, 0xBF}, {0xC1, 0x60}, {0xC2, 0xB4},
+            {0xC3, 0x2C6}, {0xC4, 0x2DC}, {0xC5, 0xAF}, {0xC6, 0x2D8}, {0xC7, 0x2D9},
+            {0xC8, 0xA8}, {0xCA, 0x2DA}, {0xCB, 0xB8}, {0xCD, 0x2DD}, {0xCE, 0x2DB},
+            {0xCF, 0x2C7}, {0xD0, 0x2014}, {0xE1, 0xC6}, {0xE3, 0xAA}, {0xE8, 0x141},
+            {0xE9, 0xD8}, {0xEA, 0x152}, {0xEB, 0xBA}, {0xF1, 0xE6}, {0xF5, 0x131},
+            {0xF8, 0x142}, {0xF9, 0xF8}, {0xFA, 0x153}, {0xFB, 0xDF},
+        };
+        for (auto& e : hi) a[e.code] = e.u;
+        return a;
+    }();
+    return t.data();
+}
+
+// The encoding built into an embedded Type1 program. Its cleartext part
+// (everything before "eexec") declares either "/Encoding StandardEncoding
+// def" or a 256-entry array filled by "dup <code> /<glyph> put" lines. TeX
+// embeds Computer Modern this way with no /Encoding in the PDF, and its math
+// symbols sit at control codes (minus at 0, asteriskmath at 3) or on letter
+// codes (dagger at 'y'), so the WinAnsi default reads them as nothing or as
+// the wrong letter.
+static void parse_type1_builtin_encoding(const std::vector<uint8_t>& data,
+                                         PdfFont& font) {
+    std::string_view sv(reinterpret_cast<const char*>(data.data()), data.size());
+    size_t end = sv.find("eexec");
+    if (end != std::string_view::npos) sv = sv.substr(0, end);
+    size_t p = sv.find("/Encoding");
+    if (p == std::string_view::npos) return;
+    p += 9;
+    while (p < sv.size() && (sv[p] == ' ' || sv[p] == '\t' || sv[p] == '\r' || sv[p] == '\n')) p++;
+    if (sv.compare(p, 16, "StandardEncoding") == 0) {
+        font.encoding_table = standard_encoding();
+        return;
+    }
+    // The array form ends at "readonly def" (or a bare "def" when the
+    // program omits readonly); nothing past that belongs to the encoding.
+    size_t stop = sv.find("readonly def", p);
+    if (stop == std::string_view::npos) stop = sv.find(" def", p);
+    if (stop == std::string_view::npos) stop = sv.size();
+    size_t q = p;
+    while ((q = sv.find("dup ", q)) != std::string_view::npos && q < stop) {
+        q += 4;
+        int code = 0;
+        bool digits = false;
+        while (q < stop && sv[q] >= '0' && sv[q] <= '9') {
+            code = code * 10 + (sv[q] - '0');
+            q++;
+            digits = true;
+        }
+        if (!digits) continue;
+        while (q < stop && sv[q] == ' ') q++;
+        if (q >= stop || sv[q] != '/') continue;
+        q++;
+        size_t name_start = q;
+        while (q < stop && sv[q] != ' ' && sv[q] != '\t' && sv[q] != '\r' &&
+               sv[q] != '\n' && sv[q] != '/')
+            q++;
+        if (code >= 0 && code < 256 && q > name_start)
+            font.builtin_names[code] = std::string(sv.substr(name_start, q - name_start));
+    }
+}
+
 PdfFont load_font(PdfDoc& doc, const PdfObj& font_ref) {
     PdfFont font;
     auto fobj = doc.resolve(font_ref);
@@ -1249,11 +1397,14 @@ PdfFont load_font(PdfDoc& doc, const PdfObj& font_ref) {
     {
         std::string lower;
         for (char c : font.name) lower += std::tolower(static_cast<unsigned char>(c));
-        // "medium" also matches names without a weight separator
-        // (KoPubWorldDotumMedium); Korean heading faces are named that way.
+        // Both spellings of a medium weight: the abbreviated "-Medi" of the
+        // URW Times bold that TeX embeds (NimbusRomNo9L-Medi), and the full
+        // word without a separator that Korean heading faces use
+        // (KoPubWorldDotumMedium).
         font.is_bold = lower.find("bold") != std::string::npos ||
                        lower.find("heavy") != std::string::npos ||
                        lower.find("black") != std::string::npos ||
+                       lower.find("-medi") != std::string::npos ||
                        lower.find("medium") != std::string::npos;
         font.is_italic = lower.find("italic") != std::string::npos ||
                          lower.find("oblique") != std::string::npos;
@@ -1387,6 +1538,17 @@ PdfFont load_font(PdfDoc& doc, const PdfObj& font_ref) {
                 if (item.is_int()) { code = item.as_int(); }
                 else if (item.is_name()) { font.differences[code++] = item.str_val; }
             }
+        }
+    }
+
+    // No named base encoding: a simple font reads through its program's own
+    // encoding (PDF 32000 9.6.6.1), beneath any /Differences. Only a Type1
+    // program (/FontFile) is readable here; CFF and TrueType keep the default.
+    if (!font.is_type0 && !font.is_type3 && !font.encoding_table && desc.is_dict()) {
+        auto ff = doc.resolve(desc.get("FontFile"));
+        if (ff.is_stream()) {
+            auto program = doc.decode_stream(ff);
+            if (!program.empty()) parse_type1_builtin_encoding(program, font);
         }
     }
 
