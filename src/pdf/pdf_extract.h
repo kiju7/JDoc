@@ -43,7 +43,7 @@ TableData build_table(const std::vector<double>& row_ys,
                       const PageCharCache& cache);
 
 // Heading-classification helpers (pdf_markdown.cpp), exposed the same way
-// so the section-number and keyword rules can be tested directly.
+// so the section-number and standalone-emphasis rules can be tested directly.
 struct SectionNumber {
     int depth = 0;        // numeric segments; 0 = no section number
     size_t text_pos = 0;  // first byte of the title text
@@ -51,10 +51,27 @@ struct SectionNumber {
 };
 SectionNumber parse_section_number(const std::string& text);
 size_t glued_mark_offset(const std::string& text);
-bool is_section_keyword(const std::string& text);
+bool line_all_caps(const std::string& text);
+bool line_letter_spaced(const std::string& text);
 
 struct FontStats {
     double body_size = 12.0;
+    // Document-wide frequency of (rounded size, weight) line styles. The
+    // standalone-heading rule uses it: a bold line only signals a heading
+    // when the document uses that bold style sparingly.
+    std::map<int, int> style_counts;
+    int style_total = 0;
+
+    static int style_key(double fs, bool bold) {
+        return static_cast<int>(fs * 10) * 2 + (bold ? 1 : 0);
+    }
+    double style_share(double fs, bool bold) const {
+        if (style_total == 0) return 0.0;
+        auto it = style_counts.find(style_key(fs, bold));
+        return it == style_counts.end()
+                   ? 0.0
+                   : static_cast<double>(it->second) / style_total;
+    }
 
     void compute(const std::vector<std::vector<TextLine>>& all_lines,
                  const std::vector<std::vector<TableData>>& all_tables = {}) {
@@ -68,6 +85,8 @@ struct FontStats {
                 p < all_tables.size() ? &all_tables[p] : nullptr;
             for (auto& l : all_lines[p]) {
                 if (l.font_size <= 1.0) continue;
+                style_counts[style_key(l.font_size, l.is_bold)]++;
+                style_total++;
                 int key = static_cast<int>(l.font_size * 10);
                 counts_all[key]++;
                 bool in_table = false;
