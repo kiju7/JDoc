@@ -2,6 +2,7 @@
 #include "common/string_utils.h"
 #include <algorithm>
 #include <cassert>
+#include <cctype>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -510,6 +511,9 @@ std::vector<TextLine> merge_colinear_lines(const std::vector<TextLine>& lines) {
                     else if (gap > word_gap)
                         m.text += " ";
                 }
+                const uint32_t base = static_cast<uint32_t>(m.text.size());
+                for (auto& sp : lines[group[k]].bold_spans)
+                    m.bold_spans.emplace_back(sp.first + base, sp.second + base);
                 m.text += lines[group[k]].text;
                 if (lines[group[k]].x_right > m.x_right)
                     m.x_right = lines[group[k]].x_right;
@@ -753,6 +757,58 @@ static bool has_letter_codepoint(const std::string& s) {
         if ((cp | 0x20) - 'a' < 26u || cp >= 0x3040) return true;
     }
     return false;
+}
+
+// True when every visible byte of the line lies inside a bold run, i.e. the
+// whole line is set bold (the case the line-level `**...**` always covered).
+static bool bold_covers_line(const TextLine& l) {
+    if (l.bold_spans.empty()) return false;
+    size_t pos = 0;
+    for (auto& sp : l.bold_spans) {
+        for (size_t k = pos; k < sp.first && k < l.text.size(); k++)
+            if (l.text[k] != ' ' && l.text[k] != '\t' && l.text[k] != '\n') return false;
+        pos = std::max(pos, static_cast<size_t>(sp.second));
+    }
+    for (size_t k = pos; k < l.text.size(); k++)
+        if (l.text[k] != ' ' && l.text[k] != '\t' && l.text[k] != '\n') return false;
+    return true;
+}
+
+// The line text with `**` around each bold run. Runs are byte ranges built on
+// glyph boundaries, so the markers never split a UTF-8 sequence.
+static std::string with_inline_bold(const TextLine& l) {
+    std::string out;
+    out.reserve(l.text.size() + 4 * l.bold_spans.size());
+    size_t pos = 0;
+    for (auto& sp : l.bold_spans) {
+        size_t a = std::max(pos, static_cast<size_t>(sp.first));
+        size_t b = std::min(l.text.size(), static_cast<size_t>(sp.second));
+        // Keep trailing punctuation outside the closing marker: CommonMark
+        // does not close "**" that follows punctuation and precedes a letter,
+        // so "**Adaptations—**If" would print its asterisks.
+        auto punct_tail = [&](size_t end) -> size_t {
+            unsigned char c = static_cast<unsigned char>(l.text[end - 1]);
+            if (c < 0x80 && std::ispunct(c)) return 1;
+            if (end - a >= 3 && static_cast<unsigned char>(l.text[end - 3]) == 0xE2 &&
+                (static_cast<unsigned char>(l.text[end - 2]) == 0x80 ||
+                 static_cast<unsigned char>(l.text[end - 2]) == 0x81))
+                return 3;   // U+2000..U+207F general punctuation (—, …, ’, ”)
+            return 0;
+        };
+        while (b > a) {
+            size_t n = punct_tail(b);
+            if (n == 0) break;
+            b -= n;
+        }
+        if (a >= b) continue;
+        out.append(l.text, pos, a - pos);
+        out += "**";
+        out.append(l.text, a, b - a);
+        out += "**";
+        pos = b;
+    }
+    out.append(l.text, pos, std::string::npos);
+    return out;
 }
 
 std::string page_to_markdown(const std::vector<TextLine>& raw_lines,
@@ -1160,8 +1216,12 @@ std::string page_to_markdown(const std::vector<TextLine>& raw_lines,
             md += ' ';
             md += heading;
             md += '\n';
-        } else if (l.is_bold && l.is_italic) {
-            md += "***" + l.text + "***\n";
+        } else if (bold_covers_line(l)) {
+            md += (l.is_italic ? "***" : "**") + l.text + (l.is_italic ? "***\n" : "**\n");
+        } else if (!l.bold_spans.empty()) {
+            // Partly bold body line: mark each bold run in place.
+            std::string body = with_inline_bold(l);
+            md += l.is_italic ? "*" + body + "*\n" : body + "\n";
         } else if (l.is_bold) {
             md += "**" + l.text + "**\n";
         } else if (l.is_italic) {
