@@ -744,6 +744,35 @@ static bool has_letter_codepoint(const std::string& s) {
     return false;
 }
 
+// Page-end block listing a page's annotations: links, then text notes.
+static std::string annotations_markdown(const std::vector<AnnotEntry>& annots) {
+    std::string md;
+    if (annots.empty()) return md;
+    bool has_links = false, has_notes = false;
+    for (auto& a : annots) {
+        if (!a.uri.empty()) has_links = true;
+        if (!a.text.empty() && a.subtype != "Link") has_notes = true;
+    }
+    if (has_links) {
+        md += "\n**Links:**\n";
+        for (auto& a : annots) {
+            if (a.uri.empty()) continue;
+            if (!a.text.empty())
+                md += "- [" + a.text + "](" + a.uri + ")\n";
+            else
+                md += "- <" + a.uri + ">\n";
+        }
+    }
+    if (has_notes) {
+        md += "\n**Notes:**\n";
+        for (auto& a : annots) {
+            if (a.text.empty() || a.subtype == "Link") continue;
+            md += "> " + a.text + "\n\n";
+        }
+    }
+    return md;
+}
+
 std::string page_to_markdown(const std::vector<TextLine>& raw_lines,
                               const FontStats& stats,
                               const std::vector<ImageData>& images,
@@ -1087,30 +1116,7 @@ std::string page_to_markdown(const std::vector<TextLine>& raw_lines,
         emit_insert(inserts[di]);
 
     // Append annotations (links, text notes) at end of page
-    if (!annots.empty()) {
-        bool has_links = false, has_notes = false;
-        for (auto& a : annots) {
-            if (!a.uri.empty()) has_links = true;
-            if (!a.text.empty() && a.subtype != "Link") has_notes = true;
-        }
-        if (has_links) {
-            md += "\n**Links:**\n";
-            for (auto& a : annots) {
-                if (a.uri.empty()) continue;
-                if (!a.text.empty())
-                    md += "- [" + a.text + "](" + a.uri + ")\n";
-                else
-                    md += "- <" + a.uri + ">\n";
-            }
-        }
-        if (has_notes) {
-            md += "\n**Notes:**\n";
-            for (auto& a : annots) {
-                if (a.text.empty() || a.subtype == "Link") continue;
-                md += "> " + a.text + "\n\n";
-            }
-        }
-    }
+    md += annotations_markdown(annots);
 
     return md;
 }
@@ -1170,6 +1176,23 @@ static std::string format_bookmarks(const std::vector<BookmarkEntry>& bookmarks,
     return out;
 }
 
+// Plain-text page: the layout grid (layout_page_text), then what a grid of
+// glyphs cannot show — the page's images and annotations — as the same
+// "[image: …]" and link/note lines plain text has always carried.
+static std::string page_to_layout_text(const ExtractResult& r, int p,
+                                       const ConvertOptions& opts) {
+    std::string text = p < (int)r.layout_text.size() ? r.layout_text[p] : "";
+    std::string tail;
+    for (auto& img : r.all_images[p]) {
+        const std::string ref =
+            util::image_ref_name(img.name, img.format, img.saved_path);
+        tail += "\n![" + img.name + "](" + opts.image_ref_prefix + ref + ")\n";
+    }
+    if (p < (int)r.all_annots.size()) tail += annotations_markdown(r.all_annots[p]);
+    if (!tail.empty()) text += util::strip_markdown(tail);
+    return text;
+}
+
 std::string result_to_markdown(ExtractResult& r, const ConvertOptions& opts) {
     std::vector<int> page_indices;
     if (opts.pages.empty()) {
@@ -1195,18 +1218,18 @@ std::string result_to_markdown(ExtractResult& r, const ConvertOptions& opts) {
         if (p < 0 || p >= r.total_pages) continue;
         if (!full_md.empty()) full_md += '\n';
         full_md += "--- Page " + std::to_string(p + 1) + " ---\n\n";
+        if (plaintext) {
+            full_md += page_to_layout_text(r, p, opts);
+            continue;
+        }
         std::string page_md = page_to_markdown(r.all_lines[p], r.stats,
                                                 r.all_images[p], r.all_image_y[p], r.all_image_x[p],
                                                 r.all_tables[p],
                                                 p < (int)r.all_annots.size() ? r.all_annots[p] : std::vector<AnnotEntry>{},
                                                 r.col_boundaries[p],
                                                 opts.image_ref_prefix);
-        if (plaintext)
-            full_md += util::strip_markdown(page_md);
-        else
-            full_md += page_md;
-        if (p < (int)r.page_diags.size() && r.page_diags[p].images_failed > 0 &&
-            !plaintext)
+        full_md += page_md;
+        if (p < (int)r.page_diags.size() && r.page_diags[p].images_failed > 0)
             full_md += "<!-- jdoc: " +
                        std::to_string(r.page_diags[p].images_failed) +
                        " image(s) failed to decode on this page -->\n";
@@ -1224,13 +1247,16 @@ static PageChunk build_page_chunk(ExtractResult& r, const ConvertOptions& opts,
     chunk.page_width = r.page_widths[p];
     chunk.page_height = r.page_heights[p];
     chunk.body_font_size = r.stats.body_size;
-    std::string page_md = page_to_markdown(r.all_lines[p], r.stats,
-                                            r.all_images[p], r.all_image_y[p], r.all_image_x[p],
-                                            r.all_tables[p],
-                                            p < (int)r.all_annots.size() ? r.all_annots[p] : std::vector<AnnotEntry>{},
-                                            r.col_boundaries[p],
-                                            opts.image_ref_prefix);
-    chunk.text = plaintext ? util::strip_markdown(page_md) : page_md;
+    if (plaintext) {
+        chunk.text = page_to_layout_text(r, p, opts);
+    } else {
+        chunk.text = page_to_markdown(r.all_lines[p], r.stats,
+                                      r.all_images[p], r.all_image_y[p], r.all_image_x[p],
+                                      r.all_tables[p],
+                                      p < (int)r.all_annots.size() ? r.all_annots[p] : std::vector<AnnotEntry>{},
+                                      r.col_boundaries[p],
+                                      opts.image_ref_prefix);
+    }
     if (p < (int)r.page_diags.size() && r.page_diags[p].images_failed > 0) {
         chunk.degraded_images = r.page_diags[p].images_failed;
         if (!plaintext)
@@ -1284,6 +1310,7 @@ void stream_result_chunks(ExtractResult& r, const ConvertOptions& opts,
             r.all_lines[p] = {};
             r.all_tables[p] = {};
             if (p < (int)r.all_annots.size()) r.all_annots[p] = {};
+            if (p < (int)r.layout_text.size()) r.layout_text[p] = {};
             r.all_image_y[p] = {};
             r.all_image_x[p] = {};
         }
