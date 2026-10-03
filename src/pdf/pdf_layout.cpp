@@ -53,8 +53,24 @@ constexpr double kPitchSlack = 0.9;
 // rather than one space after the previous word. Justified word spaces stay
 // under it; table gutters and tab stops clear it.
 constexpr double kSnapGapEm = 0.8;
+// Widest a single glyph's ink is taken to be, in ems (see ink_right).
+constexpr double kMaxGlyphEm = 1.5;
 // Blank lines a vertical gap may produce.
 constexpr int kMaxBlankLines = 2;
+
+// Right edge of the glyph's ink, for gap and overlap decisions. TextChar's
+// right edge is the next glyph's origin, so it carries character spacing
+// (Tc) and whatever advance the producer wrote. Hangul word processors place
+// table cells by spreading one run with a huge Tc: two "F"s 36 pt apart in
+// an 8 pt font each report a 40 pt box and read as touching. The box is
+// capped at kMaxGlyphEm: wide enough for a real wide letter (an italic math
+// "W" or "M" runs past one em, and a tight cap splits "W ikipedia"), far
+// below the spread of a Tc-positioned cell.
+double ink_right(const TextChar* g) {
+    double w = g->right - g->left;
+    if (g->font_size > 1.0) w = std::min(w, g->font_size * kMaxGlyphEm);
+    return g->left + w;
+}
 
 struct LayoutLine {
     std::vector<const TextChar*> glyphs;
@@ -88,10 +104,10 @@ std::string layout_page_text(const std::vector<TextChar>& chars) {
         sizes.reserve(upright.size());
         for (auto* g : upright) {
             margin = std::min(margin, g->left);
-            extent = std::max(extent, g->right);
+            extent = std::max(extent, ink_right(g));
             if (g->font_size > 1.0) sizes.push_back(g->font_size);
             int dw = util::display_width(g->unicode);
-            double w = g->right - g->left;
+            double w = ink_right(g) - g->left;
             if (dw > 0 && w > 0.1) pitches.push_back(w / dw);
         }
         double median_fs = 10.0;
@@ -172,9 +188,9 @@ std::string layout_page_text(const std::vector<TextChar>& chars) {
                 for (size_t ai = 0; clear && ai < a.glyphs.size(); ai++) {
                     auto* ga = a.glyphs[ai];
                     for (auto* gb : b.glyphs) {
-                        double overlap = std::min(ga->right, gb->right) -
+                        double overlap = std::min(ink_right(ga), ink_right(gb)) -
                                          std::max(ga->left, gb->left);
-                        if (overlap > 0.5 * (ga->right - ga->left)) {
+                        if (overlap > 0.5 * (ink_right(ga) - ga->left)) {
                             clear = false;
                             break;
                         }
@@ -206,7 +222,7 @@ std::string layout_page_text(const std::vector<TextChar>& chars) {
                 // the same spot with the same code; draw them once.
                 if (prev && prev->unicode == g->unicode &&
                     std::abs(g->left - prev->left) <
-                        std::max(1.0, 0.3 * (prev->right - prev->left)))
+                        std::max(1.0, 0.3 * (ink_right(prev) - prev->left)))
                     continue;
                 double fs = g->font_size > 1.0 ? g->font_size : median_fs;
                 long target = std::lround((g->left - margin) / unit);
@@ -218,7 +234,7 @@ std::string layout_page_text(const std::vector<TextChar>& chars) {
                     // a second column — snaps to the grid, so prose does not
                     // pick up stray double spaces wherever its proportional
                     // advances drift off the pitch.
-                    double gap = g->left - prev->right;
+                    double gap = g->left - ink_right(prev);
                     double word_gap = std::max(1.0, fs * 0.15);
                     if (gap < word_gap)
                         col = cursor;
