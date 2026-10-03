@@ -85,6 +85,53 @@ inline bool is_cp932_lead(uint8_t ch) {
 // pos past the sequence. Returns 0xFFFD on invalid/overlong sequences.
 uint32_t decode_utf8(const char* data, size_t len, size_t& pos);
 
+// ── Display width ──────────────────────────────────────────
+// Columns a codepoint occupies in a monospace view, the way terminals and
+// editors lay it out: East Asian wide/full-width forms (Hangul, CJK, kana,
+// full-width ASCII) take 2, combining marks and zero-width format characters
+// take 0, everything else 1. Plain-text output aligns table columns with
+// this, so a Korean cell is not counted as half its visual width.
+inline int display_width(uint32_t cp) {
+    if (cp < 0x300) return cp < 0x20 ? 0 : 1;
+    if ((cp >= 0x0300 && cp <= 0x036F) ||  // combining diacritics
+        (cp >= 0x200B && cp <= 0x200F) ||  // zero-width space/joiners, marks
+        (cp >= 0xFE00 && cp <= 0xFE0F) ||  // variation selectors
+        cp == 0xFEFF)                      // BOM / zero-width no-break space
+        return 0;
+    if ((cp >= 0x1100 && cp <= 0x115F) ||    // Hangul Jamo leading consonants
+        (cp >= 0x2E80 && cp <= 0x303E) ||    // CJK radicals, punctuation
+        (cp >= 0x3041 && cp <= 0x33FF) ||    // kana, compat jamo, CJK compat
+        (cp >= 0x3400 && cp <= 0x4DBF) ||    // CJK extension A
+        (cp >= 0x4E00 && cp <= 0x9FFF) ||    // CJK unified ideographs
+        (cp >= 0xA000 && cp <= 0xA4CF) ||    // Yi
+        (cp >= 0xA960 && cp <= 0xA97F) ||    // Hangul Jamo extended-A
+        (cp >= 0xAC00 && cp <= 0xD7A3) ||    // Hangul syllables
+        (cp >= 0xF900 && cp <= 0xFAFF) ||    // CJK compatibility ideographs
+        (cp >= 0xFE10 && cp <= 0xFE19) ||    // vertical forms
+        (cp >= 0xFE30 && cp <= 0xFE6F) ||    // CJK compat forms, small forms
+        (cp >= 0xFF00 && cp <= 0xFF60) ||    // full-width forms
+        (cp >= 0xFFE0 && cp <= 0xFFE6) ||    // full-width signs
+        (cp >= 0x1F300 && cp <= 0x1F64F) ||  // pictographs, emoticons
+        (cp >= 0x1F900 && cp <= 0x1F9FF) ||  // supplemental pictographs
+        (cp >= 0x20000 && cp <= 0x3FFFD))    // CJK extensions B and beyond
+        return 2;
+    return 1;
+}
+
+// Display width of a UTF-8 string, summed over its codepoints.
+inline size_t display_width(const std::string& s) {
+    size_t w = 0;
+    for (size_t pos = 0; pos < s.size(); ) {
+        if (static_cast<unsigned char>(s[pos]) < 0x80) {
+            w += s[pos] >= 0x20 ? 1 : 0;
+            pos++;
+            continue;
+        }
+        w += static_cast<size_t>(display_width(decode_utf8(s.data(), s.size(), pos)));
+    }
+    return w;
+}
+
 // True if the whole buffer is well-formed UTF-8. The pointer overload avoids
 // copying into a std::string just to validate.
 bool is_valid_utf8(const char* data, size_t len);
