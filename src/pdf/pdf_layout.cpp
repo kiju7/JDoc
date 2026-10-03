@@ -2,6 +2,7 @@
 #include "common/string_utils.h"
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -29,7 +30,13 @@ namespace jdoc { namespace pdf_detail {
 //    space) are written back to back so a word is never split by padding.
 //    Only gaps wider than a word space snap to the grid column (kSnapGapEm).
 //  - A vertical gap of extra line heights becomes blank lines (at most two).
-//  - Side-by-side columns stay side by side; that is what layout mode means.
+//  - Multi-column pages keep reading order. With a column boundary detected
+//    (chars_to_lines, the same one the markdown path uses), the page is cut
+//    into zones top to bottom: a full-width zone (title, abstract, a table
+//    or caption across the gutter) is laid out on the page grid; a column
+//    zone emits its whole left column, then its whole right column, each on
+//    a grid measured from that column's own left edge. A table inside one
+//    column stays aligned within it. See column_blocks().
 //  - Rotated runs (TextChar::rot != 0) have no place on a horizontal grid.
 //    They are read along their own baselines (chars_to_lines) and appended
 //    after the page body, one run per line.
@@ -78,9 +85,285 @@ struct LayoutLine {
     double font_size = 0;
 };
 
+// Lines laid out together on one grid: a full-width zone, or one column of a
+// column zone. `margin` is the x of grid column 0.
+struct LayoutBlock {
+    std::vector<LayoutLine> rows;
+    double margin = 0;
+    // The right column of a column zone: it starts back at the zone's top,
+    // so there is no vertical gap to measure and a blank line separates it.
+    bool restarts = false;
+};
+
+// A line over a subset of its glyphs (already in left-to-right order), with
+// its baseline and size taken again from the glyphs it keeps.
+LayoutLine slice_line(std::vector<const TextChar*>::const_iterator b,
+                      std::vector<const TextChar*>::const_iterator e,
+                      double default_fs) {
+    LayoutLine ln;
+    ln.glyphs.assign(b, e);
+    for (auto* g : ln.glyphs) {
+        double fs = g->font_size > 1.0 ? g->font_size : default_fs;
+        if (fs > ln.font_size) {
+            ln.font_size = fs;
+            ln.base_y = g->y;
+        }
+    }
+    return ln;
+}
+
+// Cut a two-column page into blocks in reading order. The rules mirror the
+// markdown path so both outputs agree on what spans the page:
+//  - A physical line splits at the gutter when the gap crossing the column
+//    boundary is wider than a word space and either wider than a gutter or
+//    followed by a single run on the right (lines_from_upright_chars). A row
+//    with several cells right of the gutter is a table row and stays whole.
+//  - A piece that straddles the boundary and is wide (> 60% of the content
+//    width) or centred on the page spans both columns; any other piece
+//    belongs to the column holding its centre (reorder_column_lines).
+//  - A centred piece that is not wide, with column text directly above and
+//    below it (an equation, a short label sitting on the gutter), is not
+//    allowed to cut the column flow in two; it joins the column of its
+//    centre.
+// Spanning pieces form full-width zones on the page grid; the pieces between
+// them form a column zone, emitted left column first, then right, each on a
+// grid starting at that column's leftmost glyph on the page.
+std::vector<LayoutBlock> column_blocks(const std::vector<LayoutLine>& lines,
+                                       double boundary, double page_margin,
+                                       double median_fs) {
+    enum Side { LEFT, RIGHT, SPAN };
+    struct Piece {
+        LayoutLine line;
+        double x0, x1;
+        Side side = LEFT;
+        size_t line_idx;    // physical line the piece was cut from
+        bool fills = false; // column text: fills its column in one run
+    };
+    const double col_gap = std::max(median_fs * 1.2, 8.0);
+    const double gutter_gap = std::max(median_fs * 2.0, 18.0);
+
+    std::vector<Piece> pieces;
+    for (size_t li = 0; li < lines.size(); li++) {
+        const auto& gl = lines[li].glyphs;
+        size_t cut = gl.size();
+        for (size_t i = 0; i + 1 < gl.size(); i++) {
+            double gap = gl[i + 1]->left - ink_right(gl[i]);
+            if (ink_right(gl[i]) < boundary && gl[i + 1]->left > boundary &&
+                gap > col_gap) {
+                int right_runs = 1;
+                for (size_t k = i + 2; k < gl.size() && right_runs < 2; k++)
+                    if (gl[k]->left - ink_right(gl[k - 1]) > col_gap)
+                        right_runs++;
+                if (gap > gutter_gap || right_runs < 2) cut = i + 1;
+                break;
+            }
+        }
+        auto add = [&](size_t b, size_t e) {
+            Piece pc;
+            pc.line_idx = li;
+            pc.line = slice_line(gl.begin() + b, gl.begin() + e, median_fs);
+            pc.x0 = gl[b]->left;
+            pc.x1 = 0;
+            for (size_t k = b; k < e; k++) pc.x1 = std::max(pc.x1, ink_right(gl[k]));
+            pieces.push_back(std::move(pc));
+        };
+        if (cut < gl.size()) {
+            add(0, cut);
+            add(cut, gl.size());
+        } else if (!gl.empty()) {
+            add(0, gl.size());
+        }
+    }
+
+    double min_x = 1e30, max_x = -1e30;
+    for (auto& pc : pieces) {
+        min_x = std::min(min_x, pc.x0);
+        max_x = std::max(max_x, pc.x1);
+    }
+    const double content_w = max_x - min_x;
+    const double page_center = (min_x + max_x) / 2.0;
+    std::vector<bool> wide(pieces.size(), false);
+    for (size_t i = 0; i < pieces.size(); i++) {
+        auto& pc = pieces[i];
+        bool straddles = pc.x0 < boundary - 5 && pc.x1 > boundary + 5;
+        wide[i] = pc.x1 - pc.x0 > content_w * 0.6;
+        double off_center = std::abs((pc.x0 + pc.x1) / 2.0 - page_center);
+        bool centered = straddles && off_center < content_w * 0.15;
+        // A short piece on the page's centre line (a page number, a centred
+        // heading) need not reach across the boundary to be page furniture
+        // rather than one column's text.
+        bool on_axis = pc.x1 - pc.x0 < content_w * 0.2 &&
+                       off_center < content_w * 0.05;
+        if ((straddles && (wide[i] || centered)) || on_axis)
+            pc.side = SPAN;
+        else
+            pc.side = (pc.x0 + pc.x1) / 2.0 < boundary ? LEFT : RIGHT;
+    }
+    for (size_t i = 1; i + 1 < pieces.size(); i++) {
+        if (pieces[i].side != SPAN || wide[i]) continue;
+        if (pieces[i - 1].side != SPAN && pieces[i + 1].side != SPAN)
+            pieces[i].side = (pieces[i].x0 + pieces[i].x1) / 2.0 < boundary
+                                 ? LEFT : RIGHT;
+    }
+
+    // A physical line is full-width or columnar as a whole: if one of its
+    // pieces spans (a centred header cell over a table), so does the rest.
+    {
+        std::vector<bool> line_spans(lines.size(), false);
+        for (auto& pc : pieces)
+            if (pc.side == SPAN) line_spans[pc.line_idx] = true;
+        for (auto& pc : pieces)
+            if (line_spans[pc.line_idx]) pc.side = SPAN;
+    }
+
+    // Each column's edge is the leftmost start of its text lines: pieces at
+    // least a tenth of the content wide, and for the right column starting
+    // right of the boundary. A short label, or a piece assigned to a column
+    // by its centre, must not indent the whole column; pieces left of the
+    // edge clamp to grid column 0.
+    double edge[2];
+    auto column_edges = [&]() {
+        double any[2] = {1e30, 1e30};
+        edge[LEFT] = edge[RIGHT] = 1e30;
+        for (auto& pc : pieces) {
+            if (pc.side == SPAN) continue;
+            any[pc.side] = std::min(any[pc.side], pc.x0);
+            if (pc.x1 - pc.x0 < content_w * 0.1) continue;
+            if (pc.side == RIGHT && pc.x0 < boundary) continue;
+            edge[pc.side] = std::min(edge[pc.side], pc.x0);
+        }
+        for (int sd = 0; sd < 2; sd++)
+            if (edge[sd] > 1e29) edge[sd] = any[sd];
+    };
+    column_edges();
+
+    // A table across the gutter whose cell gaps exceed a gutter splits like
+    // two columns, line by line. Column text is told apart by its lines
+    // filling their column in one run (no gap wider than a column gap: a
+    // table row spreads its width over cells); a run of lines with content
+    // on both sides and no line of column text is a table (or a figure)
+    // spanning the page, and goes full-width so its cells keep their
+    // positions. Three such lines are required, so a heading beside a short
+    // last line of a paragraph does not qualify. One-sided short lines inside
+    // the run (a row with its right cells empty) do not break it.
+    {
+        double right_end = 0;
+        for (auto& pc : pieces)
+            if (pc.side == RIGHT) right_end = std::max(right_end, pc.x1);
+        const double col_w[2] = {boundary - edge[LEFT], right_end - edge[RIGHT]};
+        enum LineKind { NEUTRAL, TABULAR, PROSE };
+        std::vector<LineKind> kind(lines.size(), NEUTRAL);
+        std::vector<int> sides(lines.size(), 0);
+        std::vector<bool> fills(lines.size(), false);
+        for (auto& pc : pieces) {
+            if (pc.side == SPAN) {
+                fills[pc.line_idx] = true;  // already full-width
+                continue;
+            }
+            sides[pc.line_idx] |= 1 << pc.side;
+            if (pc.x1 - pc.x0 < 0.7 * col_w[pc.side]) continue;
+            const auto& gl = pc.line.glyphs;
+            bool one_run = true;
+            for (size_t k = 1; k < gl.size() && one_run; k++)
+                one_run = gl[k]->left - ink_right(gl[k - 1]) <= col_gap;
+            if (one_run) fills[pc.line_idx] = pc.fills = true;
+        }
+        for (size_t li = 0; li < lines.size(); li++)
+            kind[li] = fills[li] ? PROSE : sides[li] == 3 ? TABULAR : NEUTRAL;
+
+        std::vector<bool> spans(lines.size(), false);
+        size_t li = 0;
+        while (li < lines.size()) {
+            if (kind[li] != TABULAR) { li++; continue; }
+            size_t end = li, tabular = 0, last_tab = li;
+            while (end < lines.size() && kind[end] != PROSE) {
+                if (kind[end] == TABULAR) { tabular++; last_tab = end; }
+                end++;
+            }
+            if (tabular >= 3)
+                for (size_t k = li; k <= last_tab; k++) spans[k] = true;
+            li = end;
+        }
+        bool changed = false;
+        for (auto& pc : pieces)
+            if (spans[pc.line_idx] && pc.side != SPAN) {
+                pc.side = SPAN;
+                changed = true;
+            }
+        if (changed) column_edges();
+    }
+    const double left_margin = edge[LEFT], right_margin = edge[RIGHT];
+
+    // Pieces [b, e) on the page grid, in physical line order; pieces of one
+    // line rejoin as one row.
+    std::vector<LayoutBlock> blocks;
+    auto page_block = [&](size_t b, size_t e) {
+        LayoutBlock full;
+        full.margin = page_margin;
+        size_t prev_line = SIZE_MAX;
+        for (size_t k = b; k < e; k++) {
+            auto& pc = pieces[k];
+            if (pc.line_idx == prev_line) {
+                auto& row = full.rows.back();
+                row.glyphs.insert(row.glyphs.end(), pc.line.glyphs.begin(),
+                                  pc.line.glyphs.end());
+                if (pc.line.font_size > row.font_size) {
+                    row.font_size = pc.line.font_size;
+                    row.base_y = pc.line.base_y;
+                }
+            } else {
+                full.rows.push_back(std::move(pc.line));
+            }
+            prev_line = pc.line_idx;
+        }
+        blocks.push_back(std::move(full));
+    };
+
+    // A band of column pieces is a column zone only when it shows two
+    // columns of text side by side: at least two physical lines whose left
+    // and right pieces both fill their column. A spurious boundary on a
+    // one-column page (cut through a table, or between short and long
+    // lines) never produces that, and its band keeps the page grid.
+    size_t i = 0;
+    while (i < pieces.size()) {
+        size_t j = i;
+        if (pieces[i].side == SPAN) {
+            while (j < pieces.size() && pieces[j].side == SPAN) j++;
+            page_block(i, j);
+            i = j;
+            continue;
+        }
+        int side_by_side = 0;
+        while (j < pieces.size() && pieces[j].side != SPAN) {
+            if (pieces[j].side == RIGHT && pieces[j].fills && j > i &&
+                pieces[j - 1].line_idx == pieces[j].line_idx &&
+                pieces[j - 1].side == LEFT && pieces[j - 1].fills)
+                side_by_side++;
+            j++;
+        }
+        if (side_by_side < 2) {
+            page_block(i, j);
+            i = j;
+            continue;
+        }
+        LayoutBlock left, right;
+        left.margin = left_margin;
+        right.margin = right_margin;
+        right.restarts = true;
+        for (size_t k = i; k < j; k++)
+            (pieces[k].side == LEFT ? left : right)
+                .rows.push_back(std::move(pieces[k].line));
+        if (!left.rows.empty()) blocks.push_back(std::move(left));
+        if (!right.rows.empty()) blocks.push_back(std::move(right));
+        i = j;
+    }
+    return blocks;
+}
+
 } // namespace
 
-std::string layout_page_text(const std::vector<TextChar>& chars) {
+std::string layout_page_text(const std::vector<TextChar>& chars,
+                             double col_boundary) {
     std::vector<const TextChar*> upright;
     std::vector<TextChar> rotated;
     upright.reserve(chars.size());
@@ -206,14 +489,38 @@ std::string layout_page_text(const std::vector<TextChar>& chars) {
         }
         lines = std::move(merged);
 
-        // ── Grid rows ──
-        bool first_line = true;
-        double prev_y = 0, prev_fs = 0;
-        for (auto& ln : lines) {
+        for (auto& ln : lines)
             std::sort(ln.glyphs.begin(), ln.glyphs.end(),
                       [](const TextChar* a, const TextChar* b) {
                           return a->left < b->left;
                       });
+
+        // ── Reading order ──
+        std::vector<LayoutBlock> blocks;
+        if (col_boundary > 0) {
+            blocks = column_blocks(lines, col_boundary, margin, median_fs);
+        } else {
+            blocks.emplace_back();
+            blocks.back().rows = std::move(lines);
+            blocks.back().margin = margin;
+        }
+
+        // ── Grid rows ──
+        struct PlacedRow {
+            const LayoutLine* line;
+            double margin;      // x of grid column 0 for this row's block
+            bool restart;       // first row of a right column
+        };
+        std::vector<PlacedRow> rows;
+        for (auto& blk : blocks)
+            for (size_t ri = 0; ri < blk.rows.size(); ri++)
+                rows.push_back({&blk.rows[ri], blk.margin,
+                                blk.restarts && ri == 0});
+
+        bool first_line = true;
+        double prev_y = 0, prev_fs = 0;
+        for (auto& placed : rows) {
+            const LayoutLine& ln = *placed.line;
             std::string row;
             size_t cursor = 0;
             const TextChar* prev = nullptr;
@@ -225,7 +532,7 @@ std::string layout_page_text(const std::vector<TextChar>& chars) {
                         std::max(1.0, 0.3 * (ink_right(prev) - prev->left)))
                     continue;
                 double fs = g->font_size > 1.0 ? g->font_size : median_fs;
-                long target = std::lround((g->left - margin) / unit);
+                long target = std::lround((g->left - placed.margin) / unit);
                 size_t col = target > 0 ? static_cast<size_t>(target) : 0;
                 if (prev) {
                     // Touching glyphs are one word (same word spacing rule
@@ -254,6 +561,7 @@ std::string layout_page_text(const std::vector<TextChar>& chars) {
                 double extra = (prev_y - ln.base_y) / line_h - 1.0;
                 long blanks = std::lround(extra);
                 if (blanks > kMaxBlankLines) blanks = kMaxBlankLines;
+                if (placed.restart && blanks < 1) blanks = 1;
                 for (long b = 0; b < blanks; b++) out += '\n';
             }
             out += row;
