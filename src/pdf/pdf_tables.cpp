@@ -4157,14 +4157,27 @@ static std::vector<TableData> detect_text_tables_range(
         // S4-S5: rejection
         double gutter = bounds.size() == 3
                             ? clean_gutter(rows, ext, bounds[1]) / median_fs : 0.0;
-        // Rows whose dot leader spans a column boundary: the leader itself
-        // pairs the cells on its two sides.
+        // Rows whose dot leader leads to a column boundary — the boundary
+        // lies on the leader or in the empty space beside it (a leader set
+        // in several runs, or ending short of a right-aligned value): the
+        // leader itself pairs the cells on its two sides.
         int led_rows = 0;
         for (size_t k = ext.first_row; k <= ext.last_row; k++) {
             bool led = false;
             for (auto& ld : rows[k].leaders)
-                for (size_t b = 1; b + 1 < bounds.size(); b++)
-                    if (ld.first <= bounds[b] + 0.5 && ld.second >= bounds[b] - 0.5) led = true;
+                for (size_t b = 1; b + 1 < bounds.size() && !led; b++) {
+                    if (ld.first <= bounds[b] + 0.5 && ld.second >= bounds[b] - 0.5) {
+                        led = true;
+                        break;
+                    }
+                    // the stretch between the leader and the boundary
+                    double lo = bounds[b] < ld.first ? bounds[b] : ld.second;
+                    double hi = bounds[b] < ld.first ? ld.first : bounds[b];
+                    bool clear = true;
+                    for (auto& cr : rows[k].char_ranges)
+                        if (cr.second > lo && cr.first < hi) clear = false;
+                    led = clear;
+                }
             if (led) led_rows++;
         }
         return accept_table(table, gutter, led_rows);
