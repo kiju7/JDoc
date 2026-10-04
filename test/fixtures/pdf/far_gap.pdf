@@ -1,0 +1,80 @@
+%PDF-1.4
+1 0 obj
+<< /Length 274 >>
+stream
+/CIDInit /ProcSet findresource begin 12 dict begin begincmap
+/CMapName /Lig def 1 begincodespacerange <00> <FF> endcodespacerange
+1 beginbfrange <20> <7D> <0020> endbfrange
+1 beginbfchar <7E> <00660066> endbfchar
+endcmap CMapName currentdict /CMap defineresource pop end end
+endstream
+endobj
+2 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Courier /FirstChar 32 /LastChar 126 /Widths [600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600] /ToUnicode 1 0 R >>
+endobj
+3 0 obj
+<< /Length 1172 >>
+stream
+BT /F1 10 Tf 1 0 -0 1 72 660 Tm (Body text line 1 of the introduction section.) Tj ET
+BT /F1 10 Tf 1 0 -0 1 72 646 Tm (Body text line 2 of the introduction section.) Tj ET
+BT /F1 10 Tf 1 0 -0 1 72 632 Tm (Body text line 3 of the introduction section.) Tj ET
+BT /F1 10 Tf 1 0 -0 1 72 618 Tm (Body text line 4 of the introduction section.) Tj ET
+BT /F1 10 Tf 1 0 -0 1 72 604 Tm (Body text line 5 of the introduction section.) Tj ET
+BT /F1 10 Tf 1 0 -0 1 72 590 Tm (Body text line 6 of the introduction section.) Tj ET
+BT /F1 10 Tf 1 0 -0 1 72 576 Tm (Body text line 7 of the introduction section.) Tj ET
+BT /F1 10 Tf 1 0 -0 1 72 562 Tm (Body text line 8 of the introduction section.) Tj ET
+BT /F1 10 Tf 8 Tc 72 520 Td (SPREAD) Tj 0 Tc ET
+BT /F1 10 Tf 72 500 Td [(K) 80 (e) 80 (r) 80 (n) 80 (e) 80 (d)] TJ ET
+BT /F1 10 Tf 72 480 Td (G) Tj 6 0 Td (l) Tj 6 0 Td (y) Tj 6 0 Td (p) Tj 6 0 Td (h) Tj 6 0 Td (s) Tj ET
+BT /F1 10 Tf 72 460 Td (Maria) Tj /F1 6 Tf 5 Ts ( ) Tj 0 Ts [400] TJ /F1 10 Tf (Hazel) Tj ET
+BT /F1 10 Tf 72 440 Td [(www.) ( ) 600 (example.org)] TJ ET
+BT /F1 10 Tf 1 0 -0 1 72 50 Tm (Annual Economic Report 2024) Tj ET
+BT /F1 10 Tf 1 0 -0 1 520 50 Tm (99) Tj ET
+
+endstream
+endobj
+4 0 obj
+<< /Type /Page /Parent 7 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 2 0 R >> >> /Contents 3 0 R >>
+endobj
+5 0 obj
+<< /Length 854 >>
+stream
+BT /F1 10 Tf 1 0 -0 1 72 740 Tm (4) Tj ET
+BT /F1 10 Tf 1 0 -0 1 380 740 Tm (Annual Economic Report 2024) Tj ET
+BT /F1 14 Tf 1 0 -0 1 72 690 Tm (1 Introduction) Tj ET
+BT /F1 10 Tf 1 0 -0 1 72 660 Tm (Body text line 1 of the introduction section.) Tj ET
+BT /F1 10 Tf 1 0 -0 1 72 646 Tm (Body text line 2 of the introduction section.) Tj ET
+BT /F1 10 Tf 1 0 -0 1 72 632 Tm (Body text line 3 of the introduction section.) Tj ET
+BT /F1 10 Tf 1 0 -0 1 72 618 Tm (Body text line 4 of the introduction section.) Tj ET
+BT /F1 10 Tf 1 0 -0 1 72 604 Tm (Body text line 5 of the introduction section.) Tj ET
+BT /F1 10 Tf 1 0 -0 1 72 590 Tm (Body text line 6 of the introduction section.) Tj ET
+BT /F1 10 Tf 1 0 -0 1 72 576 Tm (Body text line 7 of the introduction section.) Tj ET
+BT /F1 10 Tf 1 0 -0 1 72 562 Tm (Body text line 8 of the introduction section.) Tj ET
+
+endstream
+endobj
+6 0 obj
+<< /Type /Page /Parent 7 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 2 0 R >> >> /Contents 5 0 R >>
+endobj
+7 0 obj
+<< /Type /Pages /Kids [4 0 R 6 0 R] /Count 2 >>
+endobj
+8 0 obj
+<< /Type /Catalog /Pages 7 0 R >>
+endobj
+xref
+0 9
+0000000000 65535 f 
+0000000009 00000 n 
+0000000334 00000 n 
+0000000837 00000 n 
+0000002061 00000 n 
+0000002187 00000 n 
+0000003092 00000 n 
+0000003218 00000 n 
+0000003281 00000 n 
+trailer
+<< /Size 9 /Root 8 0 R >>
+startxref
+3330
+%%EOF

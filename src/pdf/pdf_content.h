@@ -1,6 +1,7 @@
 #pragma once
 // pdf_content.h — internal: content-stream parse vocabulary and line layout.
 #include "pdf_core.h"
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstring>
@@ -173,6 +174,10 @@ struct TextLine {
     // this a vertical caption whose page-space midpoint lands on a body
     // line's baseline reads as part of that line.
     int16_t rot = 0;
+    // Gap, in points, before the line's second word (0 when it has one
+    // word). A section number sits a word space or a tab from its title; a
+    // page number or an axis tick shares a baseline with text ems away.
+    double first_gap = 0;
 };
 
 // ── Reading order for rotated runs ──────────────────────
@@ -226,6 +231,50 @@ inline void text_along_span(int16_t rot, double left, double right,
     double v3 = right * c + top * s;
     lo = std::min(std::min(v0, v1), std::min(v2, v3));
     hi = std::max(std::max(v0, v1), std::max(v2, v3));
+}
+
+// A glyph of a rotated run, moved into its run's own upright frame (the page
+// turned by -rot): its baseline runs along +x and earlier lines sit at larger
+// y, so line grouping, word gaps and grid placement written for upright text
+// measure the run along its own advance. The result is marked upright (rot 0)
+// and has the box an upright glyph would have: origin to advance end along
+// x, ascender (0.8 em) over descender (0.2 em) along y.
+// The page-space box is an axis-aligned rectangle around a rectangle turned
+// by the run's angle, W = w|cos| + h|sin| wide and H = w|sin| + h|cos| high,
+// with h the em height (font_size). The advance w is recovered from whichever
+// of the two is better conditioned. Re-boxing the page box instead is exact
+// only on quarter turns: at 45° every glyph's box swells by its height and
+// neighbours overlap, so the words of a slanted axis label glue and a
+// doubled letter reads as an overprint.
+// Line building (chars_to_lines), the plain-text grid and the markdown
+// layout fallback all go through this, so they agree on a rotated run.
+inline TextChar to_writing_frame(const TextChar& ch) {
+    double c, s;
+    writing_axes(ch.rot, c, s);
+    TextChar t = ch;
+    t.x = ch.x * c + ch.y * s;
+    t.y = -ch.x * s + ch.y * c;
+    const double ac = std::fabs(c), as = std::fabs(s);
+    const double W = ch.right - ch.left, H = ch.top - ch.bot;
+    const double h = ch.font_size > 0 ? ch.font_size : 0;
+    double w = ac >= as ? (W - h * as) / ac : (H - h * ac) / as;
+    if (!(w > 0)) w = 0;
+    t.left = t.x;
+    t.right = t.x + w;
+    t.top = t.y + 0.8 * h;
+    t.bot = t.y - 0.2 * h;
+    t.rot = 0;
+    return t;
+}
+
+// Inverse of to_writing_frame for a point: frame (fx, fy) of a run written
+// at `rot` back to page space.
+inline void from_writing_frame(int16_t rot, double fx, double fy,
+                               double& px, double& py) {
+    double c, s;
+    writing_axes(rot, c, s);
+    px = fx * c - fy * s;
+    py = fx * s + fy * c;
 }
 
 struct PageCharCache {
@@ -409,6 +458,22 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
                                          const double* initial_ctm = nullptr,
                                          int depth = 0,
                                          const GfxState* inherit_gs = nullptr);
+// Word spaces the producer wrote. A space glyph drawn in the content stream
+// between two upright glyphs of one baseline, the second further right and
+// the spaces between them, separates the two even where the gap measures
+// less than a word space (but more than kWrittenSpaceMinEm — a space kerned
+// out entirely is a break opportunity, not a space): justified or kerned
+// text can close it below a word space ("2 Excludes",
+// the E kerned back over the space), and a space set in another font or
+// rise lies off the baseline and is lost to line grouping (a 6.6-pt space
+// 3 pt above 11-pt "Maria Hazel"). For each glyph index: the index of the
+// glyph such spaces separate it from, or -1. Callers apply it only when that
+// glyph is the one they placed just before, so it never adds a space
+// between glyphs the stream did not set side by side.
+std::vector<int> explicit_word_spaces(const std::vector<TextChar>& chars);
+// Smallest gap, in ems, at which such a written space still counts.
+constexpr double kWrittenSpaceMinEm = 0.02;
+
 std::vector<TextLine> chars_to_lines(const std::vector<TextChar>& chars,
                                      double* out_col_boundary = nullptr);
 // Plain-text page body as a character grid built from glyph coordinates

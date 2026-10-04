@@ -438,12 +438,55 @@ bool line_swallowed_by_table(const TextLine& line,
     return false;
 }
 
+static std::vector<TextLine> merge_upright_lines(const std::vector<TextLine>& lines);
+
 std::vector<TextLine> merge_colinear_lines(const std::vector<TextLine>& lines) {
     if (lines.size() < 2) return lines;
 
     // Skip merging when lines have been column-reordered
     for (auto& l : lines)
         if (l.is_column_split) return lines;
+
+    // Rotated lines are complete already: chars_to_lines built each along
+    // its own baseline, in its direction's reading order. Page-space y says
+    // nothing about which of them belong together — every line of a 90° run
+    // can share one page-space midpoint (merging them welds a sideways table
+    // into one line), and a 180° run's first line is its lowest. So only the
+    // upright lines are merged and sorted by y; each run of rotated lines
+    // keeps its own order and goes in as a block, where its top line's
+    // midpoint falls among the upright lines (a lone rotated line lands
+    // exactly where sorting by y put it).
+    std::vector<TextLine> upright;
+    std::vector<std::pair<size_t, size_t>> runs;   // [begin, end) in lines
+    for (size_t i = 0; i < lines.size(); i++) {
+        if (lines[i].rot == 0) {
+            upright.push_back(lines[i]);
+        } else if (!runs.empty() && runs.back().second == i &&
+                   lines[runs.back().first].rot == lines[i].rot) {
+            runs.back().second = i + 1;
+        } else {
+            runs.push_back({i, i + 1});
+        }
+    }
+    if (runs.empty()) return merge_upright_lines(lines);
+    std::vector<TextLine> merged = merge_upright_lines(upright);
+    for (auto& run : runs) {
+        double top = -1e30;
+        for (size_t k = run.first; k < run.second; k++)
+            top = std::max(top, lines[k].y_center);
+        size_t at = 0;
+        while (at < merged.size() &&
+               (merged[at].rot != 0 || merged[at].y_center >= top))
+            at++;
+        merged.insert(merged.begin() + static_cast<std::ptrdiff_t>(at),
+                      lines.begin() + static_cast<std::ptrdiff_t>(run.first),
+                      lines.begin() + static_cast<std::ptrdiff_t>(run.second));
+    }
+    return merged;
+}
+
+static std::vector<TextLine> merge_upright_lines(const std::vector<TextLine>& lines) {
+    if (lines.size() < 2) return lines;
 
     std::vector<size_t> idx(lines.size());
     for (size_t i = 0; i < idx.size(); i++) idx[i] = i;
@@ -498,9 +541,12 @@ std::vector<TextLine> merge_colinear_lines(const std::vector<TextLine>& lines) {
             m.is_bold = lines[group[0]].is_bold;
             m.is_italic = lines[group[0]].is_italic;
             m.rot = dir;
+            m.first_gap = lines[group[0]].first_gap;
             for (size_t k = 0; k < group.size(); k++) {
                 if (k > 0) {
                     double gap = lines[group[k]].x_left - lines[group[k-1]].x_right;
+                    if (k == 1 && lines[group[0]].text.find(' ') == std::string::npos)
+                        m.first_gap = std::max(0.0, gap);
                     double avg_font = (lines[group[k]].font_size +
                                        lines[group[k-1]].font_size) / 2.0;
                     double col_gap = std::max(avg_font * 6.0, 60.0);
@@ -555,6 +601,11 @@ static bool is_page_number_footer(const std::string& text) {
     }
     return false;
 }
+
+// Widest gap, in ems, between a section number and its title (TextLine::
+// first_gap): a word space, a quad, or a tab stop — half an inch out at a
+// 9-pt heading is 4 em.
+constexpr double kMaxSectionGapEm = 4.0;
 
 // Section-number prefix "1", "1.", "2.1", "4.1.2)": numeric segments, an
 // optional closing '.' or ')' and required whitespace (ASCII or U+3000)
@@ -922,6 +973,14 @@ std::string page_to_markdown(const std::vector<TextLine>& raw_lines,
                             sn.depth)
                         ok = false;
                 }
+                // A section number sits a word space, a quad or a tab stop
+                // from its title. A number several ems from the next word on
+                // its baseline is something else sharing the line: a page
+                // number beside the running head, a chart's axis tick
+                // beside a series label.
+                if (ok &&
+                    l.first_gap > kMaxSectionGapEm * std::max(1.0, l.font_size))
+                    ok = false;
                 if (ok) {
                     line_level[i] = (sn.depth == 1) ? 2 : 3;
                     continue;
