@@ -26,6 +26,12 @@ struct TableData {
     // two filled cells (a ruled box around wrapped text, a label column
     // beside long cells). Read only by detect_tables' sparse_grids output.
     bool too_sparse = false;
+    // Longest cell text (bytes) among cells the author did not rule off:
+    // there a whole paragraph in a cell means page prose swallowed by a
+    // ruled group. A cell is ruled off when its row is a drawn interval
+    // (rules across the grid above and below) and a column rule runs beside
+    // it. Set by build_table.
+    size_t open_cell_max = 0;
 };
 
 // Fold physical header rows into one: a second row whose first cell is
@@ -41,10 +47,13 @@ std::vector<double> find_column_boundaries(
     double table_left, double table_right,
     double table_bot, double table_top,
     const std::vector<double>& row_ys);
+// drawn_rules: the lines are strokes on the page (false when synthesized
+// from cell shading, which is weaker evidence for a small grid).
 TableData build_table(const std::vector<double>& row_ys,
                       const std::vector<PdfLineSegment>& h_lines,
                       const std::vector<PdfLineSegment>& v_lines,
-                      const PageCharCache& cache);
+                      const PageCharCache& cache,
+                      bool drawn_rules = true);
 
 // Heading-classification helpers (pdf_markdown.cpp), exposed the same way
 // so the section-number and keyword rules can be tested directly.

@@ -290,8 +290,13 @@ std::vector<AnnotEntry> extract_annotations(PdfDoc& doc, const PdfObj& page_obj,
 static std::string squash_ws(const std::string& s) {
     std::string out;
     out.reserve(s.size());
-    for (char c : s)
+    for (size_t i = 0; i < s.size(); i++) {
+        char c = s[i];
+        // A no-break space (U+00A0) is whitespace too: the table builder
+        // drops it from cells, so a line keeping it would never match.
+        if (c == '\xC2' && i + 1 < s.size() && s[i + 1] == '\xA0') { i++; continue; }
         if (c != ' ' && c != '\t' && c != '\n' && c != '\r') out += c;
+    }
     return out;
 }
 
@@ -328,7 +333,8 @@ static std::string alnum_only(const std::string& s) {
             continue;
         }
         size_t n = (c < 0xE0) ? 2 : (c < 0xF0) ? 3 : 4;
-        if (c != 0xE2) out.append(s, i, n);
+        bool nbsp = c == 0xC2 && i + 1 < s.size() && (unsigned char)s[i + 1] == 0xA0;
+        if (c != 0xE2 && !nbsp) out.append(s, i, n);
         i += n;
     }
     return out;
