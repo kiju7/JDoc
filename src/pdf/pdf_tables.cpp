@@ -2521,6 +2521,20 @@ static std::vector<double> infer_columns_in_band(
     // a stack whose typical cell is a phrase of five or more words is
     // prose, not a column. n receives the number of rows with text in
     // (a, b).
+    // Whether every glyph centred in (a, b) is a currency sign.
+    auto only_currency = [&](double a, double b) {
+        bool any = false;
+        for (size_t ri : mc)
+            for (size_t ci : rows[ri].char_indices) {
+                const auto& c = chars[ci];
+                double m = (c.left + c.right) / 2.0;
+                if (m <= a || m >= b) continue;
+                uint32_t u = c.unicode;
+                if (u != '$' && u != 0x20AC && u != 0xA3 && u != 0xA5 && u != 0x20A9) return false;
+                any = true;
+            }
+        return any;
+    };
     const double align_tol = std::max(median_fs * 0.5, 2.0);
     const double word_gap = std::max(median_fs * 0.2, 1.5);
     auto stack_aligned = [&](double a, double b, int& n) {
@@ -2602,9 +2616,11 @@ static std::vector<double> infer_columns_in_band(
                 double b = (k == inner.size()) ? run.second : inner[k].z_lo;
                 // A stretch holding no glyph centre is the frayed edge of
                 // the neighbouring column; one holding cells must stack.
+                // Currency signs set apart from their amounts ("$  1,111")
+                // stack too, but they are the amounts' prefix, not a column.
                 int n = 0;
                 bool aligned = stack_aligned(a, b, n);
-                if (n > 0 && !aligned) stacks_ok = false;
+                if (n > 0 && (!aligned || only_currency(a, b))) stacks_ok = false;
             }
             if (stacks_ok) {
                 for (auto& c : inner) cands.push_back(c);
