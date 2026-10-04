@@ -2328,8 +2328,32 @@ static bool row_is_multi_cell(const TextRow& tr, double cell_merge_gap) {
     return false;
 }
 
+// A row that opens a table caption ("Table 2.", "표 3") ends any band above
+// it: the rows below belong to the next table. Figure captions do not split:
+// what follows one is a figure's own labels (or, captions set below, the
+// next block), and a band of chart labels is no table either way. Not
+// applied to
+// the full-width pass of a two-column page, where rows weld both page
+// columns and a caption in one column says nothing about the other; the
+// per-column passes split there.
+static bool row_is_table_caption(const TextRow& tr, const std::vector<CharInfo>& chars) {
+    std::vector<size_t> ci = tr.char_indices;
+    std::sort(ci.begin(), ci.end(), [&](size_t a, size_t b) {
+        return chars[a].x < chars[b].x;
+    });
+    std::vector<uint32_t> cps;
+    for (size_t i = 0; i < ci.size() && cps.size() < 16; i++)
+        cps.push_back(chars[ci[i]].unicode);
+    if (!is_caption_start(cps)) return false;
+    size_t i = 0;
+    if (cps[i] == '<' || cps[i] == '[' || cps[i] == 0x3008 || cps[i] == 0xFF1C) i++;
+    return i < cps.size() && (cps[i] == 'T' || cps[i] == 't' || cps[i] == 0xD45C);
+}
+
 // S1: find y-bands of consecutive multi-cell rows (with bounded 1-cell rows)
-static std::vector<YBand> find_y_bands(const std::vector<TextRow>& rows) {
+static std::vector<YBand> find_y_bands(const std::vector<TextRow>& rows,
+                                       const std::vector<CharInfo>& chars,
+                                       bool split_at_captions) {
     std::vector<YBand> bands;
     const int kMaxSingleRunInside = 2;   // ≥3 consecutive 1-cell rows splits a band
 
@@ -2359,6 +2383,7 @@ static std::vector<YBand> find_y_bands(const std::vector<TextRow>& rows) {
             } else {
                 single_run++;
                 if (single_run > kMaxSingleRunInside) break;
+                if (split_at_captions && row_is_table_caption(rows[j], chars)) break;
             }
             j++;
         }
@@ -3537,7 +3562,7 @@ static std::vector<TableData> detect_text_tables_range(
     }
 
     // S1: find y-bands
-    auto bands = find_y_bands(rows);
+    auto bands = find_y_bands(rows, chars, gutter_x <= 0);
     if (bands.empty()) return {};
 
     std::vector<TableData> result;
