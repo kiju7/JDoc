@@ -22,6 +22,10 @@ struct TableData {
     // "1 | 2*", a numeric column) still see the bare text; format_table
     // applies it, and ignores a mask that has fallen out of step with rows.
     std::vector<std::vector<uint8_t>> cell_bold;
+    // build_table cleared the rows because fewer than the required rows had
+    // two filled cells (a ruled box around wrapped text, a label column
+    // beside long cells). Read only by detect_tables' sparse_grids output.
+    bool too_sparse = false;
 };
 
 // Fold physical header rows into one: a second row whose first cell is
@@ -164,6 +168,9 @@ struct ExtractResult {
     std::vector<std::vector<double>> all_image_x;  // per-page image X positions
     std::vector<double> col_boundaries;  // per-page column boundary (0 if single-column)
     std::vector<std::vector<TableData>> all_tables;
+    // Per-page layout blocks for tabular regions no detector claimed
+    // (markdown with tables on only; find_layout_fallbacks).
+    std::vector<std::vector<LayoutFallback>> all_fallbacks;
     std::vector<std::vector<AnnotEntry>> all_annots;
     // Per-page layout-preserving body text, filled only for plain-text
     // output (layout_page_text); the markdown path never reads it.
@@ -178,9 +185,13 @@ struct ExtractResult {
 };
 
 // Cross-translation-unit declarations.
+// sparse_grids, when given, receives every ruled grid rejected only for
+// holding too few multi-cell rows that has full-width row rules and a
+// vertical rule inside; the markdown path may show those as layout blocks.
 std::vector<TableData> detect_tables(const std::vector<PdfLineSegment>& lines,
                                      const PageCharCache& cache,
-                                     double page_width, double page_height);
+                                     double page_width, double page_height,
+                                     std::vector<SparseGrid>* sparse_grids = nullptr);
 std::vector<TableData> detect_shading_tables(
     const std::vector<PdfFillRect>& fill_rects,
     const PageCharCache& cache,
