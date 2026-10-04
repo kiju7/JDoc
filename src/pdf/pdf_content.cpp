@@ -2318,6 +2318,8 @@ static std::vector<TextLine> lines_from_upright_chars(
     int fs_count = 0;
     double prev_right = -1e9;
     double word_end = -1e9;      // right edge of the last non-space glyph
+    double reach = -1e9;         // right edge of everything placed so far
+    double hole = 0;             // widest empty stretch since word_end
     bool first_gap_set = false;  // cur.first_gap measured
     int prev_glyph = -1;         // index of the last non-space glyph placed
     bool after_space = false;    // the last glyph placed was a space glyph
@@ -2333,14 +2335,37 @@ static std::vector<TextLine> lines_from_upright_chars(
         fs_count = 0;
         prev_right = -1e9;
         word_end = -1e9;
+        reach = -1e9;
+        hole = 0;
         first_gap_set = false;
         prev_glyph = -1;
         after_space = false;
     };
 
     // Column-gutter gap threshold: large enough to skip word spaces (~0.15×fs)
-    // but small enough to catch tight body-text gutters (~1.2×fs).
+    // but small enough to catch tight body-text gutters (~1.2×fs). Journals
+    // set gutters narrower than that (11pt beside 10pt type), so on a page
+    // with a column boundary the gutter is also measured: the median gap
+    // across the boundary over the rows where it is wider than a word space
+    // (half the type size). The threshold comes down to 80% of it.
     double col_gap_thresh = std::max(median_fs * 1.2, 8.0);
+    if (col_boundary > 0) {
+        std::vector<double> gaps;
+        for (size_t i = 0; i < idx.size(); ) {
+            double row_y = chars[idx[i]].y, left = -1e18, right = 1e18;
+            for (; i < idx.size() && std::abs(chars[idx[i]].y - row_y) <= y_tol; i++) {
+                const auto& c = chars[idx[i]];
+                if (c.unicode == ' ' || c.unicode == 0xA0) continue;
+                if (c.left + c.right < 2 * col_boundary) left = std::max(left, (double)c.right);
+                else right = std::min(right, (double)c.left);
+            }
+            if (right - left >= median_fs * 0.5 && right - left < 1e17) gaps.push_back(right - left);
+        }
+        if (!gaps.empty()) {
+            std::nth_element(gaps.begin(), gaps.begin() + gaps.size() / 2, gaps.end());
+            col_gap_thresh = std::min(col_gap_thresh, gaps[gaps.size() / 2] * 0.8);
+        }
+    }
 
     // Peek-ahead helper: count distinct span clusters in the chars of the
     // current y-row that lie strictly to the right of col_boundary, starting
@@ -2378,10 +2403,17 @@ static std::vector<TextLine> lines_from_upright_chars(
         // (≥ 2×median_fs, ~20pt for 10pt body text) is always treated as a
         // page-gutter split, even when both sides have cell-like content,
         // so two tables sitting side-by-side at the same y get separated.
-        if (col_boundary > 0 && !cur.text.empty() && prev_right > -1e8) {
-            double gap = ch.left - prev_right;
-            if (gap > col_gap_thresh &&
-                prev_right < col_boundary && ch.left > col_boundary) {
+        // The gap is measured from the last glyph that is not a space: a
+        // space glyph the producer set after a column's last word reaches
+        // into the gutter and would hide it. A gap the spaces fill from end
+        // to end is text set wide ("요     약"), not a gutter: a gutter keeps
+        // an empty stretch wider than a word space somewhere across it.
+        if (col_boundary > 0 && !cur.text.empty() && word_end > -1e8 &&
+            ch.unicode != ' ' && ch.unicode != 0xA0) {
+            double gap = ch.left - word_end;
+            double empty = std::max(hole, ch.left - reach);
+            if (gap > col_gap_thresh && empty > median_fs * 0.3 &&
+                word_end < col_boundary && ch.left > col_boundary) {
                 bool gutter = gap > std::max(median_fs * 2.0, 18.0);
                 if (gutter || right_clusters(ii, cur_y) < 2) {
                     flush();
@@ -2438,6 +2470,9 @@ static std::vector<TextLine> lines_from_upright_chars(
             fs_count++;
         }
         util::append_utf8(cur.text, ch.unicode);
+        if (reach > -1e8) hole = std::max(hole, (double)ch.left - reach);
+        reach = std::max(reach, (double)ch.right);
+        if (ch.unicode != ' ' && ch.unicode != 0xA0) hole = 0;
         prev_right = ch.right;
         after_space = ch.unicode == ' ' || ch.unicode == 0xA0;
     }
