@@ -937,7 +937,63 @@ struct GlyphSource::Impl {
     Type1 t1;
     int kind = 0;                 // 1 Type1, 2 TrueType outlines, 3 CFF outlines
     bool tt_cmap = false;         // OpenType CFF selected through the sfnt cmap
+    // A CID-keyed CFF shown with glyph indices as CIDs (see choose_cid_keyed_cff_mapping).
+    bool cff_cids_are_gids = false;
     std::vector<uint16_t> cid_to_gid;
+
+    // A CID-keyed CFF program selects glyphs by CID through its charset
+    // (PDF 32000-1 9.7.4.2). Some producers embed a font whose charset is
+    // not the identity (a full OpenType font whose CFF CIDs are not its
+    // glyph indices) and still write glyph indices as the CIDs under
+    // Identity-H/V; a CFF font has no /CIDToGIDMap to say so. Read by the
+    // charset, such text draws other glyphs of the font.
+    //
+    // The choice is made once per font, from what the PDF says each code
+    // is (its ToUnicode) against what the font says each glyph is:
+    //  1. An OpenType program carries its own Unicode cmap. Each ToUnicode
+    //     entry whose character the cmap knows is a vote for the reading
+    //     that reaches the cmap's glyph: by the charset, or code = glyph
+    //     index. Glyph indices win only with more votes; a tie, or a
+    //     charset that is the identity (both readings agree), keeps the
+    //     charset.
+    //  2. Without a cmap verdict, coverage decides: glyph indices are taken
+    //     only when every mapped code is a glyph of the program and the
+    //     charset holds fewer than half of them (the codes are glyph
+    //     indices the charset does not list as CIDs).
+    // Without a ToUnicode there is no evidence and the charset is used.
+    void choose_cid_keyed_cff_mapping() {
+        const size_t ng = cff.charstrings.count();
+        bool identity = true;
+        for (size_t g = 0; g < cff.charset.size() && identity; g++)
+            identity = cff.charset[g] == g;
+        if (identity || font->to_unicode.empty()) return;
+        auto charset_gid = [&](uint32_t code) {
+            auto it = cff.cid_to_gid.find(code);
+            return it == cff.cid_to_gid.end() ? -1 : static_cast<int>(it->second);
+        };
+        if (tt_cmap && tt.has31 && !tt.cmap31.empty()) {
+            size_t by_charset = 0, by_index = 0;
+            for (auto& [code, u] : font->to_unicode) {
+                auto it = tt.cmap31.find(u);
+                if (it == tt.cmap31.end()) continue;
+                const int g = it->second;
+                if (charset_gid(code) == g) by_charset++;
+                if (code == static_cast<uint32_t>(g)) by_index++;
+            }
+            if (by_charset || by_index) {
+                cff_cids_are_gids = by_index > by_charset;
+                return;
+            }
+        }
+        size_t n = 0, in_charset = 0, in_range = 0;
+        for (auto& kv : font->to_unicode) {
+            const uint32_t code = kv.first;
+            n++;
+            if (charset_gid(code) >= 0) in_charset++;
+            if (code < ng) in_range++;
+        }
+        cff_cids_are_gids = n > 0 && in_range == n && 2 * in_charset < n;
+    }
 
     std::string glyph_name(uint32_t code) const {
         auto d = font->differences.find(static_cast<int>(code));
@@ -991,6 +1047,8 @@ struct GlyphSource::Impl {
     int cff_gid(uint32_t code) const {
         if (cff.cid_keyed) {
             if (!font->cid_font) return -1;
+            if (cff_cids_are_gids)
+                return code < cff.charstrings.count() ? static_cast<int>(code) : -1;
             auto it = cff.cid_to_gid.find(code);
             return it == cff.cid_to_gid.end() ? -1 : it->second;
         }
@@ -1045,6 +1103,8 @@ GlyphSource::GlyphSource(PdfDoc& doc, const PdfFont& font) : impl_(new Impl) {
             break;
         }
     }
+    if (impl_->kind == 3 && impl_->cff.cid_keyed && font.cid_font)
+        impl_->choose_cid_keyed_cff_mapping();
 }
 
 GlyphSource::~GlyphSource() = default;
