@@ -22,7 +22,9 @@
 
 // Fraction of a grayscale PNG's pixels that are dark. Enough of a decoder to
 // judge polarity: the fixtures below are 8-bit grayscale, no interlace.
-static double dark_fraction(const std::vector<char>& png) {
+// [fx0, fx1) limits the count to that horizontal band of the image.
+static double dark_fraction(const std::vector<char>& png, double fx0 = 0.0,
+                            double fx1 = 1.0) {
     auto be32 = [&](size_t i) {
         return (uint32_t(uint8_t(png[i])) << 24) | (uint32_t(uint8_t(png[i+1])) << 16) |
                (uint32_t(uint8_t(png[i+2])) << 8) | uint32_t(uint8_t(png[i+3]));
@@ -51,6 +53,8 @@ static double dark_fraction(const std::vector<char>& png) {
         return -1;
 
     std::vector<unsigned char> prev(w, 0), cur(w, 0);
+    const uint32_t bx0 = uint32_t(fx0 * w), bx1 = uint32_t(fx1 * w);
+    if (bx1 <= bx0) return -1;
     size_t dark = 0, i = 0;
     for (uint32_t y = 0; y < h && i < out_len; y++) {
         unsigned char f = raw[i++];
@@ -66,11 +70,11 @@ static double dark_fraction(const std::vector<char>& png) {
                 v += (pa <= pb && pa <= pc) ? a : (pb <= pc ? b : c);
             }
             cur[x] = static_cast<unsigned char>(v);
-            if (cur[x] < 128) dark++;
+            if (cur[x] < 128 && x >= bx0 && x < bx1) dark++;
         }
         prev = cur;
     }
-    return double(dark) / (double(w) * h);
+    return double(dark) / (double(bx1 - bx0) * h);
 }
 
 int main(int argc, char* argv[]) {
@@ -897,6 +901,74 @@ int main(int argc, char* argv[]) {
         std::cout << "    composite " << img.width << "x" << img.height << "\n";
         CHECK(img.width > 0 && img.height * 100 < img.width * 42);
         CHECK(img.height * 100 > img.width * 30);   // the strips and their title
+    }
+
+    // Test 22: a figure stored as raster strips under two columns of body
+    // text. Its region composite is the figure alone: column lines are
+    // narrower than half the page yet are body text, not labels to grow
+    // over — nor is a paragraph's short last line right above the figure.
+    // Strips span 435x120 pt; taking in the text above would make the
+    // image barely twice as wide as tall.
+    std::cout << "[22] Testing figure strips under multi-column body text...\n";
+    {
+        const char* fixtures[] = {
+            "test/fixtures/pdf/strip_figure_columns.pdf",
+            "test/fixtures/pdf/strip_figure_columns_short_tail.pdf",
+        };
+        for (const char* fx : fixtures) {
+            std::ifstream f(fx);
+            if (!f.good()) {
+                std::cout << "    SKIP: " << fx << "\n";
+                continue;
+            }
+            f.close();
+            auto chunks = jdoc::pdf_to_markdown_chunks(fx);
+            CHECK(chunks.size() == 1);
+            CHECK(chunks[0].images.size() == 1);
+            const auto& img = chunks[0].images[0];
+            double aspect = img.height > 0 ? double(img.width) / img.height : 0;
+            std::cout << "    " << fx << ": " << img.width << "x" << img.height
+                      << " (expected aspect >= 3)\n";
+            CHECK(aspect >= 3.0);
+            CHECK(chunks[0].text.find("sentences") != std::string::npos);
+            CHECK(chunks[0].text.find("evaluation") != std::string::npos);
+        }
+    }
+
+    // Test 23: a glyph of a CID-keyed CFF font whose charset is not the
+    // identity, drawn over a raster. Glyph 1 is a bar on the left half of
+    // the em, glyph 2 one on the right; every fixture's ToUnicode says the
+    // shown code is "A" (glyph 1). Shown by CID (the spec) the charset
+    // selects it; shown by glyph index (codes the charset maps elsewhere,
+    // or does not hold) the font's cmap or the charset's coverage says so.
+    // Either way the composite is dark on the left and light on the right.
+    std::cout << "[23] Testing CID-keyed CFF glyph selection...\n";
+    {
+        const char* fixtures[] = {
+            "test/fixtures/pdf/cid_cff_otf_gids.pdf",
+            "test/fixtures/pdf/cid_cff_otf_cids.pdf",
+            "test/fixtures/pdf/cid_cff_bare_gids.pdf",
+            "test/fixtures/pdf/cid_cff_bare_cids.pdf",
+        };
+        for (const char* fx : fixtures) {
+            std::ifstream f(fx);
+            if (!f.good()) {
+                std::cout << "    SKIP: " << fx << "\n";
+                continue;
+            }
+            f.close();
+            auto chunks = jdoc::pdf_to_markdown_chunks(fx);
+            CHECK(chunks.size() == 1);
+            CHECK(chunks[0].images.size() == 1);
+            const auto& img = chunks[0].images[0];
+            CHECK(img.format == "png");
+            double left = dark_fraction(img.data, 0.0, 0.5);
+            double right = dark_fraction(img.data, 0.5, 1.0);
+            std::cout << "    " << fx << ": dark left " << left << ", right " << right
+                      << " (expected left bar)\n";
+            CHECK(left > 0.2);
+            CHECK(right < 0.05);
+        }
     }
 
     std::cout << "\n=== All tests passed ===\n";
