@@ -586,6 +586,39 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    // Test 18: table rows whose word spaces are no-break spaces (U+00A0).
+    // The cells normalise them to spaces; the prose lines must too, or the
+    // capture check that drops a table's lines from the prose flow misses
+    // them and the shaded bold header (and a data row with "12 300") is
+    // printed a second time after the table.
+    std::cout << "[18] Testing table rows spelled with no-break spaces...\n";
+    {
+        const char* fx = "test/fixtures/pdf/nbsp_table.pdf";
+        std::ifstream f(fx);
+        if (!f.good()) {
+            std::cout << "    SKIP: " << fx << "\n";
+        } else {
+            f.close();
+            std::string md = jdoc::pdf_to_markdown(fx);
+            auto count = [&](const std::string& needle) {
+                size_t n = 0;
+                for (size_t p = md.find(needle); p != std::string::npos;
+                     p = md.find(needle, p + 1))
+                    n++;
+                return n;
+            };
+            CHECK(count("| **Park**") == 1);
+            CHECK(count("Inside temp") == 1);
+            CHECK(count("Road temp") == 1);
+            CHECK(count("North Park") == 1);
+            CHECK(count("12 300") == 1);
+            CHECK(md.find("\xC2\xA0") == std::string::npos);
+            size_t tbl = md.find("| Corner");
+            size_t tail = md.find("The smallest park");
+            CHECK(tbl != std::string::npos && tail != std::string::npos && tbl < tail);
+        }
+    }
+
     std::cout << "\n=== All tests passed ===\n";
     return 0;
 }
