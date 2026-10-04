@@ -1096,16 +1096,29 @@ std::string page_to_markdown(const std::vector<TextLine>& raw_lines,
     // first-line indent, or the line before it ending short of the
     // column's right edge; a change of type size or weight starts one too.
     // Each column's edges: where its lines start (median left) and where
-    // its full lines end (90th percentile right).
+    // its full lines end (90th percentile right). In a column of under ten
+    // lines that percentile is the rightmost line itself, so there a line
+    // under a fifth of the column's median width (a page number, a running
+    // head cut at the gutter) does not count toward the right edge.
     double col_left[3] = {0, 0, 0}, col_right[3] = {0, 0, 0};
     for (int sd = 0; sd < 3; sd++) {
+        std::vector<double> ws;
+        for (size_t k = 0; k < lines.size(); k++)
+            if (side_of(lines[k]) == sd && line_level[k] == 0)
+                ws.push_back(lines[k].x_right - lines[k].x_left);
+        double min_w = 0;
+        if (sd != 0 && !ws.empty() && ws.size() < 10) {
+            std::nth_element(ws.begin(), ws.begin() + ws.size() / 2, ws.end());
+            min_w = ws[ws.size() / 2] / 5.0;
+        }
         std::vector<double> ls, rs;
         for (size_t k = 0; k < lines.size(); k++)
             if (side_of(lines[k]) == sd && line_level[k] == 0) {
                 ls.push_back(lines[k].x_left);
-                rs.push_back(lines[k].x_right);
+                if (lines[k].x_right - lines[k].x_left >= min_w)
+                    rs.push_back(lines[k].x_right);
             }
-        if (ls.empty()) continue;
+        if (ls.empty() || rs.empty()) continue;
         std::nth_element(ls.begin(), ls.begin() + ls.size() / 2, ls.end());
         std::nth_element(rs.begin(), rs.begin() + rs.size() * 9 / 10, rs.end());
         col_left[sd] = ls[ls.size() / 2];

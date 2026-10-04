@@ -1186,6 +1186,84 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    // [30] Column detection on pages with few lines
+    // (make_short_page_fixtures.py). A page of ten rows is too short for the
+    // gutter histogram alone; it reads as two columns when three rows set
+    // text side by side, flush left in two columns of comparable width.
+    // Then the left column (heading, four lines) comes before the right one
+    // instead of the two being joined line by line, the centred title stays
+    // across the page, and the page number at the right margin does not
+    // break every line of the right column into its own paragraph. A
+    // centred borderless table, a form of short labels beside long values,
+    // rows of figures whose cell gaps are as wide as the gap on the page
+    // centre (under sideways column heads), and a one-column page set on
+    // the same short page keep their rows.
+    std::cout << "[30] Testing column detection on short pages...\n";
+    {
+        const std::string dir = "test/fixtures/pdf/";
+        std::ifstream f(dir + "short_page_columns.pdf");
+        if (!f.good()) {
+            std::cout << "    SKIP: short_page_*.pdf\n";
+        } else {
+            f.close();
+            auto in_order = [](const std::string& s,
+                               std::initializer_list<const char*> parts) {
+                size_t at = 0;
+                for (const char* p : parts) {
+                    size_t k = s.find(p, at);
+                    if (k == std::string::npos) {
+                        std::cerr << "    out of order or missing: " << p << "\n";
+                        return false;
+                    }
+                    at = k + 1;
+                }
+                return true;
+            };
+            jdoc::ConvertOptions text_opts;
+            text_opts.format = jdoc::OutputFormat::PLAINTEXT;
+
+            std::string md = jdoc::pdf_to_markdown(dir + "short_page_columns.pdf");
+            CHECK(in_order(md, {"## Green Space and Summer Heat",
+                                "## 1. Introduction",
+                                "Green space in a city is known to lower the air\n"
+                                "temperature on a summer afternoon, but how\n",
+                                "the size of the park\naround it.\n",
+                                "## 2. Measurement",
+                                "The readings were taken last summer in\n"
+                                "twelve city parks, twice a day, with the\n"
+                                "same calibrated thermometer at every\n"}));
+            CHECK(md.find("lower the air The readings") == std::string::npos);
+            std::string txt = jdoc::pdf_to_markdown(dir + "short_page_columns.pdf",
+                                                    text_opts);
+            CHECK(in_order(txt, {"Green Space and Summer Heat", "1. Introduction",
+                                 "around it.", "2. Measurement",
+                                 "same calibrated thermometer at every"}));
+
+            for (bool tables : {true, false}) {
+                jdoc::ConvertOptions o;
+                o.tables = tables;
+                std::string t = jdoc::pdf_to_markdown(dir + "short_page_table.pdf", o);
+                CHECK(in_order(t, {"Central", "31.2 degrees", "Riverside Garden",
+                                   "33.6", "North Hill", "32.4 in the shade",
+                                   "Corner lot", "34.0"}));
+                std::string fm = jdoc::pdf_to_markdown(dir + "short_page_form.pdf", o);
+                CHECK(in_order(fm, {"Applicant", "Kim Minsu", "Date of submission",
+                                    "5 October 2026", "Title of the study",
+                                    "Urban green space", "Supervisor",
+                                    "Professor Lee Jiwon"}));
+                std::string sg = jdoc::pdf_to_markdown(dir + "short_page_single.pdf", o);
+                CHECK(in_order(sg, {"2026 45", "## 3. Results",
+                                    "but how much it\nlowers it varies",
+                                    "- Larger parks were cooler."}));
+                std::string nb = jdoc::pdf_to_markdown(dir + "short_page_numbers.pdf", o);
+                CHECK(in_order(nb, {"2026 45", "Table 9", "Caltech101", "Mean",
+                                    "Model-H (large)", "Model-L (small)"}));
+            }
+            std::cout << "    short two-column page split; table, form and "
+                         "one-column page kept OK\n";
+        }
+    }
+
     std::cout << "\n=== All tests passed ===\n";
     return 0;
 }

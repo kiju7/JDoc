@@ -1,0 +1,103 @@
+%PDF-1.4
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [3 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 5 0 R /F2 6 0 R >> >> /Contents 4 0 R >>
+endobj
+4 0 obj
+<< /Length 3251 >>
+stream
+BT 0.45 g /F1 9.0 Tf 52.00 802.00 Td (Journal of Urban Climate  Vol. 8  No. 2  2026) Tj ET 0 g
+BT 0.45 g /F1 9.0 Tf 532.99 802.00 Td (45) Tj ET 0 g
+0.5 w 52.00 794.00 m 543.00 794.00 l S
+BT /F1 10.0 Tf 52.00 746.00 Td (Table 9: Accuracy across tasks.) Tj ET
+BT /F1 8.0 Tf 0 1 -1 0 123.00 672.00 Tm (Caltech101) Tj ET
+BT /F1 8.0 Tf 0 1 -1 0 147.77 672.00 Tm (CIFAR-100) Tj ET
+BT /F1 8.0 Tf 0 1 -1 0 172.54 672.00 Tm (DTD) Tj ET
+BT /F1 8.0 Tf 0 1 -1 0 197.30 672.00 Tm (Flowers102) Tj ET
+BT /F1 8.0 Tf 0 1 -1 0 222.07 672.00 Tm (Pets) Tj ET
+BT /F1 8.0 Tf 0 1 -1 0 246.84 672.00 Tm (Sun397) Tj ET
+BT /F1 8.0 Tf 0 1 -1 0 271.61 672.00 Tm (SVHN) Tj ET
+BT /F1 8.0 Tf 0 1 -1 0 296.38 672.00 Tm (Camelyon) Tj ET
+BT /F1 8.0 Tf 0 1 -1 0 321.14 672.00 Tm (EuroSAT) Tj ET
+BT /F1 8.0 Tf 0 1 -1 0 345.91 672.00 Tm (Resisc45) Tj ET
+BT /F1 8.0 Tf 0 1 -1 0 370.68 672.00 Tm (Retinopathy) Tj ET
+BT /F1 8.0 Tf 0 1 -1 0 395.45 672.00 Tm (Clevr-Count) Tj ET
+BT /F1 8.0 Tf 0 1 -1 0 420.22 672.00 Tm (Clevr-Dist) Tj ET
+BT /F1 8.0 Tf 0 1 -1 0 444.98 672.00 Tm (DMLab) Tj ET
+BT /F1 8.0 Tf 0 1 -1 0 469.75 672.00 Tm (Mean) Tj ET
+BT /F1 8.0 Tf 52.00 658.00 Td (Model-H \(large\)) Tj ET
+BT /F1 8.0 Tf 114.00 658.00 Td (95.3) Tj ET
+BT /F1 8.0 Tf 138.77 658.00 Td (85.5) Tj ET
+BT /F1 8.0 Tf 163.54 658.00 Td (75.2) Tj ET
+BT /F1 8.0 Tf 188.30 658.00 Td (99.7) Tj ET
+BT /F1 8.0 Tf 213.07 658.00 Td (97.2) Tj ET
+BT /F1 8.0 Tf 237.84 658.00 Td (65.0) Tj ET
+BT /F1 8.0 Tf 262.61 658.00 Td (88.9) Tj ET
+BT /F1 8.0 Tf 287.38 658.00 Td (83.3) Tj ET
+BT /F1 8.0 Tf 312.14 658.00 Td (96.7) Tj ET
+BT /F1 8.0 Tf 336.91 658.00 Td (91.4) Tj ET
+BT /F1 8.0 Tf 361.68 658.00 Td (76.6) Tj ET
+BT /F1 8.0 Tf 386.45 658.00 Td (91.7) Tj ET
+BT /F1 8.0 Tf 411.22 658.00 Td (63.8) Tj ET
+BT /F1 8.0 Tf 435.98 658.00 Td (53.1) Tj ET
+BT /F1 8.0 Tf 460.75 658.00 Td (79.4) Tj ET
+BT /F1 8.0 Tf 52.00 646.00 Td (Model-L \(large\)) Tj ET
+BT /F1 8.0 Tf 114.00 646.00 Td (95.4) Tj ET
+BT /F1 8.0 Tf 138.77 646.00 Td (81.9) Tj ET
+BT /F1 8.0 Tf 163.54 646.00 Td (74.3) Tj ET
+BT /F1 8.0 Tf 188.30 646.00 Td (99.7) Tj ET
+BT /F1 8.0 Tf 213.07 646.00 Td (96.7) Tj ET
+BT /F1 8.0 Tf 237.84 646.00 Td (63.5) Tj ET
+BT /F1 8.0 Tf 262.61 646.00 Td (87.4) Tj ET
+BT /F1 8.0 Tf 287.38 646.00 Td (83.6) Tj ET
+BT /F1 8.0 Tf 312.14 646.00 Td (96.5) Tj ET
+BT /F1 8.0 Tf 336.91 646.00 Td (89.7) Tj ET
+BT /F1 8.0 Tf 361.68 646.00 Td (77.1) Tj ET
+BT /F1 8.0 Tf 386.45 646.00 Td (86.4) Tj ET
+BT /F1 8.0 Tf 411.22 646.00 Td (63.1) Tj ET
+BT /F1 8.0 Tf 435.98 646.00 Td (49.7) Tj ET
+BT /F1 8.0 Tf 460.75 646.00 Td (74.5) Tj ET
+BT /F1 8.0 Tf 52.00 634.00 Td (Model-L \(small\)) Tj ET
+BT /F1 8.0 Tf 114.00 634.00 Td (90.8) Tj ET
+BT /F1 8.0 Tf 138.77 634.00 Td (84.1) Tj ET
+BT /F1 8.0 Tf 163.54 634.00 Td (74.1) Tj ET
+BT /F1 8.0 Tf 188.30 634.00 Td (99.3) Tj ET
+BT /F1 8.0 Tf 213.07 634.00 Td (92.7) Tj ET
+BT /F1 8.0 Tf 237.84 634.00 Td (61.0) Tj ET
+BT /F1 8.0 Tf 262.61 634.00 Td (80.9) Tj ET
+BT /F1 8.0 Tf 287.38 634.00 Td (82.5) Tj ET
+BT /F1 8.0 Tf 312.14 634.00 Td (95.6) Tj ET
+BT /F1 8.0 Tf 336.91 634.00 Td (85.2) Tj ET
+BT /F1 8.0 Tf 361.68 634.00 Td (75.3) Tj ET
+BT /F1 8.0 Tf 386.45 634.00 Td (70.3) Tj ET
+BT /F1 8.0 Tf 411.22 634.00 Td (56.1) Tj ET
+BT /F1 8.0 Tf 435.98 634.00 Td (41.9) Tj ET
+BT /F1 8.0 Tf 460.75 634.00 Td (74.7) Tj ET
+
+endstream
+endobj
+5 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>
+endobj
+6 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold /Encoding /WinAnsiEncoding >>
+endobj
+xref
+0 7
+0000000000 65535 f 
+0000000009 00000 n 
+0000000058 00000 n 
+0000000115 00000 n 
+0000000251 00000 n 
+0000003554 00000 n 
+0000003651 00000 n 
+trailer
+<< /Size 7 /Root 1 0 R >>
+startxref
+3753
+%%EOF

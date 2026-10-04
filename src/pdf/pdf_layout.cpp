@@ -204,6 +204,16 @@ std::vector<LayoutBlock> column_blocks(const std::vector<LayoutLine>& lines,
     }
     for (size_t i = 1; i + 1 < pieces.size(); i++) {
         if (pieces[i].side != SPAN || wide[i]) continue;
+        // A title, a line as wide as column text set well above the running
+        // size, between a running head and a short heading rather than
+        // lines of column text, stays across the page. (A large symbol
+        // among a figure's labels is no title.)
+        auto text_line = [&](const Piece& pc) {
+            return pc.x1 - pc.x0 >= content_w * 0.25;
+        };
+        if (pieces[i].line.font_size > 1.3 * median_fs && text_line(pieces[i]) &&
+            !text_line(pieces[i - 1]) && !text_line(pieces[i + 1]))
+            continue;
         if (pieces[i - 1].side != SPAN && pieces[i + 1].side != SPAN)
             pieces[i].side = (pieces[i].x0 + pieces[i].x1) / 2.0 < boundary
                                  ? LEFT : RIGHT;

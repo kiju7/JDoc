@@ -2157,6 +2157,68 @@ void drop_overprinted_chars(std::vector<TextChar>& chars) {
 // ── Layout Engine: TextChar → TextLine ───────────────────
 
 
+// Fewest rows a page needs for column detection at all. Pages with fewer
+// than ten rows (or a thin histogram) must also pass paired_rows().
+constexpr int kMinColumnRowsFew = 4;
+
+// Whether the rows of a page show two columns of text side by side around
+// `boundary`: at least three rows whose glyphs leave a gap wider than a word
+// space across the boundary and whose left and right pieces each fill most
+// of their column (the widest extent of that side's pieces over all rows)
+// in one run of text, starting at that column's left edge, with the gap at
+// the boundary at least twice as wide as any gap inside either piece.
+// Running text is set flush left in both columns, its word spaces far
+// narrower than the gutter; the cells of a borderless table are often
+// centred, and a row of table cells spreads its width over gaps as wide as
+// the one at the boundary, or wider. The two columns must be of comparable
+// width, so a form of short labels beside long values, or a key/value
+// table, does not pass for a two-column page, and the columns, not the space
+// between them, must fill the page: together they span three quarters of
+// its text width or more, each wider than the gutter (two short word lists
+// beside a figure do not). Only consulted for pages too sparse for the
+// histogram alone.
+static bool paired_rows(
+        const std::vector<std::vector<std::pair<double, double>>>& rows,
+        double boundary, double median_fs, double page_width) {
+    // A gap inside one column's line wider than this ends a run of text
+    // (the column gap of column_blocks in pdf_layout.cpp).
+    const double run_gap = std::max(median_fs * 1.2, 8.0);
+    struct Pieces { double l0, l1, r0, r1; double inner; bool runs; };
+    std::vector<Pieces> pairs;
+    double L0 = 1e18, L1 = -1e18, R0 = 1e18, R1 = -1e18;
+    for (auto g : rows) {
+        std::sort(g.begin(), g.end());
+        Pieces p{1e18, -1e18, 1e18, -1e18, 0, true};
+        bool straddle = false;
+        for (const auto& [l, r] : g) {
+            if (l < boundary && r > boundary) { straddle = true; break; }
+            double& x0 = r <= boundary ? p.l0 : p.r0;
+            double& x1 = r <= boundary ? p.l1 : p.r1;
+            if (x1 > x0) {
+                p.inner = std::max(p.inner, l - x1);
+                if (l - x1 > run_gap) p.runs = false;
+            }
+            x0 = std::min(x0, l);
+            x1 = std::max(x1, r);
+        }
+        if (straddle || p.l1 < p.l0 || p.r1 < p.r0) continue;
+        if (p.r0 - p.l1 < std::max(median_fs * 0.5, 2.0 * p.inner)) continue;
+        pairs.push_back(p);
+        L0 = std::min(L0, p.l0); L1 = std::max(L1, p.l1);
+        R0 = std::min(R0, p.r0); R1 = std::max(R1, p.r1);
+    }
+    if (pairs.size() < 3) return false;
+    double lw = L1 - L0, rw = R1 - R0;
+    if (lw <= 0 || rw <= 0 || lw < rw * 0.6 || rw < lw * 0.6) return false;
+    if (R1 - L0 < page_width * 0.75 || R0 - L1 >= std::min(lw, rw)) return false;
+    int filled = 0;
+    for (const auto& p : pairs)
+        if (p.runs && p.l1 - p.l0 >= lw * 0.6 && p.r1 - p.r0 >= rw * 0.6 &&
+            p.l0 - L0 <= median_fs && p.r0 - R0 <= median_fs)
+            filled++;
+    return filled >= 3;
+}
+
 double detect_column_boundary(const std::vector<TextChar>& chars,
                               double median_fs, double y_tol) {
     double page_left = 1e9, page_right = 0;
@@ -2184,12 +2246,16 @@ double detect_column_boundary(const std::vector<TextChar>& chars,
         constexpr int NUM_BINS = 200;
         int row_count[NUM_BINS] = {};
         int total_rows = 0;
+        // Glyph extents of each counted row, for the side-by-side check a
+        // page with few rows has to pass (below).
+        std::vector<std::vector<std::pair<double, double>>> row_glyphs;
 
         size_t ri = 0;
         while (ri < y_sorted.size()) {
             double row_y = chars[y_sorted[ri]].y;
             bool bins_hit[NUM_BINS] = {};
             double row_l = 1e9, row_r = 0;
+            std::vector<std::pair<double, double>> glyphs;
             while (ri < y_sorted.size() &&
                    std::abs(chars[y_sorted[ri]].y - row_y) <= y_tol) {
                 auto& ch = chars[y_sorted[ri]];
@@ -2201,6 +2267,7 @@ double detect_column_boundary(const std::vector<TextChar>& chars,
                     for (int b = b0; b <= b1; b++) bins_hit[b] = true;
                     row_l = std::min(row_l, (double)ch.left);
                     row_r = std::max(row_r, (double)ch.right);
+                    glyphs.emplace_back(ch.left, ch.right);
                 }
                 ri++;
             }
@@ -2210,9 +2277,15 @@ double detect_column_boundary(const std::vector<TextChar>& chars,
             for (int b = 0; b < NUM_BINS; b++)
                 if (bins_hit[b]) row_count[b]++;
             total_rows++;
+            if (!glyphs.empty()) row_glyphs.push_back(std::move(glyphs));
         }
 
-        if (total_rows < 10) continue;
+        // A page with few rows (a short page, a one-page abstract, a page
+        // that is mostly figure) cannot show the dip against the counts a
+        // full column gives. It is still read as two columns when the dip
+        // is backed by rows that set text side by side (paired_rows below).
+        if (total_rows < kMinColumnRowsFew) continue;
+        bool few_rows = total_rows < 10;
 
         // Find the deepest dip in row_count within center 50% of page
         int center_start = NUM_BINS / 4;
@@ -2225,7 +2298,10 @@ double detect_column_boundary(const std::vector<TextChar>& chars,
         if (lc > 0) left_avg /= lc;
         if (rc > 0) right_avg /= rc;
         double body_avg = (left_avg + right_avg) / 2.0;
-        if (body_avg < 5) continue;
+        if (body_avg < 5) {
+            if (body_avg < 2) continue;
+            few_rows = true;
+        }
 
         // Find the minimum row_count in center region (smoothed over 3 bins)
         int best_bin = -1;
@@ -2238,7 +2314,9 @@ double detect_column_boundary(const std::vector<TextChar>& chars,
         // The dip must be significantly lower than body average (at least 30% lower)
         if (best_val > body_avg * 0.7) continue;
 
-        return page_left + (best_bin + 0.5) / NUM_BINS * page_width;
+        double boundary = page_left + (best_bin + 0.5) / NUM_BINS * page_width;
+        if (few_rows && !paired_rows(row_glyphs, boundary, median_fs, page_width)) continue;
+        return boundary;
     }
     return 0;
 }
