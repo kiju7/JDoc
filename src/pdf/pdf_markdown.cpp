@@ -713,6 +713,20 @@ static size_t utf8_length(const std::string& s) {
     return n;
 }
 
+// The last code point of s (trailing spaces skipped), 0 if none.
+static uint32_t last_codepoint(const std::string& s) {
+    size_t end = s.find_last_not_of(' ');
+    if (end == std::string::npos) return 0;
+    size_t start = end;
+    while (start > 0 && (static_cast<unsigned char>(s[start]) & 0xC0) == 0x80) start--;
+    unsigned char c0 = s[start];
+    int len = c0 < 0x80 ? 1 : c0 < 0xE0 ? 2 : c0 < 0xF0 ? 3 : 4;
+    uint32_t cp = len == 1 ? c0 : c0 & (0xFF >> (len + 1));
+    for (int k = 1; k < len && start + k <= end; k++)
+        cp = (cp << 6) | (static_cast<unsigned char>(s[start + k]) & 0x3F);
+    return cp;
+}
+
 // Standalone structural keywords the corpus ground truth treats as
 // top-level sections regardless of their type size.
 bool is_section_keyword(const std::string& text) {
@@ -879,31 +893,33 @@ std::string page_to_markdown(const std::vector<TextLine>& raw_lines,
     // numbered subsections → H3 — because size ratios alone systematically
     // shifted every level one to two steps down.
     std::vector<int> line_level(lines.size(), 0);
+    auto side_of = [&](const TextLine& t) -> int {
+        if (!t.is_column_split) return 0;
+        return ((t.x_left + t.x_right) / 2.0 < col_boundary) ? 1 : 2;
+    };
+    // Typical line pitch: median of same-side consecutive gaps.
+    double median_gap = stats.body_size * 1.4;
     {
-        auto side_of = [&](const TextLine& t) -> int {
-            if (!t.is_column_split) return 0;
-            return ((t.x_left + t.x_right) / 2.0 < col_boundary) ? 1 : 2;
-        };
-        double top_y = -1e9, bot_y = 1e9, page_l = 1e9, page_r = 0;
-        for (auto& t : lines) {
-            top_y = std::max(top_y, t.y_center);
-            bot_y = std::min(bot_y, t.y_center);
-            page_l = std::min(page_l, t.x_left);
-            page_r = std::max(page_r, t.x_right);
-        }
-        // Typical line pitch: median of same-side consecutive gaps.
         std::vector<double> gap_samples;
         for (size_t i = 1; i < lines.size(); i++) {
             if (side_of(lines[i]) != side_of(lines[i - 1])) continue;
             double g = lines[i - 1].y_center - lines[i].y_center;
             if (g > 0.5 && g < stats.body_size * 4.0) gap_samples.push_back(g);
         }
-        double median_gap = stats.body_size * 1.4;
         if (!gap_samples.empty()) {
             std::nth_element(gap_samples.begin(),
                              gap_samples.begin() + gap_samples.size() / 2,
                              gap_samples.end());
             median_gap = gap_samples[gap_samples.size() / 2];
+        }
+    }
+    {
+        double top_y = -1e9, bot_y = 1e9, page_l = 1e9, page_r = 0;
+        for (auto& t : lines) {
+            top_y = std::max(top_y, t.y_center);
+            bot_y = std::min(bot_y, t.y_center);
+            page_l = std::min(page_l, t.x_left);
+            page_r = std::max(page_r, t.x_right);
         }
         auto gap_above = [&](size_t i) -> double {
             int side = side_of(lines[i]);
@@ -1074,7 +1090,54 @@ std::string page_to_markdown(const std::vector<TextLine>& raw_lines,
     // For column-split pages, defer inserts whose X doesn't match current text column
     std::vector<size_t> deferred_inserts;
 
+    // Paragraphs. A Markdown paragraph is a run of lines with no blank line
+    // between them, so a blank line goes before every line that opens one.
+    // Typesetting marks a paragraph's start by extra space above it, a
+    // first-line indent, or the line before it ending short of the
+    // column's right edge; a change of type size or weight starts one too.
+    // Each column's edges: where its lines start (median left) and where
+    // its full lines end (90th percentile right).
+    double col_left[3] = {0, 0, 0}, col_right[3] = {0, 0, 0};
+    for (int sd = 0; sd < 3; sd++) {
+        std::vector<double> ls, rs;
+        for (size_t k = 0; k < lines.size(); k++)
+            if (side_of(lines[k]) == sd && line_level[k] == 0) {
+                ls.push_back(lines[k].x_left);
+                rs.push_back(lines[k].x_right);
+            }
+        if (ls.empty()) continue;
+        std::nth_element(ls.begin(), ls.begin() + ls.size() / 2, ls.end());
+        std::nth_element(rs.begin(), rs.begin() + rs.size() * 9 / 10, rs.end());
+        col_left[sd] = ls[ls.size() / 2];
+        col_right[sd] = rs[rs.size() * 9 / 10];
+    }
+    int prev_body = -1;   // last body line emitted, -1 after a heading or insert
+    auto opens_paragraph = [&](size_t i) {
+        if (prev_body < 0) return true;
+        const TextLine& p = lines[prev_body];
+        const TextLine& c = lines[i];
+        int sp = side_of(p), sc = side_of(c);
+        double fs = std::max(c.font_size, 1.0);
+        double width = std::max(col_right[sp] - col_left[sp], fs);
+        bool prev_full = p.x_right >= col_right[sp] - std::max(2.0 * fs, width * 0.1);
+        bool indented = c.x_left > col_left[sc] + 0.8 * fs;
+        uint32_t last = last_codepoint(p.text);
+        bool sentence_end = last == '.' || last == '?' || last == '!' || last == ':' ||
+                            last == 0x3002 || last == 0xFF01 || last == 0xFF1F || last == 0xFF1A;
+        // Into the next column (or back up the page): a paragraph runs on
+        // only from a full line that did not end a sentence into an
+        // unindented line.
+        if (sp != sc || c.y_center > p.y_center)
+            return !(prev_full && !sentence_end && !indented);
+        if (p.y_center - c.y_center > median_gap * 1.5) return true;
+        if (c.is_bold != p.is_bold ||
+            std::min(c.font_size, p.font_size) < std::max(c.font_size, p.font_size) * 0.85)
+            return true;
+        return !prev_full || indented;
+    };
+
     auto emit_insert = [&](const InlineInsert& ins) {
+        prev_body = -1;
         if (ins.is_layout) {
             // A tabular region no detector accepted: its grid lines in a
             // fence, so the column each value sits in survives. The fence
@@ -1199,7 +1262,14 @@ std::string page_to_markdown(const std::vector<TextLine>& raw_lines,
             md += ' ';
             md += heading;
             md += '\n';
-        } else if (l.is_bold && l.is_italic) {
+            prev_body = -1;
+            continue;
+        }
+        if (opens_paragraph(i) && !md.empty() &&
+            !(md.size() >= 2 && md[md.size() - 1] == '\n' && md[md.size() - 2] == '\n'))
+            md += '\n';
+        prev_body = static_cast<int>(i);
+        if (l.is_bold && l.is_italic) {
             md += "***" + l.text + "***\n";
         } else if (l.is_bold) {
             md += "**" + l.text + "**\n";
