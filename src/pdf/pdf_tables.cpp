@@ -1,4 +1,5 @@
 #include "pdf_extract.h"
+#include "common/file_utils.h"
 #include "common/string_utils.h"
 #include <algorithm>
 #include <cassert>
@@ -3628,33 +3629,7 @@ std::string format_table(const TableData& table) {
     int n_cols = filtered[0].size();
     if (n_cols == 0) return "";
 
-    std::vector<size_t> widths(n_cols, 3);
-    for (auto& row : filtered)
-        for (int c = 0; c < n_cols && c < (int)row.size(); c++)
-            widths[c] = std::max(widths[c], row[c].size());
-
-    std::string md;
-    for (size_t r = 0; r < filtered.size(); r++) {
-        md += "|";
-        for (int c = 0; c < n_cols; c++) {
-            std::string cell = (c < (int)filtered[r].size()) ? filtered[r][c] : "";
-            md += " " + cell;
-            for (size_t p = cell.size(); p < widths[c]; p++) md += ' ';
-            md += " |";
-        }
-        md += '\n';
-
-        if (r == 0) {
-            md += "|";
-            for (int c = 0; c < n_cols; c++) {
-                md += " ";
-                for (size_t p = 0; p < widths[c]; p++) md += '-';
-                md += " |";
-            }
-            md += '\n';
-        }
-    }
-    return md;
+    return util::format_padded_markdown_table(filtered, n_cols);
 }
 
 // ── CCITTFax Decoder (lookup-table based, algorithm from ITU-T T.4/T.6) ──
