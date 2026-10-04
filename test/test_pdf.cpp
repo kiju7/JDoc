@@ -1164,11 +1164,11 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    // Test 26: glyphs drawn again over themselves (make_overprint_fixture.py):
+    // Test 29: glyphs drawn again over themselves (make_overprint_fixture.py):
     // a run struck twice 0.3pt apart to fake bold and a headline stacked
     // eight times read once, while doubled letters a whole advance apart
     // ("ll", "ss", "III", "77") all stay.
-    std::cout << "[26] Testing overprinted glyphs...\n";
+    std::cout << "[29] Testing overprinted glyphs...\n";
     {
         const char* fx = "test/fixtures/pdf/overprint.pdf";
         std::ifstream f(fx);
