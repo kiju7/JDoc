@@ -1599,6 +1599,11 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
                             rg[0] = std::max(rg[0], 0.0); rg[1] = std::max(rg[1], 0.0);
                             rg[2] = std::min(rg[2], page_w); rg[3] = std::min(rg[3], page_h);
                         }
+                        if (fig_debug)
+                            fprintf(stderr, "[figdbg] p=%d raster overlay composite"
+                                    " (%.1f,%.1f)-(%.1f,%.1f) -> (%.1f,%.1f)-(%.1f,%.1f)\n",
+                                    p + 1, pi->x0, pi->y0, pi->x1, pi->y1,
+                                    rg[0], rg[1], rg[2], rg[3]);
                         // Rasters stamped over this one (a logo, a marker)
                         // draw with it.
                         std::vector<size_t> members{idx};
