@@ -744,6 +744,24 @@ static bool has_letter_codepoint(const std::string& s) {
     return false;
 }
 
+// A text line that a layout block reproduces: same writing direction and
+// wholly inside the block's box, so every glyph of it is in the block's grid.
+// The box is measured without space glyphs, so a line's trailing space may
+// overhang it by up to a font size. A line reaching further keeps its place
+// in the prose flow, duplicating the block's part of it rather than losing
+// the rest.
+static bool line_in_layout_block(const TextLine& line,
+                                 const std::vector<LayoutFallback>& fallbacks) {
+    for (auto& fb : fallbacks) {
+        if (line.rot != fb.rot) continue;
+        if (line.y_center >= fb.y0 - 2.0 && line.y_center <= fb.y1 + 2.0 &&
+            line.x_left >= fb.x0 - 3.0 &&
+            line.x_right <= fb.x1 + 3.0 + line.font_size)
+            return true;
+    }
+    return false;
+}
+
 // Page-end block listing a page's annotations: links, then text notes.
 static std::string annotations_markdown(const std::vector<AnnotEntry>& annots) {
     std::string md;
@@ -781,7 +799,8 @@ std::string page_to_markdown(const std::vector<TextLine>& raw_lines,
                               const std::vector<TableData>& tables,
                               const std::vector<AnnotEntry>& annots = {},
                               double col_boundary = 0,
-                              const std::string& img_ref_prefix = "") {
+                              const std::string& img_ref_prefix = "",
+                              const std::vector<LayoutFallback>& fallbacks = {}) {
     auto lines = merge_colinear_lines(raw_lines);
     auto captured_cells = table_captured_text(tables);
 
@@ -966,6 +985,7 @@ std::string page_to_markdown(const std::vector<TextLine>& raw_lines,
         double x_pos;
         size_t idx;
         bool is_image; // false = table, true = image
+        bool is_layout = false; // a layout block (idx into fallbacks)
     };
     std::vector<InlineInsert> inserts;
     for (size_t ti = 0; ti < tables.size(); ti++) {
@@ -977,6 +997,10 @@ std::string page_to_markdown(const std::vector<TextLine>& raw_lines,
         double x = (ii < image_x_pos.size()) ? image_x_pos[ii] : 0.0;
         inserts.push_back({y, x, ii, true});
     }
+    for (size_t fi = 0; fi < fallbacks.size(); fi++) {
+        auto& fb = fallbacks[fi];
+        inserts.push_back({fb.y1, (fb.x0 + fb.x1) / 2.0, fi, false, true});
+    }
     std::sort(inserts.begin(), inserts.end(),
               [](const InlineInsert& a, const InlineInsert& b) { return a.y_pos > b.y_pos; });
 
@@ -986,7 +1010,19 @@ std::string page_to_markdown(const std::vector<TextLine>& raw_lines,
     std::vector<size_t> deferred_inserts;
 
     auto emit_insert = [&](const InlineInsert& ins) {
-        if (ins.is_image) {
+        if (ins.is_layout) {
+            // A tabular region no detector accepted: its grid lines in a
+            // fence, so the column each value sits in survives. The fence
+            // outgrows any backtick run inside the text.
+            const std::string& text = fallbacks[ins.idx].text;
+            size_t ticks = 2, run = 0;
+            for (char c : text) {
+                run = c == '`' ? run + 1 : 0;
+                ticks = std::max(ticks, run);
+            }
+            std::string fence(ticks + 1, '`');
+            md += "\n" + fence + "text\n" + text + fence + "\n";
+        } else if (ins.is_image) {
             auto& img = images[ins.idx];
             const std::string ref =
                 util::image_ref_name(img.name, img.format, img.saved_path);
@@ -1040,6 +1076,7 @@ std::string page_to_markdown(const std::vector<TextLine>& raw_lines,
         }
 
         if (line_swallowed_by_table(l, tables, captured_cells)) continue;
+        if (line_in_layout_block(l, fallbacks)) continue;
 
         {
             bool only_filler = true;
@@ -1081,6 +1118,7 @@ std::string page_to_markdown(const std::vector<TextLine>& raw_lines,
                     parse_section_number(nx.text).depth > 0 ||
                     is_section_keyword(nx.text) ||
                     line_swallowed_by_table(nx, tables, captured_cells) ||
+                    line_in_layout_block(nx, fallbacks) ||
                     !same_col ||
                     nx.is_bold != l.is_bold || ratio < 0.75 ||
                     line_is_mostly_cjk(nx.text) != head_cjk ||
@@ -1227,7 +1265,8 @@ std::string result_to_markdown(ExtractResult& r, const ConvertOptions& opts) {
                                                 r.all_tables[p],
                                                 p < (int)r.all_annots.size() ? r.all_annots[p] : std::vector<AnnotEntry>{},
                                                 r.col_boundaries[p],
-                                                opts.image_ref_prefix);
+                                                opts.image_ref_prefix,
+                                                p < (int)r.all_fallbacks.size() ? r.all_fallbacks[p] : std::vector<LayoutFallback>{});
         full_md += page_md;
         if (p < (int)r.page_diags.size() && r.page_diags[p].images_failed > 0)
             full_md += "<!-- jdoc: " +
@@ -1255,7 +1294,8 @@ static PageChunk build_page_chunk(ExtractResult& r, const ConvertOptions& opts,
                                       r.all_tables[p],
                                       p < (int)r.all_annots.size() ? r.all_annots[p] : std::vector<AnnotEntry>{},
                                       r.col_boundaries[p],
-                                      opts.image_ref_prefix);
+                                      opts.image_ref_prefix,
+                                      p < (int)r.all_fallbacks.size() ? r.all_fallbacks[p] : std::vector<LayoutFallback>{});
     }
     if (p < (int)r.page_diags.size() && r.page_diags[p].images_failed > 0) {
         chunk.degraded_images = r.page_diags[p].images_failed;
@@ -1311,6 +1351,7 @@ void stream_result_chunks(ExtractResult& r, const ConvertOptions& opts,
             r.all_tables[p] = {};
             if (p < (int)r.all_annots.size()) r.all_annots[p] = {};
             if (p < (int)r.layout_text.size()) r.layout_text[p] = {};
+            if (p < (int)r.all_fallbacks.size()) r.all_fallbacks[p] = {};
             r.all_image_y[p] = {};
             r.all_image_x[p] = {};
         }

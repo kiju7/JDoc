@@ -241,6 +241,7 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
     result.all_tables.resize(tp);
     result.all_annots.resize(tp);
     if (opts.format == OutputFormat::PLAINTEXT) result.layout_text.resize(tp);
+    else result.all_fallbacks.resize(tp);
     result.page_diags.resize(tp);
     result.page_widths.resize(tp, 0);
     result.page_heights.resize(tp, 0);
@@ -431,8 +432,9 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
             PageCharCache cache;
             cache.build(parse_result.chars);
 
+            std::vector<SparseGrid> sparse_grids;
             result.all_tables[p] = detect_tables(parse_result.segments, cache,
-                page_w, page_h);
+                page_w, page_h, &sparse_grids);
             auto shade_tables = detect_shading_tables(parse_result.fill_rects,
                 cache, result.all_tables[p], page_w, page_h);
             for (auto& st : shade_tables)
@@ -443,6 +445,16 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
                 result.all_tables[p].push_back(std::move(tt));
             for (auto& t : result.all_tables[p])
                 merge_header_rows(t);
+
+            // Tabular regions no detector accepted keep their layout as a
+            // fenced block in the markdown (find_layout_fallbacks).
+            std::vector<PageBox> table_boxes;
+            for (auto& t : result.all_tables[p])
+                table_boxes.push_back({std::min(t.x0, t.x1), std::min(t.y0, t.y1),
+                                       std::max(t.x0, t.x1), std::max(t.y0, t.y1)});
+            result.all_fallbacks[p] = find_layout_fallbacks(
+                parse_result.chars, result.col_boundaries[p], table_boxes,
+                sparse_grids);
             // JDOC_TABLE_DEBUG: dump every table as detected, to stderr.
             if (std::getenv("JDOC_TABLE_DEBUG")) {
                 for (auto& t : result.all_tables[p]) {

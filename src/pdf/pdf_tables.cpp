@@ -789,7 +789,10 @@ TableData build_table(const std::vector<double>& row_ys,
         small_closed_grid = all_ruled && vline_total > 0 &&
                             vline_present * 3 >= vline_total * 2;
     }
-    if (meaningful_rows < (small_closed_grid ? 2 : 3)) table.rows.clear();
+    if (meaningful_rows < (small_closed_grid ? 2 : 3)) {
+        table.rows.clear();
+        table.too_sparse = true;
+    }
 
     // Text running THROUGH a drawn v-line marks a drawing, not a table: a
     // table author never lays text across a rule, while diagram boxes (ERD
@@ -1287,7 +1290,8 @@ static std::vector<TableLineSet> split_group_at_gutter(
 
 std::vector<TableData> detect_tables(const std::vector<PdfLineSegment>& lines,
                                       const PageCharCache& cache,
-                                      double page_width, double page_height) {
+                                      double page_width, double page_height,
+                                      std::vector<SparseGrid>* sparse_grids) {
     if (lines.size() < 4) return {};
 
     std::vector<PdfLineSegment> h_lines, v_lines, h_frags;
@@ -1652,7 +1656,51 @@ std::vector<TableData> detect_tables(const std::vector<PdfLineSegment>& lines,
                                                 cache)) {
             TableData t = build_table(part.levels, part.h_lines,
                                       part.v_lines, cache);
-            if (t.rows.empty()) continue;
+            if (t.rows.empty()) {
+                // A grid of full-width row rules with a vertical rule inside
+                // it is laid out in columns even when too few of its rows
+                // fill two cells (a label column beside wrapped text):
+                // report it so the markdown path can keep its layout
+                // instead of gluing it.
+                if (sparse_grids && t.too_sparse) {
+                    double gx0 = 1e9, gx1 = -1e9;
+                    double gy0 = part.levels.front(), gy1 = part.levels.back();
+                    for (auto& hl : part.h_lines) {
+                        double hy = (hl.y0 + hl.y1) / 2.0;
+                        if (hy < gy0 - 4.0 || hy > gy1 + 4.0) continue;
+                        gx0 = std::min(gx0, (double)std::min(hl.x0, hl.x1));
+                        gx1 = std::max(gx1, (double)std::max(hl.x0, hl.x1));
+                    }
+                    // Every level a drawn rule across the grid: levels
+                    // synthesized from v-line ends (chart axes) or rules
+                    // over part of the width (a title box inside a page
+                    // frame) are not a table's row rules.
+                    bool full_rules = gx1 > gx0;
+                    for (double lv : part.levels) {
+                        double lo = 1e9, hi = -1e9;
+                        for (auto& hl : part.h_lines) {
+                            if (std::abs((hl.y0 + hl.y1) / 2.0 - lv) >= 4.0) continue;
+                            lo = std::min(lo, (double)std::min(hl.x0, hl.x1));
+                            hi = std::max(hi, (double)std::max(hl.x0, hl.x1));
+                        }
+                        if (hi - lo < 0.8 * (gx1 - gx0)) full_rules = false;
+                    }
+                    SparseGrid sg;
+                    sg.box = {gx0, gy0, gx1, gy1};
+                    sg.levels = part.levels;
+                    for (auto& vl : part.v_lines) {
+                        double vx = (vl.x0 + vl.x1) / 2.0;
+                        double vlo = std::min(vl.y0, vl.y1);
+                        double vhi = std::max(vl.y0, vl.y1);
+                        if (vx > gx0 + 5.0 && vx < gx1 - 5.0 &&
+                            std::min(vhi, gy1) - std::max(vlo, gy0) >= 10.0)
+                            sg.rules.push_back({vx, vlo, vhi});
+                    }
+                    if (full_rules && !sg.rules.empty())
+                        sparse_grids->push_back(std::move(sg));
+                }
+                continue;
+            }
             // Reject grids that swallowed page prose (stacked separate
             // tables bridged across body text): no real cell holds a whole
             // paragraph. Rejecting lets the band's lines flow back as text.

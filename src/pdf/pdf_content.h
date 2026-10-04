@@ -417,4 +417,28 @@ std::vector<TextLine> chars_to_lines(const std::vector<TextChar>& chars,
 std::string layout_page_text(const std::vector<TextChar>& chars,
                              double col_boundary = 0);
 
+// A region the markdown path shows as a layout block (a fenced grid of the
+// region's lines) because it is laid out as a table but no table detector
+// claimed it. See find_layout_fallbacks in pdf_layout.cpp.
+struct LayoutFallback {
+    double x0 = 0, y0 = 0, x1 = 0, y1 = 0;  // page-space box of its glyphs
+    int16_t rot = 0;   // writing direction of the text lines it replaces
+    std::string text;  // grid lines, newline-terminated, no fence
+};
+using PageBox = std::array<double, 4>;  // x0, y0, x1, y1 in page space
+
+// A ruled grid the ruled detector rejected for holding too few rows with two
+// filled cells (detect_tables' sparse_grids output).
+struct SparseGrid {
+    PageBox box;
+    std::vector<double> levels;                // row rule y's, ascending
+    std::vector<std::array<double, 3>> rules;  // inner v-rules: x, y0, y1
+};
+
+// table_boxes: detected tables (their glyphs are never re-used).
+std::vector<LayoutFallback> find_layout_fallbacks(
+    const std::vector<TextChar>& chars, double col_boundary,
+    const std::vector<PageBox>& table_boxes,
+    const std::vector<SparseGrid>& sparse_grids);
+
 }} // namespace jdoc::pdf_detail
