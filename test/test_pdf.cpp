@@ -834,8 +834,8 @@ int main(int argc, char* argv[]) {
     // Tick labels on both value axes of a chart, mirrored (30 | 30) or on
     // two scales (20 | 2,500), are not tables; a statement with dot leaders
     // and a year-stub table beside them still are. Contents entries joined
-    // to their page numbers by leaders are one row of two cells each, the
-    // title whole however its word gaps line up with the rows around it.
+    // to their page numbers by leaders are a list, not a table, each title
+    // whole however its word gaps line up with the rows around it.
     std::cout << "[20] Testing chart ticks and dot-leader entries...\n";
     {
         using Rows = std::vector<std::vector<std::string>>;
@@ -862,20 +862,21 @@ int main(int argc, char* argv[]) {
             std::cout << "    axis ticks are not tables; statements are OK\n";
         }
         {
+            // A contents list is a list, not a table: its entries stay
+            // lines of text, each title whole up to its page number.
             auto ts = tables_of("test/fixtures/pdf/leader_toc.pdf");
-            CHECK(ts.size() == 2);
-            CHECK(ts[0].size() == 7);
-            for (auto& row : ts[0]) CHECK(row.size() == 2);
-            CHECK((ts[0][1] == std::vector<std::string>{
-                       "4.4.1 \xEC\x9E\x85\xEB\xA0\xA5 \xEC\xA1\xB0\xEA\xB1\xB4 "
-                       "\xEB\xB3\x80\xEC\x88\x98\xEC\x9D\x98 "
-                       "\xEA\xB8\xB0\xEC\x97\xAC\xEB\x8F\x84 \xEB\xB6\x84\xEC\x84\x9D",
-                       "50"}));                 // 입력 조건 변수의 기여도 분석
-            CHECK(ts[0][6][1] == "65");
-            CHECK((ts[1] == Rows{{"Introduction", "1"}, {"The year under review", "4"},
-                                 {"Pressure points and risks ahead", "9"},
-                                 {"Policy challenges", "13"}, {"Conclusion", "21"}}));
-            std::cout << "    contents entries are title | page rows OK\n";
+            CHECK(ts.empty());
+            std::string md = jdoc::pdf_to_markdown("test/fixtures/pdf/leader_toc.pdf");
+            CHECK(md.find("4.4.1 \xEC\x9E\x85\xEB\xA0\xA5 \xEC\xA1\xB0\xEA\xB1\xB4 "
+                          "\xEB\xB3\x80\xEC\x88\x98\xEC\x9D\x98 "
+                          "\xEA\xB8\xB0\xEC\x97\xAC\xEB\x8F\x84 \xEB\xB6\x84\xEC\x84\x9D")
+                  != std::string::npos);          // 입력 조건 변수의 기여도 분석
+            // The English entries' word spaces are no-break spaces: look
+            // for the words on one line.
+            size_t pp = md.find("Pressure");
+            CHECK(pp != std::string::npos && md.find("ahead", pp) < md.find('\n', pp));
+            CHECK(md.find('|') == std::string::npos);
+            std::cout << "    contents entries stay whole list lines OK\n";
         }
     }
 

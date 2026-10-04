@@ -3345,23 +3345,49 @@ static bool accept_table(TableData& table, double gutter = 0.0, int led_rows = 0
     // not qualify: one beside a stub that is not mostly labels (axis ticks
     // of a chart), and whole numbers that nearly always rise (the page
     // references of a contents list, which is a list rather than a table).
-    bool value_cols = n_cols >= 2;
-    for (int c = 0; c < n_cols && value_cols; c++) {
-        int filled = 0, values = 0, ints = 0, rises = 0;
+    // Whole numbers that nearly always rise down the rows, entries sharing
+    // a page now and then: the page references of a contents list.
+    auto page_refs = [&](int c) {
+        int filled = 0, ints = 0, rises = 0;
         long last = -1;
+        std::vector<long> seen;
         for (auto& row : table.rows) {
             if (c >= (int)row.size() || row[c].empty()) continue;
             filled++;
-            if (is_value_cell(row[c])) values++;
             char* end = nullptr;
             long v = std::strtol(row[c].c_str(), &end, 10);
             if (*end != '\0' || end == row[c].c_str()) continue;
             if (ints++ > 0 && v >= last) rises++;
             last = v;
+            seen.push_back(v);
+        }
+        std::sort(seen.begin(), seen.end());
+        size_t distinct = std::unique(seen.begin(), seen.end()) - seen.begin();
+        return filled >= 3 && ints * 10 >= filled * 8 && rises * 10 >= (ints - 1) * 9 &&
+               distinct * 10 >= seen.size() * 4;
+    };
+    // A contents list is a list, not a table: titles (with their numbers,
+    // "표 I-1. | 주요국 경제성장률") beside the page references above. Data
+    // tables with a rising count stay: their stub is short labels, not titles.
+    if (n_cols <= 3 && page_refs(n_cols - 1)) {
+        size_t title_chars = 0, titles = 0;
+        for (auto& row : table.rows) {
+            size_t len = 0;
+            for (int c = 0; c + 1 < (int)row.size(); c++) len += row[c].size();
+            if (len) { title_chars += len; titles++; }
+        }
+        if (titles > 0 && title_chars >= titles * 15) return false;
+    }
+    bool value_cols = n_cols >= 2;
+    for (int c = 0; c < n_cols && value_cols; c++) {
+        int filled = 0, values = 0;
+        for (auto& row : table.rows) {
+            if (c >= (int)row.size() || row[c].empty()) continue;
+            filled++;
+            if (is_value_cell(row[c])) values++;
         }
         bool figures = filled >= 2 && values * 10 >= filled * 8;
-        bool page_refs = ints * 10 >= filled * 8 && rises * 10 >= (ints - 1) * 9;
-        if (c == 0 ? values * 5 > filled : (!figures || page_refs)) value_cols = false;
+        if (c == 0 ? values * 5 > filled : (!figures || page_refs(c))) value_cols = false;
     }
     // Entries joined to their values by dot leaders (a contents list, a
     // statement's line items) are pairs by construction, not prose torn at
@@ -3657,6 +3683,27 @@ static bool accept_table(TableData& table, double gutter = 0.0, int led_rows = 0
             }
         }
         if (content_rows >= 2 && marker_rows >= content_rows * 0.6) return false;
+    }
+    // Numbered notes ("12 | See Arslan et al (2020).") are a list too: the
+    // first column counts up by one row after row, and the second holds
+    // sentences, not a value or a short label.
+    if (n_cols == 2) {
+        int rows_n = 0, counted = 0;
+        size_t text_chars = 0;
+        long prev = -1;
+        for (auto& row : table.rows) {
+            if (row[0].empty() || row[1].empty()) continue;
+            rows_n++;
+            text_chars += row[1].size();
+            char* end = nullptr;
+            long v = std::strtol(row[0].c_str(), &end, 10);
+            if (*end == '\0' && end != row[0].c_str()) {
+                if (prev >= 0 && v == prev + 1) counted++;
+                prev = v;
+            }
+        }
+        if (rows_n >= 3 && counted * 10 >= (rows_n - 1) * 8 && text_chars >= (size_t)rows_n * 25)
+            return false;
     }
 
     // continuation rows (lower-letter ↔ lower-letter across column boundary)
