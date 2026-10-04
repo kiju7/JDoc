@@ -2703,8 +2703,8 @@ static bool is_value_cell(const std::string& s) {
 }
 
 // Returns true if the table is acceptable (kept). gutter is the empty gap
-// between the two columns of a 2-column candidate, in font sizes (0 if
-// unknown or not 2 columns).
+// between the two columns of a 2-column candidate, in font sizes, when it
+// is the widest gap of its rows (0 otherwise or for other widths).
 static bool accept_table(TableData& table, double gutter = 0.0) {
     if (table.rows.empty()) return false;
     // pre-step: strip body-text columns adjacent to the table
@@ -3173,19 +3173,31 @@ static bool accept_table(TableData& table, double gutter = 0.0) {
     return true;
 }
 
-// Median empty gap at boundary x over the band's rows that have text on
-// both sides of it.
-static double median_gutter(const std::vector<TextRow>& rows, const YBand& band, double x) {
+// Empty gap at boundary x, in the band's rows that have text on both sides
+// of it, when it is the widest gap in nearly all of them (median, else 0).
+// A row whose own text has a gap at least half as wide is a grid of more
+// columns than the boundary splits (an author block), not two columns.
+static double clean_gutter(const std::vector<TextRow>& rows, const YBand& band, double x) {
     std::vector<double> gaps;
+    std::vector<std::pair<double, double>> cr;
+    int rows_both = 0;
     for (size_t k = band.first_row; k <= band.last_row; k++) {
-        double left = -1e18, right = 1e18;
-        for (auto& cr : rows[k].char_ranges) {
-            if (cr.first + cr.second < 2 * x) left = std::max(left, cr.second);
-            else right = std::min(right, cr.first);
+        cr = rows[k].char_ranges;
+        std::sort(cr.begin(), cr.end());
+        double gutter = 0, other = 0, reach = -1e18;
+        bool left = false, right = false;
+        for (auto& c : cr) {
+            double g = c.first - reach;
+            if (reach > -1e17 && reach < x && c.first + c.second >= 2 * x) gutter = std::max(gutter, g);
+            else if (reach > -1e17) other = std::max(other, g);
+            (c.first + c.second < 2 * x ? left : right) = true;
+            reach = std::max(reach, c.second);
         }
-        if (left > -1e17 && right < 1e17) gaps.push_back(right - left);
+        if (!left || !right) continue;
+        rows_both++;
+        if (other < gutter * 0.5) gaps.push_back(gutter);
     }
-    if (gaps.empty()) return 0.0;
+    if (gaps.empty() || gaps.size() * 10 < (size_t)rows_both * 8) return 0.0;
     std::nth_element(gaps.begin(), gaps.begin() + gaps.size() / 2, gaps.end());
     return gaps[gaps.size() / 2];
 }
@@ -3444,7 +3456,7 @@ static std::vector<TableData> detect_text_tables_range(
 
         // S4-S5: rejection
         double gutter = bounds.size() == 3
-                            ? median_gutter(rows, ext, bounds[1]) / median_fs : 0.0;
+                            ? clean_gutter(rows, ext, bounds[1]) / median_fs : 0.0;
         if (!accept_table(table, gutter)) continue;
 
         table.kind = TableData::TEXT;
