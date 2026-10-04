@@ -2737,20 +2737,31 @@ static bool accept_table(TableData& table, double gutter = 0.0) {
     // Three rows is the minimum for a real multi-column table — anything
     // smaller is almost always a stray body paragraph that happened to
     // have a short token in a column-like position. 2-col tables need 4,
-    // because key-value lists are easy to mistake otherwise — unless every
-    // column after the stub holds figures ("Balance as of January 1 |
-    // $208,840"). Prose torn by a phantom boundary leaves word fragments on
+    // because key-value lists are easy to mistake otherwise — unless a stub
+    // of labels is followed by columns of figures ("Balance as of January 1
+    // | $208,840"). Prose torn by a phantom boundary leaves word fragments on
     // the right, never a column of values, so such a table is also exempt
-    // from the long-label prose tests below.
+    // from the long-label prose tests below. Two kinds of figure columns do
+    // not qualify: one beside a stub that is not mostly labels (axis ticks
+    // of a chart), and whole numbers that nearly always rise (the page
+    // references of a contents list, which is a list rather than a table).
     bool value_cols = n_cols >= 2;
-    for (int c = 1; c < n_cols && value_cols; c++) {
-        int filled = 0, values = 0;
+    for (int c = 0; c < n_cols && value_cols; c++) {
+        int filled = 0, values = 0, ints = 0, rises = 0;
+        long last = -1;
         for (auto& row : table.rows) {
             if (c >= (int)row.size() || row[c].empty()) continue;
             filled++;
             if (is_value_cell(row[c])) values++;
+            char* end = nullptr;
+            long v = std::strtol(row[c].c_str(), &end, 10);
+            if (*end != '\0' || end == row[c].c_str()) continue;
+            if (ints++ > 0 && v >= last) rises++;
+            last = v;
         }
-        if (filled < 2 || values * 10 < filled * 8) value_cols = false;
+        bool figures = filled >= 2 && values * 10 >= filled * 8;
+        bool page_refs = ints * 10 >= filled * 8 && rises * 10 >= (ints - 1) * 9;
+        if (c == 0 ? values * 5 > filled : (!figures || page_refs)) value_cols = false;
     }
     int min_rows = (n_cols == 2 && !value_cols) ? 4 : 3;
     if (meaningful < min_rows) return false;
@@ -3076,9 +3087,20 @@ static bool accept_table(TableData& table, double gutter = 0.0) {
         // continued words too. Its terms are short and a wide empty gutter
         // (well beyond a stretched word space) parts them from the
         // definitions; a phantom boundary in justified prose has neither.
+        // Every entry has both parts, and the definitions run longer than
+        // the terms (side-by-side chart labels pair alike text) yet stay
+        // shorter than a line of prose.
         bool glossary = n_cols == 2 && gutter >= 1.5;
-        for (auto& row : table.rows)
-            if (glossary && !row.empty() && row[0].size() > 30) glossary = false;
+        size_t term_chars = 0, def_chars = 0;
+        for (auto& row : table.rows) {
+            if (row.size() < 2 || row[0].empty() || row[1].empty() || row[0].size() > 30)
+                glossary = false;
+            else {
+                term_chars += row[0].size();
+                def_chars += row[1].size();
+            }
+        }
+        if (def_chars < term_chars * 2 || def_chars > table.rows.size() * 30) glossary = false;
         double ct = (n_cols == 2) ? 0.15 : 0.30;
         if (!glossary && checked_rows >= 2 && continuation_rows >= checked_rows * ct)
             return false;
