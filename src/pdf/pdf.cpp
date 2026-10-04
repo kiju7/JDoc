@@ -705,7 +705,10 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
                         if (ln.text.empty() || caption_line(ln.text) || body_line(ln)) continue;
                         double lw = ln.x_right - ln.x_left;
                         double fs = std::max(ln.font_size, 4.0);
-                        double ly0 = ln.y_center - 0.6 * fs, ly1 = ln.y_center + 0.6 * fs;
+                        // y_center is the baseline: the line's glyphs span
+                        // the em box above it (the compositor's descender
+                        // to ascender), not a box centred on it.
+                        double ly0 = ln.y_center - 0.3 * fs, ly1 = ln.y_center + fs;
                         if (ly0 >= R[1] && ly1 <= R[3] && ln.x_left >= R[0] && ln.x_right <= R[2]) continue;
                         double ov = std::min(ln.x_right, R[2]) - std::max(ln.x_left, R[0]);
                         if (ov < 0.5 * std::max(lw, 1.0)) continue;
