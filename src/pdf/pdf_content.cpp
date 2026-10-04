@@ -2426,7 +2426,9 @@ std::vector<int> explicit_word_spaces(const std::vector<TextChar>& chars) {
 // through one wide column never does. Each column is wide enough for prose
 // (kBandMinColumnEm), which keeps a key/value or term/definition table, whose
 // label column is narrow, out, and holds words: letters make up most of each
-// piece, where the cells of a table of figures are digits. A gap of several line heights ends a band, so
+// column, where the cells of a table of figures are digits. (Most of the
+// column, not of each line: a side column's reference line, "J Med Sci 70
+// (2023) 310-318", is mostly digits.) A gap of several line heights ends a band, so
 // two bands on either side of a figure stay apart, and a band whose gutter is
 // the page's own column boundary is left to the page-wide split. When the
 // page's boundary falls inside one of the band's columns, that column's
@@ -2545,6 +2547,7 @@ static std::vector<BandCut> find_column_bands(
             struct P { double l0, l1, r0, r1; bool runs; };
             std::vector<P> ps;
             double L0 = 1e18, L1 = -1e18, R0 = 1e18, R1 = -1e18;
+            int lt[2] = {0, 0}, n[2] = {0, 0};
             for (int r = s; r <= end; r++) {
                 P p{1e18, -1e18, 1e18, -1e18, true};
                 double last_l = -1e18, last_r = -1e18;
@@ -2557,13 +2560,11 @@ static std::vector<BandCut> find_column_bands(
                     else { p.r0 = std::min(p.r0, g.first); p.r1 = std::max(p.r1, g.second); }
                 }
                 if (p.l1 < p.l0 || p.r1 < p.r0) continue;
-                int lt[2] = {0, 0}, n[2] = {0, 0};
                 for (const auto& [x, letter] : letters[r]) {
                     int side = x < ch.first ? 0 : 1;
                     n[side]++;
                     lt[side] += letter;
                 }
-                if (lt[0] * 2 < n[0] || lt[1] * 2 < n[1]) p.runs = false;
                 ps.push_back(p);
                 L0 = std::min(L0, p.l0); L1 = std::max(L1, p.l1);
                 R0 = std::min(R0, p.r0); R1 = std::max(R1, p.r1);
@@ -2583,7 +2584,8 @@ static std::vector<BandCut> find_column_bands(
                 }
             }
             int filled = 0;
-            if (lw >= median_fs * kBandMinColumnEm && rw >= median_fs * kBandMinColumnEm)
+            if (lw >= median_fs * kBandMinColumnEm && rw >= median_fs * kBandMinColumnEm &&
+                lt[0] * 2 >= n[0] && lt[1] * 2 >= n[1])
                 for (const auto& p : ps)
                     if (p.runs && p.l1 - p.l0 >= lw * 0.6 && p.r1 - p.r0 >= rw * 0.6 &&
                         p.l0 - L0 <= median_fs && p.r0 - R0 <= median_fs * kBandAlignEm)
