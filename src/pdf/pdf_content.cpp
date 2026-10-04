@@ -2345,7 +2345,7 @@ std::vector<TextLine> reorder_column_lines(std::vector<TextLine>& lines,
         bool straddles = l.x_left < col_boundary - 5 && l.x_right > col_boundary + 5;
         bool is_wide = line_width > span_min_width;
         bool is_centered = straddles && std::abs(line_center - page_center) < content_width * 0.15;
-        if (straddles && (is_wide || is_centered))
+        if (l.band >= 0 || (straddles && (is_wide || is_centered)))
             types[i] = SPANNING;
         else if ((l.x_left + l.x_right) / 2.0 < col_boundary)
             types[i] = LEFT;
@@ -2410,6 +2410,199 @@ std::vector<int> explicit_word_spaces(const std::vector<TextChar>& chars) {
     return sep;
 }
 
+// ── Column bands ─────────────────────────────────────────
+// detect_column_boundary finds one gutter per page, and only where it shows
+// over the page as a whole. Two kinds of two-column text slip past it: a few
+// rows of two columns between figures (the page's dip lands between the
+// bars of a chart instead), and a narrow side column beside a wide one (a
+// keywords and correspondence column next to an abstract, over a body whose
+// gutter sits mid-page). Their rows are glued across the gap.
+//
+// A column band is a run of consecutive rows that all leave one vertical
+// stretch of the page empty, at least a gutter wide (kBandGutterEm), with
+// text on both sides in three rows or more. The rows of running text in two
+// columns fill their column in one run each, both columns flush left: the
+// right pieces start at one x (kBandAlignEm), which a river of word spaces
+// through one wide column never does. Each column is wide enough for prose
+// (kBandMinColumnEm), which keeps a key/value or term/definition table, whose
+// label column is narrow, out, and holds words: letters make up most of each
+// piece, where the cells of a table of figures are digits. A gap of several line heights ends a band, so
+// two bands on either side of a figure stay apart, and a band whose gutter is
+// the page's own column boundary is left to the page-wide split. When the
+// page's boundary falls inside one of the band's columns, that column's
+// lines must run across it: a column whose lines stop short of it is a page
+// column, and the band's gutter is a gap inside the other one (a bullet and
+// its indented text).
+constexpr double kBandGutterEm = 1.0;
+constexpr double kBandMinColumnEm = 10.0;
+constexpr double kBandAlignEm = 0.3;
+constexpr double kBandRowGapEm = 2.5;
+constexpr int kBandMinRows = 3;
+
+struct BandCut {
+    double split = 0;  // x the row is cut at; 0 = not in a band
+    int band = -1;
+};
+
+static std::vector<BandCut> find_column_bands(
+        const std::vector<TextChar>& chars, const std::vector<size_t>& idx,
+        const std::vector<int>& row_of, double median_fs, double col_boundary) {
+    int nrows = row_of.empty() ? 0 : row_of.back() + 1;
+    std::vector<BandCut> cut(nrows);
+    if (nrows < kBandMinRows) return cut;
+    // Per row: its y and its glyph extents merged into runs of touching ink.
+    std::vector<double> row_y(nrows, 0);
+    std::vector<std::vector<std::pair<double, double>>> ink(nrows);
+    // Glyph centres of each row, and whether each is a letter.
+    std::vector<std::vector<std::pair<double, bool>>> letters(nrows);
+    auto is_letter = [](uint32_t cp) {
+        if (cp < 0x80) return (cp | 0x20) - 'a' < 26u;
+        return cp >= 0xC0 && !(cp >= 0x2000 && cp <= 0x2BFF) &&
+               !(cp >= 0x3000 && cp <= 0x303F) && !(cp >= 0xFF00 && cp <= 0xFF20);
+    };
+    for (size_t ii = 0; ii < idx.size(); ii++) {
+        const TextChar& c = chars[idx[ii]];
+        int r = row_of[ii];
+        if (ii == 0 || row_of[ii - 1] != r) row_y[r] = c.y;
+        if (c.unicode == ' ' || c.unicode == 0xA0 || c.right <= c.left) continue;
+        ink[r].emplace_back(c.left, c.right);
+        letters[r].emplace_back((c.left + c.right) / 2, is_letter(c.unicode));
+    }
+    for (auto& v : ink) {
+        std::sort(v.begin(), v.end());
+        std::vector<std::pair<double, double>> m;
+        for (const auto& g : v)
+            if (!m.empty() && g.first <= m.back().second + 0.1)
+                m.back().second = std::max(m.back().second, g.second);
+            else
+                m.push_back(g);
+        v.swap(m);
+    }
+    const double gutter = median_fs * kBandGutterEm;
+    const double run_gap = std::max(median_fs * 1.2, 8.0);
+    // Widest stretch of [lo, hi] that row r leaves empty.
+    auto empty_part = [&](int r, double lo, double hi) {
+        std::pair<double, double> best{0, 0};
+        double from = lo;
+        for (const auto& g : ink[r]) {
+            if (g.second <= from) continue;
+            if (g.first >= hi) break;
+            if (g.first - from > best.second - best.first) best = {from, g.first};
+            from = std::max(from, g.second);
+        }
+        if (hi - from > best.second - best.first) best = {from, hi};
+        return best;
+    };
+    // Channels already grown from a row above and rejected: a table's
+    // gutter must not be grown again from each of its rows.
+    std::vector<std::vector<std::pair<double, double>>> tried(nrows);
+    int next_band = 0;
+    int s = 0;
+    while (s < nrows) {
+        int best_end = -1;
+        std::pair<double, double> best_ch;
+        const auto& row = ink[s];
+        for (size_t k = 0; k + 1 < row.size(); k++) {
+            double a = row[k].second, b = row[k + 1].first;
+            if (b - a < gutter) continue;
+            double mid = (a + b) / 2;
+            bool seen = false;
+            for (const auto& t : tried[s]) seen |= t.first <= mid && mid <= t.second;
+            if (seen) continue;
+            std::pair<double, double> ch{a, b};
+            // Where the two columns start on the first row. A row joins the
+            // band only with its pieces starting there too (an indent aside):
+            // text that starts elsewhere belongs to the layout below.
+            const double left_at = row.front().first, right_at = b;
+            auto starts_with_band = [&](int r) {
+                bool ok = true;
+                const auto& v = ink[r];
+                if (v.front().first < ch.first)
+                    ok &= std::abs(v.front().first - left_at - median_fs * 0.5) <= median_fs * 1.5;
+                auto rp = std::find_if(v.begin(), v.end(),
+                                       [&](const std::pair<double, double>& g) { return g.first >= ch.second; });
+                if (rp != v.end())
+                    ok &= std::abs(rp->first - right_at - median_fs * 0.5) <= median_fs * 1.5;
+                return ok;
+            };
+            int end = s, paired = 1;
+            for (int r = s + 1; r < nrows; r++) {
+                if (row_y[r - 1] - row_y[r] > median_fs * kBandRowGapEm) break;
+                if (ink[r].empty()) break;
+                auto e = empty_part(r, ch.first, ch.second);
+                if (e.second - e.first < gutter) break;
+                auto keep = ch;
+                ch = e;
+                if (!starts_with_band(r)) { ch = keep; break; }
+                end = r;
+                if (ink[r].front().first < ch.first && ink[r].back().second > ch.second) paired++;
+            }
+            if (paired < kBandMinRows) continue;
+            if (col_boundary > 0 && col_boundary > ch.first - median_fs &&
+                col_boundary < ch.second + median_fs)
+                continue;
+            // Running text on both sides (see the comment above).
+            struct P { double l0, l1, r0, r1; bool runs; };
+            std::vector<P> ps;
+            double L0 = 1e18, L1 = -1e18, R0 = 1e18, R1 = -1e18;
+            for (int r = s; r <= end; r++) {
+                P p{1e18, -1e18, 1e18, -1e18, true};
+                double last_l = -1e18, last_r = -1e18;
+                for (const auto& g : ink[r]) {
+                    bool left = g.second <= ch.first;
+                    double& last = left ? last_l : last_r;
+                    if (last > -1e17 && g.first - last > run_gap) p.runs = false;
+                    last = g.second;
+                    if (left) { p.l0 = std::min(p.l0, g.first); p.l1 = std::max(p.l1, g.second); }
+                    else { p.r0 = std::min(p.r0, g.first); p.r1 = std::max(p.r1, g.second); }
+                }
+                if (p.l1 < p.l0 || p.r1 < p.r0) continue;
+                int lt[2] = {0, 0}, n[2] = {0, 0};
+                for (const auto& [x, letter] : letters[r]) {
+                    int side = x < ch.first ? 0 : 1;
+                    n[side]++;
+                    lt[side] += letter;
+                }
+                if (lt[0] * 2 < n[0] || lt[1] * 2 < n[1]) p.runs = false;
+                ps.push_back(p);
+                L0 = std::min(L0, p.l0); L1 = std::max(L1, p.l1);
+                R0 = std::min(R0, p.r0); R1 = std::max(R1, p.r1);
+            }
+            double lw = L1 - L0, rw = R1 - R0;
+            if (col_boundary > 0) {
+                bool in_left = L0 < col_boundary && col_boundary < ch.first;
+                bool in_right = ch.second < col_boundary && col_boundary < R1;
+                int across = 0;
+                for (const auto& p : ps) {
+                    double a = in_left ? p.l0 : p.r0, b = in_left ? p.l1 : p.r1;
+                    across += a < col_boundary - median_fs && b > col_boundary + median_fs;
+                }
+                if ((in_left || in_right) && across * 2 < static_cast<int>(ps.size())) {
+                    for (int r = s + 1; r <= end; r++) tried[r].push_back(ch);
+                    continue;
+                }
+            }
+            int filled = 0;
+            if (lw >= median_fs * kBandMinColumnEm && rw >= median_fs * kBandMinColumnEm)
+                for (const auto& p : ps)
+                    if (p.runs && p.l1 - p.l0 >= lw * 0.6 && p.r1 - p.r0 >= rw * 0.6 &&
+                        p.l0 - L0 <= median_fs && p.r0 - R0 <= median_fs * kBandAlignEm)
+                        filled++;
+            if (filled < kBandMinRows || filled * 2 < static_cast<int>(ps.size())) {
+                for (int r = s + 1; r <= end; r++) tried[r].push_back(ch);
+                continue;
+            }
+            if (end > best_end) { best_end = end; best_ch = ch; }
+        }
+        if (best_end < 0) { s++; continue; }
+        double split = (best_ch.first + best_ch.second) / 2;
+        for (int r = s; r <= best_end; r++) cut[r] = BandCut{split, next_band};
+        next_band++;
+        s = best_end + 1;
+    }
+    return cut;
+}
+
 // Group chars that all share one writing direction into lines. Callers reach
 // this through chars_to_lines(), which rotates each non-upright direction into
 // this function's frame first.
@@ -2440,6 +2633,21 @@ static std::vector<TextLine> lines_from_upright_chars(
         return chars[a].x < chars[b].x;
     });
     const std::vector<int> word_sep = explicit_word_spaces(chars);
+
+    // Physical rows, grouped as the loop below groups them, and the column
+    // bands among them.
+    std::vector<int> row_of(idx.size());
+    double row_top = 0;
+    for (size_t ii = 0, r = 0; ii < idx.size(); ii++) {
+        if (ii > 0 && std::abs(chars[idx[ii]].y - row_top) > y_tol) r++;
+        if (ii == 0 || row_of[ii - 1] != static_cast<int>(r)) row_top = chars[idx[ii]].y;
+        row_of[ii] = static_cast<int>(r);
+    }
+    const std::vector<BandCut> band_cut =
+        find_column_bands(chars, idx, row_of, median_fs, col_boundary);
+    std::vector<double> band_split;
+    for (const auto& b : band_cut)
+        if (b.band >= static_cast<int>(band_split.size())) band_split.push_back(b.split);
 
     std::vector<TextLine> lines;
     double cur_y = chars[idx[0]].y;
@@ -2525,6 +2733,16 @@ static std::vector<TextLine> lines_from_upright_chars(
             flush();
             cur_y = ch.y;
         }
+        // A row of a column band is cut at its gutter, which no glyph of
+        // the band crosses.
+        const BandCut& bc = band_cut[row_of[ii]];
+        if (bc.band >= 0 && !cur.text.empty() && word_end > -1e8 &&
+            ch.unicode != ' ' && ch.unicode != 0xA0 &&
+            word_end <= bc.split && ch.left >= bc.split) {
+            flush();
+            cur_y = ch.y;
+        }
+        if (cur.text.empty()) cur.band = bc.band;
 
         // Split line at column boundary when a large gap crosses it.
         // Skip the split when the right side has multiple distinct cell
@@ -2620,6 +2838,25 @@ static std::vector<TextLine> lines_from_upright_chars(
         after_space = ch.unicode == ' ' || ch.unicode == 0xA0;
     }
     flush();
+
+    // Each band reads its left column, then its right column. Its lines are
+    // marked column-split so they are not joined back across the gutter.
+    for (size_t i = 0; i < lines.size();) {
+        int b = lines[i].band;
+        size_t j = i + 1;
+        while (j < lines.size() && b >= 0 && lines[j].band == b) j++;
+        if (b >= 0) {
+            double split = band_split[b];
+            std::stable_partition(lines.begin() + i, lines.begin() + j, [&](const TextLine& l) {
+                return (l.x_left + l.x_right) / 2.0 < split;
+            });
+            for (size_t k = i; k < j; k++) {
+                lines[k].is_column_split = true;
+                lines[k].band = b * 2 + ((lines[k].x_left + lines[k].x_right) / 2.0 < split ? 0 : 1);
+            }
+        }
+        i = j;
+    }
 
     if (col_boundary > 0)
         lines = reorder_column_lines(lines, col_boundary);

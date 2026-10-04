@@ -191,6 +191,11 @@ struct TextLine {
     // word). A section number sits a word space or a tab from its title; a
     // page number or an axis tick shares a baseline with text ems away.
     double first_gap = 0;
+    // Column of a column band (find_column_bands) the line was cut from, or
+    // -1: band index * 2, plus 1 for the band's right column. A band's lines
+    // are already in reading order, left column first; the page-wide column
+    // reordering leaves them where they are.
+    int band = -1;
 };
 
 // ── Reading order for rotated runs ──────────────────────

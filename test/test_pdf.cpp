@@ -1264,6 +1264,68 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    // [31] Two columns in part of a page (make_column_band_fixtures.py). A
+    // narrow side column (keywords, correspondence) beside a wide abstract
+    // has its gutter away from the page's column boundary, which the body
+    // below sets at the centre. The side column's lines read as one block
+    // before the abstract instead of each being glued to the abstract line
+    // beside it, and the body still reads left column first. A borderless
+    // glossary of short terms beside long definitions keeps each term with
+    // its definition.
+    std::cout << "[31] Testing two columns in part of a page...\n";
+    {
+        const std::string dir = "test/fixtures/pdf/";
+        std::ifstream f(dir + "column_band_sidebar.pdf");
+        if (!f.good()) {
+            std::cout << "    SKIP: column_band_*.pdf\n";
+        } else {
+            f.close();
+            auto in_order = [](const std::string& s,
+                               std::initializer_list<const char*> parts) {
+                size_t at = 0;
+                for (const char* p : parts) {
+                    size_t k = s.find(p, at);
+                    if (k == std::string::npos) {
+                        std::cerr << "    out of order or missing: " << p << "\n";
+                        return false;
+                    }
+                    at = k + 1;
+                }
+                return true;
+            };
+            std::string md = jdoc::pdf_to_markdown(dir + "column_band_sidebar.pdf");
+            CHECK(in_order(md, {"## Abstract", "Keywords", "urban heat island; city parks",
+                                "Correspondence", "Department of Geography, City\n"
+                                "University, 12 Riverside Road,\nRiverside 12345, Country.",
+                                "E-mail: parks.study@example.org",
+                                "Parks lower the air temperature of the streets around them",
+                                "## 1. Introduction", "Cities are warmer",
+                                "Earlier studies measured single parks"}));
+            CHECK(md.find("Keywords Parks") == std::string::npos);
+            CHECK(md.find("City the most") == std::string::npos);
+
+            for (bool tables : {true, false}) {
+                jdoc::ConvertOptions o;
+                o.tables = tables;
+                std::string g = jdoc::pdf_to_markdown(dir + "column_band_terms.pdf", o);
+                const std::pair<const char*, const char*> rows[] = {
+                    {"Albedo", "The share of sunlight"}, {"Canopy", "The layer of leaves"},
+                    {"Heat island", "A city area"}, {"Sky view", "The fraction of the sky"}};
+                for (const auto& [term, text] : rows) {
+                    size_t at = g.find(term);
+                    size_t eol = at == std::string::npos ? at : g.find('\n', at);
+                    size_t def = at == std::string::npos ? at : g.find(text, at);
+                    bool together = def != std::string::npos && def < eol;
+                    if (!together)
+                        std::cerr << "    term split from its definition: " << term << "\n";
+                    CHECK(together);
+                }
+            }
+            std::cout << "    side column read before the abstract; glossary rows "
+                         "kept OK\n";
+        }
+    }
+
     std::cout << "\n=== All tests passed ===\n";
     return 0;
 }

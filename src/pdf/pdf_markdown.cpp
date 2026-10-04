@@ -449,9 +449,33 @@ static std::vector<TextLine> merge_upright_lines(const std::vector<TextLine>& li
 std::vector<TextLine> merge_colinear_lines(const std::vector<TextLine>& lines) {
     if (lines.size() < 2) return lines;
 
-    // Skip merging when lines have been column-reordered
-    for (auto& l : lines)
-        if (l.is_column_split) return lines;
+    // Skip merging when lines have been column-reordered. A column band's
+    // lines (TextLine::band) are in reading order already and stay as they
+    // are; the lines between bands merge as on any page.
+    bool bands = false;
+    for (auto& l : lines) {
+        if (l.is_column_split && l.band < 0) return lines;
+        bands |= l.band >= 0;
+    }
+    if (bands) {
+        std::vector<TextLine> out, seg;
+        auto flush_seg = [&]() {
+            if (seg.empty()) return;
+            auto m = merge_colinear_lines(seg);
+            out.insert(out.end(), m.begin(), m.end());
+            seg.clear();
+        };
+        for (auto& l : lines) {
+            if (l.band < 0) {
+                seg.push_back(l);
+                continue;
+            }
+            flush_seg();
+            out.push_back(l);
+        }
+        flush_seg();
+        return out;
+    }
 
     // Rotated lines are complete already: chars_to_lines built each along
     // its own baseline, in its direction's reading order. Page-space y says
@@ -893,7 +917,12 @@ std::string page_to_markdown(const std::vector<TextLine>& raw_lines,
     // numbered subsections → H3 — because size ratios alone systematically
     // shifted every level one to two steps down.
     std::vector<int> line_level(lines.size(), 0);
+    // Side 0 is the page's full width, 1 and 2 its columns, and 3 on the
+    // columns of its column bands (TextLine::band).
+    int sides = 3;
+    for (auto& l : lines) sides = std::max(sides, 3 + l.band + 1);
     auto side_of = [&](const TextLine& t) -> int {
+        if (t.band >= 0) return 3 + t.band;
         if (!t.is_column_split) return 0;
         return ((t.x_left + t.x_right) / 2.0 < col_boundary) ? 1 : 2;
     };
@@ -1100,8 +1129,8 @@ std::string page_to_markdown(const std::vector<TextLine>& raw_lines,
     // lines that percentile is the rightmost line itself, so there a line
     // under a fifth of the column's median width (a page number, a running
     // head cut at the gutter) does not count toward the right edge.
-    double col_left[3] = {0, 0, 0}, col_right[3] = {0, 0, 0};
-    for (int sd = 0; sd < 3; sd++) {
+    std::vector<double> col_left(sides, 0), col_right(sides, 0);
+    for (int sd = 0; sd < sides; sd++) {
         std::vector<double> ws;
         for (size_t k = 0; k < lines.size(); k++)
             if (side_of(lines[k]) == sd && line_level[k] == 0)
