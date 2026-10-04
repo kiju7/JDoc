@@ -466,6 +466,99 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    // Test 15: table layouts (fixtures from make_table_fixtures.py).
+    std::cout << "[15] Testing table layouts...\n";
+    {
+        using Rows = std::vector<std::vector<std::string>>;
+        auto tables_of = [](const char* path) {
+            std::ifstream f(path);
+            if (!f.good()) {
+                std::cerr << "    missing fixture " << path << "\n";
+                return std::vector<Rows>{{{"<missing>"}}};
+            }
+            auto chunks = jdoc::pdf_to_markdown_chunks(path);
+            return chunks.empty() ? std::vector<Rows>{} : chunks[0].tables;
+        };
+        auto find_table = [](const std::vector<Rows>& ts, const std::string& first) {
+            for (auto& t : ts)
+                if (!t.empty() && !t[0].empty() && t[0][0] == first) return &t;
+            return static_cast<const Rows*>(nullptr);
+        };
+
+        // A label-column table in one page column whose rule heights match
+        // a grid in the other page column, with full-width section rows that
+        // carry no column rule: one table of six rows, not two rejected
+        // halves, and the grid beside it stays its own table.
+        {
+            auto ts = tables_of("test/fixtures/pdf/tables_side_by_side.pdf");
+            CHECK(ts.size() == 2);
+            const Rows* t = find_table(ts, "Section one header");
+            CHECK(t && t->size() == 6);
+            CHECK((*t)[3][0] == "Section two header");
+            CHECK(((*t)[5] == std::vector<std::string>{"Labels", "('O', 'O', 'B')"}));
+            const Rows* g = find_table(ts, "Set");
+            CHECK(g && g->size() == 4);
+            std::cout << "    side-by-side page columns OK\n";
+        }
+        // Three grids stacked under their captions beside a framed figure:
+        // three tables, no caption inside a table.
+        {
+            auto ts = tables_of("test/fixtures/pdf/tables_stacked_frame.pdf");
+            CHECK(ts.size() == 3);
+            for (auto& t : ts) {
+                CHECK(t.size() == 4);
+                CHECK((t[0] == std::vector<std::string>{"sample", "result", "sample", "result"}));
+                for (auto& row : t)
+                    for (auto& c : row) CHECK(c.rfind("Table ", 0) != 0);
+            }
+            std::cout << "    stacked grids beside a frame OK\n";
+        }
+        // Two closed two-row grids 34pt apart are two tables (a two-column
+        // key/value box included); a box with an empty cell in each row is
+        // none.
+        {
+            auto ts = tables_of("test/fixtures/pdf/tables_small_boxes.pdf");
+            CHECK(ts.size() == 2);
+            const Rows* kv = find_table(ts, "Platform");
+            const Rows* res = find_table(ts, "Model");
+            CHECK(kv && (*kv == Rows{{"Platform", "Linux"}, {"Framework", "PyTorch 2.1"}}));
+            CHECK(res && (*res == Rows{{"Model", "Acc", "F1"}, {"Ours", "91.2", "88.7"}}));
+            std::cout << "    small closed grids OK\n";
+        }
+        // A wide label column gets no phantom empty column.
+        {
+            auto ts = tables_of("test/fixtures/pdf/tables_wide_label.pdf");
+            CHECK(ts.size() == 1);
+            CHECK((ts[0][0] == std::vector<std::string>{"Item", "2017", "2018", "2019", "2020"}));
+            CHECK(ts[0].size() == 4);
+            std::cout << "    wide label column OK\n";
+        }
+        // A table caption between two borderless tables separates them.
+        {
+            auto ts = tables_of("test/fixtures/pdf/tables_caption_between.pdf");
+            CHECK(ts.size() == 2);
+            const Rows* a = find_table(ts, "Item");
+            const Rows* b = find_table(ts, "Code");
+            CHECK(a && a->size() == 4);
+            CHECK(b && b->size() == 4);
+            CHECK(((*b)[0] == std::vector<std::string>{"Code", "Min", "Max", "Avg"}));
+            std::cout << "    caption between tables OK\n";
+        }
+        // Sparse columns keep their own boundaries: a last column filled in
+        // four of ten rows and an inner one filled in three.
+        {
+            auto ts = tables_of("test/fixtures/pdf/tables_sparse_columns.pdf");
+            CHECK(ts.size() == 1);
+            const Rows& t = ts[0];
+            CHECK(t.size() == 11);
+            CHECK((t[0] == std::vector<std::string>{"Region", "2019", "2020", "2021", "2022", "2023", "2024"}));
+            CHECK((t[2] == std::vector<std::string>{"Busan", "", "43.1", "0.7", "71.6", "", "89.3"}));
+            CHECK((t[5] == std::vector<std::string>{"Daejeon", "55.3", "18.8", "85.2", "", "71.6", "92.7"}));
+            CHECK((t[9] == std::vector<std::string>{"Suwon", "97.2", "53.7", "23.4", "94.3", "45.7", ""}));
+            std::cout << "    sparse columns OK\n";
+        }
+    }
+
     std::cout << "\n=== All tests passed ===\n";
     return 0;
 }
