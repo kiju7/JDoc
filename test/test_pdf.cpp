@@ -466,6 +466,54 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    // Test 15: text drawn over a single raster. A chart saved as one JPEG
+    // with its title, values and axis labels typed over it must come out
+    // composited (PNG, labels drawn), while the original JPEG passes through
+    // when nothing is drawn over it (or only under it), when the raster is a
+    // page-sized background, when body text runs across it, and when the
+    // only text on it is an invisible (Tr 3) OCR layer. The text stays in the
+    // markdown in every case.
+    std::cout << "[15] Testing text drawn over a single raster...\n";
+    {
+        struct Case {
+            const char* fixture;
+            const char* want_format;
+            const char* want_text;
+        };
+        const Case cases[] = {
+            {"test/fixtures/pdf/overlay_chart.pdf", "png", "Quarterly"},
+            {"test/fixtures/pdf/overlay_none.pdf", "jpeg", "Figure"},
+            {"test/fixtures/pdf/overlay_page_background.pdf", "jpeg", "Annual"},
+            {"test/fixtures/pdf/overlay_backdrop.pdf", "jpeg", "Body"},
+            {"test/fixtures/pdf/overlay_ocr_figure.pdf", "jpeg", "Invisible"},
+            {"test/fixtures/pdf/overlay_hidden_text.pdf", "jpeg", "Hidden"},
+        };
+        for (auto& c : cases) {
+            std::ifstream f(c.fixture);
+            if (!f.good()) {
+                std::cout << "    SKIP: " << c.fixture << "\n";
+                continue;
+            }
+            f.close();
+            auto chunks = jdoc::pdf_to_markdown_chunks(c.fixture);
+            CHECK(chunks.size() == 1);
+            std::cout << "    " << c.fixture << ": "
+                      << chunks[0].images.size() << " images, "
+                      << (chunks[0].images.empty() ? "-" : chunks[0].images[0].format)
+                      << " (expected 1, " << c.want_format << ")\n";
+            CHECK(chunks[0].images.size() == 1);
+            CHECK(chunks[0].images[0].format == c.want_format);
+            CHECK(chunks[0].text.find(c.want_text) != std::string::npos);
+        }
+        // The composite is the picture's region (its labels included), not
+        // the page: wider than tall like the placement, far from page-sized.
+        auto chunks = jdoc::pdf_to_markdown_chunks("test/fixtures/pdf/overlay_chart.pdf");
+        if (chunks.size() == 1 && chunks[0].images.size() == 1) {
+            const auto& img = chunks[0].images[0];
+            CHECK(img.width > img.height);
+        }
+    }
+
     std::cout << "\n=== All tests passed ===\n";
     return 0;
 }
