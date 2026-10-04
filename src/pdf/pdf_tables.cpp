@@ -3239,12 +3239,20 @@ static std::vector<bool> dot_leader_mask(const PageCharCache& cache) {
         uint32_t u = cache.chars[i].unicode;
         if (u == '.' || u == 0x2024 || u == 0x2026 || u == 0x00B7) dots.push_back(i);
     }
+    // Top to bottom, then left to right within a baseline. Baselines jitter
+    // by fractions of a point, so the dots are cut into lines first (a gap
+    // over 1pt in y) and each line is ordered by x; a comparator that
+    // treated near-equal y as equal would not be a strict weak ordering.
     std::sort(dots.begin(), dots.end(), [&](size_t a, size_t b) {
-        const auto& ca = cache.chars[a];
-        const auto& cb = cache.chars[b];
-        if (std::abs(ca.y - cb.y) > 1.0) return ca.y > cb.y;
-        return ca.x < cb.x;
+        return cache.chars[a].y > cache.chars[b].y;
     });
+    for (size_t lo = 0, hi; lo < dots.size(); lo = hi) {
+        for (hi = lo + 1; hi < dots.size() &&
+             cache.chars[dots[hi - 1]].y - cache.chars[dots[hi]].y <= 1.0; hi++) {}
+        std::sort(dots.begin() + lo, dots.begin() + hi, [&](size_t a, size_t b) {
+            return cache.chars[a].x < cache.chars[b].x;
+        });
+    }
     size_t run_start = 0;
     auto flush = [&](size_t end) {
         if (end - run_start >= 4)
