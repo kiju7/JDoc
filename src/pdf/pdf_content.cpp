@@ -294,7 +294,7 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
 
     // Load fonts from resources, using cross-page cache when available.
     // The lock covers only lookup/insert; load_font runs outside it.
-    std::unordered_map<std::string, PdfFont> fonts;
+    std::unordered_map<std::string, std::shared_ptr<const PdfFont>> fonts;
     auto res = doc.resolve(resources);
     auto& font_dict = res.get("Font");
     if (!font_dict.is_none()) {
@@ -310,10 +310,11 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
                         continue;
                     }
                 }
-                fonts[name] = load_font(doc, ref);
+                auto font = std::make_shared<const PdfFont>(load_font(doc, ref));
+                fonts[name] = font;
                 if (font_cache && rn >= 0) {
                     std::lock_guard<std::mutex> lock(font_cache->mu);
-                    font_cache->map.emplace(rn, fonts[name]);
+                    font_cache->map.emplace(rn, std::move(font));
                 }
             }
         }
@@ -1014,13 +1015,19 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
         }
     };
 
-    // Glyphs of embedded font programs, for the compositor. Fonts are copied
-    // once per parse: gs.font points into this parse's local font table.
+    // Glyphs of embedded font programs, for the compositor. The result
+    // shares the font with this parse's font table (gs.font points into it).
     std::unordered_map<const PdfFont*, int> glyph_font_index;
     auto record_glyph = [&](const GfxState& gs, uint32_t code) {
         auto [it, fresh] = glyph_font_index.try_emplace(
             gs.font, static_cast<int>(result.glyph_fonts.size()));
-        if (fresh) result.glyph_fonts.push_back(std::make_shared<const PdfFont>(*gs.font));
+        if (fresh) {
+            std::shared_ptr<const PdfFont> owner;
+            for (auto& f : fonts)
+                if (f.second.get() == gs.font) { owner = f.second; break; }
+            if (!owner) owner = std::make_shared<const PdfFont>(*gs.font);
+            result.glyph_fonts.push_back(std::move(owner));
+        }
         GlyphDraw g;
         g.code = code;
         g.font = it->second;
@@ -1724,7 +1731,7 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
                         operand_object(operands.size() - 2);
                     if (font_name) {
                         auto it = fonts.find(font_name->str_val);
-                        gs.font = (it != fonts.end()) ? &it->second : nullptr;
+                        gs.font = (it != fonts.end()) ? it->second.get() : nullptr;
                     } else {
                         gs.font = nullptr;
                     }
@@ -2027,10 +2034,17 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
                                 for (auto& si : sub.images) si.seq += draw_seq;
                                 for (auto& sp : sub.paths) sp.seq += draw_seq;
                                 {
-                                    int font_off = static_cast<int>(result.glyph_fonts.size());
-                                    for (auto& sg : sub.glyphs) { sg.seq += draw_seq; sg.font += font_off; }
-                                    result.glyph_fonts.insert(result.glyph_fonts.end(),
-                                        sub.glyph_fonts.begin(), sub.glyph_fonts.end());
+                                    // Fonts are shared, so a form drawn many
+                                    // times adds each of its fonts once.
+                                    std::vector<int> font_map;
+                                    font_map.reserve(sub.glyph_fonts.size());
+                                    for (auto& sf : sub.glyph_fonts) {
+                                        auto [fit, fresh] = glyph_font_index.try_emplace(
+                                            sf.get(), static_cast<int>(result.glyph_fonts.size()));
+                                        if (fresh) result.glyph_fonts.push_back(std::move(sf));
+                                        font_map.push_back(fit->second);
+                                    }
+                                    for (auto& sg : sub.glyphs) { sg.seq += draw_seq; sg.font = font_map[sg.font]; }
                                     result.glyphs.insert(result.glyphs.end(),
                                         sub.glyphs.begin(), sub.glyphs.end());
                                 }

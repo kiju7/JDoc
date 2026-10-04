@@ -2492,15 +2492,13 @@ static ImageData render_composite_view(
         return parse_result.glyphs[glyph_indices ? (*glyph_indices)[pos] : pos];
     };
     std::vector<std::unique_ptr<GlyphSource>> glyph_sources(parse_result.glyph_fonts.size());
-    std::vector<PathPoint> glyph_outline;
+    RenderPath glyph_rp;   // reused: outline() refills its points for each glyph
     auto draw_glyph = [&](const GlyphDraw& g) {
         if (g.font < 0 || static_cast<size_t>(g.font) >= glyph_sources.size()) return;
         auto& src = glyph_sources[g.font];
         if (!src) src.reset(new GlyphSource(doc, *parse_result.glyph_fonts[g.font]));
-        if (!src->ok() || !src->outline(g.code, glyph_outline)) return;
-        RenderPath rp;
-        rp.points = glyph_outline;
-        for (auto& pt : rp.points) {
+        if (!src->ok() || !src->outline(g.code, glyph_rp.points)) return;
+        for (auto& pt : glyph_rp.points) {
             if (pt.type == PathPoint::CLOSE) continue;
             double x = pt.x, y = pt.y;
             pt.x = g.m[0] * x + g.m[2] * y + g.m[4];
@@ -2513,15 +2511,15 @@ static ImageData render_composite_view(
                 pt.cy2 = g.m[1] * c + g.m[3] * d + g.m[5];
             }
         }
-        rp.fill_r = g.fill_r; rp.fill_g = g.fill_g; rp.fill_b = g.fill_b;
-        rp.stroke_r = rp.stroke_g = rp.stroke_b = 0;
-        rp.fill_alpha = g.alpha;
-        rp.line_width = 0;
-        rp.do_fill = true;
-        rp.do_stroke = false;
-        std::memcpy(rp.clip, g.clip, sizeof(rp.clip));
-        rp.seq = g.seq;
-        draw_path(rp);
+        glyph_rp.fill_r = g.fill_r; glyph_rp.fill_g = g.fill_g; glyph_rp.fill_b = g.fill_b;
+        glyph_rp.stroke_r = glyph_rp.stroke_g = glyph_rp.stroke_b = 0;
+        glyph_rp.fill_alpha = g.alpha;
+        glyph_rp.line_width = 0;
+        glyph_rp.do_fill = true;
+        glyph_rp.do_stroke = false;
+        std::memcpy(glyph_rp.clip, g.clip, sizeof(glyph_rp.clip));
+        glyph_rp.seq = g.seq;
+        draw_path(glyph_rp);
     };
 
     // Draw paths, images and glyphs interleaved in content-stream order.

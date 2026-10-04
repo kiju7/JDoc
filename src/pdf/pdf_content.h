@@ -54,7 +54,7 @@ struct GfxState {
     double text_rise = 0;
     double text_leading = 0;
     int render_mode = 0;   // Tr: 2/6 = fill+stroke (faux bold in HWP exports)
-    PdfFont* font = nullptr;
+    const PdfFont* font = nullptr;
 
     // Graphics state for paths
     double stroke_r = 0, stroke_g = 0, stroke_b = 0;
@@ -390,7 +390,8 @@ struct PageCharCache {
 // deterministic, so two workers racing on a miss both compute the same value
 // and the duplicate insert is harmless.
 struct FontCache {
-    std::unordered_map<int, PdfFont> map;
+    // Fonts are read-only once loaded: pages share them instead of copying.
+    std::unordered_map<int, std::shared_ptr<const PdfFont>> map;
     std::mutex mu;
 };
 

@@ -497,10 +497,20 @@ struct Cff {
         return s;
     }
 
+    // Glyph names are indexed on first lookup: a scan of the charset per
+    // shown glyph built a string for every glyph of the font.
+    mutable std::unordered_map<std::string, int> name_to_gid;
+    mutable bool names_indexed = false;
+
     int gid_for_name(const std::string& name) const {
-        for (size_t g = 0; g < charset.size(); g++)
-            if (sid_name(charset[g]) == name) return static_cast<int>(g);
-        return -1;
+        if (!names_indexed) {
+            name_to_gid.reserve(charset.size());
+            for (size_t g = 0; g < charset.size(); g++)
+                name_to_gid.emplace(sid_name(charset[g]), static_cast<int>(g));  // first wins
+            names_indexed = true;
+        }
+        auto it = name_to_gid.find(name);
+        return it == name_to_gid.end() ? -1 : it->second;
     }
 
     static int bias(size_t count) { return count < 1240 ? 107 : count < 33900 ? 1131 : 32768; }
@@ -676,8 +686,7 @@ struct Type1 {
         d.swap(o);
     }
 
-    bool parse(const std::vector<uint8_t>& prog, size_t len1) {
-        std::vector<uint8_t> data = prog;
+    bool parse(std::vector<uint8_t> data, size_t len1) {
         // PFB segments
         if (data.size() > 6 && data[0] == 0x80) {
             std::vector<uint8_t> clear, enc;
@@ -1016,7 +1025,7 @@ GlyphSource::GlyphSource(PdfDoc& doc, const PdfFont& font) : impl_(new Impl) {
     switch (font.program_kind) {
         case 1: {
             size_t len1 = static_cast<size_t>(std::max(0, doc.resolve(st.get("Length1")).as_int()));
-            if (impl_->t1.parse(prog, len1)) impl_->kind = 1;
+            if (impl_->t1.parse(std::move(prog), len1)) impl_->kind = 1;
             break;
         }
         case 2: case 4: {
