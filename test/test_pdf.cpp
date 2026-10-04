@@ -992,6 +992,26 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    // Test 25: an LZWDecode content stream (make_lzw_fixture.py). With the
+    // default EarlyChange 1 the codes widen one table entry early; widening
+    // one late misread every code after the first few hundred bytes and the
+    // page lost all but its first lines.
+    std::cout << "[25] Testing an LZW-compressed content stream...\n";
+    {
+        const char* fx = "test/fixtures/pdf/lzw_content.pdf";
+        std::ifstream f(fx);
+        if (!f.good()) {
+            std::cout << "    SKIP: " << fx << "\n";
+        } else {
+            f.close();
+            std::string md = jdoc::pdf_to_markdown(fx);
+            CHECK(md.find("Line 000 of a long LZW compressed page") != std::string::npos);
+            CHECK(md.find("Line 219 of a long LZW compressed page") != std::string::npos);
+            CHECK(md.find("END OF LZW TEXT") != std::string::npos);
+            std::cout << "    all lines decoded OK\n";
+        }
+    }
+
     std::cout << "\n=== All tests passed ===\n";
     return 0;
 }

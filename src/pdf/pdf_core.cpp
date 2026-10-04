@@ -313,7 +313,10 @@ std::vector<uint8_t> decode_lzw(const uint8_t* src, size_t src_len, int early_ch
         }
         prev = code;
 
-        int sz = (int)table.size() + (early_change ? 0 : 1);
+        // The code widens once the next entry would need the extra bit:
+        // with EarlyChange 1 (the default) one entry early, at 511 for 10
+        // bits; with 0, at 512.
+        int sz = (int)table.size() + (early_change ? 1 : 0);
         if (sz >= (1 << bits) && bits < 12) bits++;
     }
     return out;
