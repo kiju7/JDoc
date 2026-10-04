@@ -1384,6 +1384,31 @@ static void parse_type1_builtin_encoding(const std::vector<uint8_t>& data,
     }
 }
 
+// Standard 14 font for a /BaseFont name: the exact names, a subset prefix
+// ("ABCDEF+Times-Roman"), and the common aliases Arial, TimesNewRoman and
+// CourierNew with ",Bold"/"-BoldMT"-style suffixes.
+static const jdoc_std14::Metrics* std14_for(const std::string& base, bool bold, bool italic) {
+    std::string n = base;
+    auto plus = n.find('+');
+    if (plus == 6) n = n.substr(7);
+    if (auto* m = jdoc_std14::by_name(n.c_str())) return m;
+    std::string lower;
+    for (char ch : n) lower += std::tolower(static_cast<unsigned char>(ch));
+    std::string family;
+    if (lower.find("courier") != std::string::npos) family = "Courier";
+    else if (lower.find("times") != std::string::npos) family = "Times";
+    else if (lower.find("helvetica") != std::string::npos || lower.find("arial") != std::string::npos) family = "Helvetica";
+    else if (lower == "symbol") return jdoc_std14::by_name("Symbol");
+    else if (lower.find("zapfdingbats") != std::string::npos) return jdoc_std14::by_name("ZapfDingbats");
+    else return nullptr;
+    std::string name;
+    if (family == "Times")
+        name = bold && italic ? "Times-BoldItalic" : bold ? "Times-Bold" : italic ? "Times-Italic" : "Times-Roman";
+    else
+        name = family + (bold && italic ? "-BoldOblique" : bold ? "-Bold" : italic ? "-Oblique" : "");
+    return jdoc_std14::by_name(name.c_str());
+}
+
 PdfFont load_font(PdfDoc& doc, const PdfObj& font_ref) {
     PdfFont font;
     auto fobj = doc.resolve(font_ref);
@@ -1436,6 +1461,13 @@ PdfFont load_font(PdfDoc& doc, const PdfObj& font_ref) {
             font.widths[static_cast<uint32_t>(first_char + i)] = w;
         }
     }
+
+    // A simple font that names one of the 14 standard fonts may omit /Widths;
+    // its glyph widths are then the font's built-in metrics. Without them every
+    // glyph advanced by a 600-unit default, runs overlapped the next run on the
+    // line and the characters of both interleaved when sorted by position.
+    if (!widths_arr.is_arr() && (font_type == "Type1" || font_type == "TrueType" || font_type == "MMType1"))
+        font.std14 = std14_for(font.name, font.is_bold, font.is_italic);
 
     if (font_type == "Type3") {
         font.is_type3 = true;

@@ -1,5 +1,6 @@
 #pragma once
 // pdf_core.h — internal: PDF object model, lexer, xref, crypt mapping, document, fonts.
+#include "std14_metrics.h"
 #include "jdoc/pdf.h"
 #include "pdf_crypt.h"
 #include "common/string_utils.h"
@@ -485,6 +486,9 @@ struct PdfFont {
     std::unordered_map<uint32_t, double> widths; // char code → width in 1/1000 of text space
     double default_width = 1000; // default glyph width in 1/1000 units
     double missing_width = 0;    // /MissingWidth from FontDescriptor
+    // Built-in metrics of a standard 14 font named without a /Widths array
+    // (PDF 32000-1 9.6.2.2). Looked up by the decoded Unicode value.
+    const jdoc_std14::Metrics* std14 = nullptr;
     int cmap_code_bytes = 0;     // 0=auto, 1 or 2 from codespacerange
 
     // Type3 fonts whose codes map to nothing readable (no ToUnicode, private
@@ -499,6 +503,10 @@ struct PdfFont {
     double get_width(uint32_t code) const {
         auto it = widths.find(code);
         if (it != widths.end()) return it->second;
+        if (std14) {
+            int w = jdoc_std14::width(std14, decode_char(code));
+            if (w > 0) return w;
+        }
         if (missing_width > 0) return missing_width;
         if (is_identity || is_type0) return default_width;
         return 0; // unknown — let caller use default
