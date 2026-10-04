@@ -676,6 +676,64 @@ int main(int argc, char* argv[]) {
         CHECK(md == want);
     }
 
+    // [20] Banded tables: rows separated only by background shading, with
+    // the first or last row left white. The run of painted rows must extend
+    // to the white rows that continue its column alignment (table 1: last
+    // body row; table 2: header above and last row below the stripes), and
+    // a fill written `re h f` stays a shading rect, not four fake rules.
+    // A header-only tint (table 3) must not absorb a body row of a tighter
+    // pitch. With tables off, a row's widely spaced numbers keep their spaces.
+    std::cout << "[20] Testing banded tables with unshaded edge rows...\n";
+    {
+        const char* fx = "test/fixtures/pdf/shaded_band_table.pdf";
+        std::ifstream f(fx);
+        if (!f.good()) {
+            std::cout << "    SKIP: " << fx << "\n";
+        } else {
+            f.close();
+            std::string md = jdoc::pdf_to_markdown(fx);
+            auto count = [&](const std::string& hay, const std::string& needle) {
+                size_t n = 0;
+                for (size_t p = hay.find(needle); p != std::string::npos;
+                     p = hay.find(needle, p + 1))
+                    n++;
+                return n;
+            };
+            CHECK(count(md, "| Large ") == 1);
+            CHECK(count(md, "| Small ") == 1);
+            CHECK(count(md, "| **Hour**") == 1);
+            CHECK(count(md, "| 10 pm ") == 1);
+            CHECK(md.find("Small3") == std::string::npos);
+            CHECK(md.find("10 pm25") == std::string::npos);
+            CHECK(md.find("\nSmall") == std::string::npos);
+            CHECK(md.find("| **Table") == std::string::npos);
+            CHECK(md.find("| Larger") == std::string::npos);
+            CHECK(md.find("| The gap") == std::string::npos);
+            size_t small = md.find("| Small ");
+            size_t prose = md.find("Larger parks were cooler");
+            size_t cap2 = md.find("Table 2. Mean temperature");
+            size_t hour = md.find("| **Hour**");
+            size_t last = md.find("| 10 pm ");
+            size_t tail = md.find("The gap between the park");
+            CHECK(small != std::string::npos && prose != std::string::npos &&
+                  small < prose && prose < cap2 && cap2 < hour &&
+                  hour < last && last < tail && tail != std::string::npos);
+
+            // Table 3: a header-only tint over a tighter body is no band;
+            // its first body row stays with the rest of the body.
+            CHECK(count(md, "| Austria ") == 1);
+            CHECK(count(md, "| Germany ") == 1);
+            CHECK(count(md, "| Spain ") == 1);
+            CHECK(md.find("Germany Spain") == std::string::npos);
+
+            jdoc::ConvertOptions no_tables;
+            no_tables.tables = false;
+            std::string plain = jdoc::pdf_to_markdown(fx, no_tables);
+            CHECK(plain.find("Small 3 2.8 0.5") != std::string::npos);
+            CHECK(plain.find("10 pm 25.2 25.9 0.7") != std::string::npos);
+        }
+    }
+
     std::cout << "\n=== All tests passed ===\n";
     return 0;
 }
