@@ -352,7 +352,12 @@ static std::vector<std::array<double, 4>> fragment_regions(
                 double lw = ln.x_right - ln.x_left;
                 if (body[&ln - lines.data()]) continue;
                 double fs = std::max(ln.font_size, 4.0);
-                double ly0 = ln.y_center - 0.6 * fs, ly1 = ln.y_center + 0.6 * fs;
+                // An upright line's y_center is its baseline: the glyphs span
+                // the em box above it (the compositor's descender to
+                // ascender), so a label straddling the region's top edge is
+                // taken whole. A rotated line's y_center is its box middle.
+                double ly0 = ln.rot == 0 ? ln.y_center - 0.3 * fs : ln.y_center - 0.6 * fs;
+                double ly1 = ln.rot == 0 ? ln.y_center + fs : ln.y_center + 0.6 * fs;
                 if (ly0 >= R[1] && ly1 <= R[3] && ln.x_left >= R[0] && ln.x_right <= R[2]) continue;
                 double ov = std::min(ln.x_right, R[2]) - std::max(ln.x_left, R[0]);
                 if (ov < 0.5 * std::max(lw, 1.0)) continue;
