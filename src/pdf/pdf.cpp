@@ -162,6 +162,133 @@ static void page_view_ctm(int rotate, double w, double h,
     mat_multiply(out, T, R);
 }
 
+// A figure or table caption line ("Figure 3", "Fig. 2", "그림 1", "Table 4"):
+// the caption word followed by a number within the next few characters.
+static bool is_caption_line(const std::string& t) {
+    size_t i = 0;
+    while (i < t.size() && (t[i] == ' ' || t[i] == '<' || t[i] == '[' || t[i] == '(')) i++;
+    auto starts = [&](const char* w) { return t.compare(i, strlen(w), w) == 0; };
+    if (!(starts("Figure") || starts("Fig.") || starts("FIGURE") || starts("Table") ||
+          starts("TABLE") || starts("\xea\xb7\xb8\xeb\xa6\xbc") ||   // 그림
+          starts("\xed\x91\x9c")))                                  // 표
+        return false;
+    for (size_t k = i; k < std::min(t.size(), i + 16); k++)
+        if (t[k] >= '0' && t[k] <= '9') return true;
+    return false;
+}
+
+// Composite regions of the fragment clusters on a page with body text: each
+// cluster box grown over the vector paths it touches, neighbouring panels of
+// one figure merged, and the figure's own labels taken in. Boxes are clamped
+// to the page.
+static std::vector<std::array<double, 4>> fragment_regions(
+        const std::vector<std::array<double, 4>>& cluster_boxes,
+        const std::vector<RenderPath>& paths,
+        const std::vector<TextLine>& lines, double page_w, double page_h) {
+    std::vector<std::array<double, 4>> regions;
+    std::vector<std::array<double, 4>> path_boxes;
+    for (auto& rp : paths) {
+        if (rp.synthetic) continue;
+        double bx0 = 1e300, by0 = 1e300, bx1 = -1e300, by1 = -1e300;
+        for (auto& pt : rp.points) {
+            if (pt.type == PathPoint::CLOSE) continue;
+            bx0 = std::min(bx0, pt.x); bx1 = std::max(bx1, pt.x);
+            by0 = std::min(by0, pt.y); by1 = std::max(by1, pt.y);
+        }
+        if (bx0 > bx1 || by0 > by1) continue;
+        // A frame or background panel around half the page would grow
+        // every region to the page.
+        if ((bx1 - bx0) * (by1 - by0) > 0.25 * page_w * page_h) continue;
+        path_boxes.push_back({bx0, by0, bx1, by1});
+    }
+    for (auto& c : cluster_boxes) {
+        double rg[4] = {c[0], c[1], c[2], c[3]};
+        // Grow over touching paths until the region is stable: a drawing
+        // chains box to arrow to box well past two hops.
+        for (int pass = 0; pass < 10; pass++) {
+            double g[4] = {rg[0], rg[1], rg[2], rg[3]};
+            for (auto& b : path_boxes) {
+                if (b[2] < rg[0] - 2 || b[0] > rg[2] + 2 ||
+                    b[3] < rg[1] - 2 || b[1] > rg[3] + 2) continue;
+                double n0 = std::min(g[0], b[0]), n1 = std::min(g[1], b[1]);
+                double n2 = std::max(g[2], b[2]), n3 = std::max(g[3], b[3]);
+                if ((n2 - n0) * (n3 - n1) > 0.6 * page_w * page_h) continue;
+                g[0] = n0; g[1] = n1; g[2] = n2; g[3] = n3;
+            }
+            bool same = g[0] == rg[0] && g[1] == rg[1] && g[2] == rg[2] && g[3] == rg[3];
+            std::copy(g, g + 4, rg);
+            if (same) break;
+        }
+        regions.push_back({std::max(rg[0], 0.0), std::max(rg[1], 0.0),
+                           std::min(rg[2], page_w), std::min(rg[3], page_h)});
+    }
+    // Panels of one figure ((a)-(d) under a single caption) are separate
+    // clusters; neighbouring regions merge into one image unless the union
+    // would take in body text, which marks two figures rather than two
+    // panels. A caption inside the union separates two figures too; panels
+    // share one caption outside all of them.
+    auto body_lines_in = [&](const std::array<double, 4>& r) {
+        int n = 0;
+        for (auto& ln : lines) {
+            if (ln.y_center < r[1] || ln.y_center > r[3]) continue;
+            if (ln.x_left < r[0] - 1 || ln.x_right > r[2] + 1) continue;
+            if (is_caption_line(ln.text)) return 99;
+            if (ln.x_right - ln.x_left > 0.4 * page_w && ln.text.size() >= 30) n++;
+        }
+        return n;
+    };
+    for (bool merged = true; merged;) {
+        merged = false;
+        for (size_t i = 0; i < regions.size() && !merged; i++)
+            for (size_t j = i + 1; j < regions.size() && !merged; j++) {
+                auto& A = regions[i]; auto& B = regions[j];
+                double gx = std::max(A[0], B[0]) - std::min(A[2], B[2]);
+                double gy = std::max(A[1], B[1]) - std::min(A[3], B[3]);
+                if (gx > 0.15 * page_h || gy > 0.15 * page_h) continue;
+                std::array<double, 4> U = {std::min(A[0], B[0]), std::min(A[1], B[1]),
+                                           std::max(A[2], B[2]), std::max(A[3], B[3])};
+                if (body_lines_in(U) >= 2) continue;
+                A = U;
+                regions.erase(regions.begin() + j);
+                merged = true;
+            }
+    }
+    // A figure's labels outside its drawn area (a "Class Label" over the
+    // arrows, axis titles, panel subcaptions) are text the region would cut
+    // off now that glyphs are drawn: grow each region over short lines that
+    // sit within 1.5 line heights of it. Captions and body text are not
+    // taken in.
+    for (auto& R : regions) {
+        for (int pass = 0; pass < 3; pass++) {
+            bool grew = false;
+            for (auto& ln : lines) {
+                if (ln.text.empty() || is_caption_line(ln.text)) continue;
+                double lw = ln.x_right - ln.x_left;
+                if (lw > 0.4 * page_w && ln.text.size() >= 30) continue;
+                double fs = std::max(ln.font_size, 4.0);
+                double ly0 = ln.y_center - 0.6 * fs, ly1 = ln.y_center + 0.6 * fs;
+                if (ly0 >= R[1] && ly1 <= R[3] && ln.x_left >= R[0] && ln.x_right <= R[2]) continue;
+                double ov = std::min(ln.x_right, R[2]) - std::max(ln.x_left, R[0]);
+                if (ov < 0.5 * std::max(lw, 1.0)) continue;
+                double gap = std::max(ly0 - R[3], R[1] - ly1);
+                if (gap > 1.5 * fs) continue;
+                R[0] = std::min(R[0], ln.x_left); R[2] = std::max(R[2], ln.x_right);
+                R[1] = std::min(R[1], ly0);       R[3] = std::max(R[3], ly1);
+                grew = true;
+            }
+            if (!grew) break;
+        }
+        R[0] = std::max(R[0], 0.0); R[1] = std::max(R[1], 0.0);
+        R[2] = std::min(R[2], page_w); R[3] = std::min(R[3], page_h);
+    }
+    return regions;
+}
+
+// True when a render produced an image (in memory or saved to disk).
+static bool has_image(const ImageData& img) {
+    return !img.data.empty() || !img.pixels.empty() || !img.saved_path.empty();
+}
+
 // Extract from an in-memory buffer; pdf_path is used for error messages only.
 static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
                                         const std::string& pdf_path,
@@ -672,132 +799,28 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
             // returned the page, not the figure, and carried none of the
             // page text. Pages without text (scans, vector-text pages) still
             // composite whole.
+            bool split_regions = fragment_page && !no_text && !vector_text_page;
             std::vector<std::array<double, 4>> regions;
-            if (fragment_page && !no_text && !vector_text_page) {
-            std::vector<std::array<double, 4>> path_boxes;
-            for (auto& rp : parse_result.paths) {
-                if (rp.synthetic) continue;
-                double bx0 = 1e300, by0 = 1e300, bx1 = -1e300, by1 = -1e300;
-                for (auto& pt : rp.points) {
-                    if (pt.type == PathPoint::CLOSE) continue;
-                    bx0 = std::min(bx0, pt.x); bx1 = std::max(bx1, pt.x);
-                    by0 = std::min(by0, pt.y); by1 = std::max(by1, pt.y);
-                }
-                if (bx0 > bx1 || by0 > by1) continue;
-                // A frame or background panel around half the page
-                // would grow every region to the page.
-                if ((bx1 - bx0) * (by1 - by0) > 0.25 * page_w * page_h) continue;
-                path_boxes.push_back({bx0, by0, bx1, by1});
-            }
-            for (auto& c : clusters) {
-                if (!qualifies(c)) continue;
-                double rg[4] = {c.x0, c.y0, c.x1, c.y1};
-                // Grow over touching paths until the region is stable: a
-                // drawing chains box to arrow to box well past two hops.
-                for (int pass = 0; pass < 10; pass++) {
-                    double g[4] = {rg[0], rg[1], rg[2], rg[3]};
-                    for (auto& b : path_boxes) {
-                        if (b[2] < rg[0] - 2 || b[0] > rg[2] + 2 ||
-                            b[3] < rg[1] - 2 || b[1] > rg[3] + 2) continue;
-                        double n0 = std::min(g[0], b[0]), n1 = std::min(g[1], b[1]);
-                        double n2 = std::max(g[2], b[2]), n3 = std::max(g[3], b[3]);
-                        if ((n2 - n0) * (n3 - n1) > 0.6 * page_w * page_h) continue;
-                        g[0] = n0; g[1] = n1; g[2] = n2; g[3] = n3;
-                    }
-                    bool same = g[0] == rg[0] && g[1] == rg[1] && g[2] == rg[2] && g[3] == rg[3];
-                    std::copy(g, g + 4, rg);
-                    if (same) break;
-                }
-                regions.push_back({std::max(rg[0], 0.0), std::max(rg[1], 0.0),
-                                   std::min(rg[2], page_w), std::min(rg[3], page_h)});
-            }
-            // Panels of one figure ((a)-(d) under a single caption)
-            // are separate clusters; neighbouring regions merge into
-            // one image unless the union would take in body text,
-            // which marks two figures rather than two panels.
-            // A caption ("Figure 3", "Fig. 2", "그림 1", "Table 4") inside
-            // the union separates two figures; panels share one
-            // caption outside all of them.
-            auto caption_line = [](const std::string& t) {
-                size_t i = 0;
-                while (i < t.size() && (t[i] == ' ' || t[i] == '<' || t[i] == '[' || t[i] == '(')) i++;
-                auto starts = [&](const char* w) { return t.compare(i, strlen(w), w) == 0; };
-                if (!(starts("Figure") || starts("Fig.") || starts("FIGURE") || starts("Table") ||
-                      starts("TABLE") || starts("\xea\xb7\xb8\xeb\xa6\xbc") ||   // 그림
-                      starts("\xed\x91\x9c")))                                  // 표
-                    return false;
-                for (size_t k = i; k < std::min(t.size(), i + 16); k++)
-                    if (t[k] >= '0' && t[k] <= '9') return true;
-                return false;
-            };
-            auto body_lines_in = [&](const std::array<double, 4>& r) {
-                int n = 0;
-                for (auto& ln : result.all_lines[p]) {
-                    if (ln.y_center < r[1] || ln.y_center > r[3]) continue;
-                    if (ln.x_left < r[0] - 1 || ln.x_right > r[2] + 1) continue;
-                    if (caption_line(ln.text)) return 99;
-                    if (ln.x_right - ln.x_left > 0.4 * page_w && ln.text.size() >= 30) n++;
-                }
-                return n;
-            };
-            for (bool merged = true; merged;) {
-                merged = false;
-                for (size_t i = 0; i < regions.size() && !merged; i++)
-                    for (size_t j = i + 1; j < regions.size() && !merged; j++) {
-                        auto& A = regions[i]; auto& B = regions[j];
-                        double gx = std::max(A[0], B[0]) - std::min(A[2], B[2]);
-                        double gy = std::max(A[1], B[1]) - std::min(A[3], B[3]);
-                        if (gx > 0.15 * page_h || gy > 0.15 * page_h) continue;
-                        std::array<double, 4> U = {std::min(A[0], B[0]), std::min(A[1], B[1]),
-                                                   std::max(A[2], B[2]), std::max(A[3], B[3])};
-                        if (body_lines_in(U) >= 2) continue;
-                        A = U;
-                        regions.erase(regions.begin() + j);
-                        merged = true;
-                    }
-            }
-            // A figure's labels outside its drawn area (a "Class Label" over
-            // the arrows, axis titles, panel subcaptions) are text the
-            // region would cut off now that glyphs are drawn: grow each
-            // region over short lines that sit within 1.5 line heights of
-            // it. Captions and body text are not taken in.
-            for (auto& R : regions) {
-                for (int pass = 0; pass < 3; pass++) {
-                    bool grew = false;
-                    for (auto& ln : result.all_lines[p]) {
-                        if (ln.text.empty() || caption_line(ln.text)) continue;
-                        double lw = ln.x_right - ln.x_left;
-                        if (lw > 0.4 * page_w && ln.text.size() >= 30) continue;
-                        double fs = std::max(ln.font_size, 4.0);
-                        double ly0 = ln.y_center - 0.6 * fs, ly1 = ln.y_center + 0.6 * fs;
-                        if (ly0 >= R[1] && ly1 <= R[3] && ln.x_left >= R[0] && ln.x_right <= R[2]) continue;
-                        double ov = std::min(ln.x_right, R[2]) - std::max(ln.x_left, R[0]);
-                        if (ov < 0.5 * std::max(lw, 1.0)) continue;
-                        double gap = std::max(ly0 - R[3], R[1] - ly1);
-                        if (gap > 1.5 * fs) continue;
-                        R[0] = std::min(R[0], ln.x_left); R[2] = std::max(R[2], ln.x_right);
-                        R[1] = std::min(R[1], ly0);       R[3] = std::max(R[3], ly1);
-                        grew = true;
-                    }
-                    if (!grew) break;
-                }
-                R[0] = std::max(R[0], 0.0); R[1] = std::max(R[1], 0.0);
-                R[2] = std::min(R[2], page_w); R[3] = std::min(R[3], page_h);
-            }
+            if (split_regions) {
+                std::vector<std::array<double, 4>> cluster_boxes;
+                for (auto& c : clusters)
+                    if (qualifies(c)) cluster_boxes.push_back({c.x0, c.y0, c.x1, c.y1});
+                regions = fragment_regions(cluster_boxes, parse_result.paths,
+                                           result.all_lines[p], page_w, page_h);
             }
             double region_area = 0;
             for (auto& R : regions) region_area += (R[2] - R[0]) * (R[3] - R[1]);
             // Regions that fill half the page (a cover, a full-page
             // infographic) are the page itself: composite it whole.
-            bool region_fragments = fragment_page && !no_text && !vector_text_page &&
-                                    !regions.empty() && region_area <= 0.5 * page_w * page_h;
+            bool region_fragments = split_regions && !regions.empty() &&
+                                    region_area <= 0.5 * page_w * page_h;
             bool composited = false;
             if (vector_text_page || (fragment_page && !region_fragments)) {
                 // The composite draws every placement, standalone images
                 // included; exporting those separately would store the same
                 // content twice, so a composited page emits exactly one file.
                 auto rendered = render_composite();
-                if (!rendered.data.empty() || !rendered.pixels.empty() || !rendered.saved_path.empty()) {
+                if (has_image(rendered)) {
                     result.all_images[p].push_back(std::move(rendered));
                     result.all_image_y[p].push_back(page_h);
                     result.all_image_x[p].push_back(0);
@@ -833,8 +856,7 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
                                 doc, resources, parse_result, members, p, rg,
                                 image_dir, img_idx, &result.page_diags[p]);
                         }
-                        if (rendered.data.empty() && rendered.pixels.empty() &&
-                            rendered.saved_path.empty()) {
+                        if (!has_image(rendered)) {
                             // A region that paints nothing (seen with GDI strip
                             // maps) must not lose the figure: fall back to the
                             // whole-page composite this page had before.
@@ -850,8 +872,7 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
                     }
                     if (region_failed) {
                         auto rendered = render_composite();
-                        if (!rendered.data.empty() || !rendered.pixels.empty() ||
-                            !rendered.saved_path.empty()) {
+                        if (has_image(rendered)) {
                             result.all_images[p].clear();
                             result.all_image_y[p].clear();
                             result.all_image_x[p].clear();
@@ -1243,10 +1264,7 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
                                 rgn, image_dir, img_idx,
                                 &result.page_diags[p]);
                         }
-                        if (rendered.data.empty() &&
-                            rendered.pixels.empty() &&
-                            rendered.saved_path.empty())
-                            continue;
+                        if (!has_image(rendered)) continue;
                         for (size_t mi : members) handled[mi] = 1;
                         result.all_images[p].push_back(std::move(rendered));
                         result.all_image_y[p].push_back(rgn[3]);
@@ -1391,7 +1409,7 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
                         !parse_result.paths.empty()) {
                         result.page_diags[p] = {};
                         auto rendered = render_composite();
-                        if (!rendered.data.empty() || !rendered.pixels.empty() || !rendered.saved_path.empty()) {
+                        if (has_image(rendered)) {
                             result.all_images[p].push_back(std::move(rendered));
                             result.all_image_y[p].push_back(page_h);
                             result.all_image_x[p].push_back(0);
