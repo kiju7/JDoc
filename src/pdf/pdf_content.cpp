@@ -2545,7 +2545,14 @@ static std::vector<TextLine> lines_from_upright_chars(
             if (gap > col_gap_thresh && empty > median_fs * 0.3 &&
                 word_end < col_boundary && ch.left > col_boundary) {
                 bool gutter = gap > std::max(median_fs * 2.0, 18.0);
-                if (gutter || right_clusters(ii, cur_y) < 2) {
+                // Glyphs side by side on a row but far apart in the content
+                // stream belong to two text flows (a column each), however
+                // narrow the gap or cell-like the right side: a line of text,
+                // or a table row, is drawn glyph after glyph.
+                bool other_flow = prev_glyph >= 0 &&
+                    (static_cast<long>(idx[ii]) <= prev_glyph ||
+                     static_cast<long>(idx[ii]) - prev_glyph > 4);
+                if (gutter || other_flow || right_clusters(ii, cur_y) < 2) {
                     flush();
                     cur_y = ch.y;
                 }
