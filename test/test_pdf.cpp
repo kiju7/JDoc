@@ -2,6 +2,7 @@
 #include "jdoc/pdf.h"
 #include "pdf/pdf_base14.h"
 #include "pdf/pdf_core.h"
+#include "pdf/pdf_extract.h"
 
 #include <iostream>
 #include <fstream>
@@ -907,8 +908,8 @@ int main(int argc, char* argv[]) {
     // Test 22: a figure stored as raster strips under two columns of body
     // text. Its region composite is the figure alone: column lines are
     // narrower than half the page yet are body text, not labels to grow
-    // over — nor is a paragraph's short last line right above the figure.
-    // Strips span 435x120 pt; taking in the text above would make the
+    // over — nor is a paragraph's short last line right above the figure,
+    // on a two-column page or a single-column one. Strips span 435x120 pt; taking in the text above would make the
     // image barely twice as wide as tall.
     std::cout << "[22] Testing figure strips under multi-column body text...\n";
     {
@@ -933,6 +934,37 @@ int main(int argc, char* argv[]) {
             CHECK(aspect >= 3.0);
             CHECK(chunks[0].text.find("sentences") != std::string::npos);
             CHECK(chunks[0].text.find("evaluation") != std::string::npos);
+        }
+        // One column, a paragraph of a single full line and a short last
+        // line right above the figure, and too few body-size lines on the
+        // page to measure a column: the short line still ends the
+        // paragraph. The composite is the strips alone (435x120 pt; the
+        // line taken in made it about 3.2:1) and the image follows the
+        // whole paragraph instead of splitting it.
+        const char* single = "test/fixtures/pdf/strip_figure_single_column_short_tail.pdf";
+        std::ifstream sf(single);
+        if (!sf.good()) {
+            std::cout << "    SKIP: " << single << "\n";
+        } else {
+            sf.close();
+            auto chunks = jdoc::pdf_to_markdown_chunks(single);
+            CHECK(chunks.size() == 1);
+            CHECK(chunks[0].images.size() == 1);
+            if (chunks.size() == 1 && chunks[0].images.size() == 1) {
+                const auto& img = chunks[0].images[0];
+                double aspect = img.height > 0 ? double(img.width) / img.height : 0;
+                std::cout << "    " << single << ": " << img.width << "x" << img.height
+                          << " (expected aspect >= 3.4)\n";
+                CHECK(aspect >= 3.4);
+                const std::string& t = chunks[0].text;
+                size_t tail = t.find("results, shown in Figure 3.");
+                size_t ref = t.find("![");
+                size_t cap = t.find("Figure 3. Analysis flow");
+                CHECK(tail != std::string::npos && ref != std::string::npos &&
+                      cap != std::string::npos);
+                CHECK(tail < ref && ref < cap);
+                CHECK(t.find("summary of\nresults, shown") != std::string::npos);
+            }
         }
     }
 
@@ -1009,6 +1041,126 @@ int main(int argc, char* argv[]) {
             CHECK(md.find("Line 219 of a long LZW compressed page") != std::string::npos);
             CHECK(md.find("END OF LZW TEXT") != std::string::npos);
             std::cout << "    all lines decoded OK\n";
+        }
+    }
+
+    // Test 26: table rows whose word spaces are no-break spaces (U+00A0).
+    // The cells normalise them to spaces; the prose lines must too, or the
+    // capture check that drops a table's lines from the prose flow misses
+    // them and the shaded bold header (and a data row with "12 300") is
+    // printed a second time after the table.
+    std::cout << "[26] Testing table rows spelled with no-break spaces...\n";
+    {
+        const char* fx = "test/fixtures/pdf/nbsp_table.pdf";
+        std::ifstream f(fx);
+        if (!f.good()) {
+            std::cout << "    SKIP: " << fx << "\n";
+        } else {
+            f.close();
+            std::string md = jdoc::pdf_to_markdown(fx);
+            auto count = [&](const std::string& needle) {
+                size_t n = 0;
+                for (size_t p = md.find(needle); p != std::string::npos;
+                     p = md.find(needle, p + 1))
+                    n++;
+                return n;
+            };
+            CHECK(count("| **Park**") == 1);
+            CHECK(count("Inside temp") == 1);
+            CHECK(count("Road temp") == 1);
+            CHECK(count("North Park") == 1);
+            CHECK(count("12 300") == 1);
+            CHECK(md.find("\xC2\xA0") == std::string::npos);
+            size_t tbl = md.find("| Corner");
+            size_t tail = md.find("The smallest park");
+            CHECK(tbl != std::string::npos && tail != std::string::npos && tbl < tail);
+        }
+    }
+
+    // [27] Markdown table padding counts display columns, not UTF-8 bytes:
+    // a Hangul syllable is 3 bytes but 2 columns, so byte-based padding left
+    // Korean cells short and the pipes out of line with Latin rows. Wide
+    // (Hangul, kana, CJK, full-width), combining (U+0301, conjoining Jamo
+    // vowels and finals) and narrow cells must all end on the same columns,
+    // the separator dashes included, and bold markers count as text.
+    std::cout << "[27] Testing table padding by display width...\n";
+    {
+        jdoc::pdf_detail::TableData t{};
+        t.rows = {{"공원", "면적 ha", "비고"},
+                  {"중앙공원", "42", "カナ漢字"},
+                  {"Riverside", "7", "ＡＢ e\xCC\x81"},
+                  {"\xE1\x84\x80\xE1\x85\xA1\xE1\x86\xA8", "", "x"}};
+        t.cell_bold = {{1, 1, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}};
+        const std::string md = jdoc::pdf_detail::format_table(t);
+        const std::string want =
+            "| **공원**  | **면적 ha** | 비고     |\n"
+            "| --------- | ----------- | -------- |\n"
+            "| 중앙공원  | 42          | カナ漢字 |\n"
+            "| Riverside | 7           | ＡＢ e\xCC\x81   |\n"
+            "| \xE1\x84\x80\xE1\x85\xA1\xE1\x86\xA8        |             | x        |\n";
+        if (md != want) std::cerr << "got:\n" << md << "want:\n" << want;
+        CHECK(md == want);
+    }
+
+    // [28] Banded tables: rows separated only by background shading, with
+    // the first or last row left white. The run of painted rows must extend
+    // to the white rows that continue its column alignment (table 1: last
+    // body row; table 2: header above and last row below the stripes), and
+    // a fill written `re h f` stays a shading rect, not four fake rules.
+    // A header-only tint (table 3) must not absorb a body row of a tighter
+    // pitch. With tables off, a row's widely spaced numbers keep their spaces.
+    std::cout << "[28] Testing banded tables with unshaded edge rows...\n";
+    {
+        const char* fx = "test/fixtures/pdf/shaded_band_table.pdf";
+        std::ifstream f(fx);
+        if (!f.good()) {
+            std::cout << "    SKIP: " << fx << "\n";
+        } else {
+            f.close();
+            std::string md = jdoc::pdf_to_markdown(fx);
+            auto count = [&](const std::string& hay, const std::string& needle) {
+                size_t n = 0;
+                for (size_t p = hay.find(needle); p != std::string::npos;
+                     p = hay.find(needle, p + 1))
+                    n++;
+                return n;
+            };
+            // A right-aligned header wider than its numbers keeps its
+            // first letters: the column boundary sits in the blank stretch.
+            CHECK(count(md, "| **Parks** ") == 1);
+            CHECK(count(md, "| **Mean area ha** ") == 1);
+            CHECK(count(md, "| Large ") == 1);
+            CHECK(count(md, "| Small ") == 1);
+            CHECK(count(md, "| **Hour**") == 1);
+            CHECK(count(md, "| 10 pm ") == 1);
+            CHECK(md.find("Small3") == std::string::npos);
+            CHECK(md.find("10 pm25") == std::string::npos);
+            CHECK(md.find("\nSmall") == std::string::npos);
+            CHECK(md.find("| **Table") == std::string::npos);
+            CHECK(md.find("| Larger") == std::string::npos);
+            CHECK(md.find("| The gap") == std::string::npos);
+            size_t small = md.find("| Small ");
+            size_t prose = md.find("Larger parks were cooler");
+            size_t cap2 = md.find("Table 2. Mean temperature");
+            size_t hour = md.find("| **Hour**");
+            size_t last = md.find("| 10 pm ");
+            size_t tail = md.find("The gap between the park");
+            CHECK(small != std::string::npos && prose != std::string::npos &&
+                  small < prose && prose < cap2 && cap2 < hour &&
+                  hour < last && last < tail && tail != std::string::npos);
+
+            // Table 3: a header-only tint over a tighter body is no band;
+            // its first body row stays with the rest of the body.
+            CHECK(count(md, "| Austria ") == 1);
+            CHECK(count(md, "| Germany ") == 1);
+            CHECK(count(md, "| Spain ") == 1);
+            CHECK(md.find("Germany Spain") == std::string::npos);
+
+            jdoc::ConvertOptions no_tables;
+            no_tables.tables = false;
+            std::string plain = jdoc::pdf_to_markdown(fx, no_tables);
+            CHECK(plain.find("Small 3 2.8 0.5") != std::string::npos);
+            CHECK(plain.find("10 pm 25.2 25.9 0.7") != std::string::npos);
         }
     }
 

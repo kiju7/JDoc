@@ -310,6 +310,48 @@ inline std::string render_text_table(const std::vector<std::string>& lines) {
     return out;
 }
 
+// Render rows as a GitHub-flavored markdown table whose pipes line up in a
+// monospace view: every cell is padded with spaces, and the header separator
+// drawn with dashes, to its column's width (at least 3). Widths are display
+// columns (util::display_width), not UTF-8 bytes, so a Hangul or CJK cell
+// takes two columns per character and lines up with Latin cells instead of
+// being under-padded. The first row is the header; n_cols cells are written
+// per row, missing cells as "" and extra cells dropped.
+inline std::string format_padded_markdown_table(
+    const std::vector<std::vector<std::string>>& rows, size_t n_cols) {
+    if (rows.empty() || n_cols == 0) return "";
+    std::vector<size_t> widths(n_cols, 3);
+    std::vector<std::vector<size_t>> cell_w(rows.size());
+    for (size_t r = 0; r < rows.size(); r++) {
+        cell_w[r].assign(n_cols, 0);
+        for (size_t c = 0; c < n_cols && c < rows[r].size(); c++) {
+            cell_w[r][c] = display_width(rows[r][c]);
+            widths[c] = std::max(widths[c], cell_w[r][c]);
+        }
+    }
+    std::string md;
+    for (size_t r = 0; r < rows.size(); r++) {
+        md += "|";
+        for (size_t c = 0; c < n_cols; c++) {
+            md += ' ';
+            if (c < rows[r].size()) md += rows[r][c];
+            md.append(widths[c] - cell_w[r][c], ' ');
+            md += " |";
+        }
+        md += '\n';
+        if (r == 0) {
+            md += "|";
+            for (size_t c = 0; c < n_cols; c++) {
+                md += ' ';
+                md.append(widths[c], '-');
+                md += " |";
+            }
+            md += '\n';
+        }
+    }
+    return md;
+}
+
 // Strip markdown formatting from text, returning plain text.
 // Removes: # headings, **bold**, *italic*, ![img](ref), --- separators; table
 // blocks become aligned columns (render_text_table).

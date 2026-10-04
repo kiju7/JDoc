@@ -89,14 +89,31 @@ uint32_t decode_utf8(const char* data, size_t len, size_t& pos);
 // Columns a codepoint occupies in a monospace view, the way terminals and
 // editors lay it out: East Asian wide/full-width forms (Hangul, CJK, kana,
 // full-width ASCII) take 2, combining marks and zero-width format characters
-// take 0, everything else 1. Plain-text output aligns table columns with
-// this, so a Korean cell is not counted as half its visual width.
+// take 0, everything else 1. Markdown tables pad their columns with this,
+// and plain-text output aligns table columns with it, so a Korean cell is
+// not counted as half its visual width. The table is built in rather than
+// taken from the C library (wcwidth), whose answer depends on the platform
+// and the process locale.
 inline int display_width(uint32_t cp) {
     if (cp < 0x300) return cp < 0x20 ? 0 : 1;
-    if ((cp >= 0x0300 && cp <= 0x036F) ||  // combining diacritics
-        (cp >= 0x200B && cp <= 0x200F) ||  // zero-width space/joiners, marks
-        (cp >= 0xFE00 && cp <= 0xFE0F) ||  // variation selectors
-        cp == 0xFEFF)                      // BOM / zero-width no-break space
+    if ((cp >= 0x0300 && cp <= 0x036F) ||    // combining diacritics
+        (cp >= 0x0483 && cp <= 0x0489) ||    // Cyrillic combining marks
+        (cp >= 0x0591 && cp <= 0x05BD) ||    // Hebrew points and accents
+        (cp >= 0x0610 && cp <= 0x061A) ||    // Arabic marks
+        (cp >= 0x064B && cp <= 0x065F) ||    // Arabic vowel signs
+        (cp >= 0x1160 && cp <= 0x11FF) ||    // Hangul Jamo vowels, finals
+        (cp >= 0x1AB0 && cp <= 0x1AFF) ||    // combining diacritics ext.
+        (cp >= 0x1DC0 && cp <= 0x1DFF) ||    // combining diacritics suppl.
+        (cp >= 0x200B && cp <= 0x200F) ||    // zero-width space/joiners, marks
+        (cp >= 0x2060 && cp <= 0x2064) ||    // word joiner, invisible ops
+        (cp >= 0x20D0 && cp <= 0x20FF) ||    // combining marks for symbols
+        (cp >= 0x302A && cp <= 0x302F) ||    // ideographic/Hangul tone marks
+        (cp >= 0x3099 && cp <= 0x309A) ||    // combining kana voicing marks
+        (cp >= 0xD7B0 && cp <= 0xD7FF) ||    // Hangul Jamo extended-B
+        (cp >= 0xFE00 && cp <= 0xFE0F) ||    // variation selectors
+        (cp >= 0xFE20 && cp <= 0xFE2F) ||    // combining half marks
+        cp == 0xFEFF ||                      // BOM / zero-width no-break space
+        (cp >= 0xE0100 && cp <= 0xE01EF))    // variation selectors suppl.
         return 0;
     if ((cp >= 0x1100 && cp <= 0x115F) ||    // Hangul Jamo leading consonants
         (cp >= 0x2E80 && cp <= 0x303E) ||    // CJK radicals, punctuation

@@ -689,36 +689,7 @@ std::string HtmlParser::convert(const ConvertOptions& opts,
                     for (auto& row : table_rows)
                         if (row.size() > n_cols) n_cols = row.size();
 
-                    if (n_cols > 0) {
-                        // Compute column widths
-                        std::vector<size_t> widths(n_cols, 3);
-                        for (auto& row : table_rows)
-                            for (size_t c = 0; c < row.size() && c < n_cols; c++)
-                                widths[c] = std::max(widths[c], row[c].size());
-
-                        for (size_t r = 0; r < table_rows.size(); r++) {
-                            md += "|";
-                            for (size_t c = 0; c < n_cols; c++) {
-                                std::string cell = (c < table_rows[r].size())
-                                    ? table_rows[r][c] : "";
-                                md += " " + cell;
-                                for (size_t p = cell.size(); p < widths[c]; p++) md += ' ';
-                                md += " |";
-                            }
-                            md += "\n";
-
-                            // Header separator after first row
-                            if (r == 0) {
-                                md += "|";
-                                for (size_t c = 0; c < n_cols; c++) {
-                                    md += " ";
-                                    for (size_t p = 0; p < widths[c]; p++) md += '-';
-                                    md += " |";
-                                }
-                                md += "\n";
-                            }
-                        }
-                    }
+                    md += util::format_padded_markdown_table(table_rows, n_cols);
                     md += "\n";
                 }
                 in_table = false;

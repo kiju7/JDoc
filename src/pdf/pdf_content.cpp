@@ -833,6 +833,16 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
         return false;
     };
 
+    // Closing an already-closed subpath is a no-op (PDF 32000 8.5.2.1: h,
+    // s or b right after re or h adds no segment). Producers such as MuPDF
+    // emit `re h f`; a duplicate CLOSE would make the fill look like a
+    // non-rect path and leak its edges into the rule pool as fake borders.
+    auto close_subpath = [&]() {
+        if (!current_path.empty() &&
+            current_path.back().type != PathPoint::CLOSE)
+            current_path.push_back({0, 0, PathPoint::CLOSE});
+    };
+
     // Pure-fill (f/F/f*) rect handling: thin rects become rules, sizable
     // rects are cell shading recorded as PdfFillRect — their edges stay OUT
     // of the segment pool (a shading edge is not a drawn rule; the table
@@ -1897,7 +1907,7 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
                     current_path.push_back(pp);
                 }
             } else if (op.is("h")) {
-                current_path.push_back({0, 0, PathPoint::CLOSE});
+                close_subpath();
             } else if (op.is("re")) {
                 if (operands.size() >= 4) {
                     double x = pop_num(3), y = pop_num(2), w = pop_num(1), h = pop_num(0);
@@ -1921,7 +1931,7 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
                 commit_pending_clip(gs);
                 record_render_path(false, true);
             } else if (op.is("s")) {
-                current_path.push_back({0, 0, PathPoint::CLOSE});
+                close_subpath();
                 if (!filter_white_stroke() && !filter_small_rect())
                     flush_path_segments();
                 commit_pending_clip(gs);
@@ -1933,7 +1943,7 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
                 record_render_path(true, false, op.is("f*"));
             } else if (op.is("B") || op.is("B*") || op.is("b") || op.is("b*")) {
                 if (op.is("b") || op.is("b*"))
-                    current_path.push_back({0, 0, PathPoint::CLOSE});
+                    close_subpath();
                 apply_clip_substitution(gs);
                 if (!filter_white_stroke() && !filter_small_rect())
                     flush_path_segments();
@@ -2469,7 +2479,13 @@ static std::vector<TextLine> lines_from_upright_chars(
             total_fs += ch.font_size;
             fs_count++;
         }
-        util::append_utf8(cur.text, ch.unicode);
+        // A no-break space is a word space in the line's text. Every other
+        // consumer of the glyph stream (cell text, column bins, word gaps
+        // above) already treats U+00A0 as a space; keeping the code point
+        // here made a line spell "면적 ha" where its table cell spells
+        // "면적 ha", so the capture check that drops table rows from the
+        // prose flow missed the line and the row was printed twice.
+        util::append_utf8(cur.text, ch.unicode == 0xA0 ? uint32_t(' ') : ch.unicode);
         if (reach > -1e8) hole = std::max(hole, (double)ch.left - reach);
         reach = std::max(reach, (double)ch.right);
         if (ch.unicode != ' ' && ch.unicode != 0xA0) hole = 0;

@@ -1,5 +1,6 @@
 """Regenerate the fragment-region fixtures used by test_pdf ([16] figure
-strips under multi-column body text).
+strips under multi-column body text, and under a single-column paragraph
+whose short last line sits right above the figure).
 
 PyMuPDF with an embedded (subset) Arial. The figure is stored as raster
 strips (one placement per pixel row band), the way print drivers and word
@@ -84,9 +85,36 @@ def page(last_line_short):
     return doc
 
 
+def single_column_page():
+    """One column: a heading, a two-line paragraph whose short last line
+    sits right above the figure, the figure, its caption and one more body
+    line. Only three lines are set in the body size and the paragraph has
+    a single full line, so the short line has no second full line to be
+    measured against."""
+    doc = fitz.open()
+    p = doc.new_page(width=W, height=H)
+    p.insert_font(fontname="F0", fontfile=FONT)
+    p.insert_text((60, 100), "4. Analysis procedure", fontsize=14, fontname="F0")
+    p.insert_text((60, 126), "The analysis ran in four stages from data collection "
+                  "to the final summary of", fontsize=11.5, fontname="F0")
+    p.insert_text((60, 145), "results, shown in Figure 3.", fontsize=11.5, fontname="F0")
+    step = (FY1 - FY0) / STRIPS
+    y0 = 160
+    for i in range(STRIPS):
+        y = y0 + i * step
+        p.insert_image(fitz.Rect(FX0, y, FX1, y + step), stream=strip(i))
+    p.insert_text((250, y0 + (FY1 - FY0) + 18), "Figure 3. Analysis flow",
+                  fontsize=10, fontname="F0")
+    p.insert_text((60, y0 + (FY1 - FY0) + 52), "The collected readings were "
+                  "corrected for gaps and compared with the green ratio.",
+                  fontsize=11.5, fontname="F0")
+    return doc
+
+
 for name, short in (("strip_figure_columns", False),
-                    ("strip_figure_columns_short_tail", True)):
-    doc = page(short)
+                    ("strip_figure_columns_short_tail", True),
+                    ("strip_figure_single_column_short_tail", None)):
+    doc = page(short) if short is not None else single_column_page()
     doc.subset_fonts()
     doc.save(f"{OUT}/{name}.pdf", garbage=4, deflate=True)
     doc.close()
