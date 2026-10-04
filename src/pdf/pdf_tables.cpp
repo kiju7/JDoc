@@ -3226,49 +3226,52 @@ static double clean_gutter(const std::vector<TextRow>& rows, const YBand& band, 
 
 } // namespace text_tables
 
+// Dot leaders ("Revenues ........ 100.0%") fill the gap between a row
+// label and its first value, so no empty vertical gutter separates the
+// two columns and the row reads as one cell. A run of four or more
+// periods on one baseline is a leader: it carries no text and is left
+// out of both the column evidence and the cell text. Returns one flag per
+// character of the cache.
+static std::vector<bool> dot_leader_mask(const PageCharCache& cache) {
+    std::vector<bool> is_leader(cache.chars.size(), false);
+    std::vector<size_t> dots;
+    for (size_t i = 0; i < cache.chars.size(); i++) {
+        uint32_t u = cache.chars[i].unicode;
+        if (u == '.' || u == 0x2024 || u == 0x2026 || u == 0x00B7) dots.push_back(i);
+    }
+    std::sort(dots.begin(), dots.end(), [&](size_t a, size_t b) {
+        const auto& ca = cache.chars[a];
+        const auto& cb = cache.chars[b];
+        if (std::abs(ca.y - cb.y) > 1.0) return ca.y > cb.y;
+        return ca.x < cb.x;
+    });
+    size_t run_start = 0;
+    auto flush = [&](size_t end) {
+        if (end - run_start >= 4)
+            for (size_t k = run_start; k < end; k++) is_leader[dots[k]] = true;
+    };
+    for (size_t k = 1; k <= dots.size(); k++) {
+        bool cont = false;
+        if (k < dots.size()) {
+            const auto& a = cache.chars[dots[k - 1]];
+            const auto& b = cache.chars[dots[k]];
+            double h = std::max(a.top - a.bot, 1.0);
+            cont = std::abs(a.y - b.y) <= 1.0 && b.left - a.right < 1.5 * h;
+        }
+        if (!cont) { flush(k); run_start = k; }
+    }
+    return is_leader;
+}
+
 static std::vector<TableData> detect_text_tables_range(
         const PageCharCache& cache,
         const std::vector<TableData>& existing_tables,
         double page_width, double page_height,
         double x_lo, double x_hi,
+        const std::vector<bool>& is_leader,
         double gutter_x = 0.0) {
     using namespace text_tables;
     if (cache.chars.size() < 10) return {};
-
-    // Dot leaders ("Revenues ........ 100.0%") fill the gap between a row
-    // label and its first value, so no empty vertical gutter separates the
-    // two columns and the row reads as one cell. A run of four or more
-    // periods on one baseline is a leader: it carries no text and is left
-    // out of both the column evidence and the cell text.
-    std::vector<bool> is_leader(cache.chars.size(), false);
-    {
-        std::vector<size_t> dots;
-        for (size_t i = 0; i < cache.chars.size(); i++) {
-            uint32_t u = cache.chars[i].unicode;
-            if (u == '.' || u == 0x2024 || u == 0x2026 || u == 0x00B7) dots.push_back(i);
-        }
-        std::sort(dots.begin(), dots.end(), [&](size_t a, size_t b) {
-            const auto& ca = cache.chars[a];
-            const auto& cb = cache.chars[b];
-            if (std::abs(ca.y - cb.y) > 1.0) return ca.y > cb.y;
-            return ca.x < cb.x;
-        });
-        size_t run_start = 0;
-        auto flush = [&](size_t end) {
-            if (end - run_start >= 4)
-                for (size_t k = run_start; k < end; k++) is_leader[dots[k]] = true;
-        };
-        for (size_t k = 1; k <= dots.size(); k++) {
-            bool cont = false;
-            if (k < dots.size()) {
-                const auto& a = cache.chars[dots[k - 1]];
-                const auto& b = cache.chars[dots[k]];
-                double h = std::max(a.top - a.bot, 1.0);
-                cont = std::abs(a.y - b.y) <= 1.0 && b.left - a.right < 1.5 * h;
-            }
-            if (!cont) { flush(k); run_start = k; }
-        }
-    }
 
     std::vector<CharInfo> chars;
     chars.reserve(cache.chars.size());
@@ -3491,9 +3494,13 @@ std::vector<TableData> detect_text_tables(const PageCharCache& cache,
                                            const std::vector<TableData>& existing_tables,
                                            double page_width, double page_height,
                                            double col_boundary) {
+    // Leaders are found once for the page: the per-column passes below
+    // would otherwise sort every period of the page again.
+    const std::vector<bool> is_leader = dot_leader_mask(cache);
     auto result = detect_text_tables_range(cache, existing_tables,
                                            page_width, page_height,
-                                           0.0, page_width, col_boundary);
+                                           0.0, page_width, is_leader,
+                                           col_boundary);
 
     // Two-column pages: rows built across the gutter glue a column's table
     // to the prose beside it, so the full-width pass misses column-local
@@ -3507,7 +3514,7 @@ std::vector<TableData> detect_text_tables(const PageCharCache& cache,
             double x_hi = side == 0 ? col_boundary : page_width;
             auto part = detect_text_tables_range(cache, known,
                                                  page_width, page_height,
-                                                 x_lo, x_hi);
+                                                 x_lo, x_hi, is_leader);
             for (auto& t : part) {
                 known.push_back(t);
                 result.push_back(std::move(t));
