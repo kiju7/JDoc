@@ -1505,6 +1505,46 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
                     }
                 }
 
+                // Words of drawn glyphs: runs of glyphs shown one after
+                // another whose em boxes (descender to ascender, one em
+                // wide: the compositor's own glyph box) touch or nearly
+                // touch. A word space keeps a label in one word; the gap
+                // between two labels on one baseline splits them.
+                struct GlyphWord { double x0, y0, x1, y1; int seq; };
+                std::vector<GlyphWord> glyph_words;
+                if (std::find(overlaid.begin(), overlaid.end(), 1) != overlaid.end()) {
+                    int last_seq = -2;
+                    for (auto& g : parse_result.glyphs) {
+                        double gx0 = 1e300, gy0 = 1e300, gx1 = -1e300, gy1 = -1e300;
+                        for (double ux : {0.0, 1.0})
+                            for (double uy : {-0.3, 1.0}) {
+                                double px = g.m[0] * ux + g.m[2] * uy + g.m[4];
+                                double py = g.m[1] * ux + g.m[3] * uy + g.m[5];
+                                gx0 = std::min(gx0, px); gx1 = std::max(gx1, px);
+                                gy0 = std::min(gy0, py); gy1 = std::max(gy1, py);
+                            }
+                        if (!std::isfinite(gx0) || !std::isfinite(gy0) ||
+                            !std::isfinite(gx1) || !std::isfinite(gy1))
+                            continue;
+                        double em = std::sqrt(std::abs(g.m[0] * g.m[3] - g.m[1] * g.m[2]));
+                        bool join = false;
+                        if (!glyph_words.empty() && g.seq == last_seq + 1) {
+                            auto& w = glyph_words.back();
+                            double gx = std::max(w.x0, gx0) - std::min(w.x1, gx1);
+                            double gy = std::max(w.y0, gy0) - std::min(w.y1, gy1);
+                            join = gx <= 0.3 * em && gy <= 0.3 * em;
+                        }
+                        if (join) {
+                            auto& w = glyph_words.back();
+                            w.x0 = std::min(w.x0, gx0); w.y0 = std::min(w.y0, gy0);
+                            w.x1 = std::max(w.x1, gx1); w.y1 = std::max(w.y1, gy1);
+                        } else {
+                            glyph_words.push_back({gx0, gy0, gx1, gy1, g.seq});
+                        }
+                        last_seq = g.seq;
+                    }
+                }
+
                 {
                     // A source drawn again later is a duplicate the extractor
                     // skips within one call; across flushed batches (and
@@ -1538,10 +1578,27 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
                         const PlacementInfo* pi = nullptr;
                         for (auto& info : infos)
                             if (info.idx == idx) { pi = &info; break; }
-                        std::array<double, 4> R = {std::max(pi->x0, 0.0), std::max(pi->y0, 0.0),
-                                                   std::min(pi->x1, page_w), std::min(pi->y1, page_h)};
-                        grow_over_labels(R, result.all_lines[p], page_body, page_w, page_h);
-                        double rg[4] = {R[0], R[1], R[2], R[3]};
+                        // The region is the picture plus the words drawn
+                        // on it, whole: a title straddling its edge is not
+                        // cut. Words, not lines: labels of panels standing
+                        // side by side merge into one page-wide line, and
+                        // growing over that line would take in half of the
+                        // next panel.
+                        double rg[4] = {std::max(pi->x0, 0.0), std::max(pi->y0, 0.0),
+                                        std::min(pi->x1, page_w), std::min(pi->y1, page_h)};
+                        {
+                            const double B[4] = {rg[0], rg[1], rg[2], rg[3]};
+                            const int seq = parse_result.images[idx].seq;
+                            for (auto& w : glyph_words) {
+                                if (w.seq < seq) continue;
+                                if (w.x1 <= B[0] || w.x0 >= B[2] || w.y1 <= B[1] || w.y0 >= B[3])
+                                    continue;
+                                rg[0] = std::min(rg[0], w.x0); rg[1] = std::min(rg[1], w.y0);
+                                rg[2] = std::max(rg[2], w.x1); rg[3] = std::max(rg[3], w.y1);
+                            }
+                            rg[0] = std::max(rg[0], 0.0); rg[1] = std::max(rg[1], 0.0);
+                            rg[2] = std::min(rg[2], page_w); rg[3] = std::min(rg[3], page_h);
+                        }
                         // Rasters stamped over this one (a logo, a marker)
                         // draw with it.
                         std::vector<size_t> members{idx};
