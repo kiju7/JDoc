@@ -131,6 +131,47 @@ def leader_toc():
     save(pg.doc, "leader_toc")
 
 
+def strip_png(w, h, shade):
+    pix = fitz.Pixmap(fitz.csRGB, fitz.IRect(0, 0, w, h), False)
+    pix.set_rect(pix.irect, (235, 235, 235))
+    pix.set_rect(fitz.IRect(w // 8, 0, w // 3, h), shade)
+    pix.set_rect(fitz.IRect(w // 2, 0, w * 7 // 8, h), tuple(c // 2 for c in shade))
+    return pix.tobytes("png")
+
+
+def fragmented_figure_two_columns():
+    """A two-column Hangul page: two paragraphs in each column, then a
+    figure across both columns drawn as thin abutting raster strips (a
+    print driver's banding), a short axis title just above it and a caption
+    below. The figure's composite takes in the axis title, never the
+    paragraphs: each column's lines are under 0.4 of the page wide."""
+    pg = Page(hangul=True)
+    kr = ("본문 문단은 두 단으로 조판되어 각 단의 줄이 쪽 너비의 절반에 못 미친다. "
+          "그림 바로 위에 놓인 본문이 그림 영역에 섞여 들어가면 안 된다. ") * 3
+    pg.para(60, 60, 290, 185, kr, 9, "FH")
+    pg.para(305, 60, 535, 185, kr, 9, "FH")
+    lines = ["본문 문단은 두 단으로 조판되어 각 단의 줄이",
+             "쪽 너비의 절반에 못 미친다. 그림 바로 위에",
+             "놓인 본문이 그림 영역에 섞여 들어가면 안 되며",
+             "그림의 짧은 축 제목과 범례만 함께 들어가야",
+             "한다. 문단의 마지막 줄은 그림 바로 위에서",
+             "끝난다."]
+    for col in (60, 305):
+        for k, t in enumerate(lines):
+            pg.text(col, 200 + 13 * k, t, 9, "FH")
+    pg.text(70, 276, "Input stage", 8)
+    y = 280
+    for i in range(30):
+        pg.p.insert_image(fitz.Rect(70, y, 525, y + 5),
+                          stream=strip_png(910, 10, (60 + i * 5, 110, 180)))
+        y += 5
+    pg.text(60, 448, "Fig. 2. A flowchart drawn in strips.", 9)
+    pg.para(60, 470, 290, 600, kr, 9, "FH")
+    pg.para(305, 470, 535, 600, kr, 9, "FH")
+    save(pg.doc, "fragment_two_column")
+
+
 if __name__ == "__main__":
     chart_ticks()
     leader_toc()
+    fragmented_figure_two_columns()

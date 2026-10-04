@@ -875,6 +875,30 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    // Test 21: a figure drawn as thin raster strips on a two-column page,
+    // a paragraph ending just above it in each column and a short axis title
+    // between them (make_chart_toc_fixtures.py). The composite is the figure
+    // and its title: 455pt wide, about 160pt tall. Taking in the paragraphs
+    // (each column's lines are under 0.4 of the page wide) made it some
+    // 240pt tall.
+    std::cout << "[21] Testing a fragmented figure under two-column text...\n";
+    {
+        const char* fx = "test/fixtures/pdf/fragment_two_column.pdf";
+        std::ifstream f(fx);
+        if (!f.good()) {
+            std::cerr << "    missing fixture " << fx << "\n";
+            return 1;
+        }
+        auto chunks = jdoc::pdf_to_markdown_chunks(fx);
+        CHECK(chunks.size() == 1);
+        CHECK(chunks[0].images.size() == 1);
+        const auto& img = chunks[0].images[0];
+        CHECK(img.format == "png");
+        std::cout << "    composite " << img.width << "x" << img.height << "\n";
+        CHECK(img.width > 0 && img.height * 100 < img.width * 42);
+        CHECK(img.height * 100 > img.width * 30);   // the strips and their title
+    }
+
     std::cout << "\n=== All tests passed ===\n";
     return 0;
 }

@@ -177,14 +177,100 @@ static bool is_caption_line(const std::string& t) {
     return false;
 }
 
+// Body text of a page: one flag per line. A body line spans a good part of
+// the text column it sits in, carries real character mass (glyphs set
+// close, not a row of axis ticks spread across a chart) and belongs to a
+// paragraph — another such line of its size sits a line space above or
+// below it, overlapping it — set in the page's running-text size (notes and
+// sources under a chart, in a smaller size, belong to the chart). A
+// figure's own label rows can be as wide and as full (token rows of a
+// diagram) but stand alone, several line heights apart. The short last line
+// of a paragraph is body too: it sits a line space under (or over) a body
+// line.
+//
+// On a two-column page a line within one column is measured against that
+// column, not the page: each column's lines are under half the page wide.
+// Mass counts characters, not UTF-8 bytes.
+static std::vector<char> body_line_flags(const std::vector<TextLine>& lines,
+                                         double page_w, double col_boundary) {
+    const size_t n = lines.size();
+    auto side = [&](const TextLine& ln) {
+        if (col_boundary <= 0) return 0;
+        if (ln.x_right <= col_boundary + 5) return 1;
+        if (ln.x_left >= col_boundary - 5) return 2;
+        return 0;
+    };
+    // The running-text size: the size most of the page's characters are set in.
+    std::vector<std::pair<double, size_t>> sizes;
+    size_t total = 0;
+    for (auto& ln : lines) {
+        sizes.push_back({ln.font_size, ln.text.size()});
+        total += ln.text.size();
+    }
+    std::sort(sizes.begin(), sizes.end());
+    double body_fs = 0;
+    for (size_t k = 0, acc = 0; k < sizes.size(); k++) {
+        acc += sizes[k].second;
+        if (acc * 2 >= total) { body_fs = sizes[k].first; break; }
+    }
+    std::vector<char> wide(n, 0), body(n, 0);
+    for (size_t i = 0; i < n; i++) {
+        const auto& ln = lines[i];
+        if (ln.font_size < 0.85 * body_fs) continue;
+        double lw = ln.x_right - ln.x_left;
+        int sd = side(ln);
+        double measure = sd == 1 ? col_boundary : sd == 2 ? page_w - col_boundary : page_w;
+        if (lw <= 0.4 * measure) continue;
+        size_t chars = 0;
+        for (unsigned char c : ln.text)
+            if ((c & 0xC0) != 0x80 && c != ' ') chars++;
+        double fs = std::max(ln.font_size, 4.0);
+        wide[i] = chars >= 15 && lw <= 1.3 * fs * chars;
+    }
+    // Lines i and j are neighbours in one paragraph: same column, same size,
+    // overlapping, baselines at most two font sizes apart.
+    auto neighbours = [&](size_t i, size_t j) {
+        const auto& a = lines[i]; const auto& b = lines[j];
+        if (a.rot != b.rot || side(a) != side(b)) return false;
+        double fa = std::max(a.font_size, 4.0), fb = std::max(b.font_size, 4.0);
+        if (std::abs(fa - fb) > 0.15 * std::max(fa, fb)) return false;
+        double dy = std::abs(a.y_center - b.y_center);
+        if (dy < 0.5 * fa || dy > 2.0 * fa) return false;
+        double ov = std::min(a.x_right, b.x_right) - std::max(a.x_left, b.x_left);
+        return ov >= 0.5 * std::min(a.x_right - a.x_left, b.x_right - b.x_left);
+    };
+    for (size_t i = 0; i < n; i++) {
+        if (!wide[i]) continue;
+        for (size_t j = 0; j < n && !body[i]; j++)
+            if (j != i && wide[j] && neighbours(i, j)) body[i] = 1;
+    }
+    // A line wider than 0.4 of the page with 30 bytes of text is body as
+    // before, paragraph or not (a table row beside a logo).
+    for (size_t i = 0; i < n; i++)
+        if (lines[i].x_right - lines[i].x_left > 0.4 * page_w && lines[i].text.size() >= 30)
+            body[i] = 1;
+    std::vector<char> out = body;
+    for (size_t i = 0; i < n; i++) {
+        if (body[i] || lines[i].text.empty()) continue;
+        for (size_t j = 0; j < n; j++)
+            if (body[j] && neighbours(i, j) &&
+                std::abs(lines[i].x_left - lines[j].x_left) <= 2.0 * std::max(lines[j].font_size, 4.0)) {
+                out[i] = 1;
+                break;
+            }
+    }
+    return out;
+}
+
 // Composite regions of the fragment clusters on a page with body text: each
 // cluster box grown over the vector paths it touches, neighbouring panels of
 // one figure merged, and the figure's own labels taken in. Boxes are clamped
-// to the page.
+// to the page. body flags the body lines among lines (body_line_flags).
 static std::vector<std::array<double, 4>> fragment_regions(
         const std::vector<std::array<double, 4>>& cluster_boxes,
         const std::vector<RenderPath>& paths,
-        const std::vector<TextLine>& lines, double page_w, double page_h) {
+        const std::vector<TextLine>& lines, const std::vector<char>& body,
+        double page_w, double page_h) {
     std::vector<std::array<double, 4>> regions;
     std::vector<std::array<double, 4>> path_boxes;
     for (auto& rp : paths) {
@@ -233,7 +319,7 @@ static std::vector<std::array<double, 4>> fragment_regions(
             if (ln.y_center < r[1] || ln.y_center > r[3]) continue;
             if (ln.x_left < r[0] - 1 || ln.x_right > r[2] + 1) continue;
             if (is_caption_line(ln.text)) return 99;
-            if (ln.x_right - ln.x_left > 0.4 * page_w && ln.text.size() >= 30) n++;
+            if (body[&ln - lines.data()]) n++;
         }
         return n;
     };
@@ -264,7 +350,7 @@ static std::vector<std::array<double, 4>> fragment_regions(
             for (auto& ln : lines) {
                 if (ln.text.empty() || is_caption_line(ln.text)) continue;
                 double lw = ln.x_right - ln.x_left;
-                if (lw > 0.4 * page_w && ln.text.size() >= 30) continue;
+                if (body[&ln - lines.data()]) continue;
                 double fs = std::max(ln.font_size, 4.0);
                 double ly0 = ln.y_center - 0.6 * fs, ly1 = ln.y_center + 0.6 * fs;
                 if (ly0 >= R[1] && ly1 <= R[3] && ln.x_left >= R[0] && ln.x_right <= R[2]) continue;
@@ -819,8 +905,10 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
             // with fragment_regions: a numbered caption, and body text (a
             // wide line carrying real character mass).
             auto caption_line = [](const std::string& t) { return is_caption_line(t); };
+            const std::vector<char> body_flags = body_line_flags(
+                result.all_lines[p], page_w, result.col_boundaries[p]);
             auto body_line = [&](const TextLine& ln) {
-                return ln.x_right - ln.x_left > 0.4 * page_w && ln.text.size() >= 30;
+                return body_flags[&ln - result.all_lines[p].data()] != 0;
             };
             bool split_regions = fragment_page && !no_text && !vector_text_page;
             std::vector<std::array<double, 4>> regions;
@@ -829,7 +917,8 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
                 for (auto& c : clusters)
                     if (qualifies(c)) cluster_boxes.push_back({c.x0, c.y0, c.x1, c.y1});
                 regions = fragment_regions(cluster_boxes, parse_result.paths,
-                                           result.all_lines[p], page_w, page_h);
+                                           result.all_lines[p], body_flags,
+                                           page_w, page_h);
             }
             double region_area = 0;
             for (auto& R : regions) region_area += (R[2] - R[0]) * (R[3] - R[1]);
