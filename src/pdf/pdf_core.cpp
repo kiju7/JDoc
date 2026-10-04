@@ -1493,6 +1493,13 @@ PdfFont load_font(PdfDoc& doc, const PdfObj& font_ref) {
         if (descendants.is_arr() && !descendants.arr.empty()) {
             auto cid_font = doc.resolve(descendants.arr[0]);
             if (cid_font.is_dict()) {
+                auto sys_info = doc.resolve(cid_font.get("CIDSystemInfo"));
+                if (sys_info.is_dict()) {
+                    auto reg = doc.resolve(sys_info.get("Registry"));
+                    auto ord = doc.resolve(sys_info.get("Ordering"));
+                    if (reg.is_str() && reg.str_val == "Adobe" && ord.is_str())
+                        font.cid_collection = adobe_cid_collection(ord.str_val);
+                }
                 double dw = doc.resolve(cid_font.get("DW")).as_num();
                 if (dw > 0) font.default_width = dw;
 

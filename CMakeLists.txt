@@ -235,6 +235,7 @@ add_library(jdoc_lib STATIC
     # pdf
     src/pdf/pdf_core.cpp
     src/pdf/pdf_base14.cpp
+    src/pdf/pdf_cid_unicode.cpp
     src/pdf/pdf_content.cpp
     src/pdf/pdf_tables.cpp
     src/pdf/pdf_visual.cpp

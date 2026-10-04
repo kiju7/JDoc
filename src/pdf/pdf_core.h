@@ -1,6 +1,7 @@
 #pragma once
 // pdf_core.h — internal: PDF object model, lexer, xref, crypt mapping, document, fonts.
 #include "jdoc/pdf.h"
+#include "pdf_cid_unicode.h"
 #include "pdf_crypt.h"
 #include "common/string_utils.h"
 #include "common/file_utils.h"
@@ -476,7 +477,9 @@ struct PdfFont {
     // ligature glyph mapping to "f","i"). to_unicode keeps the first one so
     // single-char consumers still work; text extraction emits the full run.
     std::unordered_map<uint32_t, std::vector<uint32_t>> to_unicode_multi;
-    std::unordered_map<uint32_t, uint32_t> cid_to_unicode; // CID → Unicode from ToUnicode
+    // Adobe character collection the CIDs of an Identity-encoded CID font
+    // number in (adobe_cid_collection; -1 if none or another registry).
+    int cid_collection = -1;
     const uint32_t* encoding_table = nullptr; // WinAnsi, MacRoman, etc.
     std::unordered_map<int, std::string> differences; // /Differences array
     // Glyph names of the encoding built into the embedded Type1 program, read
@@ -527,10 +530,13 @@ struct PdfFont {
             return u;
         }
 
-        // 2. CID fonts (Identity-H/V)
+        // 2. CID fonts: under Identity-H/V the code is the CID, which the
+        // font's character collection maps to text.
         if (is_identity || is_type0) {
-            auto cu = cid_to_unicode.find(code);
-            if (cu != cid_to_unicode.end()) return cu->second;
+            if (is_identity && cid_collection >= 0) {
+                uint32_t u = adobe_cid_to_unicode(cid_collection, code);
+                if (u) return u;
+            }
             return code; // fallback: assume code is Unicode
         }
 

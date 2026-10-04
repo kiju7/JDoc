@@ -972,6 +972,26 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    // Test 24: CID fonts with no /ToUnicode and no program, shown through
+    // Identity-H (make_cid_collection_fixtures.py). Their CIDs read through
+    // the Adobe collection /CIDSystemInfo names: Korea1 3296 1204 2479 is
+    // 한국어, GB1 4559 3795 is 中文. Taken as Unicode they were Kannada and
+    // Arabic letters.
+    std::cout << "[24] Testing CID fonts read through their Adobe collection...\n";
+    {
+        const char* fx = "test/fixtures/pdf/cid_collection.pdf";
+        std::ifstream f(fx);
+        if (!f.good()) {
+            std::cout << "    SKIP: " << fx << "\n";
+        } else {
+            f.close();
+            std::string md = jdoc::pdf_to_markdown(fx);
+            CHECK(md.find("\xED\x95\x9C\xEA\xB5\xAD\xEC\x96\xB4") != std::string::npos);  // 한국어
+            CHECK(md.find("\xE4\xB8\xAD\xE6\x96\x87") != std::string::npos);              // 中文
+            std::cout << "    Korea1 and GB1 CIDs read as text OK\n";
+        }
+    }
+
     std::cout << "\n=== All tests passed ===\n";
     return 0;
 }
