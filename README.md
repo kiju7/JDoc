@@ -301,6 +301,7 @@ HTML의 이미지는 문서가 실제로 담고 있는 `data:` URI만 추출한�
 | libjpeg-turbo | IJG/BSD | PDF 이미지 JPEG 디코딩 |
 | pugixml | MIT | XML 파싱 (번들 포함) |
 | LZMA SDK | public domain | 7z 컨테이너·LZMA 디코딩 (번들 포함, 디코더 전용) |
+| Adobe Core14 AFM 메트릭 · Adobe Glyph List | Adobe AFM 라이선스 · BSD-3 | PDF 표준 14 폰트 글리프 폭·내장 인코딩 (`src/pdf/pdf_base14_data.inc`에 수치만 내장, 고지 포함. 재생성: `tools/gen_base14_metrics.py`) |
 | libbz2 | BSD | BZ2/TAR.BZ2, ALZ/EGG bzip2 멤버 (선택, `JDOC_WITH_BZIP2`) |
 | pybind11 | BSD-3 | Python 바인딩 (선택) |
 
