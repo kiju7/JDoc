@@ -1112,6 +1112,19 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
             tc.x = gx;
             tc.y = gy;
             tc.rot = rot;
+            // A rotated glyph's box: the baseline segment from `o` to `e`,
+            // raised by the ascender and dropped by the descender along the
+            // up vector (asc_*/desc_*), as a page-space AABB.
+            double asc_x = 0, asc_y = 0, desc_x = 0, desc_y = 0;
+            auto rotated_box = [&](TextChar& t, double ox, double oy,
+                                   double ex, double ey) {
+                double cx[4] = {ox + asc_x, ox + desc_x, ex + asc_x, ex + desc_x};
+                double cy[4] = {oy + asc_y, oy + desc_y, ey + asc_y, ey + desc_y};
+                t.left = *std::min_element(cx, cx + 4);
+                t.right = *std::max_element(cx, cx + 4);
+                t.top = *std::max_element(cy, cy + 4);
+                t.bot = *std::min_element(cy, cy + 4);
+            };
             if (rot == 0) {
                 tc.left = gx;
                 tc.right = next_gx;
@@ -1135,14 +1148,9 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
                     if (bl > 0) { ux = bx / bl * up_len; uy = by / bl * up_len; }
                     else { ux = 0; uy = up_len; }
                 }
-                double ax = ux * 0.8, ay = uy * 0.8;
-                double dxx = ux * -0.2, dyy = uy * -0.2;
-                double cx[4] = {gx + ax, gx + dxx, next_gx + ax, next_gx + dxx};
-                double cy[4] = {gy + ay, gy + dyy, next_gy + ay, next_gy + dyy};
-                tc.left = *std::min_element(cx, cx + 4);
-                tc.right = *std::max_element(cx, cx + 4);
-                tc.top = *std::max_element(cy, cy + 4);
-                tc.bot = *std::min_element(cy, cy + 4);
+                asc_x = ux * 0.8; asc_y = uy * 0.8;
+                desc_x = ux * -0.2; desc_y = uy * -0.2;
+                rotated_box(tc, gx, gy, next_gx, next_gy);
                 tc.font_size = up_len;
             }
             tc.unicode = unicode;
@@ -1155,11 +1163,14 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
             if (gs.render_mode != 3 && gs.render_mode != 7)
                 result.visible_text_chars++;
             if (multi) {
-                // Split the glyph's box across its letters so word gaps and
-                // column assignment stay glyph-accurate; a rotated run keeps
-                // the shared box (nothing downstream splits those further).
-                double step = (tc.rot == 0)
-                    ? (tc.right - tc.left) / (double)multi->size() : 0.0;
+                // Split the glyph's advance across its letters so word gaps
+                // and column assignment stay glyph-accurate. A rotated run
+                // splits along its own baseline: given one shared box, the
+                // letters of an "ff" ligature would sit on one spot, and the
+                // plain-text grid (which lays rotated runs out in their own
+                // frame) would take the second for an overprint.
+                const double n = static_cast<double>(multi->size());
+                double step = (tc.right - tc.left) / n;
                 for (size_t mi = 0; mi < multi->size(); mi++) {
                     TextChar part = tc;
                     part.unicode = (*multi)[mi];
@@ -1168,6 +1179,15 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
                         part.right = (mi + 1 == multi->size())
                             ? tc.right : tc.left + step * (mi + 1);
                         part.x = part.left;
+                    } else {
+                        double t0 = mi / n, t1 = (mi + 1) / n;
+                        double ox = gx + (next_gx - gx) * t0;
+                        double oy = gy + (next_gy - gy) * t0;
+                        double ex = gx + (next_gx - gx) * t1;
+                        double ey = gy + (next_gy - gy) * t1;
+                        part.x = ox;
+                        part.y = oy;
+                        rotated_box(part, ox, oy, ex, ey);
                     }
                     result.chars.push_back(part);
                 }
@@ -2179,6 +2199,36 @@ std::vector<TextLine> reorder_column_lines(std::vector<TextLine>& lines,
     return result;
 }
 
+std::vector<int> explicit_word_spaces(const std::vector<TextChar>& chars) {
+    std::vector<int> sep(chars.size(), -1);
+    auto is_space = [](uint32_t cp) { return cp == ' ' || cp == 0xA0; };
+    for (size_t i = 1; i + 1 < chars.size(); i++) {
+        if (!is_space(chars[i].unicode) || is_space(chars[i - 1].unicode))
+            continue;
+        size_t k = i;
+        while (k < chars.size() && is_space(chars[k].unicode)) k++;
+        if (k >= chars.size()) break;
+        const TextChar& a = chars[i - 1];
+        const TextChar& b = chars[k];
+        if (a.rot != 0 || b.rot != 0 || b.x <= a.x) continue;
+        double fs = std::max(std::max(a.font_size, b.font_size), 2.0);
+        if (std::abs(a.y - b.y) > 0.5 * fs) continue;
+        // The spaces themselves must sit between the two, near their line:
+        // a space drawn elsewhere (a label's trailing blank, a run placed
+        // out of order) says nothing about these two glyphs.
+        const double ca = (a.left + a.right) / 2, cb = (b.left + b.right) / 2;
+        bool between = true;
+        for (size_t j = i; j < k && between; j++) {
+            const TextChar& sp = chars[j];
+            double cs = (sp.left + sp.right) / 2;
+            between = sp.rot == 0 && cs > ca && cs < cb &&
+                      std::abs(sp.y - b.y) <= fs;
+        }
+        if (between) sep[k] = static_cast<int>(i - 1);
+    }
+    return sep;
+}
+
 // Group chars that all share one writing direction into lines. Callers reach
 // this through chars_to_lines(), which rotates each non-upright direction into
 // this function's frame first.
@@ -2208,6 +2258,7 @@ static std::vector<TextLine> lines_from_upright_chars(
         if (std::abs(chars[a].y - chars[b].y) > y_tol) return chars[a].y > chars[b].y;
         return chars[a].x < chars[b].x;
     });
+    const std::vector<int> word_sep = explicit_word_spaces(chars);
 
     std::vector<TextLine> lines;
     double cur_y = chars[idx[0]].y;
@@ -2215,6 +2266,10 @@ static std::vector<TextLine> lines_from_upright_chars(
     double total_fs = 0;
     int fs_count = 0;
     double prev_right = -1e9;
+    double word_end = -1e9;      // right edge of the last non-space glyph
+    bool first_gap_set = false;  // cur.first_gap measured
+    int prev_glyph = -1;         // index of the last non-space glyph placed
+    bool after_space = false;    // the last glyph placed was a space glyph
 
     auto flush = [&]() {
         if (cur.text.empty()) return;
@@ -2226,6 +2281,10 @@ static std::vector<TextLine> lines_from_upright_chars(
         total_fs = 0;
         fs_count = 0;
         prev_right = -1e9;
+        word_end = -1e9;
+        first_gap_set = false;
+        prev_glyph = -1;
+        after_space = false;
     };
 
     // Column-gutter gap threshold: large enough to skip word spaces (~0.15×fs)
@@ -2281,20 +2340,47 @@ static std::vector<TextLine> lines_from_upright_chars(
         }
 
         cur.y_center = ch.y;
-        if (ch.left < cur.x_left) cur.x_left = ch.left;
-        if (ch.right > cur.x_right) cur.x_right = ch.right;
+        // The line's extent starts at its first glyph, not at TextLine's
+        // defaults: a rotated run's frame (to_writing_frame) can lie wholly
+        // at negative x, where a default right edge of 0 would stretch the
+        // line to the frame origin.
+        if (cur.text.empty() || ch.left < cur.x_left) cur.x_left = ch.left;
+        if (cur.text.empty() || ch.right > cur.x_right) cur.x_right = ch.right;
 
-        // Detect word spacing using gap between this char's left and previous char's right
+        // Word spacing from the gap between this glyph and the previous one's
+        // advance end. Every gap from a fraction of an em up separates words,
+        // however wide: two runs on one baseline far apart (a running footer
+        // and its page number, a label and its value, a row of cells nobody
+        // detected as a table) are separate words too. There used to be an
+        // upper bound of 8 em here, which glued exactly those pairs
+        // ("Report 202499").
         if (!cur.text.empty() && ch.unicode != ' ' && ch.unicode != 0xA0 && prev_right > -1e8) {
             double gap = ch.left - prev_right;
-            // Use font-size-relative threshold for word spacing
             double word_gap = ch.font_size * 0.15;
             if (word_gap < 1) word_gap = 1;
-            if (gap > word_gap && gap < ch.font_size * 8 && cur.text.back() != ' ')
+            // A space the producer wrote in the stream between this glyph
+            // and the one just placed (explicit_word_spaces) separates them
+            // even when the space itself sits off the baseline and missed
+            // this line, as long as some gap is left. A space the next glyph
+            // is moved back over entirely is a line-break opportunity, not a
+            // space.
+            bool written = !after_space && word_sep[idx[ii]] >= 0 &&
+                           word_sep[idx[ii]] == prev_glyph &&
+                           ch.left - word_end > kWrittenSpaceMinEm * ch.font_size;
+            if ((gap > word_gap || written) && cur.text.back() != ' ')
                 cur.text += ' ';
         }
 
         if (ch.unicode != ' ' && ch.unicode != 0xA0) {
+            // First glyph of the second word: measure the gap back to the
+            // end of the first, whether a space glyph or geometry split them.
+            if (!first_gap_set && word_end > -1e8 &&
+                cur.text.back() == ' ') {
+                cur.first_gap = std::max(0.0, ch.left - word_end);
+                first_gap_set = true;
+            }
+            word_end = ch.right;
+            prev_glyph = static_cast<int>(idx[ii]);
             cur.is_bold = ch.is_bold;
             cur.is_italic = ch.is_italic;
             total_fs += ch.font_size;
@@ -2302,6 +2388,7 @@ static std::vector<TextLine> lines_from_upright_chars(
         }
         util::append_utf8(cur.text, ch.unicode);
         prev_right = ch.right;
+        after_space = ch.unicode == ' ' || ch.unicode == 0xA0;
     }
     flush();
 
@@ -2338,39 +2425,15 @@ std::vector<TextLine> chars_to_lines(const std::vector<TextChar>& chars,
         lines = lines_from_upright_chars(upright, out_col_boundary);
     }
 
-    const double kDegToRad = 3.14159265358979323846 / 180.0;
     for (int r = 1; r < 24; r++) {
         if (!present[r]) continue;
-        const double theta = r * 15.0 * kDegToRad;
-        const double cs = std::cos(theta), sn = std::sin(theta);
-        // Into the direction's own frame (rotate by -theta), and back out.
-        auto fwd = [&](double px, double py, double& ox, double& oy) {
-            ox = px * cs + py * sn;
-            oy = -px * sn + py * cs;
+        const int16_t rot = static_cast<int16_t>(r);
+        auto back = [&](double fx, double fy, double& px, double& py) {
+            from_writing_frame(rot, fx, fy, px, py);
         };
-        auto back = [&](double px, double py, double& ox, double& oy) {
-            ox = px * cs - py * sn;
-            oy = px * sn + py * cs;
-        };
-
         std::vector<TextChar> rot_chars;
-        for (auto& ch : chars) {
-            if (ch.rot != r) continue;
-            TextChar t = ch;
-            fwd(ch.x, ch.y, t.x, t.y);
-            // Rotating the page-space AABB is exact on the quarter turns that
-            // real documents use, and a slight over-estimate off them.
-            double bx[4] = {ch.left, ch.right, ch.left, ch.right};
-            double by[4] = {ch.top, ch.top, ch.bot, ch.bot};
-            double rx[4], ry[4];
-            for (int k = 0; k < 4; k++) fwd(bx[k], by[k], rx[k], ry[k]);
-            t.left = *std::min_element(rx, rx + 4);
-            t.right = *std::max_element(rx, rx + 4);
-            t.top = *std::max_element(ry, ry + 4);
-            t.bot = *std::min_element(ry, ry + 4);
-            t.rot = 0;
-            rot_chars.push_back(t);
-        }
+        for (auto& ch : chars)
+            if (ch.rot == r) rot_chars.push_back(to_writing_frame(ch));
 
         for (auto& ln : lines_from_upright_chars(rot_chars, nullptr)) {
             // Report the line where it sits on the page, not where it sat in

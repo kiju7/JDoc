@@ -1,0 +1,150 @@
+%PDF-1.4
+1 0 obj
+<< /Length 274 >>
+stream
+/CIDInit /ProcSet findresource begin 12 dict begin begincmap
+/CMapName /Lig def 1 begincodespacerange <00> <FF> endcodespacerange
+1 beginbfrange <20> <7D> <0020> endbfrange
+1 beginbfchar <7E> <00660066> endbfchar
+endcmap CMapName currentdict /CMap defineresource pop end end
+endstream
+endobj
+2 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Courier /FirstChar 32 /LastChar 126 /Widths [600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600 600] /ToUnicode 1 0 R >>
+endobj
+3 0 obj
+<< /Length 1073 >>
+stream
+BT /F1 10 Tf 0 1 -1 0 256 196 Tm (Item) Tj ET
+BT /F1 10 Tf 0 1 -1 0 256 326 Tm (Q1) Tj ET
+BT /F1 10 Tf 0 1 -1 0 256 456 Tm (Q2) Tj ET
+BT /F1 10 Tf 0 1 -1 0 256 586 Tm (Q3) Tj ET
+BT /F1 10 Tf 0 1 -1 0 276 196 Tm (Row01) Tj ET
+BT /F1 10 Tf 0 1 -1 0 276 326 Tm (11) Tj ET
+BT /F1 10 Tf 0 1 -1 0 276 456 Tm (21) Tj ET
+BT /F1 10 Tf 0 1 -1 0 276 586 Tm (31) Tj ET
+BT /F1 10 Tf 0 1 -1 0 296 196 Tm (Row02) Tj ET
+BT /F1 10 Tf 0 1 -1 0 296 326 Tm (12) Tj ET
+BT /F1 10 Tf 0 1 -1 0 296 456 Tm (22) Tj ET
+BT /F1 10 Tf 0 1 -1 0 296 586 Tm (32) Tj ET
+BT /F1 10 Tf 0 1 -1 0 316 196 Tm (Row03) Tj ET
+BT /F1 10 Tf 0 1 -1 0 316 326 Tm (13) Tj ET
+BT /F1 10 Tf 0 1 -1 0 316 456 Tm (23) Tj ET
+BT /F1 10 Tf 0 1 -1 0 316 586 Tm (33) Tj ET
+BT /F1 10 Tf 0 1 -1 0 336 196 Tm (Row04) Tj ET
+BT /F1 10 Tf 0 1 -1 0 336 326 Tm (14) Tj ET
+BT /F1 10 Tf 0 1 -1 0 336 456 Tm (24) Tj ET
+BT /F1 10 Tf 0 1 -1 0 336 586 Tm (34) Tj ET
+BT /F1 10 Tf 0 1 -1 0 356 196 Tm (Row05) Tj ET
+BT /F1 10 Tf 0 1 -1 0 356 326 Tm (15) Tj ET
+BT /F1 10 Tf 0 1 -1 0 356 456 Tm (25) Tj ET
+BT /F1 10 Tf 0 1 -1 0 356 586 Tm (35) Tj ET
+
+endstream
+endobj
+4 0 obj
+<< /Type /Page /Parent 11 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 2 0 R >> >> /Contents 3 0 R >>
+endobj
+5 0 obj
+<< /Length 1121 >>
+stream
+BT /F1 10 Tf -1 0 -0 -1 506 346 Tm (Item) Tj ET
+BT /F1 10 Tf -1 0 -0 -1 376 346 Tm (Q1) Tj ET
+BT /F1 10 Tf -1 0 -0 -1 246 346 Tm (Q2) Tj ET
+BT /F1 10 Tf -1 0 -0 -1 116 346 Tm (Q3) Tj ET
+BT /F1 10 Tf -1 0 -0 -1 506 366 Tm (Row01) Tj ET
+BT /F1 10 Tf -1 0 -0 -1 376 366 Tm (11) Tj ET
+BT /F1 10 Tf -1 0 -0 -1 246 366 Tm (21) Tj ET
+BT /F1 10 Tf -1 0 -0 -1 116 366 Tm (31) Tj ET
+BT /F1 10 Tf -1 0 -0 -1 506 386 Tm (Row02) Tj ET
+BT /F1 10 Tf -1 0 -0 -1 376 386 Tm (12) Tj ET
+BT /F1 10 Tf -1 0 -0 -1 246 386 Tm (22) Tj ET
+BT /F1 10 Tf -1 0 -0 -1 116 386 Tm (32) Tj ET
+BT /F1 10 Tf -1 0 -0 -1 506 406 Tm (Row03) Tj ET
+BT /F1 10 Tf -1 0 -0 -1 376 406 Tm (13) Tj ET
+BT /F1 10 Tf -1 0 -0 -1 246 406 Tm (23) Tj ET
+BT /F1 10 Tf -1 0 -0 -1 116 406 Tm (33) Tj ET
+BT /F1 10 Tf -1 0 -0 -1 506 426 Tm (Row04) Tj ET
+BT /F1 10 Tf -1 0 -0 -1 376 426 Tm (14) Tj ET
+BT /F1 10 Tf -1 0 -0 -1 246 426 Tm (24) Tj ET
+BT /F1 10 Tf -1 0 -0 -1 116 426 Tm (34) Tj ET
+BT /F1 10 Tf -1 0 -0 -1 506 446 Tm (Row05) Tj ET
+BT /F1 10 Tf -1 0 -0 -1 376 446 Tm (15) Tj ET
+BT /F1 10 Tf -1 0 -0 -1 246 446 Tm (25) Tj ET
+BT /F1 10 Tf -1 0 -0 -1 116 446 Tm (35) Tj ET
+
+endstream
+endobj
+6 0 obj
+<< /Type /Page /Parent 11 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 2 0 R >> >> /Contents 5 0 R >>
+endobj
+7 0 obj
+<< /Length 1121 >>
+stream
+BT /F1 10 Tf -0 -1 1 -0 356 596 Tm (Item) Tj ET
+BT /F1 10 Tf -0 -1 1 -0 356 466 Tm (Q1) Tj ET
+BT /F1 10 Tf -0 -1 1 -0 356 336 Tm (Q2) Tj ET
+BT /F1 10 Tf -0 -1 1 -0 356 206 Tm (Q3) Tj ET
+BT /F1 10 Tf -0 -1 1 -0 336 596 Tm (Row01) Tj ET
+BT /F1 10 Tf -0 -1 1 -0 336 466 Tm (11) Tj ET
+BT /F1 10 Tf -0 -1 1 -0 336 336 Tm (21) Tj ET
+BT /F1 10 Tf -0 -1 1 -0 336 206 Tm (31) Tj ET
+BT /F1 10 Tf -0 -1 1 -0 316 596 Tm (Row02) Tj ET
+BT /F1 10 Tf -0 -1 1 -0 316 466 Tm (12) Tj ET
+BT /F1 10 Tf -0 -1 1 -0 316 336 Tm (22) Tj ET
+BT /F1 10 Tf -0 -1 1 -0 316 206 Tm (32) Tj ET
+BT /F1 10 Tf -0 -1 1 -0 296 596 Tm (Row03) Tj ET
+BT /F1 10 Tf -0 -1 1 -0 296 466 Tm (13) Tj ET
+BT /F1 10 Tf -0 -1 1 -0 296 336 Tm (23) Tj ET
+BT /F1 10 Tf -0 -1 1 -0 296 206 Tm (33) Tj ET
+BT /F1 10 Tf -0 -1 1 -0 276 596 Tm (Row04) Tj ET
+BT /F1 10 Tf -0 -1 1 -0 276 466 Tm (14) Tj ET
+BT /F1 10 Tf -0 -1 1 -0 276 336 Tm (24) Tj ET
+BT /F1 10 Tf -0 -1 1 -0 276 206 Tm (34) Tj ET
+BT /F1 10 Tf -0 -1 1 -0 256 596 Tm (Row05) Tj ET
+BT /F1 10 Tf -0 -1 1 -0 256 466 Tm (15) Tj ET
+BT /F1 10 Tf -0 -1 1 -0 256 336 Tm (25) Tj ET
+BT /F1 10 Tf -0 -1 1 -0 256 206 Tm (35) Tj ET
+
+endstream
+endobj
+8 0 obj
+<< /Type /Page /Parent 11 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 2 0 R >> >> /Contents 7 0 R >>
+endobj
+9 0 obj
+<< /Length 199 >>
+stream
+BT /F1 10 Tf 1 0 -0 1 72 700 Tm (Upright body text stays on the page grid.) Tj ET
+BT /F1 10 Tf 0 1 -1 0 560 200 Tm [(Sideways) -600 (caption) -600 (with) -600 (five) -600 (words) -600 (o~set)] TJ ET
+
+endstream
+endobj
+10 0 obj
+<< /Type /Page /Parent 11 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 2 0 R >> >> /Contents 9 0 R >>
+endobj
+11 0 obj
+<< /Type /Pages /Kids [4 0 R 6 0 R 8 0 R 10 0 R] /Count 4 >>
+endobj
+12 0 obj
+<< /Type /Catalog /Pages 11 0 R >>
+endobj
+xref
+0 13
+0000000000 65535 f 
+0000000009 00000 n 
+0000000334 00000 n 
+0000000837 00000 n 
+0000001962 00000 n 
+0000002089 00000 n 
+0000003262 00000 n 
+0000003389 00000 n 
+0000004562 00000 n 
+0000004689 00000 n 
+0000004939 00000 n 
+0000005067 00000 n 
+0000005144 00000 n 
+trailer
+<< /Size 13 /Root 12 0 R >>
+startxref
+5195
+%%EOF

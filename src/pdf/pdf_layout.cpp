@@ -39,9 +39,10 @@ namespace jdoc { namespace pdf_detail {
 //    zone emits its whole left column, then its whole right column, each on
 //    a grid measured from that column's own left edge. A table inside one
 //    column stays aligned within it. See column_blocks().
-//  - Rotated runs (TextChar::rot != 0) have no place on a horizontal grid.
-//    They are read along their own baselines (chars_to_lines) and appended
-//    after the page body, one run per line.
+//  - Rotated runs (TextChar::rot != 0) have no place on the page's grid.
+//    Each writing direction gets a grid of its own, built the same way in
+//    the run's own frame (to_writing_frame) and appended after the page
+//    body: a sideways table keeps its columns, sideways prose its spaces.
 
 namespace {
 
@@ -496,10 +497,23 @@ std::vector<LayoutLine> group_lines(std::vector<const TextChar*>& glyphs,
     return lines;
 }
 
+// Word spaces the producer wrote (explicit_word_spaces), indexed from `base`;
+// glyphs outside [base, base + sep.size()) — rotated-frame copies — have
+// none. between(prev, g): a space glyph separates g from prev.
+struct SpaceMarks {
+    const TextChar* base = nullptr;
+    std::vector<int> sep;
+    bool between(const TextChar* prev, const TextChar* g) const {
+        if (!base || g < base || prev < base) return false;
+        size_t i = static_cast<size_t>(g - base);
+        return i < sep.size() && sep[i] >= 0 && base + sep[i] == prev;
+    }
+};
+
 // One grid row: a line's glyphs placed from `margin` on a grid of `unit`
 // points per column.
 std::string render_row(const LayoutLine& ln, double margin, double unit,
-                       double median_fs) {
+                       double median_fs, const SpaceMarks* spaces = nullptr) {
     std::string row;
     size_t cursor = 0;
     const TextChar* prev = nullptr;
@@ -520,10 +534,14 @@ std::string render_row(const LayoutLine& ln, double margin, double unit,
             // a second column — snaps to the grid, so prose does not
             // pick up stray double spaces wherever its proportional
             // advances drift off the pitch.
+            // A space glyph the producer wrote between them is a word
+            // space even where kerning or justification closed the gap,
+            // unless it closed entirely (see chars_to_lines).
             double gap = g->left - ink_right(prev);
             double word_gap = std::max(1.0, fs * 0.15);
             if (gap < word_gap)
-                col = cursor;
+                col = (spaces && gap > kWrittenSpaceMinEm * fs &&
+                       spaces->between(prev, g)) ? cursor + 1 : cursor;
             else if (gap < fs * kSnapGapEm)
                 col = cursor + 1;
             else
@@ -546,13 +564,13 @@ struct PlacedRow {
 // Rows on their grids, one text line each, with blank lines for vertical
 // gaps of extra line heights.
 std::string render_rows(const std::vector<PlacedRow>& rows, double unit,
-                        double median_fs) {
+                        double median_fs, const SpaceMarks* spaces = nullptr) {
     std::string out;
     bool first_line = true;
     double prev_y = 0, prev_fs = 0;
     for (auto& placed : rows) {
         const LayoutLine& ln = *placed.line;
-        std::string row = render_row(ln, placed.margin, unit, median_fs);
+        std::string row = render_row(ln, placed.margin, unit, median_fs, spaces);
         if (!first_line) {
             double line_h = 1.2 * std::max(prev_fs, ln.font_size);
             double extra = (prev_y - ln.base_y) / line_h - 1.0;
@@ -614,19 +632,33 @@ std::string layout_page_text(const std::vector<TextChar>& chars,
             for (size_t ri = 0; ri < blk.rows.size(); ri++)
                 rows.push_back({&blk.rows[ri], blk.margin,
                                 blk.restarts && ri == 0});
-        out = render_rows(rows, gp.unit, gp.median_fs);
+        SpaceMarks spaces;
+        spaces.base = chars.data();
+        spaces.sep = explicit_word_spaces(chars);
+        out = render_rows(rows, gp.unit, gp.median_fs, &spaces);
     }
 
     // ── Rotated runs, after the body ──
-    if (!rotated.empty()) {
-        bool first = true;
-        for (auto& tl : chars_to_lines(rotated)) {
-            if (tl.text.empty()) continue;
-            if (first && !out.empty()) out += '\n';
-            first = false;
-            out += tl.text;
-            out += '\n';
-        }
+    // Each writing direction is laid out on its own grid in its own frame
+    // (to_writing_frame): lines along its baselines, word gaps and columns
+    // along its advance. Measured on the page axes instead, a 90° run's
+    // advance is page height, so every gap reads as zero and the cells of a
+    // sideways table glue together.
+    for (int r = 1; r < 24 && !rotated.empty(); r++) {
+        std::vector<TextChar> frame;
+        for (auto& ch : rotated)
+            if (ch.rot == r && !is_layout_space(ch.unicode))
+                frame.push_back(to_writing_frame(ch));
+        if (frame.empty()) continue;
+        std::vector<const TextChar*> glyphs;
+        glyphs.reserve(frame.size());
+        for (auto& t : frame) glyphs.push_back(&t);
+        const GridPitch gp = measure_pitch(glyphs);
+        std::vector<LayoutLine> lines = group_lines(glyphs, gp.median_fs);
+        std::vector<PlacedRow> rows;
+        for (auto& ln : lines) rows.push_back({&ln, gp.margin, false});
+        if (!out.empty()) out += '\n';
+        out += render_rows(rows, gp.unit, gp.median_fs);
     }
     return out;
 }
@@ -1030,7 +1062,8 @@ double glyph_cy(const TextChar* g) { return (g->top + g->bot) / 2.0; }
 template <typename Origin>
 LayoutFallback make_fallback(const std::vector<const LayoutLine*>& rows,
                              const GridPitch& gp, int16_t rot,
-                             Origin origin) {
+                             Origin origin,
+                             const SpaceMarks* spaces = nullptr) {
     LayoutFallback fb;
     fb.rot = rot;
     fb.x0 = fb.y0 = 1e30;
@@ -1049,7 +1082,7 @@ LayoutFallback make_fallback(const std::vector<const LayoutLine*>& rows,
         }
     std::vector<PlacedRow> placed;
     for (auto* ln : rows) placed.push_back({ln, margin, false});
-    fb.text = render_rows(placed, gp.unit, gp.median_fs);
+    fb.text = render_rows(placed, gp.unit, gp.median_fs, spaces);
     return fb;
 }
 
@@ -1077,6 +1110,9 @@ std::vector<LayoutFallback> find_layout_fallbacks(
         (ch.rot == 0 ? upright : rotated).push_back(&ch);
     }
     auto identity = [](const TextChar* g) { return g; };
+    SpaceMarks spaces;
+    spaces.base = chars.data();
+    spaces.sep = explicit_word_spaces(chars);
 
     if (!upright.empty()) {
         const GridPitch gp = measure_pitch(upright);
@@ -1182,7 +1218,7 @@ std::vector<LayoutFallback> find_layout_fallbacks(
             if (lines.size() < 2) continue;
             std::vector<const LayoutLine*> rows;
             for (auto& ln : lines) rows.push_back(&ln);
-            out.push_back(make_fallback(rows, gp, 0, identity));
+            out.push_back(make_fallback(rows, gp, 0, identity, &spaces));
         }
 
         // Whitespace alignment, zone by zone.
@@ -1202,36 +1238,18 @@ std::vector<LayoutFallback> find_layout_fallbacks(
                     std::vector<const LayoutLine*> rows;
                     for (size_t k = run.first; k <= run.second; k++)
                         rows.push_back(&blk.rows[k]);
-                    out.push_back(make_fallback(rows, gp, 0, identity));
+                    out.push_back(make_fallback(rows, gp, 0, identity, &spaces));
                 }
         }
     }
 
     // Rotated runs, each direction in its own frame (as chars_to_lines).
-    const double kDegToRad = 3.14159265358979323846 / 180.0;
     for (int r = 1; r < 24 && !rotated.empty(); r++) {
         std::vector<TextChar> frame;
         std::vector<const TextChar*> page_glyph;
-        const double theta = r * 15.0 * kDegToRad;
-        const double cs = std::cos(theta), sn = std::sin(theta);
         for (auto* ch : rotated) {
             if (ch->rot != r) continue;
-            TextChar t = *ch;
-            auto fwd = [&](double px, double py, double& ox, double& oy) {
-                ox = px * cs + py * sn;
-                oy = -px * sn + py * cs;
-            };
-            fwd(ch->x, ch->y, t.x, t.y);
-            double bx[4] = {ch->left, ch->right, ch->left, ch->right};
-            double by[4] = {ch->top, ch->top, ch->bot, ch->bot};
-            double rx[4], ry[4];
-            for (int k = 0; k < 4; k++) fwd(bx[k], by[k], rx[k], ry[k]);
-            t.left = *std::min_element(rx, rx + 4);
-            t.right = *std::max_element(rx, rx + 4);
-            t.top = *std::max_element(ry, ry + 4);
-            t.bot = *std::min_element(ry, ry + 4);
-            t.rot = 0;
-            frame.push_back(t);
+            frame.push_back(to_writing_frame(*ch));
             page_glyph.push_back(ch);
         }
         if (frame.size() < 6) continue;

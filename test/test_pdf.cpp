@@ -466,6 +466,116 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    // Test 15: rotated text is laid out in its own reading direction in
+    // plain text. A table turned 90/180/270 degrees used to come out glued
+    // ("ItemQ1Q2Q3"): word gaps and lines were measured on the page axes,
+    // and gaps over 8 em counted as no gap at all. Sideways prose beside
+    // upright text keeps its spaces.
+    std::cout << "[15] Testing rotated text in plain text and markdown...\n";
+    {
+        const char* fixture = "test/fixtures/pdf/rotated_text.pdf";
+        std::ifstream f(fixture);
+        if (!f.good()) {
+            std::cout << "    SKIP: fixture not found\n";
+        } else {
+            f.close();
+            jdoc::ConvertOptions text_opts;
+            text_opts.format = jdoc::OutputFormat::PLAINTEXT;
+            auto pages = jdoc::pdf_to_markdown_chunks(fixture, text_opts);
+            CHECK(pages.size() == 4);
+            // Cells of one row stay on one line, in reading order, with a
+            // column gap between them, whichever way the page is turned.
+            auto row_ok = [](const std::string& t, const std::vector<std::string>& cells) {
+                size_t line_start = t.find(cells[0]);
+                if (line_start == std::string::npos) return false;
+                size_t line_end = t.find('\n', line_start);
+                std::string line = t.substr(line_start, line_end - line_start);
+                size_t pos = 0;
+                for (size_t k = 0; k < cells.size(); k++) {
+                    size_t at = line.find(cells[k], pos);
+                    if (at == std::string::npos) return false;
+                    if (k > 0 && at < pos + 2) return false;  // a column gap
+                    pos = at + cells[k].size();
+                }
+                return true;
+            };
+            for (int p = 0; p < 3; p++) {
+                const std::string& t = pages[p].text;
+                CHECK(t.find("ItemQ1") == std::string::npos);
+                CHECK(t.find("Row0111") == std::string::npos);
+                CHECK(row_ok(t, {"Item", "Q1", "Q2", "Q3"}));
+                CHECK(row_ok(t, {"Row01", "11", "21", "31"}));
+                CHECK(row_ok(t, {"Row05", "15", "25", "35"}));
+                CHECK(t.find("Item") < t.find("Row01"));
+                CHECK(t.find("Row01") < t.find("Row05"));
+            }
+            CHECK(pages[3].text.find("Upright body text stays on the page grid.") !=
+                  std::string::npos);
+            // ...and a rotated ligature keeps both of its letters.
+            CHECK(pages[3].text.find("Sideways caption with five words offset") !=
+                  std::string::npos);
+
+            // Markdown: a 180-degree run reads first line first, and the
+            // lines of a 90/270-degree run (which share one page-space
+            // midpoint) are not welded into one line.
+            auto md = jdoc::pdf_to_markdown_chunks(fixture);
+            CHECK(md.size() == 4);
+            for (int p = 0; p < 3; p++) {
+                const std::string& t = md[p].text;
+                CHECK(t.find("Q3 Row01") == std::string::npos);
+                CHECK(t.find("Row01") != std::string::npos);
+                CHECK(t.find("Item") < t.find("Row01"));
+                // Each row once: the layout block replaces its lines.
+                CHECK(t.find("Row03") == t.rfind("Row03"));
+            }
+            CHECK(md[3].text.find("Sideways caption with five words offset") !=
+                  std::string::npos);
+            std::cout << "    90/180/270 tables and a sideways caption OK\n";
+        }
+    }
+
+    // Test 16: word spaces between runs. Two runs far apart on one baseline
+    // (a footer and its page number) used to glue ("2024" + "99"): gaps
+    // over 8 em were dropped. A written space set off the baseline and
+    // kerned below a word space still separates; a break space kerned out
+    // entirely does not; Tc-spread, kerned-tight and glyph-per-Td words stay
+    // whole; a page number beside a running head is not a section heading.
+    std::cout << "[16] Testing word spaces between runs...\n";
+    {
+        const char* fixture = "test/fixtures/pdf/far_gap.pdf";
+        std::ifstream f(fixture);
+        if (!f.good()) {
+            std::cout << "    SKIP: fixture not found\n";
+        } else {
+            f.close();
+            jdoc::ConvertOptions text_opts;
+            text_opts.format = jdoc::OutputFormat::PLAINTEXT;
+            for (int mode = 0; mode < 2; mode++) {
+                auto pages = mode == 0 ? jdoc::pdf_to_markdown_chunks(fixture)
+                                       : jdoc::pdf_to_markdown_chunks(fixture, text_opts);
+                CHECK(pages.size() == 2);
+                const std::string& t = pages[0].text;
+                CHECK(t.find("202499") == std::string::npos);
+                CHECK(t.find("Report 2024") != std::string::npos);
+                CHECK(t.find("99") != std::string::npos);
+                CHECK(t.find("SPREAD") != std::string::npos);
+                CHECK(t.find("Kerned") != std::string::npos);
+                CHECK(t.find("Glyphs") != std::string::npos);
+                CHECK(t.find("Maria Hazel") != std::string::npos);
+                const std::string& t2 = pages[1].text;
+                CHECK(t2.find("4Annual") == std::string::npos);
+                if (mode == 0) {
+                    CHECK(t2.find("## 4") == std::string::npos);
+                    CHECK(t2.find("## 1 Introduction") != std::string::npos);
+                } else {
+                    // The grid follows geometry: no space where none shows.
+                    CHECK(t.find("www.example.org") != std::string::npos);
+                }
+            }
+            std::cout << "    far runs, written spaces and whole words OK\n";
+        }
+    }
+
     std::cout << "\n=== All tests passed ===\n";
     return 0;
 }
