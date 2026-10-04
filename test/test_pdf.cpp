@@ -699,6 +699,10 @@ int main(int argc, char* argv[]) {
                     n++;
                 return n;
             };
+            // A right-aligned header wider than its numbers keeps its
+            // first letters: the column boundary sits in the blank stretch.
+            CHECK(count(md, "| **Parks** ") == 1);
+            CHECK(count(md, "| **Mean area ha** ") == 1);
             CHECK(count(md, "| Large ") == 1);
             CHECK(count(md, "| Small ") == 1);
             CHECK(count(md, "| **Hour**") == 1);

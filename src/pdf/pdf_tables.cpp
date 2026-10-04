@@ -1096,14 +1096,28 @@ std::vector<double> infer_columns_from_text(const PageCharCache& cache,
     std::vector<double> boundaries;
     boundaries.push_back(left);
     bool in_gap = false;
-    double gap_start = 0;
+    int gap_b0 = 0;
     for (int b = 0; b < n_bins; b++) {
-        double bx = left + b * bin_w + bin_w / 2.0;
         if (gap_counts[b] >= threshold) {
-            if (!in_gap) { gap_start = bx; in_gap = true; }
+            if (!in_gap) { gap_b0 = b; in_gap = true; }
         } else {
             if (in_gap) {
-                double gap_center = (gap_start + bx) / 2.0;
+                // Inside a gap run, the boundary goes to the stretch blank in
+                // the most rows: a right-aligned header wider than its numbers
+                // reaches into the run, and the run's plain center would cut
+                // the header's first letters off into the left column.
+                int best = 0;
+                for (int k = gap_b0; k < b; k++) best = std::max(best, gap_counts[k]);
+                int s0 = -1, s1 = -1, k = gap_b0;
+                while (k < b) {
+                    if (gap_counts[k] != best) { k++; continue; }
+                    int e = k;
+                    while (e + 1 < b && gap_counts[e + 1] == best) e++;
+                    if (s0 < 0 || e - k > s1 - s0) { s0 = k; s1 = e; }
+                    k = e + 1;
+                }
+                // (same center as before when the whole run is equally blank)
+                double gap_center = left + (s0 + s1 + 2) * bin_w / 2.0;
                 if (gap_center > left + 15 && gap_center < right - 15)
                     boundaries.push_back(gap_center);
                 in_gap = false;
