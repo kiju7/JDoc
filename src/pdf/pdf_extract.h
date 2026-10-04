@@ -165,6 +165,9 @@ struct ExtractResult {
     std::vector<double> col_boundaries;  // per-page column boundary (0 if single-column)
     std::vector<std::vector<TableData>> all_tables;
     std::vector<std::vector<AnnotEntry>> all_annots;
+    // Per-page layout-preserving body text, filled only for plain-text
+    // output (layout_page_text); the markdown path never reads it.
+    std::vector<std::string> layout_text;
     std::vector<double> page_widths;
     std::vector<double> page_heights;
     std::vector<PageRenderDiag> page_diags;

@@ -411,5 +411,10 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
                                          const GfxState* inherit_gs = nullptr);
 std::vector<TextLine> chars_to_lines(const std::vector<TextChar>& chars,
                                      double* out_col_boundary = nullptr);
+// Plain-text page body as a character grid built from glyph coordinates
+// (pdftotext -layout style); see pdf_layout.cpp. col_boundary is the page's
+// column boundary from chars_to_lines (0 = single column).
+std::string layout_page_text(const std::vector<TextChar>& chars,
+                             double col_boundary = 0);
 
 }} // namespace jdoc::pdf_detail

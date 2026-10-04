@@ -240,6 +240,7 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
     result.col_boundaries.resize(tp, 0);
     result.all_tables.resize(tp);
     result.all_annots.resize(tp);
+    if (opts.format == OutputFormat::PLAINTEXT) result.layout_text.resize(tp);
     result.page_diags.resize(tp);
     result.page_widths.resize(tp, 0);
     result.page_heights.resize(tp, 0);
@@ -419,6 +420,9 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
             initial_ctm);
 
         result.all_lines[p] = chars_to_lines(parse_result.chars, &result.col_boundaries[p]);
+        if (plaintext)
+            result.layout_text[p] = layout_page_text(parse_result.chars,
+                                                     result.col_boundaries[p]);
 
         // Extract annotations (text notes, links)
         result.all_annots[p] = extract_annotations(doc, page_obj, page_h, initial_ctm);
