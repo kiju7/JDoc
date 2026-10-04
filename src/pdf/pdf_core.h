@@ -489,6 +489,18 @@ struct PdfFont {
     // Built-in metrics of a standard 14 font named without a /Widths array
     // (PDF 32000-1 9.6.2.2). Looked up by the decoded Unicode value.
     const jdoc_std14::Metrics* std14 = nullptr;
+
+    // Embedded font program, read by the compositor to draw glyphs.
+    // program_kind: 1 Type1 (/FontFile), 2 TrueType (/FontFile2),
+    // 3 CFF (/FontFile3 Type1C or CIDFontType0C), 4 OpenType (/FontFile3).
+    int program_ref = -1, program_gen = 0;
+    uint8_t program_kind = 0;
+    bool symbolic = false;        // FontDescriptor /Flags bit 3
+    bool cid_font = false;        // CIDFontType0/2 descendant of a Type0 font
+    int cid_to_gid_ref = -1;      // /CIDToGIDMap stream; -1 = Identity
+    // Base encoding the PDF names (glyph selection by name): 0 = none (the
+    // program's built-in encoding), 1 WinAnsi, 2 MacRoman, 3 Standard.
+    uint8_t named_base_encoding = 0;
     int cmap_code_bytes = 0;     // 0=auto, 1 or 2 from codespacerange
 
     // Type3 fonts whose codes map to nothing readable (no ToUnicode, private

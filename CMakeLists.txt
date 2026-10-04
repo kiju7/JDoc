@@ -237,6 +237,7 @@ add_library(jdoc_lib STATIC
     src/pdf/pdf_content.cpp
     src/pdf/pdf_tables.cpp
     src/pdf/pdf_visual.cpp
+    src/pdf/pdf_glyphs.cpp
     src/pdf/pdf_markdown.cpp
     src/pdf/pdf.cpp
     src/pdf/pdf_crypt.cpp

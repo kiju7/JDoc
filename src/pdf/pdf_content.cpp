@@ -1014,6 +1014,30 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
         }
     };
 
+    // Glyphs of embedded font programs, for the compositor. Fonts are copied
+    // once per parse: gs.font points into this parse's local font table.
+    std::unordered_map<const PdfFont*, int> glyph_font_index;
+    auto record_glyph = [&](const GfxState& gs, uint32_t code) {
+        auto [it, fresh] = glyph_font_index.try_emplace(
+            gs.font, static_cast<int>(result.glyph_fonts.size()));
+        if (fresh) result.glyph_fonts.push_back(std::make_shared<const PdfFont>(*gs.font));
+        GlyphDraw g;
+        g.code = code;
+        g.font = it->second;
+        double trm[6];
+        double scale_mat[6] = {gs.font_size * gs.h_scaling / 100.0, 0, 0,
+                               gs.font_size, 0, gs.text_rise};
+        mat_multiply(trm, scale_mat, gs.text_mat);
+        mat_multiply(g.m, trm, gs.ctm);
+        g.fill_r = static_cast<float>(gs.fill_r);
+        g.fill_g = static_cast<float>(gs.fill_g);
+        g.fill_b = static_cast<float>(gs.fill_b);
+        g.alpha = static_cast<float>(gs.fill_alpha);
+        copy_clip(gs, g.clip);
+        g.seq = draw_seq++;
+        result.glyphs.push_back(g);
+    };
+
     auto show_text_string = [&](GfxState& gs, const std::string& s) {
         double fs = gs.font_size;
         double h_scale = gs.h_scaling / 100.0;
@@ -1034,6 +1058,11 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
                 code = static_cast<uint8_t>(s[i]);
                 i++;
             }
+
+            // Invisible text (Tr 3, 7: OCR layers, clip-only text) is not drawn.
+            if (collect_render_paths && gs.font && gs.font->program_kind &&
+                gs.render_mode != 3 && gs.render_mode != 7)
+                record_glyph(gs, code);
 
             // Scrambled Type3: draw the glyph program, advance, emit no char.
             if (t3_expand) {
@@ -1997,6 +2026,14 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
                                 // position so z-order survives the merge.
                                 for (auto& si : sub.images) si.seq += draw_seq;
                                 for (auto& sp : sub.paths) sp.seq += draw_seq;
+                                {
+                                    int font_off = static_cast<int>(result.glyph_fonts.size());
+                                    for (auto& sg : sub.glyphs) { sg.seq += draw_seq; sg.font += font_off; }
+                                    result.glyph_fonts.insert(result.glyph_fonts.end(),
+                                        sub.glyph_fonts.begin(), sub.glyph_fonts.end());
+                                    result.glyphs.insert(result.glyphs.end(),
+                                        sub.glyphs.begin(), sub.glyphs.end());
+                                }
                                 draw_seq += sub.draw_ops;
                                 result.images.insert(result.images.end(),
                                     std::make_move_iterator(sub.images.begin()),

@@ -692,7 +692,9 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
             for (auto& c : clusters) {
                 if (!qualifies(c)) continue;
                 double rg[4] = {c.x0, c.y0, c.x1, c.y1};
-                for (int pass = 0; pass < 2; pass++) {
+                // Grow over touching paths until the region is stable: a
+                // drawing chains box to arrow to box well past two hops.
+                for (int pass = 0; pass < 10; pass++) {
                     double g[4] = {rg[0], rg[1], rg[2], rg[3]};
                     for (auto& b : path_boxes) {
                         if (b[2] < rg[0] - 2 || b[0] > rg[2] + 2 ||
@@ -702,7 +704,9 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
                         if ((n2 - n0) * (n3 - n1) > 0.6 * page_w * page_h) continue;
                         g[0] = n0; g[1] = n1; g[2] = n2; g[3] = n3;
                     }
+                    bool same = g[0] == rg[0] && g[1] == rg[1] && g[2] == rg[2] && g[3] == rg[3];
                     std::copy(g, g + 4, rg);
+                    if (same) break;
                 }
                 regions.push_back({std::max(rg[0], 0.0), std::max(rg[1], 0.0),
                                    std::min(rg[2], page_w), std::min(rg[3], page_h)});
@@ -751,6 +755,34 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
                         regions.erase(regions.begin() + j);
                         merged = true;
                     }
+            }
+            // A figure's labels outside its drawn area (a "Class Label" over
+            // the arrows, axis titles, panel subcaptions) are text the
+            // region would cut off now that glyphs are drawn: grow each
+            // region over short lines that sit within 1.5 line heights of
+            // it. Captions and body text are not taken in.
+            for (auto& R : regions) {
+                for (int pass = 0; pass < 3; pass++) {
+                    bool grew = false;
+                    for (auto& ln : result.all_lines[p]) {
+                        if (ln.text.empty() || caption_line(ln.text)) continue;
+                        double lw = ln.x_right - ln.x_left;
+                        if (lw > 0.4 * page_w && ln.text.size() >= 30) continue;
+                        double fs = std::max(ln.font_size, 4.0);
+                        double ly0 = ln.y_center - 0.6 * fs, ly1 = ln.y_center + 0.6 * fs;
+                        if (ly0 >= R[1] && ly1 <= R[3] && ln.x_left >= R[0] && ln.x_right <= R[2]) continue;
+                        double ov = std::min(ln.x_right, R[2]) - std::max(ln.x_left, R[0]);
+                        if (ov < 0.5 * std::max(lw, 1.0)) continue;
+                        double gap = std::max(ly0 - R[3], R[1] - ly1);
+                        if (gap > 1.5 * fs) continue;
+                        R[0] = std::min(R[0], ln.x_left); R[2] = std::max(R[2], ln.x_right);
+                        R[1] = std::min(R[1], ly0);       R[3] = std::max(R[3], ly1);
+                        grew = true;
+                    }
+                    if (!grew) break;
+                }
+                R[0] = std::max(R[0], 0.0); R[1] = std::max(R[1], 0.0);
+                R[2] = std::min(R[2], page_w); R[3] = std::min(R[3], page_h);
             }
             }
             double region_area = 0;

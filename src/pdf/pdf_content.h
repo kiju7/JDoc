@@ -145,8 +145,21 @@ struct RenderPath {
     int seq = 0; // draw order shared with ImagePlacement
 };
 
+// One shown glyph, kept for the compositor to draw from the embedded font
+// program (only when render paths are collected).
+struct GlyphDraw {
+    uint32_t code = 0;
+    int font = -1;          // index into ContentParseResult::glyph_fonts
+    double m[6];            // text space (1 unit = 1 em) -> page space
+    float fill_r = 0, fill_g = 0, fill_b = 0, alpha = 1;
+    float clip[4] = {-1e30f, -1e30f, 1e30f, 1e30f};
+    int seq = 0;            // draw order shared with RenderPath/ImagePlacement
+};
+
 struct ContentParseResult {
     std::vector<TextChar> chars;
+    std::vector<GlyphDraw> glyphs;
+    std::vector<std::shared_ptr<const PdfFont>> glyph_fonts;
     std::vector<PdfLineSegment> segments;
     std::vector<PdfFillRect> fill_rects; // sizable pure-fill rects (cell shading)
     std::vector<ImagePlacement> images;
