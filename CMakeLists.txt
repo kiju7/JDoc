@@ -234,6 +234,7 @@ add_library(jdoc_lib STATIC
     src/archive/archive_walker.cpp
     # pdf
     src/pdf/pdf_core.cpp
+    src/pdf/pdf_base14.cpp
     src/pdf/pdf_content.cpp
     src/pdf/pdf_tables.cpp
     src/pdf/pdf_visual.cpp

@@ -1,4 +1,5 @@
 #include "pdf_core.h"
+#include "pdf_base14.h"
 #include "jbig2.h"
 #include "pdf_limits.h"
 #include "common/string_utils.h"
@@ -1524,11 +1525,13 @@ PdfFont load_font(PdfDoc& doc, const PdfObj& font_ref) {
     if (enc_obj.is_name()) {
         if (enc_obj.str_val == "WinAnsiEncoding") font.encoding_table = kWinAnsi;
         else if (enc_obj.str_val == "MacRomanEncoding") font.encoding_table = kMacRoman;
+        else if (enc_obj.str_val == "StandardEncoding") font.encoding_table = standard_encoding();
     } else if (enc_obj.is_dict()) {
         auto& base_enc = enc_obj.get("BaseEncoding");
         if (base_enc.is_name()) {
             if (base_enc.str_val == "WinAnsiEncoding") font.encoding_table = kWinAnsi;
             else if (base_enc.str_val == "MacRomanEncoding") font.encoding_table = kMacRoman;
+            else if (base_enc.str_val == "StandardEncoding") font.encoding_table = standard_encoding();
         }
         // Differences array
         auto& diffs = enc_obj.get("Differences");
@@ -1552,9 +1555,70 @@ PdfFont load_font(PdfDoc& doc, const PdfObj& font_ref) {
         }
     }
 
+    // A simple font that names a standard 14 face. The PDF may leave out
+    // its /Widths and font program (PDF 32000-1 9.6.2.2), relying on the
+    // reader's built-in metrics and the face's built-in encoding.
+    const Base14Font* base14 = nullptr;
+    bool embedded = false;
+    if (!font.is_type0 && !font.is_type3) {
+        base14 = find_base14_font(font.name);
+        if (desc.is_dict())
+            embedded = !desc.get("FontFile").is_none() || !desc.get("FontFile2").is_none() ||
+                       !desc.get("FontFile3").is_none();
+    }
+    const bool explicit_encoding = font.encoding_table != nullptr;
+
+    // With no base encoding named, a non-embedded standard face reads through
+    // its own built-in encoding (9.6.6.1, 9.6.6.2): StandardEncoding for a
+    // Type1 Latin face, the font's own table for Symbol and ZapfDingbats.
+    // A TrueType alias (non-embedded "Arial") keeps the WinAnsi reading that
+    // producers of such fonts assume.
+    const uint32_t* builtin_encoding = nullptr;
+    if (base14 && !embedded) {
+        if (base14->symbolic) builtin_encoding = base14_builtin_encoding(*base14);
+        else if (font_type == "Type1" || font_type == "MMType1")
+            builtin_encoding = standard_encoding();
+    }
+
     // Default encoding if nothing set
     if (!font.encoding_table && font.to_unicode.empty() && !font.is_identity) {
-        font.encoding_table = kWinAnsi;
+        font.encoding_table = builtin_encoding ? builtin_encoding : kWinAnsi;
+    }
+
+    // Built-in widths, only where the PDF gives none: a /Widths array always
+    // wins. Each code's glyph is found the way the text is decoded, by name
+    // through /Differences or the program's encoding, otherwise through the
+    // base encoding's character.
+    if (base14 && (!widths_arr.is_arr() || widths_arr.arr.empty())) {
+        const uint32_t* base_table = explicit_encoding ? font.encoding_table
+                                   : builtin_encoding ? builtin_encoding
+                                   : font.encoding_table ? font.encoding_table : kWinAnsi;
+        for (uint32_t code = 0; code < 256; code++) {
+            int w = -1;
+            const std::string* gname = nullptr;
+            auto d = font.differences.find(static_cast<int>(code));
+            if (d != font.differences.end()) gname = &d->second;
+            else {
+                auto b = font.builtin_names.find(static_cast<int>(code));
+                if (b != font.builtin_names.end()) gname = &b->second;
+            }
+            if (gname) {
+                w = base14_width_by_name(*base14, *gname);
+                if (w < 0) {
+                    uint32_t u = glyph_name_to_unicode(*gname);
+                    if (u) w = base14_width_by_unicode(*base14, u);
+                }
+            } else if (base14->symbolic && base_table == builtin_encoding) {
+                w = base14_width_by_code(*base14, code);
+            } else if (base_table[code]) {
+                w = base14_width_by_unicode(*base14, base_table[code]);
+                // A symbolic face addressed through a Latin encoding (Symbol
+                // with /WinAnsiEncoding) has no glyph for the Latin letter;
+                // the code then selects the glyph of the built-in encoding.
+                if (w < 0 && base14->symbolic) w = base14_width_by_code(*base14, code);
+            }
+            if (w >= 0) font.widths[code] = w;
+        }
     }
 
     // A Type3 font with no ToUnicode whose glyph names carry no meaning

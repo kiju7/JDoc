@@ -1,5 +1,7 @@
 // test_pdf.cpp — Test PDF to Markdown conversion using PDFium backend
 #include "jdoc/pdf.h"
+#include "pdf/pdf_base14.h"
+#include "pdf/pdf_core.h"
 
 #include <iostream>
 #include <fstream>
@@ -463,6 +465,113 @@ int main(int argc, char* argv[]) {
                 "test/fixtures/pdf/form_only_fonts.pdf");
             CHECK(md_on.find("Form only text line") != std::string::npos);
             std::cout << "    form-only text present with images off and on OK\n";
+        }
+    }
+
+    // Test 15: standard 14 fonts with no /Widths and no font program (PDF
+    // 32000-1 9.6.2.2). Every glyph used to get one fallback width, so word
+    // boxes overran the next word: words placed one by one with no space
+    // glyph ran together and interleaved. The metrics are compiled in, so
+    // this holds on any OS regardless of installed fonts.
+    std::cout << "[15] Testing standard 14 fonts without /Widths...\n";
+    {
+        using namespace jdoc::pdf_detail;
+        // Name resolution: aliases, style suffixes, subset tags.
+        auto face = [](const char* n) {
+            const Base14Font* f = find_base14_font(n);
+            return std::string(f ? f->name : "");
+        };
+        CHECK(face("Helvetica") == "Helvetica");
+        CHECK(face("ABCDEF+Helvetica-BoldOblique") == "Helvetica-BoldOblique");
+        CHECK(face("Arial") == "Helvetica");
+        CHECK(face("ArialMT") == "Helvetica");
+        CHECK(face("Arial,Bold") == "Helvetica-Bold");
+        CHECK(face("Arial-BoldItalicMT") == "Helvetica-BoldOblique");
+        CHECK(face("Times New Roman,Italic") == "Times-Italic");
+        CHECK(face("TimesNewRomanPSMT") == "Times-Roman");
+        CHECK(face("TimesNewRomanPS-BoldMT") == "Times-Bold");
+        CHECK(face("TimesNewRoman,BoldItalic") == "Times-BoldItalic");
+        CHECK(face("CourierNewPSMT") == "Courier");
+        CHECK(face("CourierNew,Bold") == "Courier-Bold");
+        CHECK(face("Courier-Oblique") == "Courier-Oblique");
+        CHECK(face("Symbol") == "Symbol");
+        CHECK(face("ZapfDingbats") == "ZapfDingbats");
+        // Different metrics: not a standard face.
+        CHECK(face("ArialNarrow").empty());
+        CHECK(face("Arial-Black").empty());
+        CHECK(face("Helvetica-Light").empty());
+        CHECK(face("ArialUnicodeMS").empty());
+        CHECK(face("Calibri").empty());
+
+        const uint8_t placeholder = 0;
+        PdfDoc doc(&placeholder, 1);
+        auto font_dict = [](const char* subtype, const char* base) {
+            auto d = PdfObj::make_dict();
+            d.dict.push_back({"Type", PdfObj::make_name("Font")});
+            d.dict.push_back({"Subtype", PdfObj::make_name(subtype)});
+            d.dict.push_back({"BaseFont", PdfObj::make_name(base)});
+            return d;
+        };
+        // AFM widths through the default StandardEncoding (quoteright at 0x27).
+        auto helv = load_font(doc, font_dict("Type1", "Helvetica"));
+        CHECK(helv.get_width('i') == 222);
+        CHECK(helv.get_width('W') == 944);
+        CHECK(helv.get_width(' ') == 278);
+        CHECK(helv.get_width(0x27) == 222);
+        CHECK(helv.decode_char(0x27) == 0x2019);
+        // WinAnsi: accented letters; /Differences by glyph name.
+        auto tb = font_dict("Type1", "Times-Bold");
+        auto enc = PdfObj::make_dict();
+        enc.dict.push_back({"BaseEncoding", PdfObj::make_name("WinAnsiEncoding")});
+        auto diffs = PdfObj::make_arr();
+        diffs.arr.push_back(PdfObj::make_int(1));
+        diffs.arr.push_back(PdfObj::make_name("fi"));
+        enc.dict.push_back({"Differences", diffs});
+        tb.dict.push_back({"Encoding", enc});
+        auto times_bold = load_font(doc, tb);
+        CHECK(times_bold.get_width(0xE9) == 444);  // eacute
+        CHECK(times_bold.get_width(1) == 556);     // fi
+        CHECK(times_bold.get_width('a') == 500);
+        // An alias picks up its standard face's metrics.
+        auto arial = font_dict("TrueType", "Arial,Bold");
+        arial.dict.push_back({"Encoding", PdfObj::make_name("WinAnsiEncoding")});
+        CHECK(load_font(doc, arial).get_width('i') == 278);
+        // Symbol reads through its own built-in encoding.
+        auto sym = load_font(doc, font_dict("Type1", "Symbol"));
+        CHECK(sym.decode_char('a') == 0x03B1);
+        CHECK(sym.get_width('a') == 631);
+        // Widths given by the PDF always win.
+        auto given = font_dict("Type1", "Helvetica");
+        given.dict.push_back({"FirstChar", PdfObj::make_int(105)});
+        auto warr = PdfObj::make_arr();
+        warr.arr.push_back(PdfObj::make_int(500));
+        given.dict.push_back({"Widths", warr});
+        auto helv_given = load_font(doc, given);
+        CHECK(helv_given.get_width('i') == 500);
+        CHECK(helv_given.get_width('W') == 0);  // outside /Widths: not filled in
+        // Not a standard face: nothing invented.
+        CHECK(load_font(doc, font_dict("TrueType", "Calibri")).get_width('i') == 0);
+
+        // End to end: words placed one by one at their real positions.
+        std::ifstream f("test/fixtures/pdf/base14_nowidths.pdf");
+        if (!f.good()) {
+            std::cout << "    SKIP: fixture not found\n";
+        } else {
+            f.close();
+            jdoc::ConvertOptions text_opts;
+            text_opts.format = jdoc::OutputFormat::PLAINTEXT;
+            for (const auto& out :
+                 {jdoc::pdf_to_markdown("test/fixtures/pdf/base14_nowidths.pdf"),
+                  jdoc::pdf_to_markdown("test/fixtures/pdf/base14_nowidths.pdf", text_opts)}) {
+                CHECK(out.find("illicit little lilies fill it, will Bill?") != std::string::npos);
+                CHECK(out.find("Minimal wiggly lily fills") != std::string::npos);
+                CHECK(out.find("fill it till I lift") != std::string::npos);
+                CHECK(out.find("Caf\xC3\xA9 menu is closed") != std::string::npos);
+                CHECK(out.find("\xCE\xB1 \xCE\xB2 \xCE\xB3") != std::string::npos);  // α β γ
+                CHECK(out.find("\xE2\x9C\x94") != std::string::npos);                // ✔
+                CHECK(out.find("Total 1234.12") != std::string::npos);
+            }
+            std::cout << "    base14 metrics, aliases and word spacing OK\n";
         }
     }
 
