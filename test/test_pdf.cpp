@@ -522,8 +522,8 @@ int main(int argc, char* argv[]) {
     // Test 16: a figure stored as raster strips under two columns of body
     // text. Its region composite is the figure alone: column lines are
     // narrower than half the page yet are body text, not labels to grow
-    // over — nor is a paragraph's short last line right above the figure.
-    // Strips span 435x120 pt; taking in the text above would make the
+    // over — nor is a paragraph's short last line right above the figure,
+    // on a two-column page or a single-column one. Strips span 435x120 pt; taking in the text above would make the
     // image barely twice as wide as tall.
     std::cout << "[16] Testing figure strips under multi-column body text...\n";
     {
@@ -548,6 +548,37 @@ int main(int argc, char* argv[]) {
             CHECK(aspect >= 3.0);
             CHECK(chunks[0].text.find("sentences") != std::string::npos);
             CHECK(chunks[0].text.find("evaluation") != std::string::npos);
+        }
+        // One column, a paragraph of a single full line and a short last
+        // line right above the figure, and too few body-size lines on the
+        // page to measure a column: the short line still ends the
+        // paragraph. The composite is the strips alone (435x120 pt; the
+        // line taken in made it about 3.2:1) and the image follows the
+        // whole paragraph instead of splitting it.
+        const char* single = "test/fixtures/pdf/strip_figure_single_column_short_tail.pdf";
+        std::ifstream sf(single);
+        if (!sf.good()) {
+            std::cout << "    SKIP: " << single << "\n";
+        } else {
+            sf.close();
+            auto chunks = jdoc::pdf_to_markdown_chunks(single);
+            CHECK(chunks.size() == 1);
+            CHECK(chunks[0].images.size() == 1);
+            if (chunks.size() == 1 && chunks[0].images.size() == 1) {
+                const auto& img = chunks[0].images[0];
+                double aspect = img.height > 0 ? double(img.width) / img.height : 0;
+                std::cout << "    " << single << ": " << img.width << "x" << img.height
+                          << " (expected aspect >= 3.4)\n";
+                CHECK(aspect >= 3.4);
+                const std::string& t = chunks[0].text;
+                size_t tail = t.find("results, shown in Figure 3.");
+                size_t ref = t.find("![");
+                size_t cap = t.find("Figure 3. Analysis flow");
+                CHECK(tail != std::string::npos && ref != std::string::npos &&
+                      cap != std::string::npos);
+                CHECK(tail < ref && ref < cap);
+                CHECK(t.find("summary of\nresults, shown") != std::string::npos);
+            }
         }
     }
 

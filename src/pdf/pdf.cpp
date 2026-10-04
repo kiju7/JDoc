@@ -188,9 +188,10 @@ static bool is_caption_line(const std::string& t) {
 // size spanning most of the measure, with character mass, and stacked in a
 // paragraph (a same-size line one line pitch above or below with an aligned
 // edge) is body text. Figure labels are set in their own sizes, are short,
-// or stand alone, so they stay labels. A paragraph's short last line (or a
-// short first line) is body text through the full line it continues. The
-// page-width test stays for single-column pages.
+// or stand alone, so they stay labels. The page-width test stays for
+// single-column pages. A paragraph's short last line (or a short first
+// line) is body text through the full line it continues, whichever test
+// found that line.
 static std::vector<char> page_body_lines(const std::vector<TextLine>& L,
                                          double page_w) {
     std::vector<char> body(L.size(), 0);
@@ -206,22 +207,22 @@ static std::vector<char> page_body_lines(const std::vector<TextLine>& L,
     auto body_size = [&](const TextLine& ln) {
         return body_fs > 0 && std::fabs(ln.font_size - body_fs) <= 0.1 * body_fs;
     };
+    // Two lines of one paragraph: adjacent baselines (within two line
+    // heights) and a shared left edge (indent allowed) or right edge
+    // (justified or ragged-left).
+    auto stacked = [&](const TextLine& a, const TextLine& b) {
+        double fs = std::max(a.font_size, b.font_size);
+        double dy = std::fabs(a.y_center - b.y_center);
+        if (dy < 0.5 * fs || dy > 2.0 * fs) return false;
+        return std::fabs(a.x_left - b.x_left) <= 2.0 * fs ||
+               std::fabs(a.x_right - b.x_right) <= 1.0 * fs;
+    };
     std::vector<double> widths;
     for (auto& ln : L)
         if (body_size(ln)) widths.push_back(ln.x_right - ln.x_left);
     if (widths.size() >= 3) {
         std::nth_element(widths.begin(), widths.begin() + widths.size() / 2, widths.end());
         const double measure = widths[widths.size() / 2];
-        // Two lines of one paragraph: adjacent baselines (within two line
-        // heights) and a shared left edge (indent allowed) or right edge
-        // (justified or ragged-left).
-        auto stacked = [&](const TextLine& a, const TextLine& b) {
-            double fs = std::max(a.font_size, b.font_size);
-            double dy = std::fabs(a.y_center - b.y_center);
-            if (dy < 0.5 * fs || dy > 2.0 * fs) return false;
-            return std::fabs(a.x_left - b.x_left) <= 2.0 * fs ||
-                   std::fabs(a.x_right - b.x_right) <= 1.0 * fs;
-        };
         auto full = [&](const TextLine& ln) {
             return body_size(ln) && ln.text.size() >= 30 &&
                    ln.x_right - ln.x_left >= 0.6 * measure;
@@ -232,19 +233,28 @@ static std::vector<char> page_body_lines(const std::vector<TextLine>& L,
                 if (j != i && full(L[j]) && stacked(L[i], L[j]))
                     body[i] = 1;
         }
+    }
+    for (size_t i = 0; i < L.size(); i++)
+        if (!body[i] && L[i].x_right - L[i].x_left > 0.4 * page_w && L[i].text.size() >= 30)
+            body[i] = 1;
+    // A paragraph's short last (or first) line: a body-size line in the
+    // size of a full body line one line pitch away, sharing its left edge.
+    // Runs after both full-line tests so that it also holds on a page with
+    // too few body-size lines for a column measure, or with a single wide
+    // line whose paragraph has no second full line.
+    if (body_fs > 0)
         for (size_t i = 0; i < L.size(); i++) {
             if (body[i] || !body_size(L[i]) || L[i].text.empty()) continue;
             for (size_t j = 0; j < L.size(); j++)
-                if (body[j] == 1 && stacked(L[i], L[j]) &&
+                if (body[j] == 1 &&
+                    std::fabs(L[i].font_size - L[j].font_size) <=
+                        0.1 * std::max(L[i].font_size, L[j].font_size) &&
+                    stacked(L[i], L[j]) &&
                     std::fabs(L[i].x_left - L[j].x_left) <= 2.0 * L[i].font_size) {
                     body[i] = 2;
                     break;
                 }
         }
-    }
-    for (size_t i = 0; i < L.size(); i++)
-        if (!body[i] && L[i].x_right - L[i].x_left > 0.4 * page_w && L[i].text.size() >= 30)
-            body[i] = 1;
     return body;
 }
 
