@@ -514,6 +514,38 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    // Test 16: a figure stored as raster strips under two columns of body
+    // text. Its region composite is the figure alone: column lines are
+    // narrower than half the page yet are body text, not labels to grow
+    // over — nor is a paragraph's short last line right above the figure.
+    // Strips span 435x120 pt; taking in the text above would make the
+    // image barely twice as wide as tall.
+    std::cout << "[16] Testing figure strips under multi-column body text...\n";
+    {
+        const char* fixtures[] = {
+            "test/fixtures/pdf/strip_figure_columns.pdf",
+            "test/fixtures/pdf/strip_figure_columns_short_tail.pdf",
+        };
+        for (const char* fx : fixtures) {
+            std::ifstream f(fx);
+            if (!f.good()) {
+                std::cout << "    SKIP: " << fx << "\n";
+                continue;
+            }
+            f.close();
+            auto chunks = jdoc::pdf_to_markdown_chunks(fx);
+            CHECK(chunks.size() == 1);
+            CHECK(chunks[0].images.size() == 1);
+            const auto& img = chunks[0].images[0];
+            double aspect = img.height > 0 ? double(img.width) / img.height : 0;
+            std::cout << "    " << fx << ": " << img.width << "x" << img.height
+                      << " (expected aspect >= 3)\n";
+            CHECK(aspect >= 3.0);
+            CHECK(chunks[0].text.find("sentences") != std::string::npos);
+            CHECK(chunks[0].text.find("evaluation") != std::string::npos);
+        }
+    }
+
     std::cout << "\n=== All tests passed ===\n";
     return 0;
 }
