@@ -2351,7 +2351,13 @@ static std::vector<TextLine> lines_from_upright_chars(
             total_fs += ch.font_size;
             fs_count++;
         }
-        util::append_utf8(cur.text, ch.unicode);
+        // A no-break space is a word space in the line's text. Every other
+        // consumer of the glyph stream (cell text, column bins, word gaps
+        // above) already treats U+00A0 as a space; keeping the code point
+        // here made a line spell "면적 ha" where its table cell spells
+        // "면적 ha", so the capture check that drops table rows from the
+        // prose flow missed the line and the row was printed twice.
+        util::append_utf8(cur.text, ch.unicode == 0xA0 ? uint32_t(' ') : ch.unicode);
         prev_right = ch.right;
     }
     flush();
