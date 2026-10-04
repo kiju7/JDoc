@@ -2418,9 +2418,11 @@ static std::vector<YBand> find_y_bands(const std::vector<TextRow>& rows,
 
 // S2: column boundaries inside a band by x-bin histogram of multi-cell rows.
 //   Returns boundaries (left, inner col-edges, right) — empty on failure.
+// column_evidence: also place boundaries from cell-stack evidence (sparse
+// columns, see below); false gives the gap-and-straddle columns alone.
 static std::vector<double> infer_columns_in_band(
         const std::vector<TextRow>& rows, const YBand& band,
-        double median_fs) {
+        double median_fs, bool column_evidence) {
     // Collect multi-cell rows in the band
     std::vector<size_t> mc;
     for (size_t k = band.first_row; k <= band.last_row; k++)
@@ -2486,26 +2488,155 @@ static std::vector<double> infer_columns_in_band(
         empty_runs.push_back({sx, ex});
     }
 
-    std::vector<double> col_edges;
+    // Glyph extent of row ri inside (a, b) — glyph centres decide.
+    auto row_extent = [&](size_t ri, double a, double b,
+                          double& l, double& r) {
+        l = 1e18; r = -1e18;
+        for (auto& cr : rows[ri].char_ranges) {
+            double c = (cr.first + cr.second) / 2.0;
+            if (c <= a || c >= b) continue;
+            l = std::min(l, cr.first);
+            r = std::max(r, cr.second);
+        }
+        return r > l;
+    };
+    // A column of a table is a stack of cells sharing an alignment: their
+    // left edges, right edges or centres line up (one header cell may set
+    // its own alignment once the stack has four or more cells). Lines of
+    // running text line up too (a paragraph beside a figure's labels), so
+    // a stack whose typical cell is a phrase of five or more words is
+    // prose, not a column. n receives the number of rows with text in
+    // (a, b).
+    const double align_tol = std::max(median_fs * 0.5, 2.0);
+    const double word_gap = std::max(median_fs * 0.2, 1.5);
+    auto stack_aligned = [&](double a, double b, int& n) {
+        std::vector<double> L, R, C;
+        std::vector<int> words;
+        for (size_t ri : mc) {
+            double l, r;
+            if (!row_extent(ri, a, b, l, r)) continue;
+            L.push_back(l); R.push_back(r); C.push_back((l + r) / 2.0);
+            std::vector<std::pair<double, double>> in;
+            for (auto& cr : rows[ri].char_ranges) {
+                double c = (cr.first + cr.second) / 2.0;
+                if (c > a && c < b) in.push_back(cr);
+            }
+            std::sort(in.begin(), in.end());
+            int w = 1;
+            for (size_t k = 1; k < in.size(); k++)
+                if (in[k].first - in[k - 1].second > word_gap) w++;
+            words.push_back(w);
+        }
+        n = (int)L.size();
+        if (n < 2) return false;
+        std::nth_element(words.begin(), words.begin() + words.size() / 2, words.end());
+        if (words[words.size() / 2] >= 5) return false;
+        const int keep = n >= 4 ? n - 1 : n;
+        auto tight = [&](std::vector<double>& v) {
+            std::sort(v.begin(), v.end());
+            for (int st = 0; st + keep <= n; st++)
+                if (v[st + keep - 1] - v[st] <= align_tol) return true;
+            return false;
+        };
+        return tight(L) || tight(R) || tight(C);
+    };
+
+    // Candidate boundaries. A run of bins empty in most rows normally holds
+    // one boundary at its middle. A sparse column (values in fewer than
+    // 40% of the rows) is itself "mostly empty", so its run reaches from the
+    // previous column to the next one (or the band edge) with the sparse
+    // column inside as a hump of hits between bins no row touches at all.
+    // When the hump's cells form an aligned stack, the boundaries are the
+    // untouched sub-runs around it, not the middle of the whole run.
+    struct Cand { double e; double z_lo, z_hi; };   // z_*: untouched sub-run
+    std::vector<Cand> cands;
+    auto zero_runs_in = [&](int b0, int b1) {
+        std::vector<std::pair<int, int>> z;   // [start, end) bins, hit == 0
+        int st = -1;
+        for (int b = b0; b < b1; b++) {
+            if (hit_count[b] == 0) { if (st < 0) st = b; }
+            else if (st >= 0) { z.push_back({st, b}); st = -1; }
+        }
+        if (st >= 0) z.push_back({st, b1});
+        std::vector<std::pair<int, int>> wide;
+        for (auto& r : z)
+            if ((r.second - r.first) * bin_w >= col_gap_min) wide.push_back(r);
+        return wide;
+    };
     for (auto& run : empty_runs) {
         double width = run.second - run.first;
         if (width < col_gap_min) continue;
+        int b0 = (int)std::lround((run.first - x_lo) / bin_w);
+        int b1 = std::min(n_bins, (int)std::lround((run.second - x_lo) / bin_w));
+        auto zr = zero_runs_in(b0, b1);
+        bool hump = false;
+        for (int b = b0; b < b1; b++) if (hit_count[b] > 0) { hump = true; break; }
+        if (column_evidence && hump && !zr.empty()) {
+            // Boundaries at the untouched sub-runs that are not margins;
+            // the stretches between them (and the run's ends) are columns.
+            std::vector<Cand> inner;
+            for (auto& z : zr) {
+                double zl = x_lo + z.first * bin_w, zh = x_lo + z.second * bin_w;
+                double mid = (zl + zh) / 2.0;
+                if (mid <= x_lo + 2.0 || mid >= x_hi - 2.0) continue;
+                inner.push_back({mid, zl, zh});
+            }
+            bool stacks_ok = !inner.empty();
+            for (size_t k = 0; stacks_ok && k <= inner.size(); k++) {
+                double a = (k == 0) ? run.first : inner[k - 1].z_hi;
+                double b = (k == inner.size()) ? run.second : inner[k].z_lo;
+                // A stretch holding no glyph centre is the frayed edge of
+                // the neighbouring column; one holding cells must stack.
+                int n = 0;
+                bool aligned = stack_aligned(a, b, n);
+                if (n > 0 && !aligned) stacks_ok = false;
+            }
+            if (stacks_ok) {
+                for (auto& c : inner) cands.push_back(c);
+                continue;
+            }
+        }
         double mid = (run.first + run.second) / 2.0;
         // skip runs hugging the band edges (those are just margins)
         if (mid <= x_lo + 2.0) continue;
         if (mid >= x_hi - 2.0) continue;
-        col_edges.push_back(mid);
+        // The untouched sub-run nearest the middle, if any, for the
+        // alignment test below.
+        double zl = NAN, zh = NAN, best = 1e18;
+        for (auto& z : zr) {
+            double l = x_lo + z.first * bin_w, h = x_lo + z.second * bin_w;
+            double d = std::abs((l + h) / 2.0 - mid);
+            if (d < best) { best = d; zl = l; zh = h; }
+        }
+        cands.push_back({mid, zl, zh});
     }
-    if (col_edges.empty()) return {};
+    if (cands.empty()) return {};
+    std::sort(cands.begin(), cands.end(),
+              [](const Cand& a, const Cand& b) { return a.e < b.e; });
+    if (std::getenv("JDOC_TABLE_DEBUG")) {
+        fprintf(stderr, "[band-cols] x %.1f..%.1f runs", x_lo, x_hi);
+        for (auto& r : empty_runs) fprintf(stderr, " [%.1f,%.1f]", r.first, r.second);
+        fprintf(stderr, " cands");
+        for (auto& c : cands) fprintf(stderr, " %.1f(%.1f-%.1f)", c.e, c.z_lo, c.z_hi);
+        fprintf(stderr, "\n");
+    }
 
     // Validate: for each candidate boundary, ≥70% of multi-cell rows that
     // overlap a neighborhood of the boundary must "straddle" it (chars on
     // both sides). Rows that have no chars near the boundary are ignored — a
     // row of body text on the opposite side of the page does not invalidate
     // a column boundary inside a data table.
+    //
+    // A sparse first or last column fails that test by construction: rows
+    // with its cell empty have nothing on one side. Such a boundary still
+    // stands on column evidence: no row's glyphs touch a gap at least a
+    // column gap wide around it, and the cells on each side form an aligned
+    // stack — two or more cells on the sparse side, three or more on the
+    // other. Prose torn there leaves no such stacks.
     std::vector<double> kept;
     double neigh = std::max(median_fs * 6.0, 60.0);
-    for (double e : col_edges) {
+    for (size_t ci = 0; ci < cands.size(); ci++) {
+        double e = cands[ci].e;
         int agree = 0;
         int relevant = 0;
         for (size_t ri : mc) {
@@ -2522,7 +2653,15 @@ static std::vector<double> infer_columns_in_band(
             if (has_left && has_right) agree++;
         }
         int needed = std::max(2, (int)std::ceil(relevant * 0.70));
-        if (relevant >= 2 && agree >= needed) kept.push_back(e);
+        if (relevant >= 2 && agree >= needed) { kept.push_back(e); continue; }
+        if (!column_evidence || std::isnan(cands[ci].z_lo)) continue;
+        double a = ci > 0 ? cands[ci - 1].e : x_lo - 1.0;
+        double b = ci + 1 < cands.size() ? cands[ci + 1].e : x_hi + 1.0;
+        int nl = 0, nr = 0;
+        bool al = stack_aligned(a, cands[ci].z_lo, nl);
+        bool ar = stack_aligned(cands[ci].z_hi, b, nr);
+        if (al && ar && std::min(nl, nr) >= 2 && std::max(nl, nr) >= 3)
+            kept.push_back((cands[ci].z_lo + cands[ci].z_hi) / 2.0);
     }
     if (kept.empty()) return {};
 
@@ -3590,9 +3729,11 @@ static std::vector<TableData> detect_text_tables_range(
             if (has_biblio_row) continue;
         }
 
-        // S2: infer columns
-        auto bounds = infer_columns_in_band(rows, band, median_fs);
-        if (bounds.size() < 3) continue;        // need ≥1 inner boundary
+        // S2-S4 for one set of column bounds: the gutter check, wrap-line
+        // absorption, cell building and rejection. False when no table.
+        auto build_band = [&](const std::vector<double>& bounds,
+                              TableData& table) -> bool {
+        if (bounds.size() < 3) return false;    // need ≥1 inner boundary
 
         // On a two-column page a full-width band whose inferred columns
         // split right at the page gutter is usually the two columns'
@@ -3617,7 +3758,7 @@ static std::vector<TableData> detect_text_tables_range(
                     }
                     if (left && right) both_sides++;
                 }
-                if (both_sides * 10 < band_rows * 7) continue;
+                if (both_sides * 10 < band_rows * 7) return false;
             }
         }
 
@@ -3653,11 +3794,37 @@ static std::vector<TableData> detect_text_tables_range(
         }
 
         // S3: build cells
-        TableData table = build_table_from_band(rows, ext, bounds, chars,
-                                                median_fs);
+        table = build_table_from_band(rows, ext, bounds, chars, median_fs);
 
         // S4-S5: rejection
-        if (!accept_table(table)) continue;
+        return accept_table(table);
+        };
+
+        // Whether the band is a table at all, and which rows it holds, is
+        // decided on the columns its gaps support. Cell-stack evidence (a
+        // sparse column, see infer_columns_in_band) then only re-divides
+        // those rows into columns: aligned stacks are what chart legends and
+        // axis ticks are made of too, so they must neither turn a band into
+        // a table nor change which lines a table keeps.
+        TableData table;
+        auto bounds = infer_columns_in_band(rows, band, median_fs, false);
+        if (!build_band(bounds, table)) continue;
+        auto refined = infer_columns_in_band(rows, band, median_fs, true);
+        if (refined != bounds) {
+            TableData t2;
+            auto row_text = [](const std::vector<std::string>& row) {
+                std::string t;
+                for (auto& c : row)
+                    for (char ch : c) if (ch != ' ') t += ch;
+                return t;
+            };
+            bool same_rows = build_band(refined, t2) &&
+                             t2.rows.size() == table.rows.size();
+            for (size_t r = 0; same_rows && r < t2.rows.size(); r++)
+                if (row_text(t2.rows[r]) != row_text(table.rows[r]))
+                    same_rows = false;
+            if (same_rows) table = std::move(t2);
+        }
 
         table.kind = TableData::TEXT;
         result.push_back(std::move(table));
