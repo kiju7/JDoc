@@ -1,5 +1,6 @@
 // test_pdf.cpp — Test PDF to Markdown conversion using PDFium backend
 #include "jdoc/pdf.h"
+#include "pdf/pdf_extract.h"
 
 #include <iostream>
 #include <fstream>
@@ -617,6 +618,31 @@ int main(int argc, char* argv[]) {
             size_t tail = md.find("The smallest park");
             CHECK(tbl != std::string::npos && tail != std::string::npos && tbl < tail);
         }
+    }
+
+    // [19] Markdown table padding counts display columns, not UTF-8 bytes:
+    // a Hangul syllable is 3 bytes but 2 columns, so byte-based padding left
+    // Korean cells short and the pipes out of line with Latin rows. Wide
+    // (Hangul, kana, CJK, full-width), combining (U+0301, conjoining Jamo
+    // vowels and finals) and narrow cells must all end on the same columns,
+    // the separator dashes included, and bold markers count as text.
+    std::cout << "[19] Testing table padding by display width...\n";
+    {
+        jdoc::pdf_detail::TableData t{};
+        t.rows = {{"공원", "면적 ha", "비고"},
+                  {"중앙공원", "42", "カナ漢字"},
+                  {"Riverside", "7", "ＡＢ e\xCC\x81"},
+                  {"\xE1\x84\x80\xE1\x85\xA1\xE1\x86\xA8", "", "x"}};
+        t.cell_bold = {{1, 1, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}};
+        const std::string md = jdoc::pdf_detail::format_table(t);
+        const std::string want =
+            "| **공원**  | **면적 ha** | 비고     |\n"
+            "| --------- | ----------- | -------- |\n"
+            "| 중앙공원  | 42          | カナ漢字 |\n"
+            "| Riverside | 7           | ＡＢ e\xCC\x81   |\n"
+            "| \xE1\x84\x80\xE1\x85\xA1\xE1\x86\xA8        |             | x        |\n";
+        if (md != want) std::cerr << "got:\n" << md << "want:\n" << want;
+        CHECK(md == want);
     }
 
     std::cout << "\n=== All tests passed ===\n";

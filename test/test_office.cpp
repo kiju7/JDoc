@@ -5,6 +5,7 @@
 #include "jdoc/archive.h"
 #include "jdoc/detect.h"
 #include "zip_reader.h"
+#include "common/file_utils.h"
 #include "common/string_utils.h"
 #include "legacy/ole_reader.h"
 #include "ooxml/xlsb_parser.h"
@@ -1652,6 +1653,59 @@ static std::string convert_html_with(const std::string& html,
         "page.html", opts);
 }
 
+// ── Markdown table padding by display width ─────────────────
+
+// Pipe tables are padded so their columns line up in a monospace view. The
+// padding counts display columns: East Asian wide/full-width characters take
+// two, combining marks none. Counting UTF-8 bytes instead left Hangul cells
+// (3 bytes, 2 columns) short of their Latin neighbours.
+void test_table_display_width() {
+    std::cerr << "\nMarkdown table padding by display width:\n";
+    using jdoc::util::display_width;
+
+    TEST(display_width_rule)
+        ASSERT(display_width(std::string("abc 12")) == 6);
+        ASSERT(display_width(std::string("공원")) == 4);               // Hangul syllables
+        ASSERT(display_width(std::string("\xE3\x84\xB1")) == 2);       // U+3131 compat jamo
+        ASSERT(display_width(std::string("\xE1\x84\x80\xE1\x85\xA1\xE1\x86\xA8")) == 2);  // NFD 각
+        ASSERT(display_width(std::string("漢字")) == 4);               // CJK ideographs
+        ASSERT(display_width(std::string("カナ")) == 4);               // katakana
+        ASSERT(display_width(std::string("\xE3\x81\x8B\xE3\x82\x99")) == 2);  // か + U+3099
+        ASSERT(display_width(std::string("ＡＢ")) == 4);               // full-width forms
+        ASSERT(display_width(std::string("e\xCC\x81")) == 1);          // e + U+0301
+        ASSERT(display_width(std::string("a\xE2\x80\x8B" "b")) == 2);  // zero-width space
+        ASSERT(display_width(std::string("\xC3\xA9\xC3\x9F")) == 2);   // Latin-1 letters
+        ASSERT(display_width(std::string("\xE2\x80\x94")) == 1);       // em dash stays narrow
+    TEST_END
+
+    TEST(format_padded_markdown_table_hangul)
+        const std::string md = jdoc::util::format_padded_markdown_table(
+            {{"구분", "Value"}, {"중앙공원", "42"}, {"Riverside Park", "7"}}, 2);
+        ASSERT(md ==
+               "| 구분           | Value |\n"
+               "| -------------- | ----- |\n"
+               "| 중앙공원       | 42    |\n"
+               "| Riverside Park | 7     |\n");
+        // Short rows are filled, n_cols bounds the row, empty input yields "".
+        ASSERT(jdoc::util::format_padded_markdown_table({{"가"}, {"a", "b"}}, 1) ==
+               "| 가  |\n| --- |\n| a   |\n");
+        ASSERT(jdoc::util::format_padded_markdown_table({}, 2).empty());
+    TEST_END
+
+    TEST(html_table_hangul_alignment)
+        const std::string md = convert_html(
+            "<html><head><meta charset=\"utf-8\"></head><body><table>"
+            "<tr><td>공원</td><td>면적 ha</td></tr>"
+            "<tr><td>중앙공원</td><td>42</td></tr>"
+            "<tr><td>North Park</td><td>7</td></tr>"
+            "</table></body></html>");
+        ASSERT(md.find("| 공원       | 면적 ha |\n"
+                       "| ---------- | ------- |\n"
+                       "| 중앙공원   | 42      |\n"
+                       "| North Park | 7       |\n") != std::string::npos);
+    TEST_END
+}
+
 void test_html_images() {
     std::cerr << "\nHTML embedded images:\n";
 
@@ -1941,6 +1995,7 @@ int main() {
     test_xlsb_sparse_cells();
     test_html_charset();
     test_html_images();
+    test_table_display_width();
     test_pptx_linebreak();
 
     std::cerr << "\n=== Results: " << tests_passed << " passed, "
