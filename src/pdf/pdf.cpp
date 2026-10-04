@@ -638,6 +638,7 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
             doc, content_data, resources, page_h, &font_cache, parse_options,
             initial_ctm);
 
+        drop_overprinted_chars(parse_result.chars);
         result.all_lines[p] = chars_to_lines(parse_result.chars, &result.col_boundaries[p]);
         if (plaintext)
             result.layout_text[p] = layout_page_text(parse_result.chars,

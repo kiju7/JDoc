@@ -2112,6 +2112,48 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
     return result;
 }
 
+void drop_overprinted_chars(std::vector<TextChar>& chars) {
+    // Bucket by character and a 2pt grid; a copy lies in a neighbouring cell.
+    auto key = [](uint32_t u, int16_t rot, long gx, long gy) {
+        return (static_cast<uint64_t>(u) << 40) ^ (static_cast<uint64_t>(rot & 0xFF) << 32) ^
+               (static_cast<uint64_t>(gx & 0xFFFF) << 16) ^ static_cast<uint64_t>(gy & 0xFFFF);
+    };
+    std::unordered_map<uint64_t, std::vector<uint32_t>> seen;
+    seen.reserve(chars.size());
+    size_t out = 0;
+    for (size_t i = 0; i < chars.size(); i++) {
+        const TextChar& c = chars[i];
+        // Along the line a copy sits within 0.12 em: overprints are struck
+        // within about 0.08 em (faked bold, outline stacks), while a doubled
+        // letter sits a whole advance on, at least 0.22 em even for "ll" or
+        // "II". Across the line, within a fifth of the type size.
+        double tol_x = std::max(c.font_size * 0.12, 0.3);
+        double tol = std::max(c.font_size * 0.2, 0.5);
+        long gx = std::lround(c.x / 2.0), gy = std::lround(c.y / 2.0);
+        long reach = static_cast<long>(std::ceil(tol / 2.0));
+        bool copy = false;
+        for (long dx = -reach; dx <= reach && !copy; dx++)
+            for (long dy = -reach; dy <= reach && !copy; dy++) {
+                auto it = seen.find(key(c.unicode, c.rot, gx + dx, gy + dy));
+                if (it == seen.end()) continue;
+                for (uint32_t k : it->second) {
+                    const TextChar& o = chars[k];
+                    if (std::abs(o.x - c.x) < tol_x && std::abs(o.y - c.y) < tol &&
+                        std::min(o.font_size, c.font_size) >
+                            std::max(o.font_size, c.font_size) * 0.8) {
+                        copy = true;
+                        break;
+                    }
+                }
+            }
+        if (copy) continue;
+        if (out != i) chars[out] = c;
+        seen[key(c.unicode, c.rot, gx, gy)].push_back(static_cast<uint32_t>(out));
+        out++;
+    }
+    chars.resize(out);
+}
+
 // ── Layout Engine: TextChar → TextLine ───────────────────
 
 

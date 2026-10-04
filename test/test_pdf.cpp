@@ -1164,6 +1164,28 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    // Test 26: glyphs drawn again over themselves (make_overprint_fixture.py):
+    // a run struck twice 0.3pt apart to fake bold and a headline stacked
+    // eight times read once, while doubled letters a whole advance apart
+    // ("ll", "ss", "III", "77") all stay.
+    std::cout << "[26] Testing overprinted glyphs...\n";
+    {
+        const char* fx = "test/fixtures/pdf/overprint.pdf";
+        std::ifstream f(fx);
+        if (!f.good()) {
+            std::cout << "    SKIP: " << fx << "\n";
+        } else {
+            f.close();
+            std::string md = jdoc::pdf_to_markdown(fx);
+            CHECK(md.find("Bold Title") != std::string::npos);
+            CHECK(md.find("BBoo") == std::string::npos);
+            CHECK(md.find("Shadow") != std::string::npos);
+            CHECK(md.find("SSha") == std::string::npos);
+            CHECK(md.find("Hallucination Association III 77") != std::string::npos);
+            std::cout << "    copies dropped, doubled letters kept OK\n";
+        }
+    }
+
     std::cout << "\n=== All tests passed ===\n";
     return 0;
 }

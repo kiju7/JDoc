@@ -488,6 +488,13 @@ std::vector<int> explicit_word_spaces(const std::vector<TextChar>& chars);
 // Smallest gap, in ems, at which such a written space still counts.
 constexpr double kWrittenSpaceMinEm = 0.02;
 
+// Drops glyphs drawn again over themselves: the same character at nearly
+// the same origin (within 0.12 em along the line and 0.2 em across it), in
+// the same direction and size. Producers fake bold by striking a run twice with a small offset
+// and draw outlined or shadowed headlines as a stack of copies; the copies
+// add ink, not text. The first glyph of each stack stays, in stream order.
+void drop_overprinted_chars(std::vector<TextChar>& chars);
+
 std::vector<TextLine> chars_to_lines(const std::vector<TextChar>& chars,
                                      double* out_col_boundary = nullptr);
 // Plain-text page body as a character grid built from glyph coordinates
