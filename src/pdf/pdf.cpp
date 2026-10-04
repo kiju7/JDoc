@@ -1600,7 +1600,7 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
                             result.page_diags[p] = before;
                             if (!rendered.saved_path.empty())
                                 std::remove(rendered.saved_path.c_str());
-                            batch.push_back(idx);
+                            if (!seen(idx)) batch.push_back(idx);
                             continue;
                         }
                         mark_seen(idx);
