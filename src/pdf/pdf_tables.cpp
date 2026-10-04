@@ -1698,6 +1698,121 @@ std::vector<TableData> detect_tables(const std::vector<PdfLineSegment>& lines,
     return result;
 }
 
+// Banded (zebra) tables commonly leave the first or last body row
+// unshaded: stripes start on the second body row, or the row count is odd
+// and the last stripe falls on a white row. The shading run then stops at
+// the last painted rect and the unshaded row is cut off. Extend the run
+// level by level over adjacent row slots (one row pitch each) whose text
+// is a single line that stays inside the table's width and whose word
+// spans each fall inside one column of the run's own text-inferred grid,
+// covering at least half the columns, and that keeps the run's row rhythm:
+// its line sits one pitch from the text of the run's edge row, and no other
+// line follows within most of a pitch (a header-only tint above a tighter
+// body is not a band; absorbing one body row of it would split the body).
+// A caption, a paragraph or a note fails: it crosses a column boundary,
+// spills past the table or wraps.
+static void extend_shading_run_to_aligned_rows(
+        std::vector<double>& run, double left, double right,
+        const PageCharCache& cache,
+        const std::vector<TableData>& existing_tables) {
+    if (run.size() < 3 || right - left < 30.0) return;
+    std::vector<double> gaps;
+    for (size_t i = 1; i < run.size(); i++) gaps.push_back(run[i] - run[i - 1]);
+    std::nth_element(gaps.begin(), gaps.begin() + gaps.size() / 2, gaps.end());
+    const double pitch = gaps[gaps.size() / 2];
+    if (pitch < 6.0) return;
+    const auto cols = infer_columns_from_text(cache, left, right, run);
+    if (cols.size() < 3) return;
+    const int n_cols = (int)cols.size() - 1;
+    double min_col_w = 1e9;
+    for (int c = 0; c < n_cols; c++)
+        min_col_w = std::min(min_col_w, cols[c + 1] - cols[c]);
+
+    auto in_x = [&](const PageCharCache::CharInfo& ch) {
+        return ch.unicode != ' ' && ch.unicode != 0xA0 && ch.unicode != '\t' &&
+               ch.x >= left - 2.0 && ch.x <= right + 2.0;
+    };
+    // Text line center of a run row (median glyph center), NaN when empty.
+    auto row_text_y = [&](double lo, double hi) {
+        std::vector<double> ys;
+        for (auto& ch : cache.chars)
+            if (in_x(ch) && ch.y > lo + 1.0 && ch.y < hi - 1.0) ys.push_back(ch.y);
+        if (ys.empty()) return std::nan("");
+        std::nth_element(ys.begin(), ys.begin() + ys.size() / 2, ys.end());
+        return ys[ys.size() / 2];
+    };
+
+    // dir < 0: slot below the run (lower y); dir > 0: above it.
+    auto slot_is_row = [&](double lo, double hi, double edge_text_y, int dir) {
+        if (std::isnan(edge_text_y)) return false;
+        for (auto& t : existing_tables) {
+            double tb = std::min(t.y0, t.y1), tt = std::max(t.y0, t.y1);
+            double tl = std::min(t.x0, t.x1), tr = std::max(t.x0, t.x1);
+            if (std::min(hi, tt) - std::max(lo, tb) > 2.0 &&
+                std::min(right, tr) - std::max(left, tl) > 2.0)
+                return false;
+        }
+        std::vector<std::pair<double,double>> ranges;
+        double y_lo = 1e9, y_hi = -1e9, h_max = 0;
+        for (auto& ch : cache.chars) {
+            if (ch.unicode == ' ' || ch.unicode == 0xA0 || ch.unicode == '\t')
+                continue;
+            if (ch.y <= lo + 1.0 || ch.y >= hi - 1.0) continue;
+            if (ch.x < left - 2.0 || ch.x > right + 2.0) {
+                // Text beside the table within a column width is the same
+                // line running past it (prose); farther off is another
+                // page column and says nothing about this slot.
+                if (ch.right > left - min_col_w && ch.left < right + min_col_w)
+                    return false;
+                continue;
+            }
+            // The glyph must sit inside the slot, not straddle its edge.
+            if (ch.top > hi + 1.0 || ch.bot < lo - 1.0) return false;
+            ranges.push_back({ch.left, ch.right});
+            y_lo = std::min(y_lo, ch.y);
+            y_hi = std::max(y_hi, ch.y);
+            h_max = std::max(h_max, ch.top - ch.bot);
+        }
+        if (ranges.size() < 2) return false;
+        if (y_hi - y_lo > std::max(2.0, h_max * 0.5)) return false;  // wraps
+        auto spans = merge_char_ranges(ranges);
+        if (spans.size() < 2) return false;
+        std::vector<bool> hit(n_cols, false);
+        for (auto& sp : spans) {
+            int col = -1;
+            for (int c = 0; c < n_cols; c++)
+                if (sp.first >= cols[c] - 2.0 && sp.second <= cols[c + 1] + 2.0) {
+                    col = c;
+                    break;
+                }
+            if (col < 0) return false;   // crosses a column boundary
+            hit[col] = true;
+        }
+        int n_hit = 0;
+        for (bool h : hit) n_hit += h ? 1 : 0;
+        if (n_hit < 2 || n_hit * 2 < n_cols) return false;
+        // Row rhythm: one pitch from the edge row's line, and no line
+        // crowding it from outside.
+        const double cand_y = (y_lo + y_hi) / 2.0;
+        if (std::abs(std::abs(edge_text_y - cand_y) - pitch) > pitch * 0.25)
+            return false;
+        for (auto& ch : cache.chars) {
+            if (!in_x(ch)) continue;
+            double d = (ch.y - cand_y) * dir;   // > 0: outward
+            if (d > std::max(2.0, h_max * 0.5) && d < pitch * 0.75) return false;
+        }
+        return true;
+    };
+
+    // Lower edge (smaller y) first, then the upper edge.
+    while (slot_is_row(run.front() - pitch, run.front(),
+                       row_text_y(run[0], run[1]), -1))
+        run.insert(run.begin(), run.front() - pitch);
+    while (slot_is_row(run.back(), run.back() + pitch,
+                       row_text_y(run[run.size() - 2], run.back()), +1))
+        run.push_back(run.back() + pitch);
+}
+
 // ── Shading-grid table detection ────────────────────────────────────
 //
 // Tables drawn with cell background fills and no rules at all (zebra
@@ -1848,7 +1963,7 @@ std::vector<TableData> detect_shading_tables(
     if (cur.size() >= 3) runs.push_back(cur);
 
     std::vector<TableData> result;
-    for (auto& run : runs) {
+    for (auto run : runs) {
         double y_min = run.front(), y_max = run.back();
 
         bool overlaps = false;
@@ -1869,6 +1984,23 @@ std::vector<TableData> detect_shading_tables(
         std::vector<const PdfFillRect*> rrects;
         for (auto& r : grid)
             if (r.y0 >= y_min - 3.0 && r.y1 <= y_max + 3.0) rrects.push_back(&r);
+
+        // Unshaded first/last rows that continue the column alignment.
+        const double painted_min = y_min, painted_max = y_max;
+        {
+            double rl = 1e9, rr = -1e9;
+            for (auto* r : rrects) {
+                rl = std::min(rl, (double)r->x0);
+                rr = std::max(rr, (double)r->x1);
+            }
+            if (rr > rl) {
+                std::vector<TableData> others = existing_tables;
+                others.insert(others.end(), result.begin(), result.end());
+                extend_shading_run_to_aligned_rows(run, rl, rr, cache, others);
+                y_min = run.front();
+                y_max = run.back();
+            }
+        }
 
         // Shading often starts several columns into a table (for example,
         // forecast columns are tinted while row labels and historical values
@@ -1917,7 +2049,10 @@ std::vector<TableData> detect_shading_tables(
         for (double ry : run) {
             double lo = 1e9, hi = -1e9;
             for (auto* r : rrects) {
-                if (std::abs(r->y0 - ry) < 3.0 || std::abs(r->y1 - ry) < 3.0) {
+                // An extended (unshaded) level is bounded like the run.
+                bool extended = ry < painted_min - 1.0 || ry > painted_max + 1.0;
+                if (extended || std::abs(r->y0 - ry) < 3.0 ||
+                    std::abs(r->y1 - ry) < 3.0) {
                     lo = std::min(lo, (double)r->x0);
                     hi = std::max(hi, (double)r->x1);
                 }
@@ -1940,6 +2075,12 @@ std::vector<TableData> detect_shading_tables(
             if (text_extended_grid) {
                 lo = y_min;
                 hi = y_max;
+            }
+            // A rule reaching the painted edge continues over the
+            // extended unshaded rows.
+            if (hi > lo) {
+                if (y_min < painted_min - 1.0 && lo < painted_min + 3.0) lo = y_min;
+                if (y_max > painted_max + 1.0 && hi > painted_max - 3.0) hi = y_max;
             }
             if (hi > lo)
                 v_synth.push_back({static_cast<float>(cx), static_cast<float>(lo),
