@@ -815,6 +815,13 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
             // returned the page, not the figure, and carried none of the
             // page text. Pages without text (scans, vector-text pages) still
             // composite whole.
+            // Text-line classes the single-raster overlay test below shares
+            // with fragment_regions: a numbered caption, and body text (a
+            // wide line carrying real character mass).
+            auto caption_line = [](const std::string& t) { return is_caption_line(t); };
+            auto body_line = [&](const TextLine& ln) {
+                return ln.x_right - ln.x_left > 0.4 * page_w && ln.text.size() >= 30;
+            };
             bool split_regions = fragment_page && !no_text && !vector_text_page;
             std::vector<std::array<double, 4>> regions;
             if (split_regions) {
@@ -1382,11 +1389,16 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
                     }
                     remaining.swap(kept);
                 }
-                if (!remaining.empty()) {
+                // Original rasters go out as their own bytes; the batch is
+                // flushed whenever a composite has to take the next name, so
+                // file names keep content-stream order.
+                auto export_raw = [&](const std::vector<size_t>& list) {
+                    if (list.empty()) return;
                     auto extracted = extract_page_images(
                         doc, resources, parse_result, p, image_dir,
                         opts.min_image_size, &result.page_diags[p],
-                        &remaining, img_idx);
+                        &list, img_idx);
+                    img_idx += static_cast<int>(extracted.size());
                     for (auto& ei : extracted) {
                         if (fig_debug) {
                             double ix0 = std::min(ei.ctm[4],
@@ -1413,6 +1425,225 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
                         result.all_image_x[p].push_back(ei.ctm[4]); // X position
                         result.all_images[p].push_back(std::move(ei.img));
                     }
+                };
+
+                // ── Text drawn over a standalone raster ─────────────
+                // A chart or photo saved as one raster often gets its title,
+                // values and axis labels as real text objects painted on top
+                // of it. The raster's own bytes lack them, so such a
+                // placement composites (raster, then the glyphs over it, in
+                // content-stream order) into its own region, exactly as a
+                // fragmented figure does. Only glyphs that are drawn — an
+                // embedded font program, not Tr 3/7 — after the raster and
+                // within its visible box count; text under it is hidden and
+                // invisible OCR layers paint nothing. The raster stays
+                // original when it is the page's background (it fills the
+                // page, so its "labels" are the page itself) or when body
+                // text runs over it: running text across a picture or a
+                // caption on it is page text on a backdrop, not a label.
+                std::vector<char> overlaid(parse_result.images.size(), 0);
+                if (!remaining.empty() && !parse_result.glyphs.empty()) {
+                    std::vector<const PlacementInfo*> by_idx(
+                        parse_result.images.size(), nullptr);
+                    for (auto& info : infos) by_idx[info.idx] = &info;
+                    for (size_t idx : remaining) {
+                        const PlacementInfo* pi = by_idx[idx];
+                        if (!pi) continue;
+                        // Too small to export at all: leave it to the
+                        // extractor's own skip.
+                        if (opts.min_image_size > 0 &&
+                            (pi->px_w < static_cast<int>(opts.min_image_size) ||
+                             pi->px_h < static_cast<int>(opts.min_image_size)))
+                            continue;
+                        const double B[4] = {std::max(pi->x0, 0.0), std::max(pi->y0, 0.0),
+                                             std::min(pi->x1, page_w), std::min(pi->y1, page_h)};
+                        const double bw = B[2] - B[0], bh = B[3] - B[1];
+                        if (bw < 1.0 || bh < 1.0) continue;
+                        if (bw * bh >= 0.9 * page_w * page_h) continue;
+                        const int seq = parse_result.images[idx].seq;
+                        bool over = false;
+                        for (auto& g : parse_result.glyphs) {
+                            if (g.seq < seq) continue;
+                            // Centre of the em box (descender to ascender).
+                            double cx = g.m[0] * 0.5 + g.m[2] * 0.35 + g.m[4];
+                            double cy = g.m[1] * 0.5 + g.m[3] * 0.35 + g.m[5];
+                            if (cx < B[0] || cx > B[2] || cy < B[1] || cy > B[3]) continue;
+                            if (cx < g.clip[0] || cx > g.clip[2] ||
+                                cy < g.clip[1] || cy > g.clip[3]) continue;
+                            over = true;
+                            break;
+                        }
+                        if (!over) continue;
+                        bool backdrop = false;
+                        int held_body = 0;
+                        for (auto& ln : result.all_lines[p]) {
+                            if (ln.text.empty()) continue;
+                            if (ln.y_center < B[1] || ln.y_center > B[3]) continue;
+                            double lw = ln.x_right - ln.x_left;
+                            double inside = std::min(ln.x_right, B[2]) -
+                                            std::max(ln.x_left, B[0]);
+                            if (inside <= 0) continue;
+                            if (caption_line(ln.text)) { backdrop = true; break; }
+                            // Page body text crossing the picture's edge.
+                            if (body_line(ln) && inside < 0.7 * lw) { backdrop = true; break; }
+                            // Body text the picture holds: the vector-figure
+                            // test, wide for the box and with real mass.
+                            if (lw > std::max(0.5 * bw, 60.0) && ln.text.size() >= 30 &&
+                                inside >= 0.7 * lw)
+                                held_body++;
+                        }
+                        if (backdrop || held_body >= 2) {
+                            if (fig_debug)
+                                fprintf(stderr, "[figdbg] p=%d raster overlay"
+                                        " kept:backdrop (%.1f,%.1f)-(%.1f,%.1f)\n",
+                                        p + 1, B[0], B[1], B[2], B[3]);
+                            continue;
+                        }
+                        overlaid[idx] = 1;
+                    }
+                }
+
+                // Words of drawn glyphs: runs of glyphs shown one after
+                // another whose em boxes (descender to ascender, one em
+                // wide: the compositor's own glyph box) touch or nearly
+                // touch. A word space keeps a label in one word; the gap
+                // between two labels on one baseline splits them.
+                struct GlyphWord { double x0, y0, x1, y1; int seq; };
+                std::vector<GlyphWord> glyph_words;
+                if (std::find(overlaid.begin(), overlaid.end(), 1) != overlaid.end()) {
+                    int last_seq = -2;
+                    for (auto& g : parse_result.glyphs) {
+                        double gx0 = 1e300, gy0 = 1e300, gx1 = -1e300, gy1 = -1e300;
+                        for (double ux : {0.0, 1.0})
+                            for (double uy : {-0.3, 1.0}) {
+                                double px = g.m[0] * ux + g.m[2] * uy + g.m[4];
+                                double py = g.m[1] * ux + g.m[3] * uy + g.m[5];
+                                gx0 = std::min(gx0, px); gx1 = std::max(gx1, px);
+                                gy0 = std::min(gy0, py); gy1 = std::max(gy1, py);
+                            }
+                        if (!std::isfinite(gx0) || !std::isfinite(gy0) ||
+                            !std::isfinite(gx1) || !std::isfinite(gy1))
+                            continue;
+                        double em = std::sqrt(std::abs(g.m[0] * g.m[3] - g.m[1] * g.m[2]));
+                        bool join = false;
+                        if (!glyph_words.empty() && g.seq == last_seq + 1) {
+                            auto& w = glyph_words.back();
+                            double gx = std::max(w.x0, gx0) - std::min(w.x1, gx1);
+                            double gy = std::max(w.y0, gy0) - std::min(w.y1, gy1);
+                            join = gx <= 0.3 * em && gy <= 0.3 * em;
+                        }
+                        if (join) {
+                            auto& w = glyph_words.back();
+                            w.x0 = std::min(w.x0, gx0); w.y0 = std::min(w.y0, gy0);
+                            w.x1 = std::max(w.x1, gx1); w.y1 = std::max(w.y1, gy1);
+                        } else {
+                            glyph_words.push_back({gx0, gy0, gx1, gy1, g.seq});
+                        }
+                        last_seq = g.seq;
+                    }
+                }
+
+                {
+                    // A source drawn again later is a duplicate the extractor
+                    // skips within one call; across flushed batches (and
+                    // after a composite took it) that is done here.
+                    std::unordered_set<int> seen_refs;
+                    std::unordered_set<std::string> seen_names;
+                    auto seen = [&](size_t idx) {
+                        const auto& ip = parse_result.images[idx];
+                        if (ip.inline_img) return false;
+                        if (ip.xobj_ref >= 0) return seen_refs.count(ip.xobj_ref) > 0;
+                        return !ip.xobj_name.empty() && seen_names.count(ip.xobj_name) > 0;
+                    };
+                    auto mark_seen = [&](size_t idx) {
+                        const auto& ip = parse_result.images[idx];
+                        if (ip.inline_img) return;
+                        if (ip.xobj_ref >= 0) seen_refs.insert(ip.xobj_ref);
+                        else if (!ip.xobj_name.empty()) seen_names.insert(ip.xobj_name);
+                    };
+                    auto flush = [&](std::vector<size_t>& batch) {
+                        export_raw(batch);
+                        for (size_t i : batch) mark_seen(i);
+                        batch.clear();
+                    };
+                    std::vector<size_t> batch;
+                    for (size_t idx : remaining) {
+                        if (handled[idx]) continue;
+                        if (!overlaid[idx]) {
+                            if (!seen(idx)) batch.push_back(idx);
+                            continue;
+                        }
+                        const PlacementInfo* pi = nullptr;
+                        for (auto& info : infos)
+                            if (info.idx == idx) { pi = &info; break; }
+                        // The region is the picture plus the words drawn
+                        // on it, whole: a title straddling its edge is not
+                        // cut. Words, not lines: labels of panels standing
+                        // side by side merge into one page-wide line, and
+                        // growing over that line would take in half of the
+                        // next panel.
+                        double rg[4] = {std::max(pi->x0, 0.0), std::max(pi->y0, 0.0),
+                                        std::min(pi->x1, page_w), std::min(pi->y1, page_h)};
+                        {
+                            const double B[4] = {rg[0], rg[1], rg[2], rg[3]};
+                            const int seq = parse_result.images[idx].seq;
+                            for (auto& w : glyph_words) {
+                                if (w.seq < seq) continue;
+                                if (w.x1 <= B[0] || w.x0 >= B[2] || w.y1 <= B[1] || w.y0 >= B[3])
+                                    continue;
+                                rg[0] = std::min(rg[0], w.x0); rg[1] = std::min(rg[1], w.y0);
+                                rg[2] = std::max(rg[2], w.x1); rg[3] = std::max(rg[3], w.y1);
+                            }
+                            rg[0] = std::max(rg[0], 0.0); rg[1] = std::max(rg[1], 0.0);
+                            rg[2] = std::min(rg[2], page_w); rg[3] = std::min(rg[3], page_h);
+                        }
+                        if (fig_debug)
+                            fprintf(stderr, "[figdbg] p=%d raster overlay composite"
+                                    " (%.1f,%.1f)-(%.1f,%.1f) -> (%.1f,%.1f)-(%.1f,%.1f)\n",
+                                    p + 1, pi->x0, pi->y0, pi->x1, pi->y1,
+                                    rg[0], rg[1], rg[2], rg[3]);
+                        // Rasters stamped over this one (a logo, a marker)
+                        // draw with it.
+                        std::vector<size_t> members{idx};
+                        for (auto& info : infos)
+                            if (info.idx != idx && !handled[info.idx] && !overlaid[info.idx] &&
+                                parse_result.images[info.idx].seq > parse_result.images[idx].seq &&
+                                std::find(batch.begin(), batch.end(), info.idx) == batch.end() &&
+                                info.x0 >= rg[0] && info.x1 <= rg[2] &&
+                                info.y0 >= rg[1] && info.y1 <= rg[3])
+                                members.push_back(info.idx);
+                        std::sort(members.begin(), members.end());
+                        flush(batch);
+                        const PageRenderDiag before = result.page_diags[p];
+                        ImageData rendered;
+                        {
+                            CompositeMemoryLease lease(
+                                composite_memory,
+                                composite_memory_cost(rg[2] - rg[0], rg[3] - rg[1]));
+                            rendered = render_region_composite(
+                                doc, resources, parse_result, members, p, rg,
+                                image_dir, img_idx, &result.page_diags[p]);
+                        }
+                        // A raster the compositor could not decode would come
+                        // back as bare text: keep the original instead.
+                        bool empty = rendered.data.empty() && rendered.pixels.empty() &&
+                                     rendered.saved_path.empty();
+                        if (empty || result.page_diags[p].images_failed > before.images_failed) {
+                            result.page_diags[p] = before;
+                            if (!rendered.saved_path.empty())
+                                std::remove(rendered.saved_path.c_str());
+                            if (!seen(idx)) batch.push_back(idx);
+                            continue;
+                        }
+                        mark_seen(idx);
+                        for (size_t mi : members) handled[mi] = 1;
+                        result.all_images[p].push_back(std::move(rendered));
+                        result.all_image_y[p].push_back(rg[3]);
+                        result.all_image_x[p].push_back(rg[0]);
+                        done_regions.push_back({rg[0], rg[1], rg[2], rg[3]});
+                        img_idx++;
+                    }
+                    flush(batch);
                 }
 
                 // Fallback: render page for scanned/vector-only pages.
