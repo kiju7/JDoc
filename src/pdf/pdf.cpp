@@ -690,7 +690,75 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
             };
             // Body text: a wide line carrying real character mass. Labels,
             // ticks and titles are short.
+            //
+            // "Wide" is measured against the text column, not the page: on a
+            // two- or three-column page a full body line spans well under
+            // 0.4 of the page, so a page-width test alone takes a whole
+            // paragraph above a figure for a stack of labels. The column
+            // measure is the median width of the lines set in the page's
+            // body size (the size carrying the most characters); a line in
+            // that size spanning most of the measure, with character mass,
+            // and stacked in a paragraph (a same-size line one line pitch
+            // above or below with an aligned edge) is body text. Figure
+            // labels are set in their own sizes, are short, or stand alone,
+            // so they stay labels. A paragraph's short last line (or a short
+            // first line) is body text through the full line it continues.
+            std::vector<char> column_body(result.all_lines[p].size(), 0);
+            {
+                const auto& L = result.all_lines[p];
+                std::map<int, size_t> size_mass;
+                for (auto& ln : L)
+                    if (ln.font_size > 1.0)
+                        size_mass[static_cast<int>(std::lround(ln.font_size * 10))] += ln.text.size();
+                int body_key = 0;
+                size_t best_mass = 0;
+                for (auto& [k, m] : size_mass)
+                    if (m > best_mass) { best_mass = m; body_key = k; }
+                const double body_fs = body_key / 10.0;
+                auto body_size = [&](const TextLine& ln) {
+                    return body_fs > 0 && std::fabs(ln.font_size - body_fs) <= 0.1 * body_fs;
+                };
+                std::vector<double> widths;
+                for (auto& ln : L)
+                    if (body_size(ln)) widths.push_back(ln.x_right - ln.x_left);
+                if (widths.size() >= 3) {
+                    std::nth_element(widths.begin(), widths.begin() + widths.size() / 2, widths.end());
+                    const double measure = widths[widths.size() / 2];
+                    // Two lines of one paragraph: adjacent baselines (within
+                    // two line heights) and a shared left edge (indent
+                    // allowed) or right edge (justified or ragged-left).
+                    auto stacked = [&](const TextLine& a, const TextLine& b) {
+                        double fs = std::max(a.font_size, b.font_size);
+                        double dy = std::fabs(a.y_center - b.y_center);
+                        if (dy < 0.5 * fs || dy > 2.0 * fs) return false;
+                        return std::fabs(a.x_left - b.x_left) <= 2.0 * fs ||
+                               std::fabs(a.x_right - b.x_right) <= 1.0 * fs;
+                    };
+                    auto full = [&](const TextLine& ln) {
+                        return body_size(ln) && ln.text.size() >= 30 &&
+                               ln.x_right - ln.x_left >= 0.6 * measure;
+                    };
+                    for (size_t i = 0; i < L.size(); i++) {
+                        if (!full(L[i])) continue;
+                        for (size_t j = 0; j < L.size() && !column_body[i]; j++)
+                            if (j != i && full(L[j]) && stacked(L[i], L[j]))
+                                column_body[i] = 1;
+                    }
+                    for (size_t i = 0; i < L.size(); i++) {
+                        if (column_body[i] || !body_size(L[i]) || L[i].text.empty()) continue;
+                        for (size_t j = 0; j < L.size(); j++)
+                            if (column_body[j] == 1 && stacked(L[i], L[j]) &&
+                                std::fabs(L[i].x_left - L[j].x_left) <= 2.0 * L[i].font_size) {
+                                column_body[i] = 2;
+                                break;
+                            }
+                    }
+                }
+            }
             auto body_line = [&](const TextLine& ln) {
+                const auto& L = result.all_lines[p];
+                if (&ln >= L.data() && &ln < L.data() + L.size() && column_body[&ln - L.data()])
+                    return true;
                 return ln.x_right - ln.x_left > 0.4 * page_w && ln.text.size() >= 30;
             };
             // A figure's labels outside its drawn area (a "Class Label" over
@@ -792,7 +860,12 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
                         merged = true;
                     }
             }
-            for (auto& R : regions) grow_over_labels(R);
+            for (auto& R : regions) {
+                grow_over_labels(R);
+                if (fig_debug)
+                    fprintf(stderr, "[figdbg] p=%d fragment region (%.1f,%.1f)-(%.1f,%.1f)\n",
+                            p + 1, R[0], R[1], R[2], R[3]);
+            }
             }
             double region_area = 0;
             for (auto& R : regions) region_area += (R[2] - R[0]) * (R[3] - R[1]);
