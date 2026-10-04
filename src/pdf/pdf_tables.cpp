@@ -2689,8 +2689,23 @@ static void strip_prose_columns(TableData& table) {
 }
 
 // S4: rejection / cleanup heuristics.
-// Returns true if the table is acceptable (kept).
-static bool accept_table(TableData& table) {
+// A figure cell: an amount, a ratio, a year or a short range ("$(55,218)",
+// "2.1", "12.5%", "5 to 20", "F-2"). It holds a digit and at most a few
+// letters; a cell of words is a label or prose.
+static bool is_value_cell(const std::string& s) {
+    if (s.empty() || s.size() > 20) return false;
+    int digits = 0, letters = 0;
+    for (unsigned char c : s) {
+        if (c >= '0' && c <= '9') digits++;
+        else if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c >= 0xC2) letters++;
+    }
+    return digits > 0 && letters <= 4;
+}
+
+// Returns true if the table is acceptable (kept). gutter is the empty gap
+// between the two columns of a 2-column candidate, in font sizes (0 if
+// unknown or not 2 columns).
+static bool accept_table(TableData& table, double gutter = 0.0) {
     if (table.rows.empty()) return false;
     // pre-step: strip body-text columns adjacent to the table
     strip_prose_columns(table);
@@ -2721,9 +2736,23 @@ static bool accept_table(TableData& table) {
     }
     // Three rows is the minimum for a real multi-column table — anything
     // smaller is almost always a stray body paragraph that happened to
-    // have a short token in a column-like position. (2-col tables stay at 4
-    // because key-value lists are easy to mistake otherwise.)
-    int min_rows = (n_cols == 2) ? 4 : 3;
+    // have a short token in a column-like position. 2-col tables need 4,
+    // because key-value lists are easy to mistake otherwise — unless every
+    // column after the stub holds figures ("Balance as of January 1 |
+    // $208,840"). Prose torn by a phantom boundary leaves word fragments on
+    // the right, never a column of values, so such a table is also exempt
+    // from the long-label prose tests below.
+    bool value_cols = n_cols >= 2;
+    for (int c = 1; c < n_cols && value_cols; c++) {
+        int filled = 0, values = 0;
+        for (auto& row : table.rows) {
+            if (c >= (int)row.size() || row[c].empty()) continue;
+            filled++;
+            if (is_value_cell(row[c])) values++;
+        }
+        if (filled < 2 || values * 10 < filled * 8) value_cols = false;
+    }
+    int min_rows = (n_cols == 2 && !value_cols) ? 4 : 3;
     if (meaningful < min_rows) return false;
 
     // Merge continuation rows: row with a single filled cell in column c, after
@@ -3042,8 +3071,16 @@ static bool accept_table(TableData& table) {
                 continuation_rows++;
             checked_rows++;
         }
+        // A glossary ("Drug | effects", "L | set of city locations") pairs
+        // lowercase terms with lowercase definitions, so its rows read as
+        // continued words too. Its terms are short and a wide empty gutter
+        // (well beyond a stretched word space) parts them from the
+        // definitions; a phantom boundary in justified prose has neither.
+        bool glossary = n_cols == 2 && gutter >= 1.5;
+        for (auto& row : table.rows)
+            if (glossary && !row.empty() && row[0].size() > 30) glossary = false;
         double ct = (n_cols == 2) ? 0.15 : 0.30;
-        if (checked_rows >= 2 && continuation_rows >= checked_rows * ct)
+        if (!glossary && checked_rows >= 2 && continuation_rows >= checked_rows * ct)
             return false;
         if (total_cells > 0 && filler_cells >= total_cells * 0.35)
             return false;
@@ -3085,12 +3122,12 @@ static bool accept_table(TableData& table) {
             double avg_first = sum_first / total_rows;
             double avg_second = (n_cols >= 2) ? sum_second / total_rows : 0;
             bool dense_third = n_cols >= 3 && third_filled * 10 >= total_rows * 7;
-            if (!dense_third &&
+            if (!dense_third && !value_cols &&
                 avg_first > 30 && avg_second > 0 && avg_first > avg_second * 2.5)
                 return false;
             if (n_cols == 2 && avg_first > 30 && avg_second > 30)
                 return false;
-            if (unbalanced >= total_rows * 0.4) return false;
+            if (!value_cols && unbalanced >= total_rows * 0.4) return false;
         }
     }
 
@@ -3134,6 +3171,23 @@ static bool accept_table(TableData& table) {
     trim_table(table);
     if (table.rows.empty()) return false;
     return true;
+}
+
+// Median empty gap at boundary x over the band's rows that have text on
+// both sides of it.
+static double median_gutter(const std::vector<TextRow>& rows, const YBand& band, double x) {
+    std::vector<double> gaps;
+    for (size_t k = band.first_row; k <= band.last_row; k++) {
+        double left = -1e18, right = 1e18;
+        for (auto& cr : rows[k].char_ranges) {
+            if (cr.first + cr.second < 2 * x) left = std::max(left, cr.second);
+            else right = std::min(right, cr.first);
+        }
+        if (left > -1e17 && right < 1e17) gaps.push_back(right - left);
+    }
+    if (gaps.empty()) return 0.0;
+    std::nth_element(gaps.begin(), gaps.begin() + gaps.size() / 2, gaps.end());
+    return gaps[gaps.size() / 2];
 }
 
 } // namespace text_tables
@@ -3389,7 +3443,9 @@ static std::vector<TableData> detect_text_tables_range(
                                                 median_fs);
 
         // S4-S5: rejection
-        if (!accept_table(table)) continue;
+        double gutter = bounds.size() == 3
+                            ? median_gutter(rows, ext, bounds[1]) / median_fs : 0.0;
+        if (!accept_table(table, gutter)) continue;
 
         table.kind = TableData::TEXT;
         result.push_back(std::move(table));
