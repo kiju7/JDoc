@@ -4315,28 +4315,43 @@ static std::vector<TableData> detect_text_tables_range(
         // On a two-column page a full-width band whose inferred columns
         // split right at the page gutter is usually the two columns'
         // unrelated content welded side by side; the per-column retries see
-        // each half on its own. A genuine page-wide table also straddles
-        // the gutter, but then nearly every row holds cells on both sides,
-        // while welded content pairs rows only where the sides happen to
-        // overlap — so only sparse straddling skips the band.
+        // each half on its own. So is a band whose rows all leave the gutter
+        // empty, wherever its inferred columns fall (a column of equations
+        // or a figure's labels moves them off it), when the three lines above
+        // and below it leave it empty too: a page gutter runs on past the
+        // band, while a gap between a table's columns on a one-column page
+        // ends at the prose around the table (past a heading or two). A
+        // genuine page-wide table
+        // also straddles the gutter, but then nearly every row holds cells on
+        // both sides, while welded content pairs rows only where the sides
+        // happen to overlap — so only sparse straddling skips the band.
         if (gutter_x > 0) {
             bool at_gutter = false;
             for (size_t b = 1; b + 1 < bounds.size(); b++)
                 if (std::abs(bounds[b] - gutter_x) < 20.0) at_gutter = true;
-            if (at_gutter) {
-                int band_rows = 0, both_sides = 0;
-                for (size_t k = band.first_row; k <= band.last_row; k++) {
-                    if (rows[k].char_ranges.empty()) continue;
-                    band_rows++;
-                    bool left = false, right = false;
-                    for (auto& cr : rows[k].char_ranges) {
-                        if (cr.second < gutter_x - 10.0) left = true;
-                        if (cr.first > gutter_x + 10.0) right = true;
-                    }
-                    if (left && right) both_sides++;
+            bool gutter_clear = true;
+            int band_rows = 0, both_sides = 0;
+            for (size_t k = band.first_row; k <= band.last_row; k++) {
+                if (rows[k].char_ranges.empty()) continue;
+                band_rows++;
+                bool left = false, right = false;
+                for (auto& cr : rows[k].char_ranges) {
+                    if (cr.second < gutter_x - 10.0) left = true;
+                    if (cr.first > gutter_x + 10.0) right = true;
+                    if (cr.first < gutter_x && cr.second > gutter_x) gutter_clear = false;
                 }
-                if (both_sides * 10 < band_rows * 7) return false;
+                if (left && right) both_sides++;
             }
+            auto crosses = [&](size_t k) {
+                for (auto& cr : rows[k].char_ranges)
+                    if (cr.first < gutter_x && cr.second > gutter_x) return true;
+                return false;
+            };
+            for (size_t d = 1; d <= 3 && gutter_clear; d++) {
+                if (band.first_row >= d && crosses(band.first_row - d)) gutter_clear = false;
+                if (band.last_row + d < rows.size() && crosses(band.last_row + d)) gutter_clear = false;
+            }
+            if ((at_gutter || gutter_clear) && both_sides * 10 < band_rows * 7) return false;
         }
 
         // S2.5: absorb trailing wrapped cell lines — single-cell rows just
