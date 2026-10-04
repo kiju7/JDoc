@@ -1385,6 +1385,30 @@ static void parse_type1_builtin_encoding(const std::vector<uint8_t>& data,
     }
 }
 
+// Embedded program of a FontDescriptor, for glyph rendering.
+static void record_font_program(PdfDoc& doc, const PdfObj& desc, PdfFont& font) {
+    if (!desc.is_dict()) return;
+    font.symbolic = (desc.get("Flags").as_int() & 4) != 0;
+    static const char* keys[] = {"FontFile2", "FontFile3", "FontFile"};
+    for (const char* key : keys) {
+        const PdfObj& v = desc.get(key);
+        if (!v.is_ref()) continue;
+        uint8_t kind = 0;
+        if (key[8] == '2') kind = 2;
+        else if (key[8] == '3') {
+            auto st = doc.resolve(v);
+            if (!st.is_stream()) continue;
+            auto& sub = st.get("Subtype");
+            if (sub.is_name() && sub.str_val == "OpenType") kind = 4;
+            else kind = 3;
+        } else kind = 1;
+        font.program_ref = v.ref_num;
+        font.program_gen = v.ref_gen;
+        font.program_kind = kind;
+        return;
+    }
+}
+
 PdfFont load_font(PdfDoc& doc, const PdfObj& font_ref) {
     PdfFont font;
     auto fobj = doc.resolve(font_ref);
@@ -1422,6 +1446,7 @@ PdfFont load_font(PdfDoc& doc, const PdfObj& font_ref) {
         if (flags & (1 << 6))  font.is_italic = true;  // bit 7 (Italic)
         double mw = desc.get("MissingWidth").as_num();
         if (mw > 0) font.missing_width = mw;
+        record_font_program(doc, desc, font);
     }
 
     // Font type
@@ -1437,6 +1462,7 @@ PdfFont load_font(PdfDoc& doc, const PdfObj& font_ref) {
             font.widths[static_cast<uint32_t>(first_char + i)] = w;
         }
     }
+
 
     if (font_type == "Type3") {
         font.is_type3 = true;
@@ -1504,7 +1530,11 @@ PdfFont load_font(PdfDoc& doc, const PdfObj& font_ref) {
                 if (cid_desc.is_dict()) {
                     double mw = cid_desc.get("MissingWidth").as_num();
                     if (mw > 0) font.missing_width = mw;
+                    record_font_program(doc, cid_desc, font);
                 }
+                font.cid_font = true;
+                const PdfObj& c2g = cid_font.get("CIDToGIDMap");
+                if (c2g.is_ref()) font.cid_to_gid_ref = c2g.ref_num;
             }
         }
     }
@@ -1523,15 +1553,15 @@ PdfFont load_font(PdfDoc& doc, const PdfObj& font_ref) {
     // Encoding (may be an indirect reference to an encoding dictionary)
     auto enc_obj = doc.resolve(fobj.get("Encoding"));
     if (enc_obj.is_name()) {
-        if (enc_obj.str_val == "WinAnsiEncoding") font.encoding_table = kWinAnsi;
-        else if (enc_obj.str_val == "MacRomanEncoding") font.encoding_table = kMacRoman;
-        else if (enc_obj.str_val == "StandardEncoding") font.encoding_table = standard_encoding();
+        if (enc_obj.str_val == "WinAnsiEncoding") { font.encoding_table = kWinAnsi; font.named_base_encoding = 1; }
+        else if (enc_obj.str_val == "MacRomanEncoding") { font.encoding_table = kMacRoman; font.named_base_encoding = 2; }
+        else if (enc_obj.str_val == "StandardEncoding") { font.encoding_table = standard_encoding(); font.named_base_encoding = 3; }
     } else if (enc_obj.is_dict()) {
         auto& base_enc = enc_obj.get("BaseEncoding");
         if (base_enc.is_name()) {
-            if (base_enc.str_val == "WinAnsiEncoding") font.encoding_table = kWinAnsi;
-            else if (base_enc.str_val == "MacRomanEncoding") font.encoding_table = kMacRoman;
-            else if (base_enc.str_val == "StandardEncoding") font.encoding_table = standard_encoding();
+            if (base_enc.str_val == "WinAnsiEncoding") { font.encoding_table = kWinAnsi; font.named_base_encoding = 1; }
+            else if (base_enc.str_val == "MacRomanEncoding") { font.encoding_table = kMacRoman; font.named_base_encoding = 2; }
+            else if (base_enc.str_val == "StandardEncoding") { font.encoding_table = standard_encoding(); font.named_base_encoding = 3; }
         }
         // Differences array
         auto& diffs = enc_obj.get("Differences");

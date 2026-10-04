@@ -2422,7 +2422,8 @@ static std::vector<YBand> find_y_bands(const std::vector<TextRow>& rows,
 // columns, see below); false gives the gap-and-straddle columns alone.
 static std::vector<double> infer_columns_in_band(
         const std::vector<TextRow>& rows, const YBand& band,
-        double median_fs, bool column_evidence) {
+        double median_fs, bool column_evidence,
+        const std::vector<CharInfo>& chars) {
     // Collect multi-cell rows in the band
     std::vector<size_t> mc;
     for (size_t k = band.first_row; k <= band.last_row; k++)
@@ -2548,7 +2549,8 @@ static std::vector<double> infer_columns_in_band(
     // column inside as a hump of hits between bins no row touches at all.
     // When the hump's cells form an aligned stack, the boundaries are the
     // untouched sub-runs around it, not the middle of the whole run.
-    struct Cand { double e; double z_lo, z_hi; };   // z_*: untouched sub-run
+    // z_*: untouched sub-run; lo/hi: the empty run around the boundary
+    struct Cand { double e; double z_lo, z_hi; double lo, hi; };
     std::vector<Cand> cands;
     auto zero_runs_in = [&](int b0, int b1) {
         std::vector<std::pair<int, int>> z;   // [start, end) bins, hit == 0
@@ -2579,7 +2581,7 @@ static std::vector<double> infer_columns_in_band(
                 double zl = x_lo + z.first * bin_w, zh = x_lo + z.second * bin_w;
                 double mid = (zl + zh) / 2.0;
                 if (mid <= x_lo + 2.0 || mid >= x_hi - 2.0) continue;
-                inner.push_back({mid, zl, zh});
+                inner.push_back({mid, zl, zh, zl, zh});
             }
             bool stacks_ok = !inner.empty();
             for (size_t k = 0; stacks_ok && k <= inner.size(); k++) {
@@ -2608,7 +2610,7 @@ static std::vector<double> infer_columns_in_band(
             double d = std::abs((l + h) / 2.0 - mid);
             if (d < best) { best = d; zl = l; zh = h; }
         }
-        cands.push_back({mid, zl, zh});
+        cands.push_back({mid, zl, zh, run.first, run.second});
     }
     if (cands.empty()) return {};
     std::sort(cands.begin(), cands.end(),
@@ -2635,8 +2637,39 @@ static std::vector<double> infer_columns_in_band(
     // other. Prose torn there leaves no such stacks.
     std::vector<double> kept;
     double neigh = std::max(median_fs * 6.0, 60.0);
+    // A wide gutter whose right side opens with figures on most rows is the
+    // label/value split of a financial statement ("Revenues ...... 100.0%").
+    // No glyph lies within reach of its midpoint, so nearness to it is taken
+    // from the edges of the empty run; otherwise the boundary was dropped for
+    // lack of evidence however many rows straddled it. Other wide gutters
+    // keep the midpoint test: the gap between the two text columns of a page
+    // is wide too, and must not split prose into a table.
+    auto figure_first = [&](const TextRow& r, double x) {
+        double best = 1e18; unsigned int u = 0;
+        for (size_t idx : r.char_indices) {
+            const auto& c = chars[idx];
+            if (c.left >= x && c.left < best) { best = c.left; u = c.unicode; }
+        }
+        return (u >= '0' && u <= '9') || u == '$' || u == '(' || u == '-' ||
+               u == 0x2014 || u == 0x2013 || u == '%' || u == 0x20AC || u == 0xA3;
+    };
     for (size_t ci = 0; ci < cands.size(); ci++) {
-        double e = cands[ci].e;
+        const Cand& ed = cands[ci];
+        double e = ed.e;
+        bool wide = ed.hi - ed.lo > median_fs * 6.0;
+        bool figures = false;
+        if (wide) {
+            int straddle = 0, fig = 0;
+            for (size_t ri : mc) {
+                bool l = false, rr = false;
+                for (auto& cr : rows[ri].char_ranges) {
+                    if (cr.second <= ed.lo + 0.5) l = true;
+                    if (cr.first >= ed.hi - 0.5) rr = true;
+                }
+                if (l && rr) { straddle++; if (figure_first(rows[ri], ed.hi - 0.5)) fig++; }
+            }
+            figures = straddle >= 3 && fig * 10 >= straddle * 7;
+        }
         int agree = 0;
         int relevant = 0;
         for (size_t ri : mc) {
@@ -2645,7 +2678,9 @@ static std::vector<double> infer_columns_in_band(
             for (auto& cr : rows[ri].char_ranges) {
                 if (cr.second <= e) has_left = true;
                 else if (cr.first >= e) has_right = true;
-                if (cr.first <= e + neigh && cr.second >= e - neigh) near = true;
+                if (figures ? (cr.first <= ed.hi + neigh && cr.second >= ed.lo - neigh)
+                            : (cr.first <= e + neigh && cr.second >= e - neigh))
+                    near = true;
                 if (has_left && has_right && near) break;
             }
             if (!near) continue;
@@ -3146,8 +3181,23 @@ static void strip_prose_columns(TableData& table) {
 }
 
 // S4: rejection / cleanup heuristics.
-// Returns true if the table is acceptable (kept).
-static bool accept_table(TableData& table) {
+// A figure cell: an amount, a ratio, a year or a short range ("$(55,218)",
+// "2.1", "12.5%", "5 to 20", "F-2"). It holds a digit and at most a few
+// letters; a cell of words is a label or prose.
+static bool is_value_cell(const std::string& s) {
+    if (s.empty() || s.size() > 20) return false;
+    int digits = 0, letters = 0;
+    for (unsigned char c : s) {
+        if (c >= '0' && c <= '9') digits++;
+        else if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c >= 0xC2) letters++;
+    }
+    return digits > 0 && letters <= 4;
+}
+
+// Returns true if the table is acceptable (kept). gutter is the empty gap
+// between the two columns of a 2-column candidate, in font sizes, when it
+// is the widest gap of its rows (0 otherwise or for other widths).
+static bool accept_table(TableData& table, double gutter = 0.0) {
     if (table.rows.empty()) return false;
     // pre-step: strip body-text columns adjacent to the table
     strip_prose_columns(table);
@@ -3178,9 +3228,34 @@ static bool accept_table(TableData& table) {
     }
     // Three rows is the minimum for a real multi-column table — anything
     // smaller is almost always a stray body paragraph that happened to
-    // have a short token in a column-like position. (2-col tables stay at 4
-    // because key-value lists are easy to mistake otherwise.)
-    int min_rows = (n_cols == 2) ? 4 : 3;
+    // have a short token in a column-like position. 2-col tables need 4,
+    // because key-value lists are easy to mistake otherwise — unless a stub
+    // of labels is followed by columns of figures ("Balance as of January 1
+    // | $208,840"). Prose torn by a phantom boundary leaves word fragments on
+    // the right, never a column of values, so such a table is also exempt
+    // from the long-label prose tests below. Two kinds of figure columns do
+    // not qualify: one beside a stub that is not mostly labels (axis ticks
+    // of a chart), and whole numbers that nearly always rise (the page
+    // references of a contents list, which is a list rather than a table).
+    bool value_cols = n_cols >= 2;
+    for (int c = 0; c < n_cols && value_cols; c++) {
+        int filled = 0, values = 0, ints = 0, rises = 0;
+        long last = -1;
+        for (auto& row : table.rows) {
+            if (c >= (int)row.size() || row[c].empty()) continue;
+            filled++;
+            if (is_value_cell(row[c])) values++;
+            char* end = nullptr;
+            long v = std::strtol(row[c].c_str(), &end, 10);
+            if (*end != '\0' || end == row[c].c_str()) continue;
+            if (ints++ > 0 && v >= last) rises++;
+            last = v;
+        }
+        bool figures = filled >= 2 && values * 10 >= filled * 8;
+        bool page_refs = ints * 10 >= filled * 8 && rises * 10 >= (ints - 1) * 9;
+        if (c == 0 ? values * 5 > filled : (!figures || page_refs)) value_cols = false;
+    }
+    int min_rows = (n_cols == 2 && !value_cols) ? 4 : 3;
     if (meaningful < min_rows) return false;
 
     // Merge continuation rows: row with a single filled cell in column c, after
@@ -3195,6 +3270,19 @@ static bool accept_table(TableData& table) {
             !table.rows[r-1][filled_col].empty()) {
             std::string& prev = table.rows[r-1][filled_col];
             const std::string& next = table.rows[r][filled_col];
+            // A label alone in the stub column is a group header of the rows
+            // below it ("Costs of revenues:", "Operating expenses:") rather
+            // than the wrapped tail of the row above when it ends in a colon,
+            // or when it opens with a capital after a row that is already
+            // complete (its figures filled). Folding it in glued the group
+            // name to the previous line item and the grouping was lost.
+            if (filled_col == 0 && !next.empty()) {
+                int prev_filled = 0;
+                for (auto& c : table.rows[r-1]) if (!c.empty()) prev_filled++;
+                bool colon = next.back() == ':';
+                bool capital = next[0] >= 'A' && next[0] <= 'Z';
+                if (colon || (capital && prev_filled >= 2)) continue;
+            }
             // Wrapped numbers ("991225-" / "1234567") continue without a
             // space, matching get_text_in_rect.
             bool digit_wrap = prev.size() >= 2 && prev.back() == '-' &&
@@ -3486,8 +3574,27 @@ static bool accept_table(TableData& table) {
                 continuation_rows++;
             checked_rows++;
         }
+        // A glossary ("Drug | effects", "L | set of city locations") pairs
+        // lowercase terms with lowercase definitions, so its rows read as
+        // continued words too. Its terms are short and a wide empty gutter
+        // (well beyond a stretched word space) parts them from the
+        // definitions; a phantom boundary in justified prose has neither.
+        // Every entry has both parts, and the definitions run longer than
+        // the terms (side-by-side chart labels pair alike text) yet stay
+        // shorter than a line of prose.
+        bool glossary = n_cols == 2 && gutter >= 1.5;
+        size_t term_chars = 0, def_chars = 0;
+        for (auto& row : table.rows) {
+            if (row.size() < 2 || row[0].empty() || row[1].empty() || row[0].size() > 30)
+                glossary = false;
+            else {
+                term_chars += row[0].size();
+                def_chars += row[1].size();
+            }
+        }
+        if (def_chars < term_chars * 2 || def_chars > table.rows.size() * 30) glossary = false;
         double ct = (n_cols == 2) ? 0.15 : 0.30;
-        if (checked_rows >= 2 && continuation_rows >= checked_rows * ct)
+        if (!glossary && checked_rows >= 2 && continuation_rows >= checked_rows * ct)
             return false;
         if (total_cells > 0 && filler_cells >= total_cells * 0.35)
             return false;
@@ -3529,12 +3636,12 @@ static bool accept_table(TableData& table) {
             double avg_first = sum_first / total_rows;
             double avg_second = (n_cols >= 2) ? sum_second / total_rows : 0;
             bool dense_third = n_cols >= 3 && third_filled * 10 >= total_rows * 7;
-            if (!dense_third &&
+            if (!dense_third && !value_cols &&
                 avg_first > 30 && avg_second > 0 && avg_first > avg_second * 2.5)
                 return false;
             if (n_cols == 2 && avg_first > 30 && avg_second > 30)
                 return false;
-            if (unbalanced >= total_rows * 0.4) return false;
+            if (!value_cols && unbalanced >= total_rows * 0.4) return false;
         }
     }
 
@@ -3580,21 +3687,98 @@ static bool accept_table(TableData& table) {
     return true;
 }
 
+// Empty gap at boundary x, in the band's rows that have text on both sides
+// of it, when it is the widest gap in nearly all of them (median, else 0).
+// A row whose own text has a gap at least half as wide is a grid of more
+// columns than the boundary splits (an author block), not two columns.
+static double clean_gutter(const std::vector<TextRow>& rows, const YBand& band, double x) {
+    std::vector<double> gaps;
+    std::vector<std::pair<double, double>> cr;
+    int rows_both = 0;
+    for (size_t k = band.first_row; k <= band.last_row; k++) {
+        cr = rows[k].char_ranges;
+        std::sort(cr.begin(), cr.end());
+        double gutter = 0, other = 0, reach = -1e18;
+        bool left = false, right = false;
+        for (auto& c : cr) {
+            double g = c.first - reach;
+            if (reach > -1e17 && reach < x && c.first + c.second >= 2 * x) gutter = std::max(gutter, g);
+            else if (reach > -1e17) other = std::max(other, g);
+            (c.first + c.second < 2 * x ? left : right) = true;
+            reach = std::max(reach, c.second);
+        }
+        if (!left || !right) continue;
+        rows_both++;
+        if (other < gutter * 0.5) gaps.push_back(gutter);
+    }
+    if (gaps.empty() || gaps.size() * 10 < (size_t)rows_both * 8) return 0.0;
+    std::nth_element(gaps.begin(), gaps.begin() + gaps.size() / 2, gaps.end());
+    return gaps[gaps.size() / 2];
+}
+
 } // namespace text_tables
+
+// Dot leaders ("Revenues ........ 100.0%") fill the gap between a row
+// label and its first value, so no empty vertical gutter separates the
+// two columns and the row reads as one cell. A run of four or more
+// periods on one baseline is a leader: it carries no text and is left
+// out of both the column evidence and the cell text. Returns one flag per
+// character of the cache.
+static std::vector<bool> dot_leader_mask(const PageCharCache& cache) {
+    std::vector<bool> is_leader(cache.chars.size(), false);
+    std::vector<size_t> dots;
+    for (size_t i = 0; i < cache.chars.size(); i++) {
+        uint32_t u = cache.chars[i].unicode;
+        if (u == '.' || u == 0x2024 || u == 0x2026 || u == 0x00B7) dots.push_back(i);
+    }
+    // Top to bottom, then left to right within a baseline. Baselines jitter
+    // by fractions of a point, so the dots are cut into lines first (a gap
+    // over 1pt in y) and each line is ordered by x; a comparator that
+    // treated near-equal y as equal would not be a strict weak ordering.
+    std::sort(dots.begin(), dots.end(), [&](size_t a, size_t b) {
+        return cache.chars[a].y > cache.chars[b].y;
+    });
+    for (size_t lo = 0, hi; lo < dots.size(); lo = hi) {
+        for (hi = lo + 1; hi < dots.size() &&
+             cache.chars[dots[hi - 1]].y - cache.chars[dots[hi]].y <= 1.0; hi++) {}
+        std::sort(dots.begin() + lo, dots.begin() + hi, [&](size_t a, size_t b) {
+            return cache.chars[a].x < cache.chars[b].x;
+        });
+    }
+    size_t run_start = 0;
+    auto flush = [&](size_t end) {
+        if (end - run_start >= 4)
+            for (size_t k = run_start; k < end; k++) is_leader[dots[k]] = true;
+    };
+    for (size_t k = 1; k <= dots.size(); k++) {
+        bool cont = false;
+        if (k < dots.size()) {
+            const auto& a = cache.chars[dots[k - 1]];
+            const auto& b = cache.chars[dots[k]];
+            double h = std::max(a.top - a.bot, 1.0);
+            cont = std::abs(a.y - b.y) <= 1.0 && b.left - a.right < 1.5 * h;
+        }
+        if (!cont) { flush(k); run_start = k; }
+    }
+    return is_leader;
+}
 
 static std::vector<TableData> detect_text_tables_range(
         const PageCharCache& cache,
         const std::vector<TableData>& existing_tables,
         double page_width, double page_height,
         double x_lo, double x_hi,
+        const std::vector<bool>& is_leader,
         double gutter_x = 0.0) {
     using namespace text_tables;
     if (cache.chars.size() < 10) return {};
 
     std::vector<CharInfo> chars;
     chars.reserve(cache.chars.size());
-    for (auto& ch : cache.chars) {
+    for (size_t ci = 0; ci < cache.chars.size(); ci++) {
+        const auto& ch = cache.chars[ci];
         if (ch.unicode == ' ' || ch.unicode == '\t' || ch.unicode == 0xA0) continue;
+        if (is_leader[ci]) continue;
         if (ch.x < 0 || ch.x > page_width || ch.y < 0 || ch.y > page_height) continue;
         if (ch.x < x_lo || ch.x >= x_hi) continue;
         chars.push_back({ch.x, ch.y, ch.left, ch.right, ch.top, ch.bot,
@@ -3797,7 +3981,9 @@ static std::vector<TableData> detect_text_tables_range(
         table = build_table_from_band(rows, ext, bounds, chars, median_fs);
 
         // S4-S5: rejection
-        return accept_table(table);
+        double gutter = bounds.size() == 3
+                            ? clean_gutter(rows, ext, bounds[1]) / median_fs : 0.0;
+        return accept_table(table, gutter);
         };
 
         // Whether the band is a table at all, and which rows it holds, is
@@ -3807,9 +3993,9 @@ static std::vector<TableData> detect_text_tables_range(
         // axis ticks are made of too, so they must neither turn a band into
         // a table nor change which lines a table keeps.
         TableData table;
-        auto bounds = infer_columns_in_band(rows, band, median_fs, false);
+        auto bounds = infer_columns_in_band(rows, band, median_fs, false, chars);
         if (!build_band(bounds, table)) continue;
-        auto refined = infer_columns_in_band(rows, band, median_fs, true);
+        auto refined = infer_columns_in_band(rows, band, median_fs, true, chars);
         if (refined != bounds) {
             TableData t2;
             auto row_text = [](const std::vector<std::string>& row) {
@@ -3836,9 +4022,13 @@ std::vector<TableData> detect_text_tables(const PageCharCache& cache,
                                            const std::vector<TableData>& existing_tables,
                                            double page_width, double page_height,
                                            double col_boundary) {
+    // Leaders are found once for the page: the per-column passes below
+    // would otherwise sort every period of the page again.
+    const std::vector<bool> is_leader = dot_leader_mask(cache);
     auto result = detect_text_tables_range(cache, existing_tables,
                                            page_width, page_height,
-                                           0.0, page_width, col_boundary);
+                                           0.0, page_width, is_leader,
+                                           col_boundary);
 
     // Two-column pages: rows built across the gutter glue a column's table
     // to the prose beside it, so the full-width pass misses column-local
@@ -3852,7 +4042,7 @@ std::vector<TableData> detect_text_tables(const PageCharCache& cache,
             double x_hi = side == 0 ? col_boundary : page_width;
             auto part = detect_text_tables_range(cache, known,
                                                  page_width, page_height,
-                                                 x_lo, x_hi);
+                                                 x_lo, x_hi, is_leader);
             for (auto& t : part) {
                 known.push_back(t);
                 result.push_back(std::move(t));

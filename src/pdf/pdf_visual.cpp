@@ -1,4 +1,5 @@
 #include "pdf_extract.h"
+#include "pdf_glyphs.h"
 #include "pdf_limits.h"
 #include "jbig2.h"
 #include "jpx.h"
@@ -1643,7 +1644,8 @@ static ImageData render_composite_view(
         double origin_x, double origin_y,
         int page_num, double page_w, double page_h,
         const std::string& output_dir, int img_idx,
-        PageRenderDiag* diag) {
+        PageRenderDiag* diag,
+        const std::vector<size_t>* glyph_indices = nullptr) {
     const size_t image_count = image_indices ? image_indices->size()
                                              : parse_result.images.size();
     const size_t path_count = path_indices ? path_indices->size()
@@ -2481,18 +2483,59 @@ static ImageData render_composite_view(
         }
     };
 
-    // Draw paths and images interleaved in content-stream order. Painting all
-    // paths first buried them under later-composited opaque images: a
-    // watermark background drawn below glyph outlines erased the whole body
-    // of GDI print-to-PDF pages.
+    // Text drawn from the embedded font programs: each glyph outline fills
+    // like a path in the glyph's color. Font programs are parsed on first
+    // use, once per composite.
+    const size_t glyph_count = glyph_indices ? glyph_indices->size()
+                                             : parse_result.glyphs.size();
+    auto glyph_at = [&](size_t pos) -> const GlyphDraw& {
+        return parse_result.glyphs[glyph_indices ? (*glyph_indices)[pos] : pos];
+    };
+    std::vector<std::unique_ptr<GlyphSource>> glyph_sources(parse_result.glyph_fonts.size());
+    RenderPath glyph_rp;   // reused: outline() refills its points for each glyph
+    auto draw_glyph = [&](const GlyphDraw& g) {
+        if (g.font < 0 || static_cast<size_t>(g.font) >= glyph_sources.size()) return;
+        auto& src = glyph_sources[g.font];
+        if (!src) src.reset(new GlyphSource(doc, *parse_result.glyph_fonts[g.font]));
+        if (!src->ok() || !src->outline(g.code, glyph_rp.points)) return;
+        for (auto& pt : glyph_rp.points) {
+            if (pt.type == PathPoint::CLOSE) continue;
+            double x = pt.x, y = pt.y;
+            pt.x = g.m[0] * x + g.m[2] * y + g.m[4];
+            pt.y = g.m[1] * x + g.m[3] * y + g.m[5];
+            if (pt.type == PathPoint::CURVE) {
+                double a = pt.cx1, b = pt.cy1, c = pt.cx2, d = pt.cy2;
+                pt.cx1 = g.m[0] * a + g.m[2] * b + g.m[4];
+                pt.cy1 = g.m[1] * a + g.m[3] * b + g.m[5];
+                pt.cx2 = g.m[0] * c + g.m[2] * d + g.m[4];
+                pt.cy2 = g.m[1] * c + g.m[3] * d + g.m[5];
+            }
+        }
+        glyph_rp.fill_r = g.fill_r; glyph_rp.fill_g = g.fill_g; glyph_rp.fill_b = g.fill_b;
+        glyph_rp.stroke_r = glyph_rp.stroke_g = glyph_rp.stroke_b = 0;
+        glyph_rp.fill_alpha = g.alpha;
+        glyph_rp.line_width = 0;
+        glyph_rp.do_fill = true;
+        glyph_rp.do_stroke = false;
+        std::memcpy(glyph_rp.clip, g.clip, sizeof(glyph_rp.clip));
+        glyph_rp.seq = g.seq;
+        draw_path(glyph_rp);
+    };
+
+    // Draw paths, images and glyphs interleaved in content-stream order.
+    // Painting all paths first buried them under later-composited opaque
+    // images: a watermark background drawn below glyph outlines erased the
+    // whole body of GDI print-to-PDF pages.
     {
-        size_t pi = 0, ii = 0;
-        while (pi < path_count || ii < image_count) {
-            bool take_path =
-                ii >= image_count ||
-                (pi < path_count && path_at(pi).seq <= image_at(ii).seq);
-            if (take_path) draw_path(path_at(pi++));
-            else draw_image(image_at(ii++));
+        size_t pi = 0, ii = 0, gi = 0;
+        const int kEnd = std::numeric_limits<int>::max();
+        while (pi < path_count || ii < image_count || gi < glyph_count) {
+            int ps = pi < path_count ? path_at(pi).seq : kEnd;
+            int is = ii < image_count ? image_at(ii).seq : kEnd;
+            int gs = gi < glyph_count ? glyph_at(gi).seq : kEnd;
+            if (ps <= is && ps <= gs) draw_path(path_at(pi++));
+            else if (is <= gs) draw_image(image_at(ii++));
+            else draw_glyph(glyph_at(gi++));
         }
     }
 
@@ -2596,9 +2639,27 @@ ImageData render_region_composite(PdfDoc& doc, const PdfObj& resources,
     // neither is nothing to draw.
     if (selected_images->empty() && selected_paths.empty()) return {};
 
+    // Glyphs whose em box (descender to ascender) meets the region.
+    std::vector<size_t> selected_glyphs;
+    for (size_t gi = 0; gi < parse_result.glyphs.size(); gi++) {
+        const auto& g = parse_result.glyphs[gi];
+        double gx0 = 1e300, gy0 = 1e300, gx1 = -1e300, gy1 = -1e300;
+        for (double ux : {0.0, 1.0})
+            for (double uy : {-0.3, 1.0}) {
+                double px = g.m[0] * ux + g.m[2] * uy + g.m[4];
+                double py = g.m[1] * ux + g.m[3] * uy + g.m[5];
+                gx0 = std::min(gx0, px); gx1 = std::max(gx1, px);
+                gy0 = std::min(gy0, py); gy1 = std::max(gy1, py);
+            }
+        if (gx1 < region[0] || gx0 > region[2] || gy1 < region[1] || gy0 > region[3])
+            continue;
+        selected_glyphs.push_back(gi);
+    }
+
     return render_composite_view(doc, resources, parse_result, selected_images,
                                  &selected_paths, x0, y0, page_num, rgn_w,
-                                 rgn_h, output_dir, img_idx, diag);
+                                 rgn_h, output_dir, img_idx, diag,
+                                 &selected_glyphs);
 }
 
 // ── Bookmark Extraction ──────────────────────────────────
