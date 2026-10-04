@@ -2348,10 +2348,14 @@ static std::vector<TextLine> lines_from_upright_chars(
         // Detect word spacing using gap between this char's left and previous char's right
         if (!cur.text.empty() && ch.unicode != ' ' && ch.unicode != 0xA0 && prev_right > -1e8) {
             double gap = ch.left - prev_right;
-            // Use font-size-relative threshold for word spacing
+            // Use font-size-relative threshold for word spacing. There is
+            // no upper bound: the widest gaps on a line are cell gaps between
+            // right-aligned numbers in a rule-less table row, and dropping
+            // the space there fused "소형 3 2.8 0.5" into "소형32.80.5"
+            // whenever the row was not claimed by a table.
             double word_gap = ch.font_size * 0.15;
             if (word_gap < 1) word_gap = 1;
-            if (gap > word_gap && gap < ch.font_size * 8 && cur.text.back() != ' ')
+            if (gap > word_gap && cur.text.back() != ' ')
                 cur.text += ' ';
         }
 
