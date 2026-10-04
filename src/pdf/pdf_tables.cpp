@@ -2307,6 +2307,13 @@ struct TextRow {
     std::vector<size_t> char_indices;                    // indices into chars
     double x_min, x_max;
     bool is_multi_cell;
+    // Dot leaders on the row ([x0, x1], left to right) and the label each
+    // one leads from ([first glyph left, last glyph right]). A leader joins
+    // one label to one value, so its label is a single cell however wide
+    // its word gaps. labels[i] belongs to leaders[i]; it is empty
+    // (first > second) when nothing precedes the leader.
+    std::vector<std::pair<double,double>> leaders;
+    std::vector<std::pair<double,double>> labels;
 };
 
 struct YBand {
@@ -2452,6 +2459,12 @@ static std::vector<double> infer_columns_in_band(
         for (auto& cr : rows[ri].char_ranges) {
             int b0 = bin_idx(cr.first);
             int b1 = bin_idx(cr.second);
+            for (int b = b0; b <= b1; b++) row_hit[b] = true;
+        }
+        // A leader's label fills its word gaps: no column runs through it.
+        for (auto& lb : rows[ri].labels) {
+            int b0 = bin_idx(lb.first);
+            int b1 = bin_idx(lb.second);
             for (int b = b0; b <= b1; b++) row_hit[b] = true;
         }
         for (int b = 0; b < n_bins; b++) if (row_hit[b]) hit_count[b]++;
@@ -2653,6 +2666,59 @@ static std::vector<double> infer_columns_in_band(
         return (u >= '0' && u <= '9') || u == '$' || u == '(' || u == '-' ||
                u == 0x2014 || u == 0x2013 || u == '%' || u == 0x20AC || u == 0xA3;
     };
+    // The figure that opens a row's text from x on, as a number ("2,500",
+    // "(3.4)", "–15"); NaN when the row's first token there is not one.
+    auto first_number = [&](const TextRow& r, double x) {
+        std::vector<size_t> idx;
+        for (size_t i : r.char_indices) if (chars[i].left >= x) idx.push_back(i);
+        std::sort(idx.begin(), idx.end(),
+                  [&](size_t p, size_t q) { return chars[p].left < chars[q].left; });
+        std::string tok;
+        double prev_right = 0;
+        for (size_t k = 0; k < idx.size(); k++) {
+            const auto& c = chars[idx[k]];
+            double h = std::max(c.top - c.bot, 1.0);
+            if (k > 0 && c.left - prev_right > 0.2 * h) break;   // word space
+            unsigned int u = c.unicode;
+            if (u >= '0' && u <= '9') tok += (char)u;
+            else if (u == '.') tok += '.';
+            else if (u == '-' || u == 0x2212 || u == 0x2013 || u == '(') { if (tok.empty()) tok += '-'; }
+            else if (u != ',' && u != ')' && u != '%') break;
+            prev_right = c.right;
+        }
+        if (tok.empty() || tok == "-") return std::nan("");
+        return std::strtod(tok.c_str(), nullptr);
+    };
+    // Figures falling by even steps down the rows (30, 20, 10, 0) are the
+    // tick labels of a chart's value axis, which rises up the page; amounts
+    // in a statement never step evenly, and page references in a contents
+    // list rise down it. Other chart text (data labels, legend entries) may
+    // sit on rows between the ticks or open a tick's row, so the ladder is
+    // sought in row order with rows skipped and a single rung missing at a
+    // time. True when such a ladder of three or more covers at least half
+    // of the values.
+    auto ticks = [](const std::vector<double>& v) {
+        size_t n = v.size(), best = 0;
+        for (size_t i = 0; i < n; i++) {
+            if (std::isnan(v[i])) continue;
+            for (size_t j = i + 1; j < n; j++) {
+                double d = v[j] - v[i];
+                if (std::isnan(d) || d >= 0) continue;
+                size_t len = 2;
+                long rung = 1;
+                for (size_t k = j + 1; k < n; k++) {
+                    if (std::isnan(v[k])) continue;
+                    double q = (v[k] - v[i]) / d;
+                    long r = std::lround(q);
+                    if (std::abs(q - r) > 1e-6 || r <= rung || r > rung + 2) continue;
+                    len++;
+                    rung = r;
+                }
+                best = std::max(best, len);
+            }
+        }
+        return best >= 3 && best * 2 >= n;
+    };
     for (size_t ci = 0; ci < cands.size(); ci++) {
         const Cand& ed = cands[ci];
         double e = ed.e;
@@ -2660,21 +2726,38 @@ static std::vector<double> infer_columns_in_band(
         bool figures = false;
         if (wide) {
             int straddle = 0, fig = 0;
+            std::vector<double> right_vals;
             for (size_t ri : mc) {
                 bool l = false, rr = false;
                 for (auto& cr : rows[ri].char_ranges) {
                     if (cr.second <= ed.lo + 0.5) l = true;
                     if (cr.first >= ed.hi - 0.5) rr = true;
                 }
-                if (l && rr) { straddle++; if (figure_first(rows[ri], ed.hi - 0.5)) fig++; }
+                if (l && rr) {
+                    straddle++;
+                    if (figure_first(rows[ri], ed.hi - 0.5)) {
+                        fig++;
+                        right_vals.push_back(first_number(rows[ri], e));
+                    }
+                }
             }
-            figures = straddle >= 3 && fig * 10 >= straddle * 7;
+            figures = straddle >= 3 && fig * 10 >= straddle * 7 && !ticks(right_vals);
+            if (std::getenv("JDOC_TABLE_DEBUG")) {
+                fprintf(stderr, "[fig-gutter] %.1f-%.1f straddle %d fig %d ticks %d:",
+                        ed.lo, ed.hi, straddle, fig, (int)ticks(right_vals));
+                for (double v : right_vals) fprintf(stderr, " %g", v);
+                fprintf(stderr, "\n");
+            }
         }
         int agree = 0;
         int relevant = 0;
         for (size_t ri : mc) {
             bool has_left = false, has_right = false;
             bool near = false;
+            bool splits_label = false;
+            for (auto& lb : rows[ri].labels)
+                if (lb.first < e - 0.5 && lb.second > e + 0.5) splits_label = true;
+            if (splits_label) { relevant++; continue; }
             for (auto& cr : rows[ri].char_ranges) {
                 if (cr.second <= e) has_left = true;
                 else if (cr.first >= e) has_right = true;
@@ -2840,6 +2923,15 @@ static TableData build_table_from_band(
             }
             row_bounds[c] = best;
         }
+        // A boundary that would cut a leader's label moves to that leader:
+        // the label is one cell and the leader is where it ends (a long
+        // entry runs past the point where shorter entries' leaders start).
+        for (int c = 1; c < (int)col_bounds.size() - 1; c++)
+            for (size_t li = 0; li < tr.labels.size(); li++) {
+                const auto& lb = tr.labels[li];
+                if (lb.first < row_bounds[c] && row_bounds[c] < lb.second)
+                    row_bounds[c] = (tr.leaders[li].first + tr.leaders[li].second) / 2.0;
+            }
         // Ensure monotonic
         for (int c = 1; c < (int)row_bounds.size(); c++) {
             if (row_bounds[c] < row_bounds[c-1] + 0.1)
@@ -3197,7 +3289,7 @@ static bool is_value_cell(const std::string& s) {
 // Returns true if the table is acceptable (kept). gutter is the empty gap
 // between the two columns of a 2-column candidate, in font sizes, when it
 // is the widest gap of its rows (0 otherwise or for other widths).
-static bool accept_table(TableData& table, double gutter = 0.0) {
+static bool accept_table(TableData& table, double gutter = 0.0, int led_rows = 0) {
     if (table.rows.empty()) return false;
     // pre-step: strip body-text columns adjacent to the table
     strip_prose_columns(table);
@@ -3255,30 +3347,38 @@ static bool accept_table(TableData& table, double gutter = 0.0) {
         bool page_refs = ints * 10 >= filled * 8 && rises * 10 >= (ints - 1) * 9;
         if (c == 0 ? values * 5 > filled : (!figures || page_refs)) value_cols = false;
     }
-    int min_rows = (n_cols == 2 && !value_cols) ? 4 : 3;
+    // Entries joined to their values by dot leaders (a contents list, a
+    // statement's line items) are pairs by construction, not prose torn at
+    // a phantom boundary: the leader is drawn to tie the two cells together.
+    // When most rows are such entries the prose tests below do not apply.
+    bool leader_pairs = led_rows >= 2 && led_rows * 10 >= meaningful * 6;
+    int min_rows = (n_cols == 2 && !value_cols && !leader_pairs) ? 4 : 3;
     if (meaningful < min_rows) return false;
 
     // Merge continuation rows: row with a single filled cell in column c, after
     // a row whose column c was already filled → join with " " in same cell.
-    for (size_t r = 1; r < table.rows.size(); r++) {
+    // keep_group_headers leaves a stub label that heads the rows below it on
+    // its own row (see below).
+    auto merge_continuations = [n_cols](TableData& t, bool keep_group_headers) {
+    for (size_t r = 1; r < t.rows.size(); r++) {
         int filled = 0;
         int filled_col = -1;
         for (int c = 0; c < n_cols; c++) {
-            if (!table.rows[r][c].empty()) { filled++; filled_col = c; }
+            if (!t.rows[r][c].empty()) { filled++; filled_col = c; }
         }
         if (filled == 1 && filled_col >= 0 && r > 0 &&
-            !table.rows[r-1][filled_col].empty()) {
-            std::string& prev = table.rows[r-1][filled_col];
-            const std::string& next = table.rows[r][filled_col];
+            !t.rows[r-1][filled_col].empty()) {
+            std::string& prev = t.rows[r-1][filled_col];
+            const std::string& next = t.rows[r][filled_col];
             // A label alone in the stub column is a group header of the rows
             // below it ("Costs of revenues:", "Operating expenses:") rather
             // than the wrapped tail of the row above when it ends in a colon,
             // or when it opens with a capital after a row that is already
             // complete (its figures filled). Folding it in glued the group
             // name to the previous line item and the grouping was lost.
-            if (filled_col == 0 && !next.empty()) {
+            if (keep_group_headers && filled_col == 0 && !next.empty()) {
                 int prev_filled = 0;
-                for (auto& c : table.rows[r-1]) if (!c.empty()) prev_filled++;
+                for (auto& c : t.rows[r-1]) if (!c.empty()) prev_filled++;
                 bool colon = next.back() == ':';
                 bool capital = next[0] >= 'A' && next[0] <= 'Z';
                 if (colon || (capital && prev_filled >= 2)) continue;
@@ -3291,11 +3391,21 @@ static bool accept_table(TableData& table, double gutter = 0.0) {
                               !next.empty() && next[0] >= '0' && next[0] <= '9';
             if (!digit_wrap) prev += " ";
             prev += next;
-            table.rows.erase(table.rows.begin() + r);
-            mask_erase_row(table, r);
+            t.rows.erase(t.rows.begin() + r);
+            mask_erase_row(t, r);
             r--;
         }
     }
+    };
+    // Whether the band is a table is judged on its rows with every
+    // continuation folded in: keeping group headers apart is a choice of
+    // how an accepted table reads, and must not decide acceptance — split
+    // into more, shorter rows, the lines of a chart (titles, legend entries,
+    // tick labels) pass the prose tests below that they fail as wrapped
+    // text. The accepted table is the one with its group headers kept.
+    TableData grouped = table;
+    merge_continuations(grouped, true);
+    merge_continuations(table, false);
     if ((int)table.rows.size() < 2) return false;
 
     // Reject tables with too many empty cells (likely a degenerate band).
@@ -3594,7 +3704,8 @@ static bool accept_table(TableData& table, double gutter = 0.0) {
         }
         if (def_chars < term_chars * 2 || def_chars > table.rows.size() * 30) glossary = false;
         double ct = (n_cols == 2) ? 0.15 : 0.30;
-        if (!glossary && checked_rows >= 2 && continuation_rows >= checked_rows * ct)
+        if (!glossary && !leader_pairs && checked_rows >= 2 &&
+            continuation_rows >= checked_rows * ct)
             return false;
         if (total_cells > 0 && filler_cells >= total_cells * 0.35)
             return false;
@@ -3619,7 +3730,7 @@ static bool accept_table(TableData& table, double gutter = 0.0) {
     // long-first-column test: prose with a stray fringe never fills three
     // columns row after row, while question/answer tables (long question,
     // short verdict columns) legitimately do.
-    if (n_cols <= 3) {
+    if (n_cols <= 3 && !leader_pairs) {
         int total_rows = 0;
         double sum_first = 0, sum_second = 0;
         int unbalanced = 0, third_filled = 0;
@@ -3682,6 +3793,7 @@ static bool accept_table(TableData& table, double gutter = 0.0) {
         }
     }
 
+    table = std::move(grouped);
     trim_table(table);
     if (table.rows.empty()) return false;
     return true;
@@ -3722,10 +3834,19 @@ static double clean_gutter(const std::vector<TextRow>& rows, const YBand& band, 
 // label and its first value, so no empty vertical gutter separates the
 // two columns and the row reads as one cell. A run of four or more
 // periods on one baseline is a leader: it carries no text and is left
-// out of both the column evidence and the cell text. Returns one flag per
-// character of the cache.
-static std::vector<bool> dot_leader_mask(const PageCharCache& cache) {
-    std::vector<bool> is_leader(cache.chars.size(), false);
+// out of both the column evidence and the cell text. Two ellipsis glyphs
+// in a row are one too ("……" in Hangul documents); a single one after a
+// period ("B. …together") is punctuation.
+// Returns one flag per character of the cache, and each leader's extent.
+struct DotLeaders {
+    std::vector<bool> is_leader;
+    struct Span { double x0, x1, y; };
+    std::vector<Span> spans;
+};
+static DotLeaders dot_leader_mask(const PageCharCache& cache) {
+    DotLeaders out;
+    std::vector<bool>& is_leader = out.is_leader;
+    is_leader.assign(cache.chars.size(), false);
     std::vector<size_t> dots;
     for (size_t i = 0; i < cache.chars.size(); i++) {
         uint32_t u = cache.chars[i].unicode;
@@ -3747,8 +3868,17 @@ static std::vector<bool> dot_leader_mask(const PageCharCache& cache) {
     }
     size_t run_start = 0;
     auto flush = [&](size_t end) {
-        if (end - run_start >= 4)
-            for (size_t k = run_start; k < end; k++) is_leader[dots[k]] = true;
+        size_t ellipses = 0;
+        double y = 0;
+        for (size_t k = run_start; k < end; k++) {
+            if (cache.chars[dots[k]].unicode == 0x2026) ellipses++;
+            y += cache.chars[dots[k]].y;
+        }
+        if (end - run_start < 4 && ellipses < 2) return;
+        for (size_t k = run_start; k < end; k++) is_leader[dots[k]] = true;
+        out.spans.push_back({cache.chars[dots[run_start]].left,
+                             cache.chars[dots[end - 1]].right,
+                             y / (double)(end - run_start)});
     };
     for (size_t k = 1; k <= dots.size(); k++) {
         bool cont = false;
@@ -3760,7 +3890,7 @@ static std::vector<bool> dot_leader_mask(const PageCharCache& cache) {
         }
         if (!cont) { flush(k); run_start = k; }
     }
-    return is_leader;
+    return out;
 }
 
 static std::vector<TableData> detect_text_tables_range(
@@ -3768,8 +3898,9 @@ static std::vector<TableData> detect_text_tables_range(
         const std::vector<TableData>& existing_tables,
         double page_width, double page_height,
         double x_lo, double x_hi,
-        const std::vector<bool>& is_leader,
+        const DotLeaders& leaders,
         double gutter_x = 0.0) {
+    const std::vector<bool>& is_leader = leaders.is_leader;
     using namespace text_tables;
     if (cache.chars.size() < 10) return {};
 
@@ -3857,6 +3988,49 @@ static std::vector<TableData> detect_text_tables_range(
         }
     }
     if (rows.size() < 3) return {};
+
+    // Attach each dot leader to its row, with the label it leads from: the
+    // row's glyphs left of it, back to the value of an earlier leader on the
+    // same row (contents set in two columns) — that value is the first word
+    // after the earlier leader.
+    for (const auto& sp : leaders.spans) {
+        if (sp.x0 < x_lo || sp.x1 > x_hi) continue;
+        TextRow* row = nullptr;
+        double best = std::max(median_fs * 0.4, 3.0);
+        for (auto& r : rows) {
+            double d = std::abs(r.y_center - sp.y);
+            if (d < best) { best = d; row = &r; }
+        }
+        if (!row) continue;
+        row->leaders.push_back({sp.x0, sp.x1});
+    }
+    for (auto& r : rows) {
+        if (r.leaders.empty()) continue;
+        std::sort(r.leaders.begin(), r.leaders.end());
+        auto cr = r.char_ranges;
+        std::sort(cr.begin(), cr.end());
+        double word_gap = std::max(median_fs * 0.3, 1.5);
+        double from = -1e18;
+        for (auto& ld : r.leaders) {
+            double lo = 1e18, hi = -1e18;
+            for (auto& c : cr)
+                if (c.first >= from && c.second <= ld.first + 0.5) {
+                    lo = std::min(lo, c.first);
+                    hi = std::max(hi, c.second);
+                }
+            r.labels.push_back({lo, hi});   // lo > hi: the leader has no label
+            // skip the value this leader leads to
+            double reach = ld.second;
+            bool started = false;
+            for (auto& c : cr) {
+                if (c.first < ld.second - 0.5) continue;
+                if (started && c.first - reach > word_gap) break;
+                started = true;
+                reach = std::max(reach, c.second);
+            }
+            from = reach + 0.01;
+        }
+    }
 
     // multi-cell: at least one gap ≥ cell_merge_gap
     double cell_merge_gap = std::max(median_fs * 0.8, 8.0);
@@ -3983,7 +4157,17 @@ static std::vector<TableData> detect_text_tables_range(
         // S4-S5: rejection
         double gutter = bounds.size() == 3
                             ? clean_gutter(rows, ext, bounds[1]) / median_fs : 0.0;
-        return accept_table(table, gutter);
+        // Rows whose dot leader spans a column boundary: the leader itself
+        // pairs the cells on its two sides.
+        int led_rows = 0;
+        for (size_t k = ext.first_row; k <= ext.last_row; k++) {
+            bool led = false;
+            for (auto& ld : rows[k].leaders)
+                for (size_t b = 1; b + 1 < bounds.size(); b++)
+                    if (ld.first <= bounds[b] + 0.5 && ld.second >= bounds[b] - 0.5) led = true;
+            if (led) led_rows++;
+        }
+        return accept_table(table, gutter, led_rows);
         };
 
         // Whether the band is a table at all, and which rows it holds, is
@@ -4024,10 +4208,10 @@ std::vector<TableData> detect_text_tables(const PageCharCache& cache,
                                            double col_boundary) {
     // Leaders are found once for the page: the per-column passes below
     // would otherwise sort every period of the page again.
-    const std::vector<bool> is_leader = dot_leader_mask(cache);
+    const DotLeaders leaders = dot_leader_mask(cache);
     auto result = detect_text_tables_range(cache, existing_tables,
                                            page_width, page_height,
-                                           0.0, page_width, is_leader,
+                                           0.0, page_width, leaders,
                                            col_boundary);
 
     // Two-column pages: rows built across the gutter glue a column's table
@@ -4042,7 +4226,7 @@ std::vector<TableData> detect_text_tables(const PageCharCache& cache,
             double x_hi = side == 0 ? col_boundary : page_width;
             auto part = detect_text_tables_range(cache, known,
                                                  page_width, page_height,
-                                                 x_lo, x_hi, is_leader);
+                                                 x_lo, x_hi, leaders);
             for (auto& t : part) {
                 known.push_back(t);
                 result.push_back(std::move(t));
