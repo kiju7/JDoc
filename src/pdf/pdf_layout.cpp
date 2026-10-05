@@ -840,6 +840,19 @@ bool is_math_glyph(uint32_t cp) {
     return cp >= 0x2200 && cp <= 0x22FF && cp != 0x2212;
 }
 
+// Width of a cell measured to its last word: dot leaders after a label run
+// to its value and are not part of it ("Restructuring charge . . . . (99)").
+double cell_word_width(const LayoutLine& ln, std::pair<size_t, size_t> c) {
+    const auto& gl = ln.glyphs;
+    size_t end = c.second;
+    while (end > c.first + 1) {
+        uint32_t cp = gl[end - 1]->unicode;
+        if (cp != '.' && cp != 0x2026 && cp != 0xB7 && cp != '_') break;
+        end--;
+    }
+    return ink_right(gl[end - 1]) - gl[c.first]->left;
+}
+
 // Row index ranges [first, last] of one block's rows that pass the
 // whitespace rule (see the section comment).
 std::vector<std::pair<size_t, size_t>> tabular_runs(
@@ -943,7 +956,7 @@ std::vector<std::pair<size_t, size_t>> tabular_runs(
                     uint32_t cp = gl[k]->unicode;
                     if ((cp | 0x20) - 'a' < 26u || cp >= 0x3040) letter = true;
                 }
-                double w = ink_right(gl[first.second - 1]) - gl[first.first]->left;
+                double w = cell_word_width(rows[a], first);
                 if (!letter || w > 0.4 * width) continue;
                 data_rows++;
                 for (size_t c = 1; c < rc.cells.size(); c++) {
@@ -970,15 +983,7 @@ std::vector<std::pair<size_t, size_t>> tabular_runs(
                     auto first = cells[a].cells.front(), lastc = cells[a].cells.back();
                     const auto& gl = rows[a].glyphs;
                     double fs = gl[first.first]->font_size > 1.0 ? gl[first.first]->font_size : 10.0;
-                    // Measured to its last word: dot leaders after it run
-                    // to the value.
-                    size_t end = first.second;
-                    while (end > first.first + 1) {
-                        uint32_t cp = gl[end - 1]->unicode;
-                        if (cp != '.' && cp != 0x2026 && cp != 0xB7 && cp != '_') break;
-                        end--;
-                    }
-                    double w = ink_right(gl[end - 1]) - gl[first.first]->left;
+                    double w = cell_word_width(rows[a], first);
                     double wl = ink_right(gl[lastc.second - 1]) - gl[lastc.first]->left;
                     if (w <= 0.4 * width || (w <= 12 * fs && wl <= 12 * fs)) narrow++;
                 }
