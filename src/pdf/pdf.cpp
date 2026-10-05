@@ -308,11 +308,13 @@ static std::vector<std::array<double, 4>> fragment_regions(
         regions.push_back({std::max(rg[0], 0.0), std::max(rg[1], 0.0),
                            std::min(rg[2], page_w), std::min(rg[3], page_h)});
     }
-    // Panels of one figure ((a)-(d) under a single caption) are separate
-    // clusters; neighbouring regions merge into one image unless the union
-    // would take in body text, which marks two figures rather than two
-    // panels. A caption inside the union separates two figures too; panels
-    // share one caption outside all of them.
+    // Each fragment cluster is one original picture cut into strips or
+    // tiles; two clusters are two pictures (separate charts, the panels a
+    // producer stored as separate images) and keep their own images. They
+    // merge only when the drawing grown around them overlaps: arrows and
+    // frames that join raster pieces into one diagram. Nearness alone does
+    // not join them. The union still may not take in body text or a caption,
+    // which mark two figures.
     auto body_lines_in = [&](const std::array<double, 4>& r) {
         int n = 0;
         for (auto& ln : lines) {
@@ -330,7 +332,7 @@ static std::vector<std::array<double, 4>> fragment_regions(
                 auto& A = regions[i]; auto& B = regions[j];
                 double gx = std::max(A[0], B[0]) - std::min(A[2], B[2]);
                 double gy = std::max(A[1], B[1]) - std::min(A[3], B[3]);
-                if (gx > 0.15 * page_h || gy > 0.15 * page_h) continue;
+                if (gx >= 0 || gy >= 0) continue;   // touching or apart: two pictures
                 std::array<double, 4> U = {std::min(A[0], B[0]), std::min(A[1], B[1]),
                                            std::max(A[2], B[2]), std::max(A[3], B[3])};
                 if (body_lines_in(U) >= 2) continue;
@@ -1005,10 +1007,12 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
             }
             double region_area = 0;
             for (auto& R : regions) region_area += (R[2] - R[0]) * (R[3] - R[1]);
-            // Regions that fill half the page (a cover, a full-page
-            // infographic) are the page itself: composite it whole.
+            // Regions that cover the page (a cover, a scan with a text
+            // line) are the page itself: composite it whole. A full-page
+            // infographic or a page of charts still leaves margins, a page
+            // number, a running head: it keeps its regions.
             bool region_fragments = split_regions && !regions.empty() &&
-                                    region_area <= 0.5 * page_w * page_h;
+                                    region_area <= 0.9 * page_w * page_h;
             bool composited = false;
             if (vector_text_page || (fragment_page && !region_fragments)) {
                 // The composite draws every placement, standalone images
