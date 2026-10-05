@@ -1402,6 +1402,39 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    // [35] A table of two columns of words is not two columns of text
+    // (make_glossary_fixtures.py). A glossary's terms beside their
+    // definitions: the gap between them dips like a page gutter, but the
+    // terms are a label column, under ten ems wide beside one far wider.
+    // A dialogue beside its replies, both columns prose-wide, ruled off
+    // row from row: the rules box it as a table for the column vote. Each
+    // row keeps its two cells on one line, as text or as a table row.
+    std::cout << "[35] Testing two-column tables of words against the column split...\n";
+    {
+        const std::string dir = "test/fixtures/pdf/";
+        std::ifstream f(dir + "column_glossary.pdf");
+        if (!f.good()) {
+            std::cout << "    SKIP: column_glossary.pdf\n";
+        } else {
+            f.close();
+            auto same_line = [](const std::string& md, const std::string& a, const std::string& b) {
+                size_t p = md.find(a);
+                if (p == std::string::npos) return false;
+                size_t s = md.rfind('\n', p), e = md.find('\n', p);
+                std::string line = md.substr(s == std::string::npos ? 0 : s, e == std::string::npos ? std::string::npos : e - s);
+                return line.find(b) != std::string::npos;
+            };
+            std::string gl = jdoc::pdf_to_markdown(dir + "column_glossary.pdf");
+            CHECK(same_line(gl, "ASC", "Accounting Standards Codification"));
+            CHECK(same_line(gl, "NYMEX", "New York Mercantile Exchange"));
+            CHECK(same_line(gl, "WTI", "West Texas Intermediate"));
+            std::string rr = jdoc::pdf_to_markdown(dir + "ruled_rows.pdf");
+            CHECK(same_line(rr, "Input: hear it ?", "Choice: first reply"));
+            CHECK(same_line(rr, "Fifth: the man is a man of faith", "Seventh: it is my duty"));
+            std::cout << "    glossary and ruled dialogue rows kept whole OK\n";
+        }
+    }
+
     std::cout << "\n=== All tests passed ===\n";
     return 0;
 }

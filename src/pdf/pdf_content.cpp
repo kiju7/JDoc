@@ -2293,6 +2293,38 @@ static bool paired_rows(
     return filled >= 3;
 }
 
+// A page gutter parts two columns of text of comparable width. A strip of
+// text under ten ems wide beside a column several times wider is a label
+// column (a glossary's terms beside their definitions, a list's markers),
+// and the dip beside it is the gap between a label and its text: the rows
+// must stay whole. Measured over the rows with text on both sides of the
+// boundary; rows that cross it are left out.
+static bool label_column(
+        const std::vector<std::vector<std::pair<double, double>>>& rows,
+        double boundary, double median_fs) {
+    double L0 = 1e18, L1 = -1e18, R0 = 1e18, R1 = -1e18;
+    size_t pairs = 0;
+    for (const auto& g : rows) {
+        double l0 = 1e18, l1 = -1e18, r0 = 1e18, r1 = -1e18;
+        bool straddle = false;
+        for (const auto& [l, r] : g) {
+            if (l < boundary && r > boundary) { straddle = true; break; }
+            double& x0 = r <= boundary ? l0 : r0;
+            double& x1 = r <= boundary ? l1 : r1;
+            x0 = std::min(x0, l);
+            x1 = std::max(x1, r);
+        }
+        if (straddle || l1 < l0 || r1 < r0) continue;
+        pairs++;
+        L0 = std::min(L0, l0); L1 = std::max(L1, l1);
+        R0 = std::min(R0, r0); R1 = std::max(R1, r1);
+    }
+    if (pairs < 3) return false;
+    const double narrow = std::min(L1 - L0, R1 - R0);
+    const double wide = std::max(L1 - L0, R1 - R0);
+    return narrow < 10.0 * median_fs && wide > 3.0 * narrow;
+}
+
 double detect_column_boundary(const std::vector<TextChar>& chars,
                               double median_fs, double y_tol) {
     double page_left = 1e9, page_right = 0;
@@ -2316,6 +2348,10 @@ double detect_column_boundary(const std::vector<TextChar>& chars,
     // only rows narrow enough to live inside one column. The retry cannot
     // run first: aligned column pairs share a y and group into one wide
     // row, which would starve exactly the cleanest two-column pages.
+    // Every row's glyph extents (the first pass), for the label-column
+    // check both passes make: what stands either side of the dip is a
+    // question about all of the page's rows, not the narrow ones alone.
+    std::vector<std::vector<std::pair<double, double>>> all_rows;
     for (int narrow_only = 0; narrow_only < 2; narrow_only++) {
         constexpr int NUM_BINS = 200;
         int row_count[NUM_BINS] = {};
@@ -2354,6 +2390,8 @@ double detect_column_boundary(const std::vector<TextChar>& chars,
             if (!glyphs.empty()) row_glyphs.push_back(std::move(glyphs));
         }
 
+        if (!narrow_only) all_rows = row_glyphs;
+
         // A page with few rows (a short page, a one-page abstract, a page
         // that is mostly figure) cannot show the dip against the counts a
         // full column gives. It is still read as two columns when the dip
@@ -2390,6 +2428,7 @@ double detect_column_boundary(const std::vector<TextChar>& chars,
 
         double boundary = page_left + (best_bin + 0.5) / NUM_BINS * page_width;
         if (few_rows && !paired_rows(row_glyphs, boundary, median_fs, page_width)) continue;
+        if (label_column(all_rows, boundary, median_fs)) continue;
         return boundary;
     }
     return 0;
@@ -2702,14 +2741,15 @@ static std::vector<TextLine> lines_from_upright_chars(
     double y_tol = median_fs * 0.4;
     if (y_tol < 2) y_tol = 2;
 
-    double col_boundary;
+    // A glyph inside a ruled table votes as the table's full width: the
+    // gaps between its columns are not gutters of the page, nor the gutter
+    // of a column band. A table across most of the page then covers the
+    // page centre, and one inside a column covers that column only, leaving
+    // the gutter beside it empty.
+    std::vector<TextChar> voted;
+    const std::vector<TextChar>* vote_chars = &chars;
     if (ruled && !ruled->empty()) {
-        // A glyph inside a ruled table votes as the table's full width: the
-        // gaps between its columns are not gutters of the page. A table
-        // across most of the page then covers the page centre, and one
-        // inside a column covers that column only, leaving the gutter
-        // beside it empty.
-        std::vector<TextChar> voted = chars;
+        voted = chars;
         for (auto& ch : voted) {
             double cx = (ch.left + ch.right) / 2, cy = (ch.top + ch.bot) / 2;
             for (const auto& b : *ruled)
@@ -2719,10 +2759,9 @@ static std::vector<TextLine> lines_from_upright_chars(
                     break;
                 }
         }
-        col_boundary = detect_column_boundary(voted, median_fs, y_tol);
-    } else {
-        col_boundary = detect_column_boundary(chars, median_fs, y_tol);
+        vote_chars = &voted;
     }
+    double col_boundary = detect_column_boundary(*vote_chars, median_fs, y_tol);
     if (out_col_boundary) *out_col_boundary = col_boundary;
 
     std::sort(idx.begin(), idx.end(), [&](size_t a, size_t b) {
@@ -2741,7 +2780,7 @@ static std::vector<TextLine> lines_from_upright_chars(
         row_of[ii] = static_cast<int>(r);
     }
     const std::vector<BandCut> band_cut =
-        find_column_bands(chars, idx, row_of, median_fs, col_boundary);
+        find_column_bands(*vote_chars, idx, row_of, median_fs, col_boundary);
     std::vector<double> band_split;
     for (const auto& b : band_cut)
         if (b.band >= static_cast<int>(band_split.size())) band_split.push_back(b.split);

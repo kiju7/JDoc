@@ -381,6 +381,67 @@ static bool has_image(const ImageData& img) {
 }
 
 // Extract from an in-memory buffer; pdf_path is used for error messages only.
+// Rows ruled off one from the next: four or more horizontal rules across
+// half the page at least, stacked at most six lines apart with the same span (a
+// table drawn with rules between its rows and none between its columns, a
+// dialogue's turns boxed by rules). No ruled-table detector takes them, so
+// they are boxed here for the column boundary: as with a ruled table, the
+// glyphs between the rules vote as the stack's full width, and a table of
+// two columns of words set alone on a page is not read as two text columns.
+static std::vector<PageBox> rule_stack_boxes(const std::vector<PdfLineSegment>& segs,
+                                             const std::vector<TextChar>& chars,
+                                             double page_w) {
+    std::vector<PageBox> out;
+    std::vector<double> fs;
+    for (const auto& c : chars)
+        if (c.font_size > 1.0 && c.unicode != ' ') fs.push_back(c.font_size);
+    if (fs.size() < 20) return out;
+    std::nth_element(fs.begin(), fs.begin() + fs.size() / 2, fs.end());
+    const double line = fs[fs.size() / 2];
+    struct Rule { double y, x0, x1; };
+    std::vector<Rule> rules;
+    for (const auto& s : segs) {
+        if (!s.is_horizontal()) continue;
+        double x0 = std::min(s.x0, s.x1), x1 = std::max(s.x0, s.x1);
+        if (x1 - x0 < 0.5 * page_w) continue;
+        rules.push_back({(s.y0 + s.y1) / 2.0, x0, x1});
+    }
+    std::sort(rules.begin(), rules.end(),
+              [](const Rule& a, const Rule& b) { return a.y < b.y; });
+    size_t i = 0;
+    while (i < rules.size()) {
+        size_t j = i;
+        PageBox box{rules[i].x0, rules[i].y, rules[i].x1, rules[i].y};
+        while (j + 1 < rules.size()) {
+            const Rule& a = rules[j];
+            const Rule& b = rules[j + 1];
+            double span = std::max(a.x1 - a.x0, b.x1 - b.x0);
+            if (b.y - a.y > 6.0 * line ||
+                std::min(a.x1, b.x1) - std::max(a.x0, b.x0) < 0.8 * span)
+                break;
+            j++;
+            box[0] = std::min(box[0], b.x0);
+            box[2] = std::max(box[2], b.x1);
+            box[3] = b.y;
+        }
+        // A table has text in nearly every band between its rules; a
+        // chart's gridlines run through its plot with none.
+        size_t bands = 0, with_text = 0;
+        for (size_t k = i; j - i + 1 >= 4 && k < j; k++) {
+            double lo = std::min(rules[k].y, rules[k + 1].y), hi = std::max(rules[k].y, rules[k + 1].y);
+            bands++;
+            for (const auto& c : chars) {
+                if (c.unicode == ' ' || c.right <= c.left) continue;
+                double cx = (c.left + c.right) / 2, cy = (c.top + c.bot) / 2;
+                if (cy > lo && cy < hi && cx >= box[0] && cx <= box[2]) { with_text++; break; }
+            }
+        }
+        if (j - i + 1 >= 4 && with_text * 4 >= bands * 3) out.push_back(box);
+        i = j + 1;
+    }
+    return out;
+}
+
 static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
                                         const std::string& pdf_path,
                                         const ConvertOptions& opts,
@@ -652,6 +713,8 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
             for (auto& t : ruled_tables)
                 ruled_boxes.push_back({std::min(t.x0, t.x1), std::min(t.y0, t.y1),
                                        std::max(t.x0, t.x1), std::max(t.y0, t.y1)});
+            for (auto& b : rule_stack_boxes(parse_result.segments, parse_result.chars, page_w))
+                ruled_boxes.push_back(b);
         }
         result.all_lines[p] = chars_to_lines(parse_result.chars, &result.col_boundaries[p],
                                              &ruled_boxes);
