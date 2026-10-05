@@ -757,11 +757,22 @@ static uint32_t last_codepoint(const std::string& s) {
 
 // A line set entirely in capitals ("ABSTRACT"): at least three Latin
 // capitals and not a single lowercase letter — sentence case never counts.
+// A letter of a caseless script (Hangul, kana, ideographs) makes it a
+// sentence that merely holds an acronym ("한편 SPV는 ...").
 bool line_all_caps(const std::string& text) {
     int caps = 0;
-    for (char ch : text) {
+    for (size_t i = 0; i < text.size(); i++) {
+        unsigned char ch = static_cast<unsigned char>(text[i]);
         if (ch >= 'a' && ch <= 'z') return false;
         if (ch >= 'A' && ch <= 'Z') caps++;
+        if (ch >= 0xE0 && ch < 0xF0 && i + 2 < text.size()) {
+            uint32_t cp = ((ch & 0x0F) << 12) |
+                          ((static_cast<unsigned char>(text[i + 1]) & 0x3F) << 6) |
+                          (static_cast<unsigned char>(text[i + 2]) & 0x3F);
+            if ((cp >= 0x3040 && cp <= 0x30FF) || (cp >= 0x3130 && cp <= 0x318F) ||
+                (cp >= 0x4E00 && cp <= 0x9FFF) || (cp >= 0xAC00 && cp <= 0xD7A3))
+                return false;
+        }
     }
     return caps >= 3;
 }

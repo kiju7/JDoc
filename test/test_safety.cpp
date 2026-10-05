@@ -1020,6 +1020,7 @@ void test_pdf_heading_section_number_rules() {
     CHECK(!line_all_caps("References"));       // sentence case is no signal
     CHECK(!line_all_caps("A B"));              // too few capitals
     CHECK(!line_all_caps("PDF parsing"));      // lowercase kills it
+    CHECK(!line_all_caps("\xed\x95\x9c\xed\x8e\xb8 SPV"));  // "한편 SPV": Hangul kills it
     // "참 고 문 헌", "요<U+3000>약": every token a single character
     CHECK(line_letter_spaced(
         "\xec\xb0\xb8 \xea\xb3\xa0 \xeb\xac\xb8 \xed\x97\x8c"));
