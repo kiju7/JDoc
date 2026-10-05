@@ -1055,6 +1055,10 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
         result.glyphs.push_back(g);
     };
 
+    // Font of the last glyph emitted, for joining a spacing accent to the
+    // letter drawn next to it (compose_spacing_accent).
+    const void* last_glyph_font = nullptr;
+
     auto show_text_string = [&](GfxState& gs, const std::string& s) {
         double fs = gs.font_size;
         double h_scale = gs.h_scaling / 100.0;
@@ -1238,8 +1242,35 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
                     result.chars.push_back(part);
                 }
             } else {
-                result.chars.push_back(tc);
+                // A spacing accent and the letter it sits on, drawn one after
+                // the other from the same font, become the precomposed letter
+                // when the accent lies over the letter (half its width or
+                // more). A hat over a variable in an equation comes from the
+                // roman font over a math-italic letter, and stays as drawn.
+                bool merged = false;
+                if (tc.rot == 0 && !result.chars.empty() && last_glyph_font == gs.font &&
+                    result.chars.back().rot == 0) {
+                    TextChar& prev = result.chars.back();
+                    bool tc_accent = is_spacing_accent(tc.unicode);
+                    const TextChar& acc = tc_accent ? tc : prev;
+                    const TextChar& let = tc_accent ? prev : tc;
+                    uint32_t form = compose_spacing_accent(let.unicode, acc.unicode);
+                    double ov = std::min(acc.right, let.right) - std::max(acc.left, let.left);
+                    if (form && acc.right > acc.left && ov >= 0.5 * (acc.right - acc.left) &&
+                        std::abs(acc.y - let.y) <= std::max(let.font_size, 1.0)) {
+                        if (tc_accent) {
+                            prev.unicode = form;
+                        } else {
+                            TextChar joined = tc;
+                            joined.unicode = form;
+                            prev = joined;
+                        }
+                        merged = true;
+                    }
+                }
+                if (!merged) result.chars.push_back(tc);
             }
+            last_glyph_font = gs.font;
         }
     };
 
@@ -2112,6 +2143,49 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
     return result;
 }
 
+// The text of one glyph. A ligature that decodes to a presentation form
+// (U+FB00–FB06, from a glyph name such as "fl") is spelt out, so "efﬂuents"
+// reads, and searches, as "effluents". It stays one glyph for layout: split
+// into letters it would change the set of glyphs that rows are sorted from.
+void append_glyph_text(std::string& out, uint32_t cp) {
+    static const char* const kLigatures[7] = {"ff", "fi", "fl", "ffi", "ffl", "st", "st"};
+    if (cp >= 0xFB00 && cp <= 0xFB06) {
+        out += kLigatures[cp - 0xFB00];
+        return;
+    }
+    util::append_utf8(out, cp);
+}
+
+// Spacing accents a producer draws over a letter as a glyph of their own
+// (TeX sets "Muñoz" as n and a tilde). The tables come from the Unicode
+// Character Database (tools/gen_accent_compose.py): every spacing accent and
+// its combining mark, and every letter that composes with such a mark.
+#include "pdf_accent_compose.inc"
+
+static uint32_t combining_mark_of(uint32_t spacing) {
+    for (const auto& a : kSpacingAccents)
+        if (a.spacing == spacing) return a.mark;
+    return 0;
+}
+
+bool is_spacing_accent(uint32_t cp) { return combining_mark_of(cp) != 0; }
+
+uint32_t compose_spacing_accent(uint32_t base, uint32_t accent) {
+    uint32_t mark = combining_mark_of(accent);
+    if (!mark) return 0;
+    // Producers set accents over a dotless i or j.
+    if (base == 0x131) base = 'i';
+    if (base == 0x237) base = 'j';
+    if (base > 0xFFFF) return 0;
+    const AccentCompose key{static_cast<uint16_t>(mark), static_cast<uint16_t>(base), 0};
+    auto less = [](const AccentCompose& x, const AccentCompose& y) {
+        return x.mark != y.mark ? x.mark < y.mark : x.base < y.base;
+    };
+    auto it = std::lower_bound(std::begin(kAccentCompose), std::end(kAccentCompose), key, less);
+    if (it == std::end(kAccentCompose) || it->mark != mark || it->base != base) return 0;
+    return it->composed;
+}
+
 void drop_overprinted_chars(std::vector<TextChar>& chars) {
     // Bucket by character and a 2pt grid; a copy lies in a neighbouring cell.
     auto key = [](uint32_t u, int16_t rot, long gx, long gy) {
@@ -2832,7 +2906,7 @@ static std::vector<TextLine> lines_from_upright_chars(
         // here made a line spell "면적 ha" where its table cell spells
         // "면적 ha", so the capture check that drops table rows from the
         // prose flow missed the line and the row was printed twice.
-        util::append_utf8(cur.text, ch.unicode == 0xA0 ? uint32_t(' ') : ch.unicode);
+        append_glyph_text(cur.text, ch.unicode == 0xA0 ? uint32_t(' ') : ch.unicode);
         if (reach > -1e8) hole = std::max(hole, (double)ch.left - reach);
         reach = std::max(reach, (double)ch.right);
         if (ch.unicode != ' ' && ch.unicode != 0xA0) hole = 0;

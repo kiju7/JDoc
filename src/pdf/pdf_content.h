@@ -499,6 +499,12 @@ constexpr double kWrittenSpaceMinEm = 0.02;
 // and draw outlined or shadowed headlines as a stack of copies; the copies
 // add ink, not text. The first glyph of each stack stays, in stream order.
 void drop_overprinted_chars(std::vector<TextChar>& chars);
+// Append one glyph's text; ligature presentation forms are spelt out.
+void append_glyph_text(std::string& out, uint32_t cp);
+// Whether a code point is a spacing accent (U+02DC small tilde, ...).
+bool is_spacing_accent(uint32_t cp);
+// Precomposed letter for a base letter and a spacing accent, or 0.
+uint32_t compose_spacing_accent(uint32_t base, uint32_t accent);
 
 std::vector<TextLine> chars_to_lines(const std::vector<TextChar>& chars,
                                      double* out_col_boundary = nullptr);

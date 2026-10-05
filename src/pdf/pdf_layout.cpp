@@ -558,8 +558,12 @@ std::string render_row(const LayoutLine& ln, double margin, double unit,
                 col = std::max(col, cursor + 1);
         }
         row.append(col - cursor, ' ');
-        util::append_utf8(row, g->unicode);
-        cursor = col + static_cast<size_t>(util::display_width(g->unicode));
+        const size_t before = row.size();
+        append_glyph_text(row, g->unicode);
+        // A spelt-out ligature takes a column per letter.
+        cursor = col + (g->unicode >= 0xFB00 && g->unicode <= 0xFB06
+                            ? row.size() - before
+                            : static_cast<size_t>(util::display_width(g->unicode)));
         prev = g;
     }
     return row;
@@ -743,7 +747,7 @@ RowCells cut_cells(const LayoutLine& ln, double cell_gap) {
 std::string cell_text(const LayoutLine& ln, std::pair<size_t, size_t> r) {
     std::string t;
     for (size_t k = r.first; k < r.second; k++)
-        util::append_utf8(t, ln.glyphs[k]->unicode);
+        append_glyph_text(t, ln.glyphs[k]->unicode);
     return t;
 }
 

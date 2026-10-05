@@ -1375,6 +1375,28 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    // [34] Ligatures and spacing accents (make_ligature_accent_fixtures.py).
+    // Glyphs named "fl" and "fi" read as their letters; a tilde drawn back
+    // over an "n" from the same font reads as "ñ"; a circumflex from another
+    // font over a variable (a hat in an equation) stays as drawn.
+    std::cout << "[34] Testing ligatures and spacing accents...\n";
+    {
+        const std::string path = "test/fixtures/pdf/ligature_accent.pdf";
+        std::ifstream f(path);
+        if (!f.good()) {
+            std::cout << "    SKIP: ligature_accent.pdf\n";
+        } else {
+            f.close();
+            std::string md = jdoc::pdf_to_markdown(path);
+            CHECK(md.find("effluents and fields") != std::string::npos);
+            CHECK(md.find("Mu\xC3\xB1oz") != std::string::npos);
+            CHECK(md.find("\xEF\xAC") == std::string::npos);      // no U+FB0x left
+            CHECK(md.find("Y\xCB\x86") != std::string::npos);     // "Yˆ" kept
+            CHECK(jdoc::pdf_detail::compose_spacing_accent('e', 0x02C6) == 0xEA);
+            std::cout << "    ligatures spelt out, accent joined, equation hat kept OK\n";
+        }
+    }
+
     std::cout << "\n=== All tests passed ===\n";
     return 0;
 }

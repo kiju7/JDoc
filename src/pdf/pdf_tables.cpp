@@ -3030,7 +3030,7 @@ static bool spanning_header_cells(const std::vector<size_t>& ci,
             runs.push_back({"", ch.left, ch.right});
         else if (ch.left - prev_right >= word_gap)
             runs.back().text += ' ';
-        util::append_utf8(runs.back().text, ch.unicode);
+        append_glyph_text(runs.back().text, ch.unicode);
         runs.back().right = std::max(runs.back().right, ch.right);
         prev_right = std::max(prev_right, ch.right);
     }
@@ -3326,7 +3326,7 @@ static TableData build_table_from_band(
             if (!cells[col].empty() &&
                 (ch.rot != last_rot[col] || (lo - last_right[col]) >= word_gap))
                 cells[col] += ' ';
-            util::append_utf8(cells[col], ch.unicode);
+            append_glyph_text(cells[col], ch.unicode);
             last_right[col] = hi;
             last_rot[col] = ch.rot;
             glyphs[col]++;
