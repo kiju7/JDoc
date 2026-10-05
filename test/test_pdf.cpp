@@ -1353,9 +1353,11 @@ int main(int argc, char* argv[]) {
 
     // [33] Layout blocks of two columns (make_two_col_grid_fixtures.py). A
     // borderless table of codes beside counts that no detector takes keeps
-    // its rows aligned in a fenced layout block, as do years joined to their
-    // labels by dot leaders that leave no gap; a contents list (titles
-    // beside rising page numbers) stays a list.
+    // its rows aligned in a fenced layout block; years joined to their
+    // labels by dot leaders keep each year on its label's line, as a table
+    // (a narrow label column beside its values) or in a layout block; a
+    // contents list (titles beside rising page numbers) stays a list, its
+    // shape notwithstanding.
     std::cout << "[33] Testing layout blocks of two columns...\n";
     {
         const std::string dir = "test/fixtures/pdf/";
@@ -1370,9 +1372,15 @@ int main(int argc, char* argv[]) {
             CHECK(md.find("01000110", fence) != std::string::npos);
             CHECK(md.find("480", fence) != std::string::npos);
             std::string yr = jdoc::pdf_to_markdown(dir + "layout_leader_years.pdf");
-            size_t yf = yr.find("```text");
-            CHECK(yf != std::string::npos);
-            CHECK(yr.find("2004 to 2009", yf) != std::string::npos);
+            {
+                size_t p = yr.find("Korea");
+                CHECK(p != std::string::npos);
+                size_t ls = yr.rfind('\n', p), le = yr.find('\n', p);
+                std::string line = yr.substr(ls == std::string::npos ? 0 : ls,
+                                             le == std::string::npos ? std::string::npos : le - ls);
+                CHECK(line.find("2004 to 2009") != std::string::npos);
+                CHECK(yr.find("```text") != std::string::npos || line.find('|') != std::string::npos);
+            }
             std::string toc = jdoc::pdf_to_markdown(dir + "layout_contents.pdf");
             CHECK(toc.find("```") == std::string::npos);
             CHECK(toc.find('|') == std::string::npos);
@@ -1408,8 +1416,9 @@ int main(int argc, char* argv[]) {
     // terms are a label column, under ten ems wide beside one far wider.
     // A notation table whose definitions run long is a table all the same:
     // their lines end where their words end, ragged, as prose never does.
-    // Labels joined by dot leaders to values in words keep their alignment
-    // in a layout block: the leaders pair the rows, figures or not.
+    // Labels joined by dot leaders to values in words keep each value on
+    // its label's line, as a table or in a layout block: the leaders pair
+    // the rows, figures or not.
     // A dialogue beside its replies, both columns prose-wide, ruled off
     // row from row: the rules box it as a table for the column vote, and
     // the text table detector takes a band whose rows rules part as a
@@ -1438,18 +1447,69 @@ int main(int argc, char* argv[]) {
             std::string nt = jdoc::pdf_to_markdown(dir + "glossary_long.pdf");
             CHECK(nt.find('|') != std::string::npos);
             CHECK(same_line(nt, "| S ", "set of all possible messages"));
-            // Labels joined by dot leaders to values in words: a layout block.
+            // Labels joined by dot leaders to values in words keep each
+            // value on its label's line: a table (a narrow label column
+            // beside ragged values) or, failing that, a layout block.
             std::string lw = jdoc::pdf_to_markdown(dir + "leader_words.pdf");
-            size_t lf = lw.find("```text");
-            CHECK(lf != std::string::npos);
-            CHECK(lw.find("5 to 40 years", lf) != std::string::npos);
+            CHECK(same_line(lw, "Buildings and related improvements", "5 to 40 years"));
             CHECK(same_line(lw, "Machinery and equipment", "1 to 15 years"));
+            CHECK(lw.find("```text") != std::string::npos || same_line(lw, "| Machinery", "1 to 15 years"));
             std::string rr = jdoc::pdf_to_markdown(dir + "ruled_rows.pdf");
             CHECK(same_line(rr, "Input: hear it ?", "Choice: first reply"));
             CHECK(same_line(rr, "Fifth: the man is a man of faith", "Seventh: it is my duty"));
             // Rules parting the rows make it a table, prose-like cells or not.
             CHECK(rr.find('|') != std::string::npos);
             std::cout << "    glossary and ruled dialogue rows kept whole OK\n";
+        }
+    }
+
+    // [37] The shape of a two-column band of words (make_glossary_fixtures.py).
+    // Products beside the terms of their revenue recognition: a narrow
+    // column of terms under a bold header beside descriptions of several
+    // lines each, no rule anywhere. The wrapped lines keep the band whole
+    // and the shape says table where the cells' lengths say prose. Two
+    // tables parted by one line of prose running edge to edge stay two
+    // tables, the prose line between them. A table's bold group labels
+    // spanning most of its width do not part it: the rows below keep the
+    // column gap of the rows above.
+    std::cout << "[37] Testing the shape of two-column bands of words...\n";
+    {
+        const std::string dir = "test/fixtures/pdf/";
+        std::ifstream f(dir + "hanging_terms.pdf");
+        if (!f.good()) {
+            std::cout << "    SKIP: hanging_terms.pdf\n";
+        } else {
+            f.close();
+            auto line_of = [](const std::string& md, const std::string& a) {
+                size_t p = md.find(a);
+                if (p == std::string::npos) return std::string();
+                size_t s = md.rfind('\n', p), e = md.find('\n', p);
+                return md.substr(s == std::string::npos ? 0 : s, e == std::string::npos ? std::string::npos : e - s);
+            };
+            auto same_line = [&](const std::string& md, const std::string& a, const std::string& b) {
+                return line_of(md, a).find(b) != std::string::npos;
+            };
+            auto separators = [](const std::string& md) {
+                size_t n = 0, p = 0;
+                while ((p = md.find("\n| ---", p)) != std::string::npos) { n++; p += 6; }
+                return n;
+            };
+            std::string ht = jdoc::pdf_to_markdown(dir + "hanging_terms.pdf");
+            CHECK(same_line(ht, "| Instruments", "For instruments that include installation"));
+            CHECK(same_line(ht, "| Cloud services", "Cloud services, which allow customers"));
+            CHECK(same_line(ht, "| Extended warranty", "straight-line basis"));
+            std::string ta = jdoc::pdf_to_markdown(dir + "tables_apart.pdf");
+            CHECK(same_line(ta, "| Expected dividend yield", "$-"));
+            CHECK(same_line(ta, "Weighted average fair value", "$26.15"));
+            CHECK(same_line(ta, "Balance at December 31, 2006", "4,872"));
+            CHECK(line_of(ta, "The following table summarizes").find('|') == std::string::npos);
+            CHECK(separators(ta) == 2);
+            std::string gl = jdoc::pdf_to_markdown(dir + "group_labels.pdf");
+            CHECK(same_line(gl, "| No. of Cameras in the ACS", "| 2 "));
+            CHECK(same_line(gl, "| Translations of cameras", "2 x 30 x 100"));
+            CHECK(same_line(gl, "| Rotation noise", "0 to 2.4"));
+            CHECK(separators(gl) == 1);
+            std::cout << "    hanging terms a table; two tables kept apart; group labels kept inside OK\n";
         }
     }
 

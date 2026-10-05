@@ -1,0 +1,61 @@
+%PDF-1.4
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [3 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 5 0 R /F2 6 0 R >> >> /Contents 4 0 R >>
+endobj
+4 0 obj
+<< /Length 1507 >>
+stream
+BT /F1 10.0 Tf 239.69 762.00 Td (Table 2: Simulation setup.) Tj ET
+BT /F2 10.0 Tf 264.73 732.00 Td (Configuration) Tj ET
+BT /F1 10.0 Tf 180.00 719.00 Td (No. of Cameras in the ACS) Tj ET
+BT /F1 10.0 Tf 400.00 719.00 Td (2) Tj ET
+BT /F1 10.0 Tf 180.00 706.00 Td (No. of Joints in the ACS) Tj ET
+BT /F1 10.0 Tf 400.00 706.00 Td (1) Tj ET
+BT /F1 10.0 Tf 180.00 693.00 Td (Random transformations per test \(n\)) Tj ET
+BT /F1 10.0 Tf 400.00 693.00 Td (30) Tj ET
+BT /F1 10.0 Tf 180.00 680.00 Td (Number of tests) Tj ET
+BT /F1 10.0 Tf 400.00 680.00 Td (100) Tj ET
+BT /F2 10.0 Tf 180.00 667.00 Td (Transformations with fixed joint pose:) Tj ET
+BT /F1 10.0 Tf 180.00 654.00 Td (Rotations of cameras \(RA, RB\)) Tj ET
+BT /F1 10.0 Tf 400.00 654.00 Td (2 x 30 x 100) Tj ET
+BT /F1 10.0 Tf 180.00 641.00 Td (Translations of cameras \(TA, TB\)) Tj ET
+BT /F1 10.0 Tf 400.00 641.00 Td (2 x 30 x 100) Tj ET
+BT /F2 10.0 Tf 180.00 628.00 Td (General transformations:) Tj ET
+BT /F1 10.0 Tf 180.00 615.00 Td (Rotations of cameras \(RA, RB\)) Tj ET
+BT /F1 10.0 Tf 400.00 615.00 Td (2 x 30 x 100) Tj ET
+BT /F1 10.0 Tf 180.00 602.00 Td (Translations of cameras \(TA, TB\)) Tj ET
+BT /F1 10.0 Tf 400.00 602.00 Td (2 x 30 x 100) Tj ET
+BT /F2 10.0 Tf 180.00 589.00 Td (Zero mean Gaussian noise:) Tj ET
+BT /F1 10.0 Tf 180.00 576.00 Td (Rotation noise \(degrees\)) Tj ET
+BT /F1 10.0 Tf 400.00 576.00 Td (0 to 2.4) Tj ET
+BT /F1 10.0 Tf 180.00 563.00 Td (Translation noise \(meters\)) Tj ET
+BT /F1 10.0 Tf 400.00 563.00 Td (0 to 0.1) Tj ET
+
+endstream
+endobj
+5 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>
+endobj
+6 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold /Encoding /WinAnsiEncoding >>
+endobj
+xref
+0 7
+0000000000 65535 f 
+0000000009 00000 n 
+0000000058 00000 n 
+0000000115 00000 n 
+0000000251 00000 n 
+0000001810 00000 n 
+0000001907 00000 n 
+trailer
+<< /Size 7 /Root 1 0 R >>
+startxref
+2009
+%%EOF

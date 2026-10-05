@@ -2375,7 +2375,7 @@ static bool paired_rows(
 }
 
 // A page gutter parts two columns of text of comparable width. A strip of
-// text under ten ems wide beside a column several times wider is a label
+// text under twelve ems wide beside a column several times wider is a label
 // column (a glossary's terms beside their definitions, a list's markers),
 // and the dip beside it is the gap between a label and its text: the rows
 // must stay whole. Measured over the rows with text on both sides of the
@@ -2403,7 +2403,7 @@ static bool label_column(
     if (pairs < 3) return false;
     const double narrow = std::min(L1 - L0, R1 - R0);
     const double wide = std::max(L1 - L0, R1 - R0);
-    return narrow < 10.0 * median_fs && wide > 3.0 * narrow;
+    return narrow < 12.0 * median_fs && wide > 3.0 * narrow;
 }
 
 double detect_column_boundary(const std::vector<TextChar>& chars,
