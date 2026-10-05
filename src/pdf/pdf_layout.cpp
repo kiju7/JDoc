@@ -870,6 +870,7 @@ std::vector<std::pair<size_t, size_t>> tabular_runs(
         for (size_t k = i; k <= last; k++)
             if (multi[k]) m.push_back(k);
         bool ok = m.size() >= 3 && m.size() * 10 >= (last - i + 1) * 6;
+        bool two_col = false;
         if (ok) {
             // Column gaps: maximal x-intervals where at least 60% of the
             // multi-cell rows (and three) have a gap. Two are needed (three
@@ -897,7 +898,10 @@ std::vector<std::pair<size_t, size_t>> tabular_runs(
                 if (now && !inside) rivers++;
                 inside = now;
             }
-            ok = rivers >= 2;
+            // Two gaps make three columns; one (two columns) is held to the
+            // narrow first cell below.
+            ok = rivers >= 1;
+            two_col = rivers == 1;
         }
         if (ok) {
             // Data rows: a label first cell, digits in the cells after it.
@@ -950,6 +954,99 @@ std::vector<std::pair<size_t, size_t>> tabular_runs(
             ok = data_rows >= 3 && data_rows * 2 >= m.size() &&
                  digit_cells * 10 >= value_cells * 4 &&
                  wide_rows * 2 < m.size() && number_first * 5 <= m.size();
+            if (two_col) {
+                // Two columns: a narrow first cell on most rows (a term, a
+                // year, a code) beside its value, figures or words. Two
+                // columns of running text fill half the width each, so their
+                // first cells are never narrow.
+                // A short table may be narrow enough that its first column
+                // takes more than 40% of it; then both ends are short.
+                size_t narrow = 0;
+                for (size_t a : m) {
+                    auto first = cells[a].cells.front(), lastc = cells[a].cells.back();
+                    const auto& gl = rows[a].glyphs;
+                    double fs = gl[first.first]->font_size > 1.0 ? gl[first.first]->font_size : 10.0;
+                    // Measured to its last word: dot leaders after it run
+                    // to the value.
+                    size_t end = first.second;
+                    while (end > first.first + 1) {
+                        uint32_t cp = gl[end - 1]->unicode;
+                        if (cp != '.' && cp != 0x2026 && cp != 0xB7 && cp != '_') break;
+                        end--;
+                    }
+                    double w = ink_right(gl[end - 1]) - gl[first.first]->left;
+                    double wl = ink_right(gl[lastc.second - 1]) - gl[lastc.first]->left;
+                    if (w <= 0.4 * width || (w <= 12 * fs && wl <= 12 * fs)) narrow++;
+                }
+                ok = narrow >= 3 && narrow * 10 >= m.size() * 8;
+                // A column of running text beside a side column has lines of
+                // its own at the second column's left edge: above the side
+                // column, among its lines, or below its last. A table's
+                // value column ends with the table.
+                std::vector<double> xs;
+                for (size_t a : m) {
+                    const auto& gl = rows[a].glyphs;
+                    xs.push_back(gl[cells[a].cells[1].first]->left);
+                }
+                std::nth_element(xs.begin(), xs.begin() + xs.size() / 2, xs.end());
+                const double col2 = xs[xs.size() / 2];
+                auto carries_on = [&](size_t k) {
+                    if (multi[k] || rows[k].glyphs.empty()) return false;
+                    const auto* g = rows[k].glyphs.front();
+                    double fs = g->font_size > 1.0 ? g->font_size : 10.0;
+                    return std::abs(g->left - col2) <= fs;
+                };
+                bool runs_on = i > 0 && close(i - 1, i) && carries_on(i - 1);
+                for (size_t k = i; k <= last && !runs_on; k++) runs_on = carries_on(k);
+                for (size_t k = last + 1; k < n && k <= last + 3 && !runs_on && close(k - 1, k); k++)
+                    runs_on = carries_on(k);
+                // Numbers opening most rows ("4:", "12.", "(3)"): the steps of
+                // an algorithm or a numbered list, not a table.
+                size_t numbered = 0;
+                for (size_t a : m) {
+                    std::string t = cell_text(rows[a], cells[a].cells.front());
+                    size_t d = t.find_first_not_of("(");
+                    size_t e = t.find_first_not_of("0123456789", d);
+                    if (d != std::string::npos && e != d && e - d <= 3 &&
+                        (e == t.size() || (e + 1 >= t.size() - (t.back() == ')' ? 1 : 0) &&
+                                           std::string(".:)").find(t[e]) != std::string::npos)))
+                        numbered++;
+                }
+                // The value column holds figures on most rows ("480",
+                // "$ 672.8"); a second column of words beside a first is a
+                // list, a form, two side columns or a chart's labels as
+                // often as a table, and stays text. Rising whole numbers
+                // closing the rows are the page numbers of a contents list.
+                // Both cells the same on most rows: the axis labels of two
+                // charts set side by side.
+                size_t figures = 0, pages = 0, twins = 0;
+                double prev_page = -1;
+                for (size_t a : m) {
+                    if (cell_text(rows[a], cells[a].cells.front()) ==
+                        cell_text(rows[a], cells[a].cells.back()))
+                        twins++;
+                    const auto& gl = rows[a].glyphs;
+                    auto lc = cells[a].cells.back();
+                    size_t digits = 0, letters = 0;
+                    for (size_t k = lc.first; k < lc.second; k++) {
+                        uint32_t cp = gl[k]->unicode;
+                        if (cp >= '0' && cp <= '9') digits++;
+                        else if ((cp | 0x20) - 'a' < 26u || cp >= 0x3040) letters++;
+                    }
+                    if (digits > 0 && digits >= 2 * letters) figures++;
+                    double v;
+                    std::string lt = cell_text(rows[a], lc);
+                    if (cell_number(lt, v) && v == std::floor(v) && v >= 1 && v < 10000 &&
+                        lt.find_first_of(".,") == std::string::npos && v >= prev_page) {
+                        pages++;
+                        prev_page = v;
+                    }
+                }
+                if (ok && (runs_on || numbered * 10 >= m.size() * 6 ||
+                           figures * 10 < m.size() * 6 || pages * 10 >= m.size() * 7 ||
+                           twins * 10 >= m.size() * 6))
+                    ok = false;
+            }
         }
         if (ok) {
             // A column of figures: cells that are mostly digits ("5.1",
@@ -1046,10 +1143,25 @@ std::vector<std::pair<size_t, size_t>> tabular_runs(
                 if (has_leader(all)) leaders++;
                 if (all.find('@') != std::string::npos) mails++;
             }
+            // Dot leaders run to page numbers in a table of contents (a
+            // list) and to amounts in a financial statement (a table): only
+            // the first, rising whole numbers closing the rows, is dropped.
+            size_t pages = 0;
+            double prev_page = -1;
+            for (size_t a : m) {
+                double v;
+                std::string lt = cell_text(rows[a], cells[a].cells.back());
+                if (cell_number(lt, v) && v == std::floor(v) && v >= 1 && v < 10000 &&
+                    lt.find_first_of(".,") == std::string::npos && v >= prev_page) {
+                    pages++;
+                    prev_page = v;
+                }
+            }
+            bool contents = leaders * 2 >= m.size() && pages * 10 >= m.size() * 7;
             if (lists * 10 >= m.size() * 6 || eqs * 2 >= m.size() ||
                 (eqs > 0 && last - i + 1 <= 5) ||
                 maths * 10 >= m.size() * 3 || (maths > 0 && last - i + 1 <= 8) ||
-                leaders * 2 >= m.size() || mails >= 2)
+                contents || (two_col && leaders * 2 >= m.size() && pages > 0) || mails >= 2)
                 ok = false;
         }
         if (ok) out.push_back({i, last});
@@ -1243,6 +1355,7 @@ std::vector<LayoutFallback> find_layout_fallbacks(
                 blocks.emplace_back();
                 blocks.back().rows = std::move(lines);
             }
+            const size_t found = out.size();
             for (auto& blk : blocks)
                 for (auto& run : tabular_runs(blk.rows, cell_gap)) {
                     std::vector<const LayoutLine*> rows;
@@ -1250,6 +1363,26 @@ std::vector<LayoutFallback> find_layout_fallbacks(
                         rows.push_back(&blk.rows[k]);
                     out.push_back(make_fallback(rows, gp, 0, identity, &spaces));
                 }
+            // A page whose column boundary falls inside a tabular region (a
+            // page holding little but that region) cuts its rows in two at
+            // the boundary, and neither half is a region any more. The rows
+            // are tried again whole; a region found that way is kept where
+            // no column block found one at its height. Two columns of
+            // running text do not pass: their first cells are not narrow.
+            if (col_boundary > 0) {
+                auto whole = group_lines(rest, gp.median_fs);
+                for (auto& run : tabular_runs(whole, cell_gap)) {
+                    double top = whole[run.first].base_y, bot = whole[run.second].base_y;
+                    bool seen = false;
+                    for (size_t k = found; k < out.size() && !seen; k++)
+                        seen = out[k].y0 <= top + gp.median_fs && out[k].y1 >= bot - gp.median_fs;
+                    if (seen) continue;
+                    std::vector<const LayoutLine*> rows;
+                    for (size_t k = run.first; k <= run.second; k++)
+                        rows.push_back(&whole[k]);
+                    out.push_back(make_fallback(rows, gp, 0, identity, &spaces));
+                }
+            }
         }
     }
 

@@ -1,5 +1,5 @@
-"""Regenerate the two-column grid fixtures used by test_pdf ([32] ruled
-tables of two columns).
+"""Regenerate the two-column fixtures used by test_pdf ([32] ruled tables of
+two columns, [33] layout blocks of two columns).
 
   grid_two_col_terms.pdf   a page holding nothing but a ruled table of two
       columns and twelve rows (enough for the page's gutter histogram to
@@ -8,6 +8,12 @@ tables of two columns).
       at a time, as LaTeX draws them. Every row
       ends a word in the left cell and starts one in the right, as any table
       of words does.
+  layout_two_col_counts.pdf  a borderless table of two right-aligned columns,
+      codes beside their counts, under a paragraph. No rule, no third
+      column: no table detector takes it, and its rows must keep their
+      alignment in a layout block.
+  layout_contents.pdf      a contents list: titles beside rising page
+      numbers. A list, never a layout block.
   grid_split_prose.pdf     a paragraph set across a frame that a vertical
       rule cuts in two: the words on either side of the rule sit a word
       space apart, so the text runs on across it. It is not a table.
@@ -81,8 +87,38 @@ def make_split_prose():
     pg.save("grid_split_prose.pdf")
 
 
+COUNTS = [("Transducer", "Frequency"), ("0000", "1"), ("000100", "8"),
+          ("0001010110", "1"), ("00010110", "4"), ("0001011100", "1"),
+          ("000110", "8"), ("00011100", "4"), ("01000110", "480")]
+CONTENTS = [("Introduction", "1"), ("Related work", "4"), ("Measurement sites", "9"),
+            ("Results", "15"), ("Discussion", "22"), ("Conclusion", "27")]
+
+
+def make_counts():
+    pg = Page()
+    pg.text(72, 100, "The transducers below were observed over the whole corpus.", size=10)
+    for i, (a, b) in enumerate(COUNTS):
+        y = 130 + 13 * i
+        font = "F2" if i == 0 else "F1"
+        pg.text(260 - width(a, font, 10), y, a, font, 10)
+        pg.text(340 - width(b, font, 10), y, b, font, 10)
+    pg.save("layout_two_col_counts.pdf")
+
+
+def make_contents():
+    pg = Page()
+    pg.text(72, 100, "Contents", "F2", 12)
+    for i, (a, b) in enumerate(CONTENTS):
+        y = 130 + 16 * i
+        pg.text(90, y, a, size=10)
+        pg.text(500 - width(b, "F1", 10), y, b, size=10)
+    pg.save("layout_contents.pdf")
+
+
 if __name__ == "__main__":
+    make_counts()
+    make_contents()
     make_terms()
     make_split_prose()
-    print("wrote grid_two_col_terms.pdf, grid_split_prose.pdf to",
+    print("wrote grid_two_col_terms.pdf, grid_split_prose.pdf, layout_*.pdf to",
           os.path.dirname(os.path.abspath(__file__)))

@@ -1351,6 +1351,30 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    // [33] Layout blocks of two columns (make_two_col_grid_fixtures.py). A
+    // borderless table of codes beside counts that no detector takes keeps
+    // its rows aligned in a fenced layout block; a contents list (titles
+    // beside rising page numbers) stays a list.
+    std::cout << "[33] Testing layout blocks of two columns...\n";
+    {
+        const std::string dir = "test/fixtures/pdf/";
+        std::ifstream f(dir + "layout_two_col_counts.pdf");
+        if (!f.good()) {
+            std::cout << "    SKIP: layout_*.pdf\n";
+        } else {
+            f.close();
+            std::string md = jdoc::pdf_to_markdown(dir + "layout_two_col_counts.pdf");
+            size_t fence = md.find("```text");
+            CHECK(fence != std::string::npos);
+            CHECK(md.find("01000110", fence) != std::string::npos);
+            CHECK(md.find("480", fence) != std::string::npos);
+            std::string toc = jdoc::pdf_to_markdown(dir + "layout_contents.pdf");
+            CHECK(toc.find("```") == std::string::npos);
+            CHECK(toc.find('|') == std::string::npos);
+            std::cout << "    counts kept in a layout block; contents kept as a list OK\n";
+        }
+    }
+
     std::cout << "\n=== All tests passed ===\n";
     return 0;
 }
