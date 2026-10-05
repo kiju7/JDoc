@@ -262,6 +262,70 @@ static std::vector<char> body_line_flags(const std::vector<TextLine>& lines,
     return out;
 }
 
+// Runs of upright text on one baseline, split where the gap between two
+// glyphs exceeds 1.5 font sizes. A line can join headings that only share a
+// baseline (two charts' titles set side by side read as one line); a run
+// keeps them apart.
+struct TextRun { double x0, x1, y, fs; };
+static std::vector<TextRun> text_runs(const std::vector<TextChar>& chars) {
+    std::vector<const TextChar*> cs;
+    for (auto& c : chars)
+        if (c.rot == 0 && c.unicode != ' ' && c.font_size > 1.0) cs.push_back(&c);
+    std::sort(cs.begin(), cs.end(), [](const TextChar* a, const TextChar* b) {
+        if (std::abs(a->y - b->y) > 0.3 * std::max(a->font_size, b->font_size))
+            return a->y > b->y;
+        return a->left < b->left;
+    });
+    std::vector<TextRun> runs;
+    for (auto* c : cs) {
+        if (!runs.empty()) {
+            auto& r = runs.back();
+            if (std::abs(c->y - r.y) <= 0.3 * std::max(c->font_size, r.fs) &&
+                c->left - r.x1 <= 1.5 * std::max(c->font_size, r.fs) && c->left >= r.x0) {
+                r.x1 = std::max(r.x1, c->right);
+                r.fs = std::max(r.fs, c->font_size);
+                continue;
+            }
+        }
+        runs.push_back({c->left, c->right, c->y, c->font_size});
+    }
+    return runs;
+}
+
+// A title of a picture's own: a run of text over the picture's top (above
+// it, or inside its top band) that stays within the picture's width and does
+// not reach over to the neighbour beside it. Page space is y-up here: the
+// top edge is y1 and a run's glyphs stand above its baseline y.
+static bool has_own_title(const std::vector<TextRun>& runs,
+                          double x0, double y0, double x1, double y1,
+                          double nx0, double nx1) {
+    const double h = y1 - y0;
+    for (auto& r : runs) {
+        double fs = std::max(r.fs, 4.0);
+        if (r.x1 - r.x0 < 3.0 * fs) continue;                    // a mark, not a title
+        if (r.x0 < x0 - 2 || r.x1 > x1 + 2) continue;            // within this picture
+        if (r.x1 > nx0 && r.x0 < nx1) continue;                  // reaches the neighbour
+        double ry0 = r.y - 0.3 * fs, ry1 = r.y + fs;
+        if (ry0 > y1 + 2.5 * fs || ry1 < y1 - 0.15 * h) continue;  // over the top
+        return true;
+    }
+    return false;
+}
+
+// Two placements or regions side by side, each with a title of its own,
+// are two pictures however close they sit. Two pictures set side by side
+// each carry one (two charts' headings, panels A and B, a row of cards); the
+// two halves of one raster cut down the middle carry none of their own,
+// their title spanning the seam if they have one.
+static bool separate_titled_pictures(const std::vector<TextRun>& runs,
+                                     double ax0, double ay0, double ax1, double ay1,
+                                     double bx0, double by0, double bx1, double by1) {
+    double yov = std::min(ay1, by1) - std::max(ay0, by0);
+    if (yov < 0.5 * std::min(ay1 - ay0, by1 - by0)) return false;  // not side by side
+    return has_own_title(runs, ax0, ay0, ax1, ay1, bx0, bx1) &&
+           has_own_title(runs, bx0, by0, bx1, by1, ax0, ax1);
+}
+
 // Composite regions of the fragment clusters on a page with body text: each
 // cluster box grown over the vector paths it touches, neighbouring panels of
 // one figure merged, and the figure's own labels taken in. Boxes are clamped
@@ -270,9 +334,10 @@ static std::vector<std::array<double, 4>> fragment_regions(
         const std::vector<std::array<double, 4>>& cluster_boxes,
         const std::vector<RenderPath>& paths,
         const std::vector<TextLine>& lines, const std::vector<char>& body,
-        double page_w, double page_h) {
+        const std::vector<TextRun>& runs, double page_w, double page_h) {
     std::vector<std::array<double, 4>> regions;
     std::vector<std::array<double, 4>> path_boxes;
+    std::vector<char> path_backdrop;   // filled, not stroked: a panel or shading
     for (auto& rp : paths) {
         if (rp.synthetic) continue;
         double bx0 = 1e300, by0 = 1e300, bx1 = -1e300, by1 = -1e300;
@@ -286,16 +351,62 @@ static std::vector<std::array<double, 4>> fragment_regions(
         // every region to the page.
         if ((bx1 - bx0) * (by1 - by0) > 0.25 * page_w * page_h) continue;
         path_boxes.push_back({bx0, by0, bx1, by1});
+        path_backdrop.push_back(rp.do_fill && !rp.do_stroke);
     }
-    for (auto& c : cluster_boxes) {
+    // A filled panel fitted around the pictures it holds (the tinted card
+    // behind a chart, with the chart's legend as a second cluster inside it)
+    // is ground: compare it with the union of every cluster inside it.
+    std::vector<char> path_ground(path_boxes.size(), 0);
+    for (size_t pi = 0; pi < path_boxes.size(); pi++) {
+        if (!path_backdrop[pi]) continue;
+        const auto& b = path_boxes[pi];
+        double u0 = 1e300, u1 = 1e300, u2 = -1e300, u3 = -1e300;
+        for (auto& c : cluster_boxes)
+            if (b[0] <= c[0] + 1 && b[1] <= c[1] + 1 && b[2] >= c[2] - 1 && b[3] >= c[3] - 1) {
+                u0 = std::min(u0, c[0]); u1 = std::min(u1, c[1]);
+                u2 = std::max(u2, c[2]); u3 = std::max(u3, c[3]);
+            }
+        if (u0 > u2) continue;
+        path_ground[pi] = (b[2] - b[0]) * (b[3] - b[1]) <= 1.6 * (u2 - u0) * (u3 - u1);
+    }
+    // The clusters one ground panel holds are one picture (a chart cut into
+    // bands, its legend strips below): they become one cluster, the union of
+    // their own boxes, without the panel's margins.
+    std::vector<std::array<double, 4>> clusters_in = cluster_boxes;
+    for (size_t pi = 0; pi < path_boxes.size(); pi++) {
+        if (!path_ground[pi]) continue;
+        const auto& b = path_boxes[pi];
+        std::array<double, 4> u = {1e300, 1e300, -1e300, -1e300};
+        std::vector<std::array<double, 4>> rest;
+        for (auto& c : clusters_in) {
+            if (b[0] <= c[0] + 1 && b[1] <= c[1] + 1 && b[2] >= c[2] - 1 && b[3] >= c[3] - 1) {
+                u = {std::min(u[0], c[0]), std::min(u[1], c[1]),
+                     std::max(u[2], c[2]), std::max(u[3], c[3])};
+            } else {
+                rest.push_back(c);
+            }
+        }
+        if (u[0] > u[2]) continue;
+        rest.push_back(u);
+        clusters_in.swap(rest);
+    }
+    for (auto& c : clusters_in) {
         double rg[4] = {c[0], c[1], c[2], c[3]};
         // Grow over touching paths until the region is stable: a drawing
         // chains box to arrow to box well past two hops.
         for (int pass = 0; pass < 10; pass++) {
             double g[4] = {rg[0], rg[1], rg[2], rg[3]};
-            for (auto& b : path_boxes) {
+            for (size_t pi = 0; pi < path_boxes.size(); pi++) {
+                const auto& b = path_boxes[pi];
                 if (b[2] < rg[0] - 2 || b[0] > rg[2] + 2 ||
                     b[3] < rg[1] - 2 || b[1] > rg[3] + 2) continue;
+                // Ground (see path_ground) would add its margins and pull the
+                // chart's title in after them. A box in a diagram that holds
+                // a small raster among its other parts is far larger than
+                // that raster and still grows the region, as do stroked axes
+                // and frames.
+                if (path_ground[pi] && b[0] <= c[0] + 1 && b[1] <= c[1] + 1 &&
+                    b[2] >= c[2] - 1 && b[3] >= c[3] - 1) continue;
                 double n0 = std::min(g[0], b[0]), n1 = std::min(g[1], b[1]);
                 double n2 = std::max(g[2], b[2]), n3 = std::max(g[3], b[3]);
                 if ((n2 - n0) * (n3 - n1) > 0.6 * page_w * page_h) continue;
@@ -308,11 +419,13 @@ static std::vector<std::array<double, 4>> fragment_regions(
         regions.push_back({std::max(rg[0], 0.0), std::max(rg[1], 0.0),
                            std::min(rg[2], page_w), std::min(rg[3], page_h)});
     }
-    // Panels of one figure ((a)-(d) under a single caption) are separate
-    // clusters; neighbouring regions merge into one image unless the union
-    // would take in body text, which marks two figures rather than two
-    // panels. A caption inside the union separates two figures too; panels
-    // share one caption outside all of them.
+    // Each fragment cluster is one original picture cut into strips or
+    // tiles; two clusters are two pictures (separate charts, the panels a
+    // producer stored as separate images) and keep their own images. They
+    // merge only when the drawing grown around them overlaps: arrows and
+    // frames that join raster pieces into one diagram. Nearness alone does
+    // not join them. The union still may not take in body text or a caption,
+    // which mark two figures.
     auto body_lines_in = [&](const std::array<double, 4>& r) {
         int n = 0;
         for (auto& ln : lines) {
@@ -330,7 +443,9 @@ static std::vector<std::array<double, 4>> fragment_regions(
                 auto& A = regions[i]; auto& B = regions[j];
                 double gx = std::max(A[0], B[0]) - std::min(A[2], B[2]);
                 double gy = std::max(A[1], B[1]) - std::min(A[3], B[3]);
-                if (gx > 0.15 * page_h || gy > 0.15 * page_h) continue;
+                if (gx >= 0 || gy >= 0) continue;   // touching or apart: two pictures
+                if (separate_titled_pictures(runs, A[0], A[1], A[2], A[3],
+                                             B[0], B[1], B[2], B[3])) continue;
                 std::array<double, 4> U = {std::min(A[0], B[0]), std::min(A[1], B[1]),
                                            std::max(A[2], B[2]), std::max(A[3], B[3])};
                 if (body_lines_in(U) >= 2) continue;
@@ -363,6 +478,13 @@ static std::vector<std::array<double, 4>> fragment_regions(
                 if (ov < 0.5 * std::max(lw, 1.0)) continue;
                 double gap = std::max(ly0 - R[3], R[1] - ly1);
                 if (gap > 1.5 * fs) continue;
+                // Above the picture sit its title and subtitle, below it the
+                // caption, notes and source: long lines of their own. The
+                // drawing's labels there are short (a unit "(%)", an axis
+                // title, "(a)"), so a line wider than a quarter of the region
+                // is not taken in over the top or bottom edge.
+                bool over_edge = ly0 >= R[3] - 0.5 * fs || ly1 <= R[1] + 0.5 * fs;
+                if (over_edge && lw > 0.25 * (R[2] - R[0])) continue;
                 R[0] = std::min(R[0], ln.x_left); R[2] = std::max(R[2], ln.x_right);
                 R[1] = std::min(R[1], ly0);       R[3] = std::max(R[3], ly1);
                 grew = true;
@@ -858,6 +980,7 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
 
             const size_t n_inf = infos.size();
             DisjointSet image_sets(n_inf);
+            const std::vector<TextRun> page_runs = text_runs(parse_result.chars);
 
             // Print-driver strips abut within sub-point rounding; distinct
             // assets sit tens of points apart in real layouts.
@@ -887,7 +1010,11 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
                             if (xov >= 0.5 * std::min(wa, wb))
                                 eps_y = std::max(eps, 0.02 * page_h);
                         }
-                        if (gx <= eps && gy <= eps_y) {
+                        if (gx <= eps && gy <= eps_y &&
+                            !separate_titled_pictures(
+                                page_runs, infos[a].x0, infos[a].y0,
+                                infos[a].x1, infos[a].y1, infos[b].x0, infos[b].y0,
+                                infos[b].x1, infos[b].y1)) {
                             image_sets.unite(a, b);
                         }
                     }
@@ -1001,14 +1128,16 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
                     if (qualifies(c)) cluster_boxes.push_back({c.x0, c.y0, c.x1, c.y1});
                 regions = fragment_regions(cluster_boxes, parse_result.paths,
                                            result.all_lines[p], body_flags,
-                                           page_w, page_h);
+                                           page_runs, page_w, page_h);
             }
             double region_area = 0;
             for (auto& R : regions) region_area += (R[2] - R[0]) * (R[3] - R[1]);
-            // Regions that fill half the page (a cover, a full-page
-            // infographic) are the page itself: composite it whole.
+            // Regions that cover the page (a cover, a scan with a text
+            // line) are the page itself: composite it whole. A full-page
+            // infographic or a page of charts still leaves margins, a page
+            // number, a running head: it keeps its regions.
             bool region_fragments = split_regions && !regions.empty() &&
-                                    region_area <= 0.5 * page_w * page_h;
+                                    region_area <= 0.9 * page_w * page_h;
             bool composited = false;
             if (vector_text_page || (fragment_page && !region_fragments)) {
                 // The composite draws every placement, standalone images

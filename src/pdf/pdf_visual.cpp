@@ -616,13 +616,26 @@ static bool decode_smask(PdfDoc& doc, const PdfObj& xobj,
 }
 
 // Decode an explicit stencil /Mask (an image XObject with ImageMask true)
-// into an 8-bit alpha plane (255 = base image shows). The sample the Decode
-// array maps to 1 is the visible area — the polarity Acrobat and mupdf
-// render for the JBIG2-masked logos in Korean office documents.
+// into an 8-bit alpha plane (255 = base image shows). As with any stencil,
+// the sample the Decode array maps to 0 is painted and 1 is masked out: with
+// the default [0 1] a Flate mask carries 1 over the background it hides (the
+// chart strips of KDI and Bank of Korea reports mask out their white ground
+// this way). jbig2_decode hands back JBIG2's own sense, 1 = black, where the
+// PDF filter delivers 0 = black, so a JBIG2-coded mask reads the other way
+// round — the polarity Acrobat and mupdf render for the JBIG2-masked logos in
+// Korean office documents.
 static bool decode_stencil_mask(PdfDoc& doc, const PdfObj& xobj,
                                 std::vector<uint8_t>& alpha, int& aw, int& ah) {
     auto mk = doc.resolve(xobj.get("Mask"));
     if (!mk.is_stream() || !mk.get("ImageMask").bool_val) return false;
+    bool jbig2 = false;
+    {
+        auto f = doc.resolve(mk.get("Filter"));
+        if (f.is_name()) jbig2 = f.str_val == "JBIG2Decode";
+        else if (f.is_arr())
+            for (auto& e : f.arr)
+                if (doc.resolve(e).is_name() && doc.resolve(e).str_val == "JBIG2Decode") jbig2 = true;
+    }
     int w = mk.get("Width").as_int();
     int h = mk.get("Height").as_int();
     if (w <= 0 || h <= 0) return false;
@@ -637,7 +650,9 @@ static bool decode_stencil_mask(PdfDoc& doc, const PdfObj& xobj,
         for (int x = 0; x < w; x++) {
             bool bit = (data[static_cast<size_t>(y) * row_bytes + (x >> 3)]
                         >> (7 - (x & 7))) & 1;
-            alpha[static_cast<size_t>(y) * w + x] = (bit != flip) ? 255 : 0;
+            // Painted where the Decode-mapped sample is 0 (JBIG2: inverted).
+            bool painted = jbig2 ? (bit != flip) : (bit == flip);
+            alpha[static_cast<size_t>(y) * w + x] = painted ? 255 : 0;
         }
     aw = w;
     ah = h;
