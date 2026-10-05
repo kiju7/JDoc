@@ -3506,8 +3506,12 @@ static bool is_value_cell(const std::string& s) {
 
 // Returns true if the table is acceptable (kept). gutter is the empty gap
 // between the two columns of a 2-column candidate, in font sizes, when it
-// is the widest gap of its rows (0 otherwise or for other widths).
-static bool accept_table(TableData& table, double gutter = 0.0, int led_rows = 0) {
+// is the widest gap of its rows (0 otherwise or for other widths). ragged:
+// the lines of a 2-column candidate's second column end where their words
+// end, well short of the column's right edge on a third of the rows at
+// least, as a table's cells do and a column of prose does not.
+static bool accept_table(TableData& table, double gutter = 0.0, int led_rows = 0,
+                         bool ragged = false) {
     if (table.rows.empty()) return false;
     // pre-step: strip body-text columns adjacent to the table
     strip_prose_columns(table);
@@ -3967,7 +3971,12 @@ static bool accept_table(TableData& table, double gutter = 0.0, int led_rows = 0
                 def_chars += row[1].size();
             }
         }
-        if (def_chars < term_chars * 2 || def_chars > table.rows.size() * 30) glossary = false;
+        // Definitions of a line or less each, or longer ones whose lines
+        // end where their words end (ragged): a column of prose beside a
+        // column of chart labels fills its lines to the right edge.
+        bool short_defs = def_chars >= term_chars * 2 && def_chars <= table.rows.size() * 30;
+        bool long_defs = ragged && def_chars * 2 >= term_chars * 3;
+        if (!short_defs && !long_defs) glossary = false;
         double ct = (n_cols == 2) ? 0.15 : 0.30;
         if (!glossary && !leader_pairs && checked_rows >= 2 &&
             continuation_rows >= checked_rows * ct)
@@ -4460,7 +4469,29 @@ static std::vector<TableData> detect_text_tables_range(
                 }
             if (led) led_rows++;
         }
-        return accept_table(table, gutter, led_rows);
+        // Second-column lines of a two-column candidate that stop well
+        // short of the column's right edge (over a quarter of its width):
+        // a third of the rows or more makes the column ragged.
+        bool ragged = false;
+        if (bounds.size() == 3) {
+            double left = 1e18, right = -1e18;
+            std::vector<double> ends;
+            for (size_t k = ext.first_row; k <= ext.last_row; k++) {
+                double e = -1e18;
+                for (auto& cr : rows[k].char_ranges)
+                    if (cr.first >= bounds[1]) {
+                        left = std::min(left, cr.first);
+                        e = std::max(e, cr.second);
+                    }
+                if (e > -1e18) ends.push_back(e);
+            }
+            for (double e : ends) right = std::max(right, e);
+            size_t shortn = 0;
+            for (double e : ends)
+                if (e < right - 0.25 * (right - left)) shortn++;
+            ragged = ends.size() >= 3 && shortn * 3 >= ends.size();
+        }
+        return accept_table(table, gutter, led_rows, ragged);
         };
 
         // Whether the band is a table at all, and which rows it holds, is

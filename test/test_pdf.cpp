@@ -1406,6 +1406,8 @@ int main(int argc, char* argv[]) {
     // (make_glossary_fixtures.py). A glossary's terms beside their
     // definitions: the gap between them dips like a page gutter, but the
     // terms are a label column, under ten ems wide beside one far wider.
+    // A notation table whose definitions run long is a table all the same:
+    // their lines end where their words end, ragged, as prose never does.
     // A dialogue beside its replies, both columns prose-wide, ruled off
     // row from row: the rules box it as a table for the column vote. Each
     // row keeps its two cells on one line, as text or as a table row.
@@ -1428,6 +1430,10 @@ int main(int argc, char* argv[]) {
             CHECK(same_line(gl, "ASC", "Accounting Standards Codification"));
             CHECK(same_line(gl, "NYMEX", "New York Mercantile Exchange"));
             CHECK(same_line(gl, "WTI", "West Texas Intermediate"));
+            // Long ragged definitions make a table, not prose.
+            std::string nt = jdoc::pdf_to_markdown(dir + "glossary_long.pdf");
+            CHECK(nt.find('|') != std::string::npos);
+            CHECK(same_line(nt, "| S ", "set of all possible messages"));
             std::string rr = jdoc::pdf_to_markdown(dir + "ruled_rows.pdf");
             CHECK(same_line(rr, "Input: hear it ?", "Choice: first reply"));
             CHECK(same_line(rr, "Fifth: the man is a man of faith", "Seventh: it is my duty"));

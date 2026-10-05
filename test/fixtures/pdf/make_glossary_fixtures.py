@@ -12,6 +12,11 @@ words is not two columns of text).
       from two columns of prose: each row must keep its term beside its
       definition.
 
+  glossary_long.pdf  symbols beside definitions that run from a few words
+      to most of a line, every definition on one line and no rule anywhere:
+      a notation table. The definitions average more than thirty characters,
+      which once made the candidate prose; their ragged right edge is what
+      tells the table from a column of text.
   ruled_rows.pdf  a table of two columns of equal width, both holding
       sentences, three rows to a cell, a rule across the table under every
       cell row and above the first: a dialogue beside its replies. Nothing
@@ -89,6 +94,37 @@ TURNS = [("Input: hear it ?", "Choice: first reply"),
          ("Fifth: the man is a man of faith .", "Seventh: it is my duty to protect the father .")]
 
 
+NOTATION = [("Symbol", "Description"),
+            ("A", "sender agent"),
+            ("R", "receiver agent"),
+            ("S", "set of all possible messages used for communication by both agents"),
+            ("O", "set of mammal classes"),
+            ("Q", "set of mammal images available to the sender"),
+            ("W", "set of mammal descriptions available to the receiver"),
+            ("g", "ground-truth map between the images and the descriptions"),
+            ("m", "binary message sent by the sender"),
+            ("n", "binary message sent by the receiver"),
+            ("T", "maximal number of time steps in a conversation"),
+            ("t", "time step in conversation between sender and receiver"),
+            ("h", "hidden state vector of the sender"),
+            ("k", "hidden state of the receiver at time step t"),
+            ("B", "baseline feedforward network of the sender"),
+            ("L", "per-instance reinforcement learning loss"),
+            ("H", "entropy regularization coefficient for the binary message distributions")]
+
+
+def make_glossary_long():
+    pg = Page()
+    pg.text(72, 90, "Table 1: notation used throughout the paper.", size=10)
+    y = 116
+    for i, (a, b) in enumerate(NOTATION):
+        font = "F2" if i == 0 else "F1"
+        pg.text(72, y, a, font, 10)
+        pg.text(140, y, b, font, 10)
+        y += 13
+    pg.save("glossary_long.pdf")
+
+
 def make_ruled_rows():
     pg = Page()
     x0, xm, x1 = 60, 300, 540
@@ -106,4 +142,5 @@ def make_ruled_rows():
 
 if __name__ == "__main__":
     make_glossary()
+    make_glossary_long()
     make_ruled_rows()
