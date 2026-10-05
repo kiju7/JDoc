@@ -273,6 +273,7 @@ static std::vector<std::array<double, 4>> fragment_regions(
         double page_w, double page_h) {
     std::vector<std::array<double, 4>> regions;
     std::vector<std::array<double, 4>> path_boxes;
+    std::vector<char> path_backdrop;   // filled, not stroked: a panel or shading
     for (auto& rp : paths) {
         if (rp.synthetic) continue;
         double bx0 = 1e300, by0 = 1e300, bx1 = -1e300, by1 = -1e300;
@@ -286,6 +287,7 @@ static std::vector<std::array<double, 4>> fragment_regions(
         // every region to the page.
         if ((bx1 - bx0) * (by1 - by0) > 0.25 * page_w * page_h) continue;
         path_boxes.push_back({bx0, by0, bx1, by1});
+        path_backdrop.push_back(rp.do_fill && !rp.do_stroke);
     }
     for (auto& c : cluster_boxes) {
         double rg[4] = {c[0], c[1], c[2], c[3]};
@@ -293,9 +295,20 @@ static std::vector<std::array<double, 4>> fragment_regions(
         // chains box to arrow to box well past two hops.
         for (int pass = 0; pass < 10; pass++) {
             double g[4] = {rg[0], rg[1], rg[2], rg[3]};
-            for (auto& b : path_boxes) {
+            for (size_t pi = 0; pi < path_boxes.size(); pi++) {
+                const auto& b = path_boxes[pi];
                 if (b[2] < rg[0] - 2 || b[0] > rg[2] + 2 ||
                     b[3] < rg[1] - 2 || b[1] > rg[3] + 2) continue;
+                // A filled panel the whole picture sits on, fitted to it (the
+                // tinted card behind a chart), is ground, not drawing: it
+                // would add its margins and pull the chart's title in after
+                // them. A box in a diagram that holds a small raster among
+                // its other parts is far larger than that raster and still
+                // grows the region, as do stroked axes and frames.
+                if (path_backdrop[pi] && b[0] <= c[0] + 1 && b[1] <= c[1] + 1 &&
+                    b[2] >= c[2] - 1 && b[3] >= c[3] - 1 &&
+                    (b[2] - b[0]) * (b[3] - b[1]) <=
+                        1.6 * (c[2] - c[0]) * (c[3] - c[1])) continue;
                 double n0 = std::min(g[0], b[0]), n1 = std::min(g[1], b[1]);
                 double n2 = std::max(g[2], b[2]), n3 = std::max(g[3], b[3]);
                 if ((n2 - n0) * (n3 - n1) > 0.6 * page_w * page_h) continue;
@@ -365,6 +378,10 @@ static std::vector<std::array<double, 4>> fragment_regions(
                 if (ov < 0.5 * std::max(lw, 1.0)) continue;
                 double gap = std::max(ly0 - R[3], R[1] - ly1);
                 if (gap > 1.5 * fs) continue;
+                // Above the picture sit its title and subtitle, which are
+                // text of their own; only a short unit label ("(%)", "(조원)")
+                // belongs to the drawing there.
+                if (ly1 <= R[1] + 0.5 * fs && lw > 0.25 * (R[2] - R[0])) continue;
                 R[0] = std::min(R[0], ln.x_left); R[2] = std::max(R[2], ln.x_right);
                 R[1] = std::min(R[1], ly0);       R[3] = std::max(R[3], ly1);
                 grew = true;
