@@ -1,0 +1,88 @@
+"""Regenerate the two-column grid fixtures used by test_pdf ([32] ruled
+tables of two columns).
+
+  grid_two_col_terms.pdf   a page holding nothing but a ruled table of two
+      columns and twelve rows (enough for the page's gutter histogram to
+      read its two columns as two text columns), terms beside their descriptions, every cell centred: a frame,
+      a rule under the header and a rule between the columns drawn one row
+      at a time, as LaTeX draws them. Every row
+      ends a word in the left cell and starts one in the right, as any table
+      of words does.
+  grid_split_prose.pdf     a paragraph set across a frame that a vertical
+      rule cuts in two: the words on either side of the rule sit a word
+      space apart, so the text runs on across it. It is not a table.
+
+The PDFs are written by hand (base-14 Helvetica, no font files) so the
+fixtures are the same on every OS. Run from the repo root:
+    python3 test/fixtures/pdf/make_two_col_grid_fixtures.py
+"""
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from make_short_page_fixtures import Page, width  # noqa: E402
+
+ROWS = [("Drug", "Effects"), ("heroin", "anxiety, euphoria"),
+        ("cocaine", "euphoria, anxiety, comedown, paranoia"),
+        ("ketamine", "euphoria, visuals, hallucinations, nausea"),
+        ("methadone", "anxiety, euphoria"), ("codeine", "euphoria, anxiety, nausea"),
+        ("morphine", "euphoria, anxiety, analgesic, nausea"),
+        ("amphetamine", "euphoria, anxiety, comedown, visuals"),
+        ("oxycodone", "euphoria, anxiety"), ("caffeine", "alertness, anxiety"),
+        ("nicotine", "alertness, calm"), ("dopamine", "euphoria, anxiety, comedown")]
+PROSE = ["Parks lower the air temperature of the streets around them",
+         "but by how much depends on their size their trees and the wind",
+         "as twelve parks of one city measured twice a day for a year show",
+         "with readings taken at the same hours in the streets nearby"]
+
+
+def make_terms():
+    pg = Page()
+    x0, xm, x1 = 140, 230, 470
+    top, lead = 320, 14
+    bottom = top + lead * len(ROWS) + 4
+    for y in (top, top + lead + 2, bottom):
+        pg.rule(x0, x1, y)
+    # Vertical rules drawn one row at a time, as LaTeX tables are.
+    edges = [top, top + lead + 2] + [top + lead * (i + 1) + 2 for i in range(1, len(ROWS) - 1)] + [bottom]
+    for ya, yb in zip(edges, edges[1:]):
+        for x in (x0, xm, x1):
+            pg.c += "0.5 w %.2f %.2f m %.2f %.2f l S\n" % (x, 842 - ya, x, 842 - yb)
+    for i, (a, b) in enumerate(ROWS):
+        y = top + lead * (i + 1) - 2
+        font = "F2" if i == 0 else "F1"
+        pg.text((x0 + xm - width(a, font, 9)) / 2, y, a, font, 9)
+        pg.text((xm + x1 - width(b, font, 9)) / 2, y, b, font, 9)
+    pg.save("grid_two_col_terms.pdf")
+
+
+def make_split_prose():
+    pg = Page()
+    x0, x1, top, lead = 100, 500, 300, 14
+    bottom = top + lead * len(PROSE) + 6
+    for y in (top, bottom):
+        pg.rule(x0, x1, y)
+    # The rule falls inside every line, between two words.
+    cut = 300
+    for x in (x0, cut, x1):
+        pg.c += "0.5 w %.2f %.2f m %.2f %.2f l S\n" % (x, 842 - top, x, 842 - bottom)
+    space = width(" ", "F1", 10)
+    for i, line in enumerate(PROSE):
+        words = line.split()
+        y = top + lead * (i + 1)
+        left, k = "", 0
+        while k < len(words) and x0 + 6 + width((left + " " + words[k]).strip(), "F1", 10) < cut - 1:
+            left = (left + " " + words[k]).strip()
+            k += 1
+        right = " ".join(words[k:])
+        lx = cut - space / 2 - width(left, "F1", 10)
+        pg.text(lx, y, left, size=10)
+        pg.text(cut + space / 2, y, right, size=10)
+    pg.save("grid_split_prose.pdf")
+
+
+if __name__ == "__main__":
+    make_terms()
+    make_split_prose()
+    print("wrote grid_two_col_terms.pdf, grid_split_prose.pdf to",
+          os.path.dirname(os.path.abspath(__file__)))

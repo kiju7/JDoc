@@ -1326,6 +1326,31 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    // [32] Ruled tables of two columns (make_two_col_grid_fixtures.py). A
+    // grid of terms beside their descriptions ends a word in one cell and
+    // starts one in the next on every row, as any table of words does; it
+    // stays a table. A paragraph a vertical rule cuts between two words,
+    // with only a word space across the rule, is text, not a table.
+    std::cout << "[32] Testing ruled tables of two columns...\n";
+    {
+        const std::string dir = "test/fixtures/pdf/";
+        std::ifstream f(dir + "grid_two_col_terms.pdf");
+        if (!f.good()) {
+            std::cout << "    SKIP: grid_*.pdf\n";
+        } else {
+            f.close();
+            std::string md = jdoc::pdf_to_markdown(dir + "grid_two_col_terms.pdf");
+            CHECK(md.find("| heroin") != std::string::npos);
+            CHECK(md.find("| anxiety, euphoria") != std::string::npos);
+            CHECK(md.find("| dopamine") != std::string::npos);
+            std::string prose = jdoc::pdf_to_markdown(dir + "grid_split_prose.pdf");
+            CHECK(prose.find('|') == std::string::npos);
+            CHECK(prose.find("Parks lower the air temperature of the streets around them") !=
+                  std::string::npos);
+            std::cout << "    term grid kept as a table; prose cut by a rule kept as text OK\n";
+        }
+    }
+
     std::cout << "\n=== All tests passed ===\n";
     return 0;
 }

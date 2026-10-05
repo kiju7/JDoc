@@ -961,7 +961,53 @@ TableData build_table(const std::vector<double>& row_ys,
                 if (is_content((unsigned char)row[0].back()) && is_content((unsigned char)row[1][0]))
                     cont_rows++;
             }
-            if (checked >= 3 && cont_rows >= checked * 0.15)
+            // In a two-column grid of words, text runs on across the rule only where
+            // the glyphs either side of it sit a word space apart or closer.
+            // Cells keep their padding between them, however their words
+            // begin and end ("heroin | anxiety, euphoria"). A grid of three
+            // columns is left to this test alone: its rules are often the
+            // coarse outline of a table whose columns the text alignment
+            // detector finds in full.
+            // Only for a grid of words on both sides (a term beside its
+            // description): a chart frame's two cells hold axis figures.
+            int worded = 0;
+            for (auto& row : table.rows) {
+                if ((int)row.size() < 2) continue;
+                int letters[2] = {0, 0};
+                for (int c = 0; c < 2; c++)
+                    for (unsigned char ch : row[c])
+                        if ((ch | 0x20) - 'a' < 26u || ch >= 0x80) letters[c]++;
+                if (letters[0] >= 2 && letters[1] >= 2) worded++;
+            }
+            const bool word_grid = n_cols_t == 2 && worded * 2 >= checked;
+            int tight_rows = word_grid ? 0 : checked;
+            for (int r = 0; word_grid && r < n_rows; r++) {
+                double row_bot = std::min(actual_ys[r], actual_ys[r + 1]);
+                double row_top = std::max(actual_ys[r], actual_ys[r + 1]);
+                bool tight = false;
+                for (int b = 1; b < n_cols && !tight; b++) {
+                    double cx = col_xs[b];
+                    const PageCharCache::CharInfo* prev = nullptr;
+                    const PageCharCache::CharInfo* next = nullptr;
+                    for (auto& ch : cache.chars) {
+                        if (ch.unicode == ' ' || ch.unicode == 0xA0 ||
+                            ch.unicode == '\t') continue;
+                        if (ch.y < row_bot + 1 || ch.y > row_top - 1) continue;
+                        if ((ch.left + ch.right) / 2.0 < cx) {
+                            if (!prev || ch.right > prev->right) prev = &ch;
+                        } else {
+                            if (!next || ch.left < next->left) next = &ch;
+                        }
+                    }
+                    if (!prev || !next) continue;
+                    double fs = std::max(prev->font_size, next->font_size);
+                    if (fs < 4) fs = 10;
+                    tight = next->left - prev->right <= fs * 0.6;
+                }
+                tight_rows += tight;
+            }
+            if (checked >= 3 && cont_rows >= checked * 0.15 &&
+                tight_rows * 20 >= checked * 3)
                 table.rows.clear();
             if (!table.rows.empty() && n_cols_t == 2) {
                 int long_first = 0;
