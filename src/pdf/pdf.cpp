@@ -262,39 +262,68 @@ static std::vector<char> body_line_flags(const std::vector<TextLine>& lines,
     return out;
 }
 
-// A title of a picture's own: a text line over the picture's top (above it,
-// or inside its top band) that stays within the picture's width and does not
-// reach over to the neighbour beside it. Page space is y-up here: the top
-// edge is y1 and a line's glyphs stand above its baseline y_center. Two pictures set side by side each
-// carry one (two charts' headings, panels A and B, a row of cards); the two
-// halves of one raster cut down the middle carry none of their own, their
-// title spanning the seam if they have one.
-static bool has_own_title(const std::vector<TextLine>& lines,
+// Runs of upright text on one baseline, split where the gap between two
+// glyphs exceeds 1.5 font sizes. A line can join headings that only share a
+// baseline (two charts' titles set side by side read as one line); a run
+// keeps them apart.
+struct TextRun { double x0, x1, y, fs; };
+static std::vector<TextRun> text_runs(const std::vector<TextChar>& chars) {
+    std::vector<const TextChar*> cs;
+    for (auto& c : chars)
+        if (c.rot == 0 && c.unicode != ' ' && c.font_size > 1.0) cs.push_back(&c);
+    std::sort(cs.begin(), cs.end(), [](const TextChar* a, const TextChar* b) {
+        if (std::abs(a->y - b->y) > 0.3 * std::max(a->font_size, b->font_size))
+            return a->y > b->y;
+        return a->left < b->left;
+    });
+    std::vector<TextRun> runs;
+    for (auto* c : cs) {
+        if (!runs.empty()) {
+            auto& r = runs.back();
+            if (std::abs(c->y - r.y) <= 0.3 * std::max(c->font_size, r.fs) &&
+                c->left - r.x1 <= 1.5 * std::max(c->font_size, r.fs) && c->left >= r.x0) {
+                r.x1 = std::max(r.x1, c->right);
+                r.fs = std::max(r.fs, c->font_size);
+                continue;
+            }
+        }
+        runs.push_back({c->left, c->right, c->y, c->font_size});
+    }
+    return runs;
+}
+
+// A title of a picture's own: a run of text over the picture's top (above
+// it, or inside its top band) that stays within the picture's width and does
+// not reach over to the neighbour beside it. Page space is y-up here: the
+// top edge is y1 and a run's glyphs stand above its baseline y.
+static bool has_own_title(const std::vector<TextRun>& runs,
                           double x0, double y0, double x1, double y1,
                           double nx0, double nx1) {
     const double h = y1 - y0;
-    for (auto& ln : lines) {
-        if (ln.text.empty() || ln.rot != 0) continue;
-        double fs = std::max(ln.font_size, 4.0);
-        if (ln.x_right - ln.x_left < 3.0 * fs) continue;          // a mark, not a title
-        if (ln.x_left < x0 - 2 || ln.x_right > x1 + 2) continue;   // within this picture
-        if (ln.x_right > nx0 && ln.x_left < nx1) continue;         // reaches the neighbour
-        double ly0 = ln.y_center - 0.3 * fs, ly1 = ln.y_center + fs;
-        if (ly0 > y1 + 2.5 * fs || ly1 < y1 - 0.15 * h) continue;  // over the top
+    for (auto& r : runs) {
+        double fs = std::max(r.fs, 4.0);
+        if (r.x1 - r.x0 < 3.0 * fs) continue;                    // a mark, not a title
+        if (r.x0 < x0 - 2 || r.x1 > x1 + 2) continue;            // within this picture
+        if (r.x1 > nx0 && r.x0 < nx1) continue;                  // reaches the neighbour
+        double ry0 = r.y - 0.3 * fs, ry1 = r.y + fs;
+        if (ry0 > y1 + 2.5 * fs || ry1 < y1 - 0.15 * h) continue;  // over the top
         return true;
     }
     return false;
 }
 
 // Two placements or regions side by side, each with a title of its own,
-// are two pictures however close they sit.
-static bool separate_titled_pictures(const std::vector<TextLine>& lines,
+// are two pictures however close they sit. Two pictures set side by side
+// each carry one (two charts' headings, panels A and B, a row of cards); the
+// two halves of one raster cut down the middle carry none of their own,
+// their title spanning the seam if they have one.
+static bool separate_titled_pictures(const std::vector<TextRun>& runs,
                                      double ax0, double ay0, double ax1, double ay1,
                                      double bx0, double by0, double bx1, double by1) {
     double yov = std::min(ay1, by1) - std::max(ay0, by0);
     if (yov < 0.5 * std::min(ay1 - ay0, by1 - by0)) return false;  // not side by side
-    return has_own_title(lines, ax0, ay0, ax1, ay1, bx0, bx1) &&
-           has_own_title(lines, bx0, by0, bx1, by1, ax0, ax1);
+    return has_own_title(runs, ax0, ay0, ax1, ay1, bx0, bx1) &&
+           has_own_title(runs, bx0, by0, bx1, by1, ax0, ax1);
 }
 
 // Composite regions of the fragment clusters on a page with body text: each
@@ -305,7 +334,7 @@ static std::vector<std::array<double, 4>> fragment_regions(
         const std::vector<std::array<double, 4>>& cluster_boxes,
         const std::vector<RenderPath>& paths,
         const std::vector<TextLine>& lines, const std::vector<char>& body,
-        double page_w, double page_h) {
+        const std::vector<TextRun>& runs, double page_w, double page_h) {
     std::vector<std::array<double, 4>> regions;
     std::vector<std::array<double, 4>> path_boxes;
     std::vector<char> path_backdrop;   // filled, not stroked: a panel or shading
@@ -381,7 +410,7 @@ static std::vector<std::array<double, 4>> fragment_regions(
                 double gx = std::max(A[0], B[0]) - std::min(A[2], B[2]);
                 double gy = std::max(A[1], B[1]) - std::min(A[3], B[3]);
                 if (gx >= 0 || gy >= 0) continue;   // touching or apart: two pictures
-                if (separate_titled_pictures(lines, A[0], A[1], A[2], A[3],
+                if (separate_titled_pictures(runs, A[0], A[1], A[2], A[3],
                                              B[0], B[1], B[2], B[3])) continue;
                 std::array<double, 4> U = {std::min(A[0], B[0]), std::min(A[1], B[1]),
                                            std::max(A[2], B[2]), std::max(A[3], B[3])};
@@ -917,6 +946,7 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
 
             const size_t n_inf = infos.size();
             DisjointSet image_sets(n_inf);
+            const std::vector<TextRun> page_runs = text_runs(parse_result.chars);
 
             // Print-driver strips abut within sub-point rounding; distinct
             // assets sit tens of points apart in real layouts.
@@ -948,7 +978,7 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
                         }
                         if (gx <= eps && gy <= eps_y &&
                             !separate_titled_pictures(
-                                result.all_lines[p], infos[a].x0, infos[a].y0,
+                                page_runs, infos[a].x0, infos[a].y0,
                                 infos[a].x1, infos[a].y1, infos[b].x0, infos[b].y0,
                                 infos[b].x1, infos[b].y1)) {
                             image_sets.unite(a, b);
@@ -1064,7 +1094,7 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
                     if (qualifies(c)) cluster_boxes.push_back({c.x0, c.y0, c.x1, c.y1});
                 regions = fragment_regions(cluster_boxes, parse_result.paths,
                                            result.all_lines[p], body_flags,
-                                           page_w, page_h);
+                                           page_runs, page_w, page_h);
             }
             double region_area = 0;
             for (auto& R : regions) region_area += (R[2] - R[0]) * (R[3] - R[1]);
