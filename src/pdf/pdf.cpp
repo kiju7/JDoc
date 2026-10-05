@@ -353,7 +353,44 @@ static std::vector<std::array<double, 4>> fragment_regions(
         path_boxes.push_back({bx0, by0, bx1, by1});
         path_backdrop.push_back(rp.do_fill && !rp.do_stroke);
     }
-    for (auto& c : cluster_boxes) {
+    // A filled panel fitted around the pictures it holds (the tinted card
+    // behind a chart, with the chart's legend as a second cluster inside it)
+    // is ground: compare it with the union of every cluster inside it.
+    std::vector<char> path_ground(path_boxes.size(), 0);
+    for (size_t pi = 0; pi < path_boxes.size(); pi++) {
+        if (!path_backdrop[pi]) continue;
+        const auto& b = path_boxes[pi];
+        double u0 = 1e300, u1 = 1e300, u2 = -1e300, u3 = -1e300;
+        for (auto& c : cluster_boxes)
+            if (b[0] <= c[0] + 1 && b[1] <= c[1] + 1 && b[2] >= c[2] - 1 && b[3] >= c[3] - 1) {
+                u0 = std::min(u0, c[0]); u1 = std::min(u1, c[1]);
+                u2 = std::max(u2, c[2]); u3 = std::max(u3, c[3]);
+            }
+        if (u0 > u2) continue;
+        path_ground[pi] = (b[2] - b[0]) * (b[3] - b[1]) <= 1.6 * (u2 - u0) * (u3 - u1);
+    }
+    // The clusters one ground panel holds are one picture (a chart cut into
+    // bands, its legend strips below): they become one cluster, the union of
+    // their own boxes, without the panel's margins.
+    std::vector<std::array<double, 4>> clusters_in = cluster_boxes;
+    for (size_t pi = 0; pi < path_boxes.size(); pi++) {
+        if (!path_ground[pi]) continue;
+        const auto& b = path_boxes[pi];
+        std::array<double, 4> u = {1e300, 1e300, -1e300, -1e300};
+        std::vector<std::array<double, 4>> rest;
+        for (auto& c : clusters_in) {
+            if (b[0] <= c[0] + 1 && b[1] <= c[1] + 1 && b[2] >= c[2] - 1 && b[3] >= c[3] - 1) {
+                u = {std::min(u[0], c[0]), std::min(u[1], c[1]),
+                     std::max(u[2], c[2]), std::max(u[3], c[3])};
+            } else {
+                rest.push_back(c);
+            }
+        }
+        if (u[0] > u[2]) continue;
+        rest.push_back(u);
+        clusters_in.swap(rest);
+    }
+    for (auto& c : clusters_in) {
         double rg[4] = {c[0], c[1], c[2], c[3]};
         // Grow over touching paths until the region is stable: a drawing
         // chains box to arrow to box well past two hops.
@@ -363,16 +400,13 @@ static std::vector<std::array<double, 4>> fragment_regions(
                 const auto& b = path_boxes[pi];
                 if (b[2] < rg[0] - 2 || b[0] > rg[2] + 2 ||
                     b[3] < rg[1] - 2 || b[1] > rg[3] + 2) continue;
-                // A filled panel the whole picture sits on, fitted to it (the
-                // tinted card behind a chart), is ground, not drawing: it
-                // would add its margins and pull the chart's title in after
-                // them. A box in a diagram that holds a small raster among
-                // its other parts is far larger than that raster and still
-                // grows the region, as do stroked axes and frames.
-                if (path_backdrop[pi] && b[0] <= c[0] + 1 && b[1] <= c[1] + 1 &&
-                    b[2] >= c[2] - 1 && b[3] >= c[3] - 1 &&
-                    (b[2] - b[0]) * (b[3] - b[1]) <=
-                        1.6 * (c[2] - c[0]) * (c[3] - c[1])) continue;
+                // Ground (see path_ground) would add its margins and pull the
+                // chart's title in after them. A box in a diagram that holds
+                // a small raster among its other parts is far larger than
+                // that raster and still grows the region, as do stroked axes
+                // and frames.
+                if (path_ground[pi] && b[0] <= c[0] + 1 && b[1] <= c[1] + 1 &&
+                    b[2] >= c[2] - 1 && b[3] >= c[3] - 1) continue;
                 double n0 = std::min(g[0], b[0]), n1 = std::min(g[1], b[1]);
                 double n2 = std::max(g[2], b[2]), n3 = std::max(g[3], b[3]);
                 if ((n2 - n0) * (n3 - n1) > 0.6 * page_w * page_h) continue;
