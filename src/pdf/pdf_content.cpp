@@ -406,6 +406,21 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
         out[2] = static_cast<float>(g.clip_x1);
         out[3] = static_cast<float>(g.clip_y1);
     };
+    // The page box an image placed under `g` covers (the unit square under
+    // the CTM, cut to the clip), kept in every graphics mode so the table
+    // detectors know where rasters lie.
+    auto record_image_box = [&](const GfxState& g) {
+        double xs[4], ys[4];
+        const double cs[4][2] = {{0, 0}, {1, 0}, {1, 1}, {0, 1}};
+        for (int k = 0; k < 4; k++) transform_point(g.ctm, cs[k][0], cs[k][1], xs[k], ys[k]);
+        double x0 = std::max(*std::min_element(xs, xs + 4), g.clip_x0);
+        double x1 = std::min(*std::max_element(xs, xs + 4), g.clip_x1);
+        double y0 = std::max(*std::min_element(ys, ys + 4), g.clip_y0);
+        double y1 = std::min(*std::max_element(ys, ys + 4), g.clip_y1);
+        if (x1 > x0 && y1 > y0 && std::isfinite(x0) && std::isfinite(x1) && std::isfinite(y0) && std::isfinite(y1))
+            result.image_boxes.push_back({static_cast<float>(x0), static_cast<float>(y0),
+                                          static_cast<float>(x1), static_cast<float>(y1)});
+    };
 
     // "Clip to the shape, then paint a covering rect" draws the clip shape;
     // without a clip stack, substituting the clip path is the faithful read.
@@ -914,8 +929,65 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
         return true;
     };
 
+    // The painted path, summarised for the table detectors (DrawnShape),
+    // one summary per subpath.
+    auto record_shape = [&](bool do_fill, bool do_stroke) {
+        if (skip_graphics || current_path.empty()) return;
+        auto lum = [](double r, double g, double b) { return 0.299 * r + 0.587 * g + 0.114 * b; };
+        const bool dark = (do_stroke && lum(gs.stroke_r, gs.stroke_g, gs.stroke_b) < 0.7) ||
+                          (do_fill && lum(gs.fill_r, gs.fill_g, gs.fill_b) < 0.7);
+        const bool colored = do_fill && std::max({gs.fill_r, gs.fill_g, gs.fill_b}) -
+                                            std::min({gs.fill_r, gs.fill_g, gs.fill_b}) >= 0.25;
+        const double pad = do_stroke ? 0.5 * gs.line_width * ctm_pen_scale(gs.ctm) : 0.0;
+        double bx0 = 1e300, by0 = 1e300, bx1 = -1e300, by1 = -1e300;
+        bool curve = false, ortho = true, have = false;
+        double px = 0, py = 0, sx = 0, sy = 0;
+        auto flush = [&]() {
+            if (!have) return;
+            have = false;
+            if (!(bx0 <= bx1) || !std::isfinite(bx0) || !std::isfinite(bx1) ||
+                !std::isfinite(by0) || !std::isfinite(by1))
+                return;
+            double x0 = std::max(bx0 - pad, gs.clip_x0), y0 = std::max(by0 - pad, gs.clip_y0);
+            double x1 = std::min(bx1 + pad, gs.clip_x1), y1 = std::min(by1 + pad, gs.clip_y1);
+            if (x1 < x0 || y1 < y0) return;
+            double w = x1 - x0, h = y1 - y0, mind = std::min(w, h);
+            bool rule = !curve && mind <= 2.0 && std::max(w, h) >= 4.0 * std::max(mind, 0.05);
+            result.shapes.push_back({static_cast<float>(x0), static_cast<float>(y0),
+                                     static_cast<float>(x1), static_cast<float>(y1),
+                                     curve, ortho, rule, dark, colored, do_fill});
+        };
+        for (auto& pt : current_path) {
+            if (pt.type == PathPoint::MOVE) {
+                flush();
+                bx0 = bx1 = pt.x; by0 = by1 = pt.y;
+                curve = false; ortho = true; have = true;
+                sx = px = pt.x; sy = py = pt.y;
+                continue;
+            }
+            if (!have) continue;
+            if (pt.type == PathPoint::CLOSE) {
+                if (std::abs(sx - px) > 0.05 && std::abs(sy - py) > 0.05) ortho = false;
+                continue;
+            }
+            bx0 = std::min(bx0, pt.x); bx1 = std::max(bx1, pt.x);
+            by0 = std::min(by0, pt.y); by1 = std::max(by1, pt.y);
+            if (pt.type == PathPoint::CURVE) {
+                curve = true;
+                ortho = false;
+                bx0 = std::min({bx0, pt.cx1, pt.cx2}); bx1 = std::max({bx1, pt.cx1, pt.cx2});
+                by0 = std::min({by0, pt.cy1, pt.cy2}); by1 = std::max({by1, pt.cy1, pt.cy2});
+            } else if (std::abs(pt.x - px) > 0.05 && std::abs(pt.y - py) > 0.05) {
+                ortho = false;
+            }
+            px = pt.x; py = pt.y;
+        }
+        flush();
+    };
+
     auto record_render_path = [&](bool do_fill, bool do_stroke,
                                   bool even_odd = false) {
+        record_shape(do_fill, do_stroke);
         if (collect_render_paths) {
             // Shading-pattern fill: a rect-ish path becomes gradient strips
             // clipped to its box (exact for the title-bar idiom); other
@@ -1545,6 +1617,7 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
             ip.seq = draw_seq++;
             result.images.push_back(std::move(ip));
         }
+        if (!skip_graphics) record_image_box(gs);
         lex.pos = resume;
     };
 
@@ -2090,6 +2163,10 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
                                 result.fill_rects.insert(result.fill_rects.end(),
                                     std::make_move_iterator(sub.fill_rects.begin()),
                                     std::make_move_iterator(sub.fill_rects.end()));
+                                result.shapes.insert(result.shapes.end(),
+                                    sub.shapes.begin(), sub.shapes.end());
+                                result.image_boxes.insert(result.image_boxes.end(),
+                                    sub.image_boxes.begin(), sub.image_boxes.end());
                                 // Rebase the form's draw order to this Do's
                                 // position so z-order survives the merge.
                                 for (auto& si : sub.images) si.seq += draw_seq;
@@ -2117,7 +2194,9 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
                                     std::make_move_iterator(sub.paths.begin()),
                                     std::make_move_iterator(sub.paths.end()));
                             }
-                        } else if (collect_render_paths) {
+                        } else {
+                            if (!skip_graphics) record_image_box(gs);
+                            if (collect_render_paths) {
                             ImagePlacement ip;
                             ip.xobj_name = xname;
                             if (xref.is_ref()) ip.xobj_ref = xref.ref_num;
@@ -2129,6 +2208,7 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
                             copy_clip(gs, ip.clip);
                             ip.seq = draw_seq++;
                             result.images.push_back(ip);
+                            }
                         }
                     }
                 }

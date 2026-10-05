@@ -1449,6 +1449,29 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    // [36] A chart's labels are not a table (make_chart_fixtures.py). Tick
+    // labels, years and a legend align across two chart panels as neatly as
+    // cells do; the bars and lines drawn around them (drawing_regions) say
+    // they are a figure's, so no table is made of them, and every label
+    // stays in the text.
+    std::cout << "[36] Testing chart labels against the table detectors...\n";
+    {
+        const std::string path = "test/fixtures/pdf/chart_labels.pdf";
+        std::ifstream f(path);
+        if (!f.good()) {
+            std::cout << "    SKIP: chart_labels.pdf\n";
+        } else {
+            f.close();
+            std::string md = jdoc::pdf_to_markdown(path);
+            CHECK(md.find('|') == std::string::npos);
+            CHECK(md.find("```") == std::string::npos);
+            for (const char* label : {"2019", "2022", "Advanced", "Emerging", "60", "-4", "Output level"})
+                CHECK(md.find(label) != std::string::npos);
+            CHECK(md.find("Output grew in every region") != std::string::npos);
+            std::cout << "    chart labels kept as text, no table OK\n";
+        }
+    }
+
     std::cout << "\n=== All tests passed ===\n";
     return 0;
 }

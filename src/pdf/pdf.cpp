@@ -706,8 +706,10 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
         std::vector<SparseGrid> sparse_grids;
         std::vector<TableData> ruled_tables;
         std::vector<PageBox> ruled_boxes;
+        std::vector<PageBox> figures;  // drawings: their text is no table's
         if (need_tables) {
             cache.build(parse_result.chars);
+            figures = drawing_regions(parse_result, parse_result.chars, page_w, page_h);
             ruled_tables = detect_tables(parse_result.segments, cache,
                 page_w, page_h, &sparse_grids);
             for (auto& t : ruled_tables)
@@ -732,7 +734,7 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
             for (auto& st : shade_tables)
                 result.all_tables[p].push_back(std::move(st));
             auto text_tables = detect_text_tables(cache, result.all_tables[p],
-                page_w, page_h, result.col_boundaries[p]);
+                page_w, page_h, result.col_boundaries[p], figures);
             for (auto& tt : text_tables)
                 result.all_tables[p].push_back(std::move(tt));
             for (auto& t : result.all_tables[p])
@@ -744,6 +746,8 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
             for (auto& t : result.all_tables[p])
                 table_boxes.push_back({std::min(t.x0, t.x1), std::min(t.y0, t.y1),
                                        std::max(t.x0, t.x1), std::max(t.y0, t.y1)});
+            // A drawing's labels keep no layout block either.
+            table_boxes.insert(table_boxes.end(), figures.begin(), figures.end());
             result.all_fallbacks[p] = find_layout_fallbacks(
                 parse_result.chars, result.col_boundaries[p], table_boxes,
                 sparse_grids, &parse_result.segments);

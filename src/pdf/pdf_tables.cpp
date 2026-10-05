@@ -4173,7 +4173,8 @@ static std::vector<TableData> detect_text_tables_range(
         double page_width, double page_height,
         double x_lo, double x_hi,
         const DotLeaders& leaders,
-        double gutter_x = 0.0) {
+        double gutter_x = 0.0,
+        const std::vector<std::array<double, 4>>* figures = nullptr) {
     const std::vector<bool>& is_leader = leaders.is_leader;
     using namespace text_tables;
     if (cache.chars.size() < 10) return {};
@@ -4520,6 +4521,33 @@ static std::vector<TableData> detect_text_tables_range(
             if (same_rows) table = std::move(t2);
         }
 
+        // Text aligned inside a drawing is a figure's labels (drawing_regions):
+        // the candidate's box lies half or more over a drawing, or half its
+        // glyphs or more do (axis ticks stand just outside the plot, so the
+        // box test reaches what the glyph test misses, and the glyph test a
+        // narrow candidate the box test misses).
+        if (figures && !figures->empty()) {
+            size_t total = 0, inside = 0;
+            for (size_t k = band.first_row; k <= band.last_row && k < rows.size(); k++)
+                for (size_t ci : rows[k].char_indices) {
+                    const auto& ch = chars[ci];
+                    total++;
+                    for (const auto& f : *figures)
+                        if (ch.x >= f[0] && ch.x <= f[2] && ch.y >= f[1] && ch.y <= f[3]) { inside++; break; }
+                }
+            double tx0 = std::min(table.x0, table.x1), tx1 = std::max(table.x0, table.x1);
+            double ty0 = std::min(table.y0, table.y1), ty1 = std::max(table.y0, table.y1);
+            // Drawings overlapping the box, summed: a candidate spanning the
+            // panels of one figure lies over several regions at once.
+            double area = std::max(1.0, (tx1 - tx0) * (ty1 - ty0)), covered = 0;
+            for (const auto& f : *figures) {
+                double ox = std::min(tx1, f[2]) - std::max(tx0, f[0]);
+                double oy = std::min(ty1, f[3]) - std::max(ty0, f[1]);
+                if (ox > 0 && oy > 0) covered += ox * oy;
+            }
+            covered = std::min(covered, area);
+            if ((total > 0 && inside * 2 >= total) || covered >= 0.5 * area) continue;
+        }
         table.kind = TableData::TEXT;
         result.push_back(std::move(table));
     }
@@ -4529,14 +4557,15 @@ static std::vector<TableData> detect_text_tables_range(
 std::vector<TableData> detect_text_tables(const PageCharCache& cache,
                                            const std::vector<TableData>& existing_tables,
                                            double page_width, double page_height,
-                                           double col_boundary) {
+                                           double col_boundary,
+                                           const std::vector<std::array<double, 4>>& figures) {
     // Leaders are found once for the page: the per-column passes below
     // would otherwise sort every period of the page again.
     const DotLeaders leaders = dot_leader_mask(cache);
     auto result = detect_text_tables_range(cache, existing_tables,
                                            page_width, page_height,
                                            0.0, page_width, leaders,
-                                           col_boundary);
+                                           col_boundary, &figures);
 
     // Two-column pages: rows built across the gutter glue a column's table
     // to the prose beside it, so the full-width pass misses column-local
@@ -4550,7 +4579,7 @@ std::vector<TableData> detect_text_tables(const PageCharCache& cache,
             double x_hi = side == 0 ? col_boundary : page_width;
             auto part = detect_text_tables_range(cache, known,
                                                  page_width, page_height,
-                                                 x_lo, x_hi, leaders);
+                                                 x_lo, x_hi, leaders, 0.0, &figures);
             for (auto& t : part) {
                 known.push_back(t);
                 result.push_back(std::move(t));

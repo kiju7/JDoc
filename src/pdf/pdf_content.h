@@ -118,6 +118,25 @@ struct PdfFillRect {
     float r, g, b;
 };
 
+// One painted subpath, summarised: its box and what kind of mark it is.
+// Kept in every graphics mode, so the page's drawings are known to the
+// table detectors whether or not figures are rendered. A path painting
+// several subpaths at once (a bar chart's bars, a table's shaded cells)
+// yields one of these per subpath, so each bar and each cell is measured
+// on its own. Rules, boxes and cell shading are axis-aligned (ortho) and
+// a rule is a hairline; a chart's lines, curves and markers are not, and
+// its bars are fills with no text inside. Light (pastel) marks are
+// backgrounds, not ink.
+struct DrawnShape {
+    float x0, y0, x1, y1;  // page-space box, stroke width included
+    bool curve;            // holds a Bezier segment
+    bool ortho;            // no curve and no diagonal segment
+    bool rule;             // a hairline: one dimension a stroke wide
+    bool dark;             // stroked or filled in a colour darker than 0.7
+    bool colored;          // filled in a saturated colour (chroma 0.25 or more)
+    bool filled;
+};
+
 struct ImagePlacement {
     int xobj_ref = -1;
     std::string xobj_name;
@@ -163,6 +182,8 @@ struct ContentParseResult {
     std::vector<std::shared_ptr<const PdfFont>> glyph_fonts;
     std::vector<PdfLineSegment> segments;
     std::vector<PdfFillRect> fill_rects; // sizable pure-fill rects (cell shading)
+    std::vector<DrawnShape> shapes;      // every painted author path, summarised
+    std::vector<std::array<float, 4>> image_boxes; // every image placement's page box
     std::vector<ImagePlacement> images;
     std::vector<RenderPath> paths; // for vector rendering
     int draw_ops = 0; // total paths+images recorded (seq offset for nested forms)
@@ -529,6 +550,15 @@ struct LayoutFallback {
     std::string text;  // grid lines, newline-terminated, no fence
 };
 using PageBox = std::array<double, 4>;  // x0, y0, x1, y1 in page space
+
+// Regions of the page that are drawings (pdf_figures.cpp): clusters of the
+// page's marks that hold what tables never draw, a curve or a diagonal
+// line, bars (dark fills with no text in them, taller than a line) or a
+// raster, grown by a margin for the labels set beside the drawing. The text
+// inside them is a figure's labels and axis ticks, never table cells.
+std::vector<PageBox> drawing_regions(const ContentParseResult& pr,
+                                     const std::vector<TextChar>& chars,
+                                     double page_w, double page_h);
 
 // A ruled grid the ruled detector rejected for holding too few rows with two
 // filled cells (detect_tables' sparse_grids output).
