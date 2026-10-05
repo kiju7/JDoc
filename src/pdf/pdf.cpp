@@ -262,6 +262,41 @@ static std::vector<char> body_line_flags(const std::vector<TextLine>& lines,
     return out;
 }
 
+// A title of a picture's own: a text line over the picture's top (above it,
+// or inside its top band) that stays within the picture's width and does not
+// reach over to the neighbour beside it. Page space is y-up here: the top
+// edge is y1 and a line's glyphs stand above its baseline y_center. Two pictures set side by side each
+// carry one (two charts' headings, panels A and B, a row of cards); the two
+// halves of one raster cut down the middle carry none of their own, their
+// title spanning the seam if they have one.
+static bool has_own_title(const std::vector<TextLine>& lines,
+                          double x0, double y0, double x1, double y1,
+                          double nx0, double nx1) {
+    const double h = y1 - y0;
+    for (auto& ln : lines) {
+        if (ln.text.empty() || ln.rot != 0) continue;
+        double fs = std::max(ln.font_size, 4.0);
+        if (ln.x_right - ln.x_left < 3.0 * fs) continue;          // a mark, not a title
+        if (ln.x_left < x0 - 2 || ln.x_right > x1 + 2) continue;   // within this picture
+        if (ln.x_right > nx0 && ln.x_left < nx1) continue;         // reaches the neighbour
+        double ly0 = ln.y_center - 0.3 * fs, ly1 = ln.y_center + fs;
+        if (ly0 > y1 + 2.5 * fs || ly1 < y1 - 0.15 * h) continue;  // over the top
+        return true;
+    }
+    return false;
+}
+
+// Two placements or regions side by side, each with a title of its own,
+// are two pictures however close they sit.
+static bool separate_titled_pictures(const std::vector<TextLine>& lines,
+                                     double ax0, double ay0, double ax1, double ay1,
+                                     double bx0, double by0, double bx1, double by1) {
+    double yov = std::min(ay1, by1) - std::max(ay0, by0);
+    if (yov < 0.5 * std::min(ay1 - ay0, by1 - by0)) return false;  // not side by side
+    return has_own_title(lines, ax0, ay0, ax1, ay1, bx0, bx1) &&
+           has_own_title(lines, bx0, by0, bx1, by1, ax0, ax1);
+}
+
 // Composite regions of the fragment clusters on a page with body text: each
 // cluster box grown over the vector paths it touches, neighbouring panels of
 // one figure merged, and the figure's own labels taken in. Boxes are clamped
@@ -346,6 +381,8 @@ static std::vector<std::array<double, 4>> fragment_regions(
                 double gx = std::max(A[0], B[0]) - std::min(A[2], B[2]);
                 double gy = std::max(A[1], B[1]) - std::min(A[3], B[3]);
                 if (gx >= 0 || gy >= 0) continue;   // touching or apart: two pictures
+                if (separate_titled_pictures(lines, A[0], A[1], A[2], A[3],
+                                             B[0], B[1], B[2], B[3])) continue;
                 std::array<double, 4> U = {std::min(A[0], B[0]), std::min(A[1], B[1]),
                                            std::max(A[2], B[2]), std::max(A[3], B[3])};
                 if (body_lines_in(U) >= 2) continue;
@@ -378,10 +415,13 @@ static std::vector<std::array<double, 4>> fragment_regions(
                 if (ov < 0.5 * std::max(lw, 1.0)) continue;
                 double gap = std::max(ly0 - R[3], R[1] - ly1);
                 if (gap > 1.5 * fs) continue;
-                // Above the picture sit its title and subtitle, which are
-                // text of their own; only a short unit label ("(%)", "(조원)")
-                // belongs to the drawing there.
-                if (ly1 <= R[1] + 0.5 * fs && lw > 0.25 * (R[2] - R[0])) continue;
+                // Above the picture sit its title and subtitle, below it the
+                // caption, notes and source: long lines of their own. The
+                // drawing's labels there are short (a unit "(%)", an axis
+                // title, "(a)"), so a line wider than a quarter of the region
+                // is not taken in over the top or bottom edge.
+                bool over_edge = ly0 >= R[3] - 0.5 * fs || ly1 <= R[1] + 0.5 * fs;
+                if (over_edge && lw > 0.25 * (R[2] - R[0])) continue;
                 R[0] = std::min(R[0], ln.x_left); R[2] = std::max(R[2], ln.x_right);
                 R[1] = std::min(R[1], ly0);       R[3] = std::max(R[3], ly1);
                 grew = true;
@@ -906,7 +946,11 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
                             if (xov >= 0.5 * std::min(wa, wb))
                                 eps_y = std::max(eps, 0.02 * page_h);
                         }
-                        if (gx <= eps && gy <= eps_y) {
+                        if (gx <= eps && gy <= eps_y &&
+                            !separate_titled_pictures(
+                                result.all_lines[p], infos[a].x0, infos[a].y0,
+                                infos[a].x1, infos[a].y1, infos[b].x0, infos[b].y0,
+                                infos[b].x1, infos[b].y1)) {
                             image_sets.unite(a, b);
                         }
                     }
