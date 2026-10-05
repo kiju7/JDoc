@@ -730,9 +730,25 @@ struct RowCells {
 RowCells cut_cells(const LayoutLine& ln, double cell_gap) {
     RowCells rc;
     const auto& gl = ln.glyphs;
+    // Dot leaders (four or more in a row) separate a label from its value
+    // as a gap does, though they leave no gap: the leaders are dropped and
+    // the cells cut either side of them.
+    auto is_dot = [](uint32_t cp) { return cp == '.' || cp == 0xB7 || cp == 0x2026; };
     size_t start = 0;
     double reach = gl.empty() ? 0 : ink_right(gl[0]);
     for (size_t k = 1; k < gl.size(); k++) {
+        if (is_dot(gl[k]->unicode)) {
+            size_t e = k;
+            while (e < gl.size() && is_dot(gl[e]->unicode)) e++;
+            if (e - k >= 4 && e < gl.size()) {
+                if (k > start) rc.cells.push_back({start, k});
+                rc.gaps.push_back({reach, gl[e]->left});
+                start = e;
+                reach = ink_right(gl[e]);
+                k = e;
+                continue;
+            }
+        }
         if (gl[k]->left - reach >= cell_gap) {
             rc.cells.push_back({start, k});
             rc.gaps.push_back({reach, gl[k]->left});
@@ -856,7 +872,8 @@ double cell_word_width(const LayoutLine& ln, std::pair<size_t, size_t> c) {
 // Row index ranges [first, last] of one block's rows that pass the
 // whitespace rule (see the section comment).
 std::vector<std::pair<size_t, size_t>> tabular_runs(
-        const std::vector<LayoutLine>& rows, double cell_gap) {
+        const std::vector<LayoutLine>& rows, double cell_gap,
+        const std::vector<PdfLineSegment>* rules = nullptr) {
     std::vector<std::pair<size_t, size_t>> out;
     const size_t n = rows.size();
     std::vector<RowCells> cells(n);
@@ -888,6 +905,7 @@ std::vector<std::pair<size_t, size_t>> tabular_runs(
             if (multi[k]) m.push_back(k);
         bool ok = m.size() >= 3 && m.size() * 10 >= (last - i + 1) * 6;
         bool two_col = false;
+        bool word_frame = false;  // two columns of words framed by rules
         if (ok) {
             // Column gaps: maximal x-intervals where at least 60% of the
             // multi-cell rows (and three) have a gap. Two are needed (three
@@ -1051,13 +1069,54 @@ std::vector<std::pair<size_t, size_t>> tabular_runs(
                         prev_page = v;
                     }
                 }
-                if (ok && (runs_on || numbered * 10 >= m.size() * 6 ||
-                           figures * 10 < m.size() * 6 || pages * 10 >= m.size() * 7 ||
+                // Two columns of words (letters on both sides of most rows)
+                // pass when rules frame the region, a
+                // rule across it just above its first row and another just
+                // below its last: a table set with top and bottom rules, its
+                // value cells wrapping onto lines of their own as they may.
+                // Lists, side columns and contributor notes are not ruled.
+                // Framed columns of words skip the stacked-figure test below:
+                // their value cells hold words.
+                bool framed = false;
+                if (rules) {
+                    auto spans = [&](const PdfLineSegment& r) {
+                        double a = std::min(r.x0, r.x1), b = std::max(r.x0, r.x1);
+                        return std::min(b, x1) - std::max(a, x0) >= 0.8 * (x1 - x0);
+                    };
+                    const double fs_top = std::max(rows[i].font_size, 1.0);
+                    const double fs_bot = std::max(rows[last].font_size, 1.0);
+                    bool above = false, below = false;
+                    for (const auto& r : *rules) {
+                        if (!r.is_horizontal() || !spans(r)) continue;
+                        double y = (r.y0 + r.y1) / 2;
+                        if (y > rows[i].base_y + 0.3 * fs_top && y < rows[i].base_y + 3.0 * fs_top) above = true;
+                        if (y < rows[last].base_y && y > rows[last].base_y - 2.5 * fs_bot) below = true;
+                    }
+                    // Words on both sides of most rows: a chart's frame and
+                    // gridlines rule its axis figures too.
+                    size_t worded = 0;
+                    for (size_t a : m) {
+                        int lt[2] = {0, 0};
+                        const auto& gl = rows[a].glyphs;
+                        auto ends = std::array<std::pair<size_t, size_t>, 2>{
+                            cells[a].cells.front(), cells[a].cells.back()};
+                        for (int c = 0; c < 2; c++)
+                            for (size_t k = ends[c].first; k < ends[c].second; k++) {
+                                uint32_t cp = gl[k]->unicode;
+                                if ((cp | 0x20) - 'a' < 26u || cp >= 0x3040) lt[c]++;
+                            }
+                        if (lt[0] >= 2 && lt[1] >= 2) worded++;
+                    }
+                    framed = above && below && worded * 10 >= m.size() * 6;
+                }
+                word_frame = framed;
+                if (ok && ((runs_on && !framed) || numbered * 10 >= m.size() * 6 ||
+                           (figures * 10 < m.size() * 6 && !framed) || pages * 10 >= m.size() * 7 ||
                            twins * 10 >= m.size() * 6))
                     ok = false;
             }
         }
-        if (ok) {
+        if (ok && !word_frame) {
             // A column of figures: cells that are mostly digits ("5.1",
             // "1,200", "12%"), stacked over one another in three rows.
             // Legends and timelines carry digits scattered or among words
@@ -1222,7 +1281,8 @@ LayoutFallback make_fallback(const std::vector<const LayoutLine*>& rows,
 std::vector<LayoutFallback> find_layout_fallbacks(
         const std::vector<TextChar>& chars, double col_boundary,
         const std::vector<PageBox>& table_boxes,
-        const std::vector<SparseGrid>& sparse_grids) {
+        const std::vector<SparseGrid>& sparse_grids,
+        const std::vector<PdfLineSegment>* rules) {
     std::vector<LayoutFallback> out;
 
     std::vector<const TextChar*> upright;
@@ -1366,7 +1426,7 @@ std::vector<LayoutFallback> find_layout_fallbacks(
             }
             const size_t found = out.size();
             for (auto& blk : blocks)
-                for (auto& run : tabular_runs(blk.rows, cell_gap)) {
+                for (auto& run : tabular_runs(blk.rows, cell_gap, rules)) {
                     std::vector<const LayoutLine*> rows;
                     for (size_t k = run.first; k <= run.second; k++)
                         rows.push_back(&blk.rows[k]);
@@ -1380,7 +1440,7 @@ std::vector<LayoutFallback> find_layout_fallbacks(
             // running text do not pass: their first cells are not narrow.
             if (col_boundary > 0) {
                 auto whole = group_lines(rest, gp.median_fs);
-                for (auto& run : tabular_runs(whole, cell_gap)) {
+                for (auto& run : tabular_runs(whole, cell_gap, rules)) {
                     double top = whole[run.first].base_y, bot = whole[run.second].base_y;
                     bool seen = false;
                     for (size_t k = found; k < out.size() && !seen; k++)

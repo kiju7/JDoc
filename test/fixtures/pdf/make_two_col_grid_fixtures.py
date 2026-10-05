@@ -12,6 +12,8 @@ two columns, [33] layout blocks of two columns).
       codes beside their counts, under a paragraph. No rule, no third
       column: no table detector takes it, and its rows must keep their
       alignment in a layout block.
+  layout_leader_years.pdf  jurisdictions beside year ranges, joined by dot
+      leaders that run right up to the value (no gap between the cells).
   layout_contents.pdf      a contents list: titles beside rising page
       numbers. A list, never a layout block.
   grid_split_prose.pdf     a paragraph set across a frame that a vertical
@@ -105,6 +107,29 @@ def make_counts():
     pg.save("layout_two_col_counts.pdf")
 
 
+YEARS = [("Jurisdiction", "Years"), ("United States", "2006 to 2009"),
+         ("United Kingdom", "2008 to 2009"), ("Canada", "2005 to 2009"),
+         ("Korea", "2004 to 2009"), ("Australia", "2005 to 2009")]
+
+
+def make_leader_years():
+    pg = Page()
+    pg.text(72, 100, "Tax years open to examination in major jurisdictions:", size=10)
+    for i, (a, b) in enumerate(YEARS):
+        y = 130 + 13 * i
+        if i == 0:
+            pg.text(72, y, a, "F2", 10)
+            pg.text(500 - width(b, "F2", 10), y, b, "F2", 10)
+            continue
+        right = 500 - width(b, "F1", 10)
+        dots = ""
+        while width(a + " " + dots + " .", "F1", 10) < right - 72 - 1:
+            dots += " ."
+        pg.text(72, y, a + " " + dots.strip(), size=10)
+        pg.text(right, y, b, size=10)
+    pg.save("layout_leader_years.pdf")
+
+
 def make_contents():
     pg = Page()
     pg.text(72, 100, "Contents", "F2", 12)
@@ -117,6 +142,7 @@ def make_contents():
 
 if __name__ == "__main__":
     make_counts()
+    make_leader_years()
     make_contents()
     make_terms()
     make_split_prose()

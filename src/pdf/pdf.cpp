@@ -683,7 +683,7 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
                                        std::max(t.x0, t.x1), std::max(t.y0, t.y1)});
             result.all_fallbacks[p] = find_layout_fallbacks(
                 parse_result.chars, result.col_boundaries[p], table_boxes,
-                sparse_grids);
+                sparse_grids, &parse_result.segments);
             // JDOC_TABLE_DEBUG: dump every table as detected, to stderr.
             if (std::getenv("JDOC_TABLE_DEBUG")) {
                 for (auto& t : result.all_tables[p]) {

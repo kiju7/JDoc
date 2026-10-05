@@ -1353,7 +1353,8 @@ int main(int argc, char* argv[]) {
 
     // [33] Layout blocks of two columns (make_two_col_grid_fixtures.py). A
     // borderless table of codes beside counts that no detector takes keeps
-    // its rows aligned in a fenced layout block; a contents list (titles
+    // its rows aligned in a fenced layout block, as do years joined to their
+    // labels by dot leaders that leave no gap; a contents list (titles
     // beside rising page numbers) stays a list.
     std::cout << "[33] Testing layout blocks of two columns...\n";
     {
@@ -1368,6 +1369,10 @@ int main(int argc, char* argv[]) {
             CHECK(fence != std::string::npos);
             CHECK(md.find("01000110", fence) != std::string::npos);
             CHECK(md.find("480", fence) != std::string::npos);
+            std::string yr = jdoc::pdf_to_markdown(dir + "layout_leader_years.pdf");
+            size_t yf = yr.find("```text");
+            CHECK(yf != std::string::npos);
+            CHECK(yr.find("2004 to 2009", yf) != std::string::npos);
             std::string toc = jdoc::pdf_to_markdown(dir + "layout_contents.pdf");
             CHECK(toc.find("```") == std::string::npos);
             CHECK(toc.find('|') == std::string::npos);

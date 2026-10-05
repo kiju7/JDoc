@@ -542,6 +542,7 @@ struct SparseGrid {
 std::vector<LayoutFallback> find_layout_fallbacks(
     const std::vector<TextChar>& chars, double col_boundary,
     const std::vector<PageBox>& table_boxes,
-    const std::vector<SparseGrid>& sparse_grids);
+    const std::vector<SparseGrid>& sparse_grids,
+    const std::vector<PdfLineSegment>* rules = nullptr);
 
 }} // namespace jdoc::pdf_detail
