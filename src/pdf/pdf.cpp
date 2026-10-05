@@ -639,7 +639,22 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
             initial_ctm);
 
         drop_overprinted_chars(parse_result.chars);
-        result.all_lines[p] = chars_to_lines(parse_result.chars, &result.col_boundaries[p]);
+        // Ruled tables first: they need no column boundary, and the page's
+        // column boundary is then found without their glyphs.
+        PageCharCache cache;
+        std::vector<SparseGrid> sparse_grids;
+        std::vector<TableData> ruled_tables;
+        std::vector<PageBox> ruled_boxes;
+        if (need_tables) {
+            cache.build(parse_result.chars);
+            ruled_tables = detect_tables(parse_result.segments, cache,
+                page_w, page_h, &sparse_grids);
+            for (auto& t : ruled_tables)
+                ruled_boxes.push_back({std::min(t.x0, t.x1), std::min(t.y0, t.y1),
+                                       std::max(t.x0, t.x1), std::max(t.y0, t.y1)});
+        }
+        result.all_lines[p] = chars_to_lines(parse_result.chars, &result.col_boundaries[p],
+                                             &ruled_boxes);
         if (plaintext)
             result.layout_text[p] = layout_page_text(parse_result.chars,
                                                      result.col_boundaries[p]);
@@ -648,12 +663,7 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
         result.all_annots[p] = extract_annotations(doc, page_obj, page_h, initial_ctm);
 
         if (need_tables) {
-            PageCharCache cache;
-            cache.build(parse_result.chars);
-
-            std::vector<SparseGrid> sparse_grids;
-            result.all_tables[p] = detect_tables(parse_result.segments, cache,
-                page_w, page_h, &sparse_grids);
+            result.all_tables[p] = std::move(ruled_tables);
             auto shade_tables = detect_shading_tables(parse_result.fill_rects,
                 cache, result.all_tables[p], page_w, page_h);
             for (auto& st : shade_tables)

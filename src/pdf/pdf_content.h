@@ -506,8 +506,14 @@ bool is_spacing_accent(uint32_t cp);
 // Precomposed letter for a base letter and a spacing accent, or 0.
 uint32_t compose_spacing_accent(uint32_t base, uint32_t accent);
 
+// `ruled` holds the boxes of ruled tables found before the text is read
+// (detect_tables needs no column boundary): their glyphs count as the
+// table's full width when the page's column boundary is found. A page
+// holding little but a ruled table would otherwise read the table's columns
+// as its own.
 std::vector<TextLine> chars_to_lines(const std::vector<TextChar>& chars,
-                                     double* out_col_boundary = nullptr);
+                                     double* out_col_boundary = nullptr,
+                                     const std::vector<std::array<double, 4>>* ruled = nullptr);
 // Plain-text page body as a character grid built from glyph coordinates
 // (pdftotext -layout style); see pdf_layout.cpp. col_boundary is the page's
 // column boundary from chars_to_lines (0 = single column).

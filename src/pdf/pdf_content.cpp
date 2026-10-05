@@ -2683,7 +2683,8 @@ static std::vector<BandCut> find_column_bands(
 // this through chars_to_lines(), which rotates each non-upright direction into
 // this function's frame first.
 static std::vector<TextLine> lines_from_upright_chars(
-    const std::vector<TextChar>& chars, double* out_col_boundary) {
+    const std::vector<TextChar>& chars, double* out_col_boundary,
+    const std::vector<std::array<double, 4>>* ruled = nullptr) {
     if (chars.empty()) return {};
 
     // Sort by y (descending, top-first) then x (left-to-right)
@@ -2701,7 +2702,27 @@ static std::vector<TextLine> lines_from_upright_chars(
     double y_tol = median_fs * 0.4;
     if (y_tol < 2) y_tol = 2;
 
-    double col_boundary = detect_column_boundary(chars, median_fs, y_tol);
+    double col_boundary;
+    if (ruled && !ruled->empty()) {
+        // A glyph inside a ruled table votes as the table's full width: the
+        // gaps between its columns are not gutters of the page. A table
+        // across most of the page then covers the page centre, and one
+        // inside a column covers that column only, leaving the gutter
+        // beside it empty.
+        std::vector<TextChar> voted = chars;
+        for (auto& ch : voted) {
+            double cx = (ch.left + ch.right) / 2, cy = (ch.top + ch.bot) / 2;
+            for (const auto& b : *ruled)
+                if (cx >= b[0] - 2 && cx <= b[2] + 2 && cy >= b[1] - 2 && cy <= b[3] + 2) {
+                    ch.left = b[0];
+                    ch.right = b[2];
+                    break;
+                }
+        }
+        col_boundary = detect_column_boundary(voted, median_fs, y_tol);
+    } else {
+        col_boundary = detect_column_boundary(chars, median_fs, y_tol);
+    }
     if (out_col_boundary) *out_col_boundary = col_boundary;
 
     std::sort(idx.begin(), idx.end(), [&](size_t a, size_t b) {
@@ -2941,7 +2962,8 @@ static std::vector<TextLine> lines_from_upright_chars(
 }
 
 std::vector<TextLine> chars_to_lines(const std::vector<TextChar>& chars,
-                                    double* out_col_boundary) {
+                                    double* out_col_boundary,
+                                    const std::vector<std::array<double, 4>>* ruled) {
     if (out_col_boundary) *out_col_boundary = 0;
     if (chars.empty()) return {};
 
@@ -2953,7 +2975,7 @@ std::vector<TextLine> chars_to_lines(const std::vector<TextChar>& chars,
     int directions = 0;
     for (bool p : present) directions += p ? 1 : 0;
     if (directions <= 1 && present[0])
-        return lines_from_upright_chars(chars, out_col_boundary);
+        return lines_from_upright_chars(chars, out_col_boundary, ruled);
 
     // Upright text first and unchanged — it drives the column boundary and
     // keeps the body's reading order. Rotated runs follow, each grouped in its
@@ -2964,7 +2986,7 @@ std::vector<TextLine> chars_to_lines(const std::vector<TextChar>& chars,
         upright.reserve(chars.size());
         for (auto& ch : chars)
             if (ch.rot == 0) upright.push_back(ch);
-        lines = lines_from_upright_chars(upright, out_col_boundary);
+        lines = lines_from_upright_chars(upright, out_col_boundary, ruled);
     }
 
     for (int r = 1; r < 24; r++) {
