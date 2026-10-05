@@ -3506,12 +3506,16 @@ static bool is_value_cell(const std::string& s) {
 
 // Returns true if the table is acceptable (kept). gutter is the empty gap
 // between the two columns of a 2-column candidate, in font sizes, when it
-// is the widest gap of its rows (0 otherwise or for other widths). ragged:
+// is the widest gap of its rows (0 otherwise or for other widths). ruled:
+// rules across the band frame it, underline its first row or part its
+// rows; such a band is a table whatever its cells read like, so the tests
+// that tell prose torn at a phantom boundary from a table do not apply to
+// it (lists and contents still do). ragged:
 // the lines of a 2-column candidate's second column end where their words
 // end, well short of the column's right edge on a third of the rows at
 // least, as a table's cells do and a column of prose does not.
 static bool accept_table(TableData& table, double gutter = 0.0, int led_rows = 0,
-                         bool ragged = false) {
+                         bool ragged = false, bool ruled = false) {
     if (table.rows.empty()) return false;
     // pre-step: strip body-text columns adjacent to the table
     strip_prose_columns(table);
@@ -3600,7 +3604,7 @@ static bool accept_table(TableData& table, double gutter = 0.0, int led_rows = 0
     // a phantom boundary: the leader is drawn to tie the two cells together.
     // When most rows are such entries the prose tests below do not apply.
     bool leader_pairs = led_rows >= 2 && led_rows * 10 >= meaningful * 6;
-    int min_rows = (n_cols == 2 && !value_cols && !leader_pairs) ? 4 : 3;
+    int min_rows = (n_cols == 2 && !value_cols && !leader_pairs && !ruled) ? 4 : 3;
     if (meaningful < min_rows) return false;
 
     // Merge continuation rows: row with a single filled cell in column c, after
@@ -3680,8 +3684,8 @@ static bool accept_table(TableData& table, double gutter = 0.0, int led_rows = 0
                 if (c.size() > max_cell) max_cell = c.size();
             }
         }
-        if (max_cell > 250) return false;
-        if (filled >= 4 && sum > filled * 60) return false;
+        if (!ruled && max_cell > 250) return false;
+        if (!ruled && filled >= 4 && sum > filled * 60) return false;
     }
 
     // Reject tables where most cells consist only of junk characters
@@ -3854,7 +3858,7 @@ static bool accept_table(TableData& table, double gutter = 0.0, int led_rows = 0
                 if (code) code_cells++;
             }
         }
-        if (total >= 6 && code_cells * 10 >= total * 3) return false;
+        if (!ruled && total >= 6 && code_cells * 10 >= total * 3) return false;
     }
 
     // Wide but ragged: real 6+ column grids are densely filled; torn prose
@@ -3978,7 +3982,7 @@ static bool accept_table(TableData& table, double gutter = 0.0, int led_rows = 0
         bool long_defs = ragged && def_chars * 2 >= term_chars * 3;
         if (!short_defs && !long_defs) glossary = false;
         double ct = (n_cols == 2) ? 0.15 : 0.30;
-        if (!glossary && !leader_pairs && checked_rows >= 2 &&
+        if (!glossary && !leader_pairs && !ruled && checked_rows >= 2 &&
             continuation_rows >= checked_rows * ct)
             return false;
         if (total_cells > 0 && filler_cells >= total_cells * 0.35)
@@ -3994,7 +3998,7 @@ static bool accept_table(TableData& table, double gutter = 0.0, int led_rows = 0
                     for (char ch : c) if (ch >= '0' && ch <= '9') { has_digits++; break; }
                 }
             bool numeric_table = total_cells > 0 && has_digits >= total_cells * 0.30;
-            if (!numeric_table && total_cells >= 4 &&
+            if (!ruled && !numeric_table && total_cells >= 4 &&
                 hyphen_end_cells >= total_cells * 0.20)
                 return false;
         }
@@ -4004,7 +4008,7 @@ static bool accept_table(TableData& table, double gutter = 0.0, int led_rows = 0
     // long-first-column test: prose with a stray fringe never fills three
     // columns row after row, while question/answer tables (long question,
     // short verdict columns) legitimately do.
-    if (n_cols <= 3 && !leader_pairs) {
+    if (n_cols <= 3 && !leader_pairs && !ruled) {
         int total_rows = 0;
         double sum_first = 0, sum_second = 0;
         int unbalanced = 0, third_filled = 0;
@@ -4063,7 +4067,7 @@ static bool accept_table(TableData& table, double gutter = 0.0, int led_rows = 0
             // definitions table: col 0 short labels in ≥70% of rows
             bool is_definitions = col0_filled >= 3 &&
                                   short_col0 >= col0_filled * 0.70;
-            if (!is_definitions && long_cells >= data_cells * 0.3) return false;
+            if (!is_definitions && !ruled && long_cells >= data_cells * 0.3) return false;
         }
     }
 
@@ -4174,7 +4178,8 @@ static std::vector<TableData> detect_text_tables_range(
         double x_lo, double x_hi,
         const DotLeaders& leaders,
         double gutter_x = 0.0,
-        const std::vector<std::array<double, 4>>* figures = nullptr) {
+        const std::vector<std::array<double, 4>>* figures = nullptr,
+        const std::vector<PdfLineSegment>* rules = nullptr) {
     const std::vector<bool>& is_leader = leaders.is_leader;
     using namespace text_tables;
     if (cache.chars.size() < 10) return {};
@@ -4441,6 +4446,76 @@ static std::vector<TableData> detect_text_tables_range(
             }
         }
 
+        // Rules across the band (four fifths of its width or more), away
+        // from the page's head and foot where running heads are underlined.
+        // The band is ruled when two rules or more part its rows, a quarter
+        // of its row gaps at least; a rule
+        // under the first row alone (a running head is underlined too) or a
+        // frame alone is not enough. A chart's gridlines part its labels the
+        // same way, so a band over a drawing is not ruled, and a candidate
+        // whose cells hide cell gaps (a wide table read as two columns) is
+        // not trusted on its rules.
+        bool ruled = false;
+        if (rules && ext.last_row >= ext.first_row) {
+            const double bx0 = bounds.front(), bx1 = bounds.back();
+            const double fs = std::max(median_fs, 4.0);
+            const double margin = 0.08 * page_height;
+            std::vector<double> span_y;
+            for (const auto& seg : *rules) {
+                if (!seg.is_horizontal()) continue;
+                double y = (seg.y0 + seg.y1) / 2.0;
+                if (y < margin || y > page_height - margin) continue;
+                double sx0 = std::min(seg.x0, seg.x1), sx1 = std::max(seg.x0, seg.x1);
+                if (std::min(sx1, bx1) - std::max(sx0, bx0) >= 0.8 * (bx1 - bx0)) span_y.push_back(y);
+            }
+            // Rules parting the rows: strictly between two rows, not under
+            // the first (a header's underline, or a running head's). A rule
+            // drawn twice (a double rule) counts once.
+            int inner = 0;
+            std::vector<double> ys = span_y;
+            std::sort(ys.begin(), ys.end());
+            for (size_t k = 0; k < ys.size(); k++) {
+                if (k > 0 && ys[k] - ys[k - 1] < 0.5 * fs) continue;
+                for (size_t r = ext.first_row + 1; r < ext.last_row; r++)
+                    if (ys[k] < rows[r].y_bot && ys[k] > rows[r + 1].y_top) { inner++; break; }
+            }
+            // Cells that hold a cell gap inside them are several cells the
+            // column inference did not part (a wide table read as two
+            // columns at the page gutter); such a candidate is not trusted
+            // on its rules.
+            size_t hidden = 0, checked = 0;
+            for (size_t r = ext.first_row; r <= ext.last_row; r++) {
+                checked++;
+                bool hid = false;
+                for (size_t c = 0; c + 1 < bounds.size() && !hid; c++) {
+                    std::vector<std::pair<double, double>> in;
+                    for (auto& cr : rows[r].char_ranges)
+                        if (cr.first >= bounds[c] && cr.second <= bounds[c + 1]) in.push_back(cr);
+                    std::sort(in.begin(), in.end());
+                    for (size_t k = 1; k < in.size(); k++)
+                        if (in[k].first - in[k - 1].second >= cell_merge_gap) { hid = true; break; }
+                }
+                if (hid) hidden++;
+            }
+            const bool hidden_cells = checked > 0 && hidden * 10 >= checked * 3;
+            bool over_drawing = false;
+            if (figures) {
+                double ty0 = rows[ext.last_row].y_bot, ty1 = rows[ext.first_row].y_top;
+                double area = std::max(1.0, (bx1 - bx0) * (ty1 - ty0)), covered = 0;
+                for (const auto& f : *figures) {
+                    double ox = std::min(bx1, f[2]) - std::max(bx0, f[0]);
+                    double oy = std::min(ty1, f[3]) - std::max(ty0, f[1]);
+                    if (ox > 0 && oy > 0) covered += ox * oy;
+                }
+                over_drawing = covered >= 0.2 * area;
+            }
+            // The rules must part the band's rows, not a few rows at one end
+            // of it: a ruled table glued to the paragraphs above it is not
+            // ruled as a whole. A quarter of the row gaps at least.
+            const size_t gaps = ext.last_row - ext.first_row;
+            ruled = inner >= 2 && static_cast<size_t>(inner) * 4 >= gaps && !over_drawing && !hidden_cells;
+        }
+
         // S3: build cells
         table = build_table_from_band(rows, ext, bounds, chars, median_fs);
 
@@ -4492,7 +4567,7 @@ static std::vector<TableData> detect_text_tables_range(
                 if (e < right - 0.25 * (right - left)) shortn++;
             ragged = ends.size() >= 3 && shortn * 3 >= ends.size();
         }
-        return accept_table(table, gutter, led_rows, ragged);
+        return accept_table(table, gutter, led_rows, ragged, ruled);
         };
 
         // Whether the band is a table at all, and which rows it holds, is
@@ -4558,14 +4633,15 @@ std::vector<TableData> detect_text_tables(const PageCharCache& cache,
                                            const std::vector<TableData>& existing_tables,
                                            double page_width, double page_height,
                                            double col_boundary,
-                                           const std::vector<std::array<double, 4>>& figures) {
+                                           const std::vector<std::array<double, 4>>& figures,
+                                           const std::vector<PdfLineSegment>* rules) {
     // Leaders are found once for the page: the per-column passes below
     // would otherwise sort every period of the page again.
     const DotLeaders leaders = dot_leader_mask(cache);
     auto result = detect_text_tables_range(cache, existing_tables,
                                            page_width, page_height,
                                            0.0, page_width, leaders,
-                                           col_boundary, &figures);
+                                           col_boundary, &figures, rules);
 
     // Two-column pages: rows built across the gutter glue a column's table
     // to the prose beside it, so the full-width pass misses column-local
@@ -4579,7 +4655,7 @@ std::vector<TableData> detect_text_tables(const PageCharCache& cache,
             double x_hi = side == 0 ? col_boundary : page_width;
             auto part = detect_text_tables_range(cache, known,
                                                  page_width, page_height,
-                                                 x_lo, x_hi, leaders, 0.0, &figures);
+                                                 x_lo, x_hi, leaders, 0.0, &figures, rules);
             for (auto& t : part) {
                 known.push_back(t);
                 result.push_back(std::move(t));

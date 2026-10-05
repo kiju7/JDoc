@@ -210,7 +210,8 @@ std::vector<TableData> detect_text_tables(const PageCharCache& cache,
                                           const std::vector<TableData>& existing_tables,
                                           double page_width, double page_height,
                                           double col_boundary = 0.0,
-                                           const std::vector<std::array<double, 4>>& figures = {});
+                                           const std::vector<std::array<double, 4>>& figures = {},
+                                           const std::vector<PdfLineSegment>* rules = nullptr);
 std::string format_table(const TableData& table);
 std::vector<ExtractedImage> extract_page_images(PdfDoc& doc, const PdfObj& resources,
                                                 const ContentParseResult& parse_result,

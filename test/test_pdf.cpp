@@ -1411,8 +1411,10 @@ int main(int argc, char* argv[]) {
     // Labels joined by dot leaders to values in words keep their alignment
     // in a layout block: the leaders pair the rows, figures or not.
     // A dialogue beside its replies, both columns prose-wide, ruled off
-    // row from row: the rules box it as a table for the column vote. Each
-    // row keeps its two cells on one line, as text or as a table row.
+    // row from row: the rules box it as a table for the column vote, and
+    // the text table detector takes a band whose rows rules part as a
+    // table whatever its cells read like. Each row keeps its two cells on
+    // one line, and the dialogue comes out as a table.
     std::cout << "[35] Testing two-column tables of words against the column split...\n";
     {
         const std::string dir = "test/fixtures/pdf/";
@@ -1445,6 +1447,8 @@ int main(int argc, char* argv[]) {
             std::string rr = jdoc::pdf_to_markdown(dir + "ruled_rows.pdf");
             CHECK(same_line(rr, "Input: hear it ?", "Choice: first reply"));
             CHECK(same_line(rr, "Fifth: the man is a man of faith", "Seventh: it is my duty"));
+            // Rules parting the rows make it a table, prose-like cells or not.
+            CHECK(rr.find('|') != std::string::npos);
             std::cout << "    glossary and ruled dialogue rows kept whole OK\n";
         }
     }
