@@ -996,15 +996,24 @@ std::vector<std::pair<size_t, size_t>> tabular_runs(
                 // first cells are never narrow.
                 // A short table may be narrow enough that its first column
                 // takes more than 40% of it; then both ends are short.
-                size_t narrow = 0;
+                // Dot leaders on most rows tie each label to its value
+                // ("Buildings .... 5 to 40 years"): the leader fills the
+                // gap, so the label's width says nothing, and the value
+                // may be words. Such rows count as narrow, and the region
+                // skips the tests below that ask for figures or reject a
+                // wrapped value line, as a framed region does.
+                size_t narrow = 0, led = 0;
                 for (size_t a : m) {
                     auto first = cells[a].cells.front(), lastc = cells[a].cells.back();
                     const auto& gl = rows[a].glyphs;
                     double fs = gl[first.first]->font_size > 1.0 ? gl[first.first]->font_size : 10.0;
                     double w = cell_word_width(rows[a], first);
                     double wl = ink_right(gl[lastc.second - 1]) - gl[lastc.first]->left;
-                    if (w <= 0.4 * width || (w <= 12 * fs && wl <= 12 * fs)) narrow++;
+                    bool leader = has_leader(cell_text(rows[a], {0, gl.size()}));
+                    if (leader) led++;
+                    if (leader || w <= 0.4 * width || (w <= 12 * fs && wl <= 12 * fs)) narrow++;
                 }
+                const bool leader_pairs = led >= 3 && led * 10 >= m.size() * 6;
                 ok = narrow >= 3 && narrow * 10 >= m.size() * 8;
                 // A column of running text beside a side column has lines of
                 // its own at the second column's left edge: above the side
@@ -1109,9 +1118,9 @@ std::vector<std::pair<size_t, size_t>> tabular_runs(
                     }
                     framed = above && below && worded * 10 >= m.size() * 6;
                 }
-                word_frame = framed;
-                if (ok && ((runs_on && !framed) || numbered * 10 >= m.size() * 6 ||
-                           (figures * 10 < m.size() * 6 && !framed) || pages * 10 >= m.size() * 7 ||
+                word_frame = framed || leader_pairs;
+                if (ok && ((runs_on && !word_frame) || numbered * 10 >= m.size() * 6 ||
+                           (figures * 10 < m.size() * 6 && !word_frame) || pages * 10 >= m.size() * 7 ||
                            twins * 10 >= m.size() * 6))
                     ok = false;
             }

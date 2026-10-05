@@ -1408,6 +1408,8 @@ int main(int argc, char* argv[]) {
     // terms are a label column, under ten ems wide beside one far wider.
     // A notation table whose definitions run long is a table all the same:
     // their lines end where their words end, ragged, as prose never does.
+    // Labels joined by dot leaders to values in words keep their alignment
+    // in a layout block: the leaders pair the rows, figures or not.
     // A dialogue beside its replies, both columns prose-wide, ruled off
     // row from row: the rules box it as a table for the column vote. Each
     // row keeps its two cells on one line, as text or as a table row.
@@ -1434,6 +1436,12 @@ int main(int argc, char* argv[]) {
             std::string nt = jdoc::pdf_to_markdown(dir + "glossary_long.pdf");
             CHECK(nt.find('|') != std::string::npos);
             CHECK(same_line(nt, "| S ", "set of all possible messages"));
+            // Labels joined by dot leaders to values in words: a layout block.
+            std::string lw = jdoc::pdf_to_markdown(dir + "leader_words.pdf");
+            size_t lf = lw.find("```text");
+            CHECK(lf != std::string::npos);
+            CHECK(lw.find("5 to 40 years", lf) != std::string::npos);
+            CHECK(same_line(lw, "Machinery and equipment", "1 to 15 years"));
             std::string rr = jdoc::pdf_to_markdown(dir + "ruled_rows.pdf");
             CHECK(same_line(rr, "Input: hear it ?", "Choice: first reply"));
             CHECK(same_line(rr, "Fifth: the man is a man of faith", "Seventh: it is my duty"));

@@ -17,6 +17,11 @@ words is not two columns of text).
       a notation table. The definitions average more than thirty characters,
       which once made the candidate prose; their ragged right edge is what
       tells the table from a column of text.
+  leader_words.pdf  three asset classes joined by dot leaders to the lives
+      they are depreciated over, in words ("5 to 40 years"), one value
+      wrapping onto a second line, inside a page of prose. No rule, no
+      figure column: the leaders pair the rows, and the rows must keep
+      their alignment in a layout block.
   ruled_rows.pdf  a table of two columns of equal width, both holding
       sentences, three rows to a cell, a rule across the table under every
       cell row and above the first: a dialogue beside its replies. Nothing
@@ -125,6 +130,39 @@ def make_glossary_long():
     pg.save("glossary_long.pdf")
 
 
+LIVES = [("Buildings and related improvements", "5 to 40 years"),
+         ("Leasehold improvements", "Lesser of remaining term of the lease or"),
+         ("Machinery and equipment", "1 to 15 years")]
+BODY = ["Net property, plant, and equipment is recorded at cost less accumulated depreciation.",
+        "Maintenance and repair expenditures are charged to expense when incurred. Depreciation",
+        "is calculated using the straight-line method over the estimated useful lives as follows:"]
+
+
+def make_leader_words():
+    pg = Page()
+    y = 100
+    for ln in BODY:
+        pg.text(72, y, ln, size=10)
+        y += 13
+    y += 8
+    for a, b in LIVES:
+        right = 330
+        dots = ""
+        while width(a + " " + dots + " .", "F1", 10) < right - 110 - 1:
+            dots += " ."
+        pg.text(110, y, a + " " + dots.strip(), size=10)
+        pg.text(right + 18, y, b, size=10)
+        y += 13
+        if b.endswith("or"):
+            pg.text(right + 18 + width("Lesser of ", "F1", 10), y, "economic useful life", size=10)
+            y += 13
+    y += 8
+    for ln in BODY:
+        pg.text(72, y, ln, size=10)
+        y += 13
+    pg.save("leader_words.pdf")
+
+
 def make_ruled_rows():
     pg = Page()
     x0, xm, x1 = 60, 300, 540
@@ -143,4 +181,5 @@ def make_ruled_rows():
 if __name__ == "__main__":
     make_glossary()
     make_glossary_long()
+    make_leader_words()
     make_ruled_rows()
