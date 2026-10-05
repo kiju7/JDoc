@@ -217,6 +217,11 @@ struct TextLine {
     // are already in reading order, left column first; the page-wide column
     // reordering leaves them where they are.
     int band = -1;
+    // Byte ranges [first, second) of `text` set in a bold face, for inline
+    // emphasis in the Markdown body. `is_bold` above stays the line-level
+    // flag the heading logic reads; these only change how a body line that
+    // is partly bold is written ("**Residual Dropout** We apply ...").
+    std::vector<std::pair<uint32_t, uint32_t>> bold_spans;
 };
 
 // ── Reading order for rotated runs ──────────────────────

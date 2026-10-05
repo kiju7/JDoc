@@ -3,6 +3,7 @@
 #include "common/string_utils.h"
 #include <algorithm>
 #include <cassert>
+#include <cctype>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -2877,8 +2878,32 @@ static std::vector<TextLine> lines_from_upright_chars(
     bool first_gap_set = false;  // cur.first_gap measured
     int prev_glyph = -1;         // index of the last non-space glyph placed
     bool after_space = false;    // the last glyph placed was a space glyph
+    // Open bold run: byte start in cur.text, byte end after its last bold
+    // glyph, and whether it holds a letter. A bold run of only digits,
+    // punctuation or leader dots is not marked: Hangul word processors
+    // outline-stroke the number of a caption whose words come from a nameless
+    // Type 3 face, and marking the number alone ("그림 **1.1** ...") reads as
+    // emphasis the page does not have.
+    bool bold_open = false, bold_has_word = false;
+    uint32_t bold_start = 0, bold_end = 0;
+    auto close_bold = [&]() {
+        if (bold_open && bold_has_word && bold_end > bold_start)
+            cur.bold_spans.emplace_back(bold_start, bold_end);
+        bold_open = false;
+        bold_has_word = false;
+    };
+    auto is_word_cp = [](uint32_t u) {
+        if (u < 128) return std::isalpha(static_cast<unsigned char>(u)) != 0;
+        if (u >= 0xFF10 && u <= 0xFF19) return false;   // fullwidth digits
+        if (u >= 0x02B0 && u <= 0x036F) return false;   // spacing accents, combining marks
+        if (u >= 0x2000 && u <= 0x2BFF) return false;   // punctuation, arrows, symbols
+        if (u >= 0x3000 && u <= 0x303F) return false;   // CJK punctuation
+        if (u >= 0xFF00 && u <= 0xFF0F) return false;   // fullwidth punctuation
+        return u >= 0x00C0;
+    };
 
     auto flush = [&]() {
+        close_bold();
         if (cur.text.empty()) return;
         size_t end = cur.text.find_last_not_of(" \t");
         if (end != std::string::npos) cur.text.resize(end + 1);
@@ -3025,7 +3050,8 @@ static std::vector<TextLine> lines_from_upright_chars(
                 cur.text += ' ';
         }
 
-        if (ch.unicode != ' ' && ch.unicode != 0xA0) {
+        bool visible = ch.unicode != ' ' && ch.unicode != 0xA0;
+        if (visible) {
             // First glyph of the second word: measure the gap back to the
             // end of the first, whether a space glyph or geometry split them.
             if (!first_gap_set && word_end > -1e8 &&
@@ -3039,6 +3065,12 @@ static std::vector<TextLine> lines_from_upright_chars(
             cur.is_italic = ch.is_italic;
             total_fs += ch.font_size;
             fs_count++;
+            if (ch.is_bold && !bold_open) {
+                bold_open = true;
+                bold_start = static_cast<uint32_t>(cur.text.size());
+            } else if (!ch.is_bold) {
+                close_bold();
+            }
         }
         // A no-break space is a word space in the line's text. Every other
         // consumer of the glyph stream (cell text, column bins, word gaps
@@ -3050,6 +3082,10 @@ static std::vector<TextLine> lines_from_upright_chars(
         if (reach > -1e8) hole = std::max(hole, (double)ch.left - reach);
         reach = std::max(reach, (double)ch.right);
         if (ch.unicode != ' ' && ch.unicode != 0xA0) hole = 0;
+        if (visible && ch.is_bold) {
+            bold_end = static_cast<uint32_t>(cur.text.size());
+            if (is_word_cp(ch.unicode)) bold_has_word = true;
+        }
         prev_right = ch.right;
         after_space = ch.unicode == ' ' || ch.unicode == 0xA0;
     }

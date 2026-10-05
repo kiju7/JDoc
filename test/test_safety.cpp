@@ -1016,11 +1016,17 @@ void test_pdf_heading_section_number_rules() {
     CHECK(glued_mark_offset("1)1. \xec\x84\x9c\xeb\xa1\xa0") == 2);
     CHECK(glued_mark_offset("1. \xec\x84\x9c\xeb\xa1\xa0") == 0);
 
-    CHECK(is_section_keyword("ABSTRACT"));
-    CHECK(is_section_keyword("References"));
-    // "요<U+3000>약"
-    CHECK(is_section_keyword("\xec\x9a\x94\xe3\x80\x80\xec\x95\xbd"));
-    CHECK(!is_section_keyword("Abstract painting methods"));
+    CHECK(line_all_caps("ABSTRACT"));
+    CHECK(!line_all_caps("References"));       // sentence case is no signal
+    CHECK(!line_all_caps("A B"));              // too few capitals
+    CHECK(!line_all_caps("PDF parsing"));      // lowercase kills it
+    // "참 고 문 헌", "요<U+3000>약": every token a single character
+    CHECK(line_letter_spaced(
+        "\xec\xb0\xb8 \xea\xb3\xa0 \xeb\xac\xb8 \xed\x97\x8c"));
+    CHECK(line_letter_spaced("\xec\x9a\x94\xe3\x80\x80\xec\x95\xbd"));
+    CHECK(!line_letter_spaced("Abstract painting methods"));
+    CHECK(!line_letter_spaced(
+        "\xec\xb0\xb8\xea\xb3\xa0\xeb\xac\xb8\xed\x97\x8c"));  // unspaced
 }
 
 void test_pdf_side_by_side_tables_split_at_gutter() {

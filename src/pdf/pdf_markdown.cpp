@@ -2,6 +2,7 @@
 #include "common/string_utils.h"
 #include <algorithm>
 #include <cassert>
+#include <cctype>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -586,6 +587,9 @@ static std::vector<TextLine> merge_upright_lines(const std::vector<TextLine>& li
                     else if (gap > word_gap)
                         m.text += " ";
                 }
+                const uint32_t base = static_cast<uint32_t>(m.text.size());
+                for (auto& sp : lines[group[k]].bold_spans)
+                    m.bold_spans.emplace_back(sp.first + base, sp.second + base);
                 m.text += lines[group[k]].text;
                 if (lines[group[k]].x_right > m.x_right)
                     m.x_right = lines[group[k]].x_right;
@@ -751,31 +755,42 @@ static uint32_t last_codepoint(const std::string& s) {
     return cp;
 }
 
-// Standalone structural keywords the corpus ground truth treats as
-// top-level sections regardless of their type size.
-bool is_section_keyword(const std::string& text) {
-    std::string key;
-    for (size_t i = 0; i < text.size();) {
-        unsigned char c = text[i];
-        if (c == ' ' || c == '\t') { i++; continue; }
-        if (c == 0xE3 && i + 2 < text.size() &&
-            static_cast<unsigned char>(text[i + 1]) == 0x80 &&
-            static_cast<unsigned char>(text[i + 2]) == 0x80) {
-            i += 3;
-            continue;
-        }
-        key += (c >= 'A' && c <= 'Z') ? static_cast<char>(c + 32) : text[i];
-        i++;
+// A line set entirely in capitals ("ABSTRACT"): at least three Latin
+// capitals and not a single lowercase letter — sentence case never counts.
+bool line_all_caps(const std::string& text) {
+    int caps = 0;
+    for (char ch : text) {
+        if (ch >= 'a' && ch <= 'z') return false;
+        if (ch >= 'A' && ch <= 'Z') caps++;
     }
-    while (!key.empty() && (key.back() == ':' || key.back() == '.'))
-        key.pop_back();
-    return key == "abstract" || key == "references" ||
-           key == "acknowledgments" || key == "acknowledgements" ||
-           key == "appendix" ||
-           key == "\xec\x9a\x94\xec\x95\xbd" ||                           // 요약
-           key == "\xec\xb4\x88\xeb\xa1\x9d" ||                           // 초록
-           key == "\xea\xb5\xad\xeb\xac\xb8\xec\x9a\x94\xec\x95\xbd" ||   // 국문요약
-           key == "\xec\xb0\xb8\xea\xb3\xa0\xeb\xac\xb8\xed\x97\x8c";     // 참고문헌
+    return caps >= 3;
+}
+
+// A line whose glyphs are spaced out one by one ("참 고 문 헌", "요　약"):
+// every space-separated token is a single character, and there are at
+// least two of them. Body text never wears this shape; Korean section
+// names conventionally do.
+static bool at_ideographic_space(const std::string& s, size_t i) {
+    return static_cast<unsigned char>(s[i]) == 0xE3 && i + 2 < s.size() &&
+           static_cast<unsigned char>(s[i + 1]) == 0x80 &&
+           static_cast<unsigned char>(s[i + 2]) == 0x80;
+}
+bool line_letter_spaced(const std::string& text) {
+    int tokens = 0, singles = 0;
+    size_t i = 0, n = text.size();
+    while (i < n) {
+        if (text[i] == ' ' || text[i] == '\t') { i++; continue; }
+        if (at_ideographic_space(text, i)) { i += 3; continue; }
+        int cps = 0;
+        while (i < n && text[i] != ' ' && text[i] != '\t' &&
+               !at_ideographic_space(text, i)) {
+            if ((static_cast<unsigned char>(text[i]) & 0xC0) != 0x80) cps++;
+            i++;
+        }
+        tokens++;
+        if (cps == 1) singles++;
+    }
+    return tokens >= 2 && singles == tokens;
 }
 
 // Name-list punctuation that betrays an author line under the title:
@@ -886,6 +901,58 @@ static std::string annotations_markdown(const std::vector<AnnotEntry>& annots) {
     return md;
 }
 
+// True when every visible byte of the line lies inside a bold run, i.e. the
+// whole line is set bold (the case the line-level `**...**` always covered).
+static bool bold_covers_line(const TextLine& l) {
+    if (l.bold_spans.empty()) return false;
+    size_t pos = 0;
+    for (auto& sp : l.bold_spans) {
+        for (size_t k = pos; k < sp.first && k < l.text.size(); k++)
+            if (l.text[k] != ' ' && l.text[k] != '\t' && l.text[k] != '\n') return false;
+        pos = std::max(pos, static_cast<size_t>(sp.second));
+    }
+    for (size_t k = pos; k < l.text.size(); k++)
+        if (l.text[k] != ' ' && l.text[k] != '\t' && l.text[k] != '\n') return false;
+    return true;
+}
+
+// The line text with `**` around each bold run. Runs are byte ranges built on
+// glyph boundaries, so the markers never split a UTF-8 sequence.
+static std::string with_inline_bold(const TextLine& l) {
+    std::string out;
+    out.reserve(l.text.size() + 4 * l.bold_spans.size());
+    size_t pos = 0;
+    for (auto& sp : l.bold_spans) {
+        size_t a = std::max(pos, static_cast<size_t>(sp.first));
+        size_t b = std::min(l.text.size(), static_cast<size_t>(sp.second));
+        // Keep trailing punctuation outside the closing marker: CommonMark
+        // does not close "**" that follows punctuation and precedes a letter,
+        // so "**Adaptations—**If" would print its asterisks.
+        auto punct_tail = [&](size_t end) -> size_t {
+            unsigned char c = static_cast<unsigned char>(l.text[end - 1]);
+            if (c < 0x80 && std::ispunct(c)) return 1;
+            if (end - a >= 3 && static_cast<unsigned char>(l.text[end - 3]) == 0xE2 &&
+                (static_cast<unsigned char>(l.text[end - 2]) == 0x80 ||
+                 static_cast<unsigned char>(l.text[end - 2]) == 0x81))
+                return 3;   // U+2000..U+207F general punctuation (—, …, ’, ”)
+            return 0;
+        };
+        while (b > a) {
+            size_t n = punct_tail(b);
+            if (n == 0) break;
+            b -= n;
+        }
+        if (a >= b) continue;
+        out.append(l.text, pos, a - pos);
+        out += "**";
+        out.append(l.text, a, b - a);
+        out += "**";
+        pos = b;
+    }
+    out.append(l.text, pos, std::string::npos);
+    return out;
+}
+
 std::string page_to_markdown(const std::vector<TextLine>& raw_lines,
                               const FontStats& stats,
                               const std::vector<ImageData>& images,
@@ -912,11 +979,12 @@ std::string page_to_markdown(const std::vector<TextLine>& raw_lines,
     // ── Heading classification (pre-pass) ──
     // Decide every line's heading level up front; the emit loop and the
     // wrap-merge inside it both need the neighbour's verdict. Levels follow
-    // the corpus-wide convention — document title → H1; top-level sections
-    // (depth-1 numbers, structural keywords, other prominent text) → H2;
-    // numbered subsections → H3 — because size ratios alone systematically
-    // shifted every level one to two steps down.
+    // the typesetting convention — document title → H1; top-level sections
+    // (depth-1 numbers, standalone emphasized names, other prominent text)
+    // → H2; numbered subsections → H3 — because size ratios alone
+    // systematically shifted every level one to two steps down.
     std::vector<int> line_level(lines.size(), 0);
+    std::vector<uint8_t> line_standalone(lines.size(), 0);
     // Side 0 is the page's full width, 1 and 2 its columns, and 3 on the
     // columns of its column bands (TextLine::band).
     int sides = 3;
@@ -989,11 +1057,6 @@ std::string page_to_markdown(const std::vector<TextLine>& raw_lines,
             size_t cp_len = utf8_length(l.text);
             int base = stats.heading_level(l.font_size, l.is_bold);
 
-            if (is_section_keyword(l.text) && cp_len <= 24) {
-                line_level[i] = 2;
-                continue;
-            }
-
             SectionNumber sn = parse_section_number(l.text);
             size_t sn_off = 0;
             if (sn.depth == 0) {
@@ -1035,6 +1098,99 @@ std::string page_to_markdown(const std::vector<TextLine>& raw_lines,
                 if (ok) {
                     line_level[i] = (sn.depth == 1) ? 2 : 3;
                     continue;
+                }
+            }
+
+            // Standalone structural heading at body-tier size ("참 고 문 헌",
+            // "ABSTRACT", a bold "요약"): no word list — the signals are the
+            // line's own dress (weight, letter spacing, capitals), its
+            // isolation from the surrounding pitch, and, when weight is the
+            // only mark, the document's sparing use of that style. A press
+            // release that bolds half its lines offers no weight signal.
+            if (cp_len >= 2 && cp_len <= 32 && sn.depth == 0 &&
+                !is_caption_heading(l.text) &&
+                !looks_like_author_line(l.text) &&
+                // A name list wears commas a section name never does.
+                l.text.find(',') == std::string::npos &&
+                // A cover-like sparse page has its own title rule below;
+                // its spaced-out names and labels are not section headings.
+                (has_display || lines.size() > 30)) {
+                bool spaced = line_letter_spaced(l.text);
+                bool caps = line_all_caps(l.text);
+                bool weight_only = l.is_bold && !spaced && !caps;
+                bool emphasized = l.is_bold || spaced || caps;
+                char lastc = l.text[l.text.size() - 1];
+                // A trailing colon is a fragment of a wrapped title or a
+                // lead-in; a trailing digit is a running head carrying its
+                // page number. Neither is a finished section name.
+                bool clean_tail = lastc != '.' && lastc != ',' &&
+                                  lastc != ';' && lastc != '?' &&
+                                  lastc != '!' && lastc != ':' &&
+                                  !(lastc >= '0' && lastc <= '9');
+                bool rare = !weight_only ||
+                            stats.style_share(l.font_size, true) <= 0.25;
+                // The page title outranks this rule: a display-size line in
+                // the top region stays on the H1 path below.
+                bool h1_candidate = h1_size > 0 &&
+                                    l.font_size >= h1_size - 0.1 &&
+                                    l.y_center >= bot_y + (top_y - bot_y) * 0.70;
+                if (emphasized && clean_tail && rare && !h1_candidate &&
+                    gap_above(i) >= median_gap * 1.35) {
+                    // A line inside a run of same-style lines is a block
+                    // member — the wrapped second line of a display title,
+                    // the first line of a bold paragraph — not a standalone
+                    // heading. Check the nearest same-side neighbour on
+                    // each side for the same weight and size.
+                    bool block_member = false;
+                    if (weight_only) {
+                        // An address or name list above (an author block)
+                        // is not the candidate's own block: those styles
+                        // end exactly where the section heading begins.
+                        auto blockish = [](const std::string& s) {
+                            return s.find('@') == std::string::npos &&
+                                   s.find(',') == std::string::npos;
+                        };
+                        for (size_t j = i; j-- > 0;) {
+                            if (side_of(lines[j]) != side_of(l)) continue;
+                            block_member =
+                                lines[j].is_bold &&
+                                blockish(lines[j].text) &&
+                                std::fabs(lines[j].font_size - l.font_size) <
+                                    0.6 &&
+                                lines[j].y_center - l.y_center <
+                                    median_gap * 2.2;
+                            break;
+                        }
+                        // A heading heads something: text must follow
+                        // below it, under its own extent. A bold fragment
+                        // left at the foot of a column has no body under
+                        // it. Reading order may put other lines between the
+                        // two (a column band's side column), and the body
+                        // may sit on another side than the heading (a
+                        // column band starting under it).
+                        size_t nx = i + 1;
+                        while (nx < lines.size() &&
+                               !(lines[nx].y_center < l.y_center &&
+                                 lines[nx].x_left < l.x_right &&
+                                 lines[nx].x_right > l.x_left))
+                            nx++;
+                        bool has_body_below =
+                            nx < lines.size() &&
+                            l.y_center - lines[nx].y_center <
+                                median_gap * 2.5;
+                        if (!has_body_below) block_member = true;
+                        if (!block_member && lines[nx].is_bold &&
+                            std::fabs(lines[nx].font_size - l.font_size) <
+                                0.6 &&
+                            l.y_center - lines[nx].y_center <
+                                median_gap * 1.2)
+                            block_member = true;
+                    }
+                    if (!block_member) {
+                        line_level[i] = 2;
+                        line_standalone[i] = 1;
+                        continue;
+                    }
                 }
             }
 
@@ -1286,7 +1442,7 @@ std::string page_to_markdown(const std::vector<TextLine>& raw_lines,
                                std::max(nx.font_size, l.font_size);
                 if (line_level[i + 1] == 0 ||
                     parse_section_number(nx.text).depth > 0 ||
-                    is_section_keyword(nx.text) ||
+                    line_standalone[i + 1] != 0 ||
                     line_swallowed_by_table(nx, tables, captured_cells) ||
                     line_in_layout_block(nx, fallbacks) ||
                     !same_col ||
@@ -1311,7 +1467,13 @@ std::string page_to_markdown(const std::vector<TextLine>& raw_lines,
             !(md.size() >= 2 && md[md.size() - 1] == '\n' && md[md.size() - 2] == '\n'))
             md += '\n';
         prev_body = static_cast<int>(i);
-        if (l.is_bold && l.is_italic) {
+        if (bold_covers_line(l)) {
+            md += (l.is_italic ? "***" : "**") + l.text + (l.is_italic ? "***\n" : "**\n");
+        } else if (!l.bold_spans.empty()) {
+            // Partly bold body line: mark each bold run in place.
+            std::string body = with_inline_bold(l);
+            md += l.is_italic ? "*" + body + "*\n" : body + "\n";
+        } else if (l.is_bold && l.is_italic) {
             md += "***" + l.text + "***\n";
         } else if (l.is_bold) {
             md += "**" + l.text + "**\n";
