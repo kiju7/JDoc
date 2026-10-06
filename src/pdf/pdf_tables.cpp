@@ -734,23 +734,41 @@ TableData build_table(const std::vector<double>& row_ys,
                 // and the line above it prohibits continuation in this cell.
                 // Use the actual text centers: the rule need not coincide
                 // with the midpoint chosen for text extraction.
-                std::vector<std::pair<double, double>> intervals;
+                struct Stroke { double y, left, right; };
+                std::vector<Stroke> strokes;
                 for (const auto& line : h_lines) {
                     double y = (line.y0 + line.y1) * 0.5;
                     if (y <= split_centers[r] || y >= split_centers[r + 1])
                         continue;
                     double lo = std::max(left, double(std::min(line.x0, line.x1)));
                     double hi = std::min(right, double(std::max(line.x0, line.x1)));
-                    if (hi > lo) intervals.push_back({lo, hi});
+                    if (hi > lo) strokes.push_back({y, lo, hi});
                 }
-                std::sort(intervals.begin(), intervals.end());
-                double coverage = 0, end = left;
-                for (const auto& interval : intervals) {
-                    coverage += std::max(0.0, interval.second -
-                                              std::max(end, interval.first));
-                    end = std::max(end, interval.second);
+                std::sort(strokes.begin(), strokes.end(),
+                    [](const Stroke& a, const Stroke& b) { return a.y < b.y; });
+                // Only strokes on one rule level can close the cell. Use
+                // the same 4-point level tolerance as the grid coverage
+                // test, anchored to the first stroke to avoid chaining
+                // several staggered levels into one apparent border.
+                for (size_t start = 0; start < strokes.size(); ) {
+                    size_t next = start;
+                    std::vector<std::pair<double, double>> intervals;
+                    while (next < strokes.size() &&
+                           strokes[next].y - strokes[start].y <= 4.0) {
+                        intervals.push_back({strokes[next].left, strokes[next].right});
+                        ++next;
+                    }
+                    std::sort(intervals.begin(), intervals.end());
+                    double coverage = 0, end = left;
+                    for (const auto& interval : intervals) {
+                        coverage += std::max(0.0, interval.second -
+                                                  std::max(end, interval.first));
+                        end = std::max(end, interval.second);
+                    }
+                    if (coverage >= (right - left) * 0.8) return true;
+                    start = next;
                 }
-                return coverage >= (right - left) * 0.8;
+                return false;
             };
 
             // A cell set entirely in a bold face keeps the emphasis (mask

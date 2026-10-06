@@ -1544,7 +1544,7 @@ int main(int argc, char* argv[]) {
     std::cout << "[38] Testing continuation rows against cell rules...\n";
     {
         using namespace jdoc::pdf_detail;
-        for (int mode = 0; mode < 6; ++mode) {
+        for (int mode = 0; mode < 8; ++mode) {
             PageCharCache cache;
             for (int r = 0; r < 10; ++r) {
                 for (int c = 0; c < 3; ++c) {
@@ -1583,8 +1583,21 @@ int main(int argc, char* argv[]) {
                 horizontal.push_back({150, 370, 250, 370});
                 horizontal.push_back({250, 370, 350, 370});
             }
+            if (mode == 6) {
+                // Staggered short strokes do not form one horizontal border.
+                levels.insert(levels.begin() + 1, 367);
+                levels.insert(levels.begin() + 2, 373);
+                horizontal.push_back({150, 367, 250, 367});
+                horizontal.push_back({250, 373, 350, 373});
+            }
+            if (mode == 7) {
+                // Slightly misaligned segments still form one rule level.
+                levels.insert(levels.begin() + 1, 370);
+                horizontal.push_back({150, 368, 250, 368});
+                horizontal.push_back({250, 371, 350, 371});
+            }
             auto table = build_table(levels, horizontal, vertical, cache);
-            bool separates = mode == 1 || mode == 2 || mode == 5;
+            bool separates = mode == 1 || mode == 2 || mode == 5 || mode == 7;
             CHECK(table.rows.size() == (separates ? 10u : 9u));
             if (separates) {
                 CHECK(table.rows[1][1] == "B");
