@@ -601,7 +601,83 @@ TableData build_table(const std::vector<double>& row_ys,
         bool use_text_rows = ((rows_in_grid < n_rows_expected * 0.9) &&
                               (rows_in_grid >= n_rows_expected * 0.8)) ||
                              under_segmented;
-        merge_wrap_rows = under_segmented;
+        // Several physical text lines do not imply several logical rows
+        // inside a closed grid. A single-line stub beside wrapped prose in
+        // multiple cells is positive evidence for the drawn row bands. In
+        // contrast, sparse ruled groups of short values still need the text
+        // split above, even when their group label appears only once.
+        bool wrapped_grid = under_segmented && drawn_rules && n_cols_found >= 3 &&
+                            text_boundaries.empty();
+        for (double coverage : level_coverage)
+            if (coverage < 0.8) wrapped_grid = false;
+        for (size_t r = 0; wrapped_grid && r + 1 < row_ys.size(); ++r) {
+            double bottom = row_ys[r], top = row_ys[r + 1];
+            for (int c = 1; wrapped_grid && c < n_cols_found; ++c) {
+                std::vector<std::pair<double, double>> spans;
+                for (const auto& line : v_lines) {
+                    if (std::abs((line.x0 + line.x1) * 0.5 - col_xs[c]) > 4.0) continue;
+                    double lo = std::max(bottom, double(std::min(line.y0, line.y1)));
+                    double hi = std::min(top, double(std::max(line.y0, line.y1)));
+                    if (hi > lo) spans.push_back({lo, hi});
+                }
+                std::sort(spans.begin(), spans.end());
+                double coverage = 0, end = bottom;
+                for (const auto& span : spans) {
+                    coverage += std::max(0.0, span.second - std::max(end, span.first));
+                    end = std::max(end, span.second);
+                }
+                if (coverage < (top - bottom) * 0.8) wrapped_grid = false;
+            }
+            int physical_rows = 0;
+            for (double y : grid_centers) if (y > bottom && y < top) ++physical_rows;
+            if (!wrapped_grid || physical_rows <= 1) continue;
+            int prose_cells = 0;
+            for (int c = 0; c < n_cols_found; ++c) {
+                std::vector<const PageCharCache::CharInfo*> glyphs;
+                double fs = 4.0;
+                for (const auto& ch : cache.chars) {
+                    if (ch.unicode == ' ' || ch.unicode == '\t' || ch.unicode == 0xA0) continue;
+                    double x = (ch.left + ch.right) * 0.5;
+                    if (x <= col_xs[c] || x >= col_xs[c + 1] || ch.y <= bottom || ch.y >= top) continue;
+                    glyphs.push_back(&ch);
+                    fs = std::max(fs, ch.font_size);
+                }
+                std::sort(glyphs.begin(), glyphs.end(),
+                    [](const auto* a, const auto* b) { return a->y < b->y; });
+                struct Line { double y, lo, hi; };
+                std::vector<Line> lines;
+                size_t letters = 0;
+                for (const auto* ch : glyphs) {
+                    auto u = ch->unicode;
+                    letters += (u >= 'A' && u <= 'Z') || (u >= 'a' && u <= 'z') ||
+                               (u >= 0x2E80 && u <= 0xD7AF);
+                    if (lines.empty() || ch->y - lines.back().y > std::max(2.0, fs * 0.4))
+                        lines.push_back({ch->y, ch->left, ch->right});
+                    else {
+                        lines.back().lo = std::min(lines.back().lo, ch->left);
+                        lines.back().hi = std::max(lines.back().hi, ch->right);
+                    }
+                }
+                if (c == 0) {
+                    if (lines.size() != 1) wrapped_grid = false;
+                    continue;
+                }
+                int wide_lines = 0;
+                bool continuous_leading = true;
+                for (size_t k = 0; k < lines.size(); ++k) {
+                    const auto& line = lines[k];
+                    if (line.hi - line.lo >= (col_xs[c + 1] - col_xs[c]) * 0.5) ++wide_lines;
+                    // Blank space between independent text records is a
+                    // row cue, even when the records themselves are long.
+                    if (k && line.y - lines[k - 1].y > fs * 1.8) continuous_leading = false;
+                }
+                if (lines.size() >= 3 && wide_lines >= 2 && continuous_leading &&
+                    letters * 2 >= glyphs.size()) ++prose_cells;
+            }
+            if (prose_cells < 2) wrapped_grid = false;
+        }
+        if (wrapped_grid) use_text_rows = false;
+        merge_wrap_rows = under_segmented && use_text_rows;
 
         if (use_text_rows && !grid_centers.empty()) {
             rows_are_drawn = false;

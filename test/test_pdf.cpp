@@ -1663,6 +1663,56 @@ int main(int argc, char* argv[]) {
             {30, 660, 550, 660}, {30, 640, 550, 640}, {30, 500, 550, 500}};
         CHECK(detect_text_tables(prose, {}, 600, 800, 0, {}, &prose_rules).empty());
     }
+
+    // Closed cells with a one-line stub and several wrapped prose columns
+    // retain their drawn row bands, including a last line in just one cell.
+    // The same sparse rules around groups of numeric records still split.
+    std::cout << "[40] Testing closed grids with wrapped cell text...\n";
+    {
+        using namespace jdoc::pdf_detail;
+        for (int mode = 0; mode < 4; ++mode) {
+            const bool numeric = mode == 1, spaced_records = mode == 2, repeated_stub = mode == 3;
+            PageCharCache cache;
+            auto put = [&](double x, double y, const std::string& text) {
+                for (unsigned char u : text) {
+                    cache.chars.push_back({x, y, x, x + 5, y + 8, y - 2,
+                                           10, unsigned(u), 0, false});
+                    x += 5;
+                }
+            };
+            put(55, 650, "Group");
+            for (int c = 0; c < 3; ++c) put(130 + 110 * c, 650, "Heading");
+            for (int band = 0; band < 2; ++band) {
+                put(55, 600 - 90 * band, band ? "Beta" : "Alpha");
+                for (int row = 0; row < 4; ++row)
+                    for (int c = 0; c < 3; ++c)
+                        put(130 + 110 * c, 621 - 90 * band - row * (spaced_records ? 22 : 14),
+                            numeric ? "123456789123456789" : "Wrapped sample text");
+                if (repeated_stub)
+                    for (int row = 0; row < 4; ++row)
+                        put(55, 621 - 90 * band - row * 14, "Item");
+                if (!numeric && !spaced_records && !repeated_stub)
+                    put(350, band ? 460 : 560, "Final continuation");
+            }
+            for (size_t i = 0; i < cache.chars.size(); ++i) cache.y_sorted.push_back(i);
+            std::stable_sort(cache.y_sorted.begin(), cache.y_sorted.end(),
+                [&](size_t a, size_t b) { return cache.chars[a].y < cache.chars[b].y; });
+            std::vector<double> levels = {445, 545, 635, 665};
+            std::vector<PdfLineSegment> h, v;
+            for (double y : levels) h.push_back({40, float(y), 440, float(y)});
+            for (float x : {40.f, 110.f, 220.f, 330.f, 440.f}) v.push_back({x, 445, x, 665});
+            auto table = build_table(levels, h, v, cache);
+            if (numeric || spaced_records || repeated_stub) {
+                CHECK(table.rows.size() > 3);
+            } else {
+                CHECK(table.rows.size() == 3);
+                CHECK(table.rows[1][0] == "Alpha");
+                CHECK(table.rows[2][0] == "Beta");
+                CHECK(table.rows[1][3].find("Final continuation") != std::string::npos);
+                CHECK(table.rows[2][3].find("Final continuation") != std::string::npos);
+            }
+        }
+    }
     std::cout << "\n=== All tests passed ===\n";
     return 0;
 }
