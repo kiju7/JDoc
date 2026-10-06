@@ -2797,7 +2797,8 @@ static std::vector<YBand> find_y_bands(const std::vector<TextRow>& rows,
 static std::vector<double> infer_columns_in_band(
         const std::vector<TextRow>& rows, const YBand& band,
         double median_fs, bool column_evidence,
-        const std::vector<CharInfo>& chars, double gutter_x) {
+        const std::vector<CharInfo>& chars, double gutter_x,
+        bool ruled_header = false) {
     // Collect multi-cell rows in the band
     std::vector<size_t> mc;
     for (size_t k = band.first_row; k <= band.last_row; k++)
@@ -2926,8 +2927,14 @@ static std::vector<double> infer_columns_in_band(
         if (n < 2) return false;
         std::nth_element(words.begin(), words.begin() + words.size() / 2, words.end());
         if (words[words.size() / 2] >= 5) return false;
+        double header_l, header_r;
+        const bool separate_header = ruled_header && n == 3 &&
+            row_extent(band.first_row, a, b, header_l, header_r);
         const int keep = n >= 4 ? n - 1 : n;
         auto tight = [&](std::vector<double>& v) {
+            // In a compact ruled table only the actual first/header row
+            // may differ: both body cells must agree on their alignment.
+            if (separate_header) return std::abs(v[1] - v[2]) <= align_tol;
             std::sort(v.begin(), v.end());
             for (int st = 0; st + keep <= n; st++)
                 if (v[st + keep - 1] - v[st] <= align_tol) return true;
@@ -4992,7 +4999,37 @@ static std::vector<TableData> detect_text_tables_range(
             for (double b : bounds) fprintf(stderr, " %.0f", b);
             fprintf(stderr, "\n");
         }
-        if (!build_band(bounds, table)) continue;
+        if (!build_band(bounds, table)) {
+            // A sparse stub (often blank in the header) can fail the initial
+            // 70% straddling vote. Recover it only when actual rules enclose
+            // the band and explicitly separate its header. This is stronger
+            // evidence than aligned chart labels or two columns of prose.
+            bool top_rule = false, bottom_rule = false, header_rule = false;
+            if (rules && band.last_row > band.first_row) {
+                const double fs = std::max(median_fs, 4.0);
+                const auto& first = rows[band.first_row];
+                const auto& second = rows[band.first_row + 1];
+                const auto& last = rows[band.last_row];
+                for (const auto& line : *rules) {
+                    if (!line.is_horizontal()) continue;
+                    double lo = std::min(line.x0, line.x1);
+                    double hi = std::max(line.x0, line.x1);
+                    if (std::min(hi, band.x_max) - std::max(lo, band.x_min) <
+                        0.8 * (band.x_max - band.x_min)) continue;
+                    double y = (line.y0 + line.y1) * 0.5;
+                    top_rule |= y >= first.y_top - 1.0 && y <= first.y_top + fs;
+                    bottom_rule |= y <= last.y_bot + 1.0 && y >= last.y_bot - fs;
+                    header_rule |= y < first.y_bot && y > second.y_top;
+                }
+            }
+            if (!(top_rule && bottom_rule && header_rule)) continue;
+            auto enclosed = infer_columns_in_band(rows, band, median_fs, true,
+                                                   chars, gutter_x, true);
+            // At least three columns: a framed pair of prose columns is
+            // still not a table. The usual content/figure rejection remains.
+            if (enclosed.size() < 4 || !build_band(enclosed, table)) continue;
+            bounds = std::move(enclosed);
+        }
         if (std::getenv("JDOC_TABLE_DEBUG"))
             fprintf(stderr, "[band-accepted] rows %zu..%zu cols %zu rows %zu\n", band.first_row, band.last_row, bounds.size() - 1, table.rows.size());
         auto refined = infer_columns_in_band(rows, band, median_fs, true, chars, gutter_x);

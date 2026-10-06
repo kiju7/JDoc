@@ -1612,6 +1612,57 @@ int main(int argc, char* argv[]) {
         }
     }
 
+
+    // A header may omit the stub and center its labels above two data rows.
+    // Its sparse stub must not disappear before the table is accepted.
+    std::cout << "[39] Testing sparse stubs under ruled headers...\n";
+    {
+        using namespace jdoc::pdf_detail;
+        auto put = [](PageCharCache& cache, double x, double y, const std::string& text) {
+            for (unsigned char u : text) {
+                cache.chars.push_back({x, y, x, x + 5, y + 8, y - 2,
+                                       10, unsigned(u), 0, false});
+                x += 5;
+            }
+        };
+        auto index = [](PageCharCache& cache) {
+            for (size_t i = 0; i < cache.chars.size(); ++i) cache.y_sorted.push_back(i);
+            std::stable_sort(cache.y_sorted.begin(), cache.y_sorted.end(),
+                [&](size_t a, size_t b) { return cache.chars[a].y < cache.chars[b].y; });
+        };
+        PageCharCache cache;
+        put(cache, 110, 650, "Average estimate");
+        put(cache, 220, 650, "Maximum value");
+        put(cache, 50, 630, "Alpha"); put(cache, 150, 630, "-0.51"); put(cache, 250, 630, "1.52");
+        put(cache, 50, 610, "Beta"); put(cache, 150, 610, "0.008"); put(cache, 250, 610, "0.031");
+        index(cache);
+        std::vector<PdfLineSegment> rules = {
+            {40, 660, 300, 660}, {40, 640, 300, 640}, {40, 600, 300, 600}};
+        auto tables = detect_text_tables(cache, {}, 600, 800, 0, {}, &rules);
+        CHECK(tables.size() == 1);
+        CHECK(tables[0].rows.size() == 3);
+        CHECK(tables[0].rows[0].size() == 3);
+        CHECK(tables[0].rows[1][0] == "Alpha");
+        CHECK(tables[0].rows[1][1] == "-0.51");
+        CHECK(tables[0].rows[2][2] == "0.031");
+        CHECK(detect_text_tables(cache, {}, 600, 800).empty());
+        auto frame_only = rules;
+        frame_only.erase(frame_only.begin() + 1);
+        CHECK(detect_text_tables(cache, {}, 600, 800, 0, {}, &frame_only).empty());
+        std::vector<std::array<double, 4>> drawing = {{{40, 600, 300, 660}}};
+        CHECK(detect_text_tables(cache, {}, 600, 800, 0, drawing, &rules).empty());
+
+        // Actual rules must not turn two framed prose columns into a table.
+        PageCharCache prose;
+        for (int r = 0; r < 8; ++r) {
+            put(prose, 40, 650 - r * 20, "Words form a line of prose.");
+            put(prose, 300, 650 - r * 20, "Other words form more prose.");
+        }
+        index(prose);
+        std::vector<PdfLineSegment> prose_rules = {
+            {30, 660, 550, 660}, {30, 640, 550, 640}, {30, 500, 550, 500}};
+        CHECK(detect_text_tables(prose, {}, 600, 800, 0, {}, &prose_rules).empty());
+    }
     std::cout << "\n=== All tests passed ===\n";
     return 0;
 }
