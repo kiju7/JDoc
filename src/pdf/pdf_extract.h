@@ -9,6 +9,8 @@ struct TableData {
     std::string title;  // full-width title row extracted from top of table
     double x0, y0, x1, y1;
     int page = 0;
+    // Full drawn cells with verified wrapped text, safe from prose-size rejection.
+    bool wrapped_closed_grid = false;
     // What the detection keyed on. Ruled/shading tables are drawn geometry
     // (their paths must not be mistaken for a vector figure); text tables
     // are alignment-only and own no paths.

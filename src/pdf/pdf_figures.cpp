@@ -127,10 +127,27 @@ std::vector<PageBox> drawing_regions(const ContentParseResult& pr,
     // over its gridlines, and the panels of one figure sit side by side a
     // gutter apart. Hulls within three ems of one another are one drawing.
     const double near = 3.0 * em;
+    // A cluster of rules alone that frames a block of text is a table or a
+    // text box set near the drawing, not a part of it: legend swatches and
+    // axis ticks hold no text. Keep it out of the proximity merge, or the
+    // drawing's region swallows the table's text.
+    auto framed_text = [&](const Cluster& c) {
+        if (c.nonortho || c.bars || c.images) return false;
+        size_t glyphs = 0;
+        for (const auto& ch : chars) {
+            if (ch.unicode == ' ' || ch.unicode == 0xA0) continue;
+            double cx = (ch.left + ch.right) / 2, cy = (ch.top + ch.bot) / 2;
+            if (cx >= c.hx0 && cx <= c.hx1 && cy >= c.hy0 && cy <= c.hy1 && ++glyphs >= 20) return true;
+        }
+        return false;
+    };
+    std::vector<char> framed(live.size());
+    for (size_t i = 0; i < live.size(); i++) framed[i] = framed_text(live[i]);
     for (bool merged = true; merged;) {
         merged = false;
         for (size_t a = 0; a < live.size() && !merged; a++)
             for (size_t b = a + 1; b < live.size(); b++) {
+                if (framed[a] || framed[b]) continue;
                 if (std::max(live[a].hx0, live[b].hx0) - std::min(live[a].hx1, live[b].hx1) > near) continue;
                 if (std::max(live[a].hy0, live[b].hy0) - std::min(live[a].hy1, live[b].hy1) > near) continue;
                 live[a].nonortho += live[b].nonortho;
@@ -141,6 +158,7 @@ std::vector<PageBox> drawing_regions(const ContentParseResult& pr,
                 live[a].hx0 = std::min(live[a].hx0, live[b].hx0); live[a].hy0 = std::min(live[a].hy0, live[b].hy0);
                 live[a].hx1 = std::max(live[a].hx1, live[b].hx1); live[a].hy1 = std::max(live[a].hy1, live[b].hy1);
                 live.erase(live.begin() + b);
+                framed.erase(framed.begin() + b);
                 merged = true;
                 break;
             }
