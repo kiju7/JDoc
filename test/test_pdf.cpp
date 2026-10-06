@@ -1536,6 +1536,69 @@ int main(int argc, char* argv[]) {
         }
     }
 
+
+    // Sparse grids can contain one-cell continuation fragments after text
+    // segmentation. A rule through that cell makes a separate row; a partial
+    // rule in a different column does not. Construct page geometry directly
+    // so these cases run without optional external fixtures or a PDF writer.
+    std::cout << "[38] Testing continuation rows against cell rules...\n";
+    {
+        using namespace jdoc::pdf_detail;
+        for (int mode = 0; mode < 6; ++mode) {
+            PageCharCache cache;
+            for (int r = 0; r < 10; ++r) {
+                for (int c = 0; c < 3; ++c) {
+                    if ((r == 2 || (mode == 4 && r == 5)) && c == 0) continue;
+                    double x = 65 + c * 100, y = 400 - r * 20;
+                    cache.chars.push_back({x, y, x, x + 5, y + 8, y - 2,
+                                           10, unsigned('A' + r), 0, false});
+                }
+            }
+            for (size_t i = 0; i < cache.chars.size(); ++i)
+                cache.y_sorted.push_back(i);
+            std::stable_sort(cache.y_sorted.begin(), cache.y_sorted.end(),
+                [&](size_t a, size_t b) { return cache.chars[a].y < cache.chars[b].y; });
+            std::vector<double> levels = {210, 410};
+            std::vector<PdfLineSegment> horizontal = {
+                {50, 210, 350, 210}, {50, 410, 350, 410}};
+            if (mode > 0 && mode < 4) {
+                levels.insert(levels.begin() + 1, 370);
+                horizontal.push_back({mode == 2 ? 150.f : 50.f, 370,
+                                      mode == 3 ? 150.f : 350.f, 370});
+            }
+            // The third physical line has a blank stub and one wide cell.
+            std::vector<PdfLineSegment> vertical = {
+                {50, 210, 50, 410}, {150, 210, 150, 410},
+                {250, 210, 250, 349}, {250, 371, 250, 410},
+                {350, 210, 350, 410}};
+            if (mode == 4) {
+                // An earlier merge must not shift the later boundary evidence.
+                levels.insert(levels.begin() + 1, 310);
+                horizontal.push_back({50, 310, 350, 310});
+                vertical[2].y1 = 289;
+                vertical.push_back({250, 311, 250, 349});
+            } else if (mode == 5) {
+                // PDF producers may emit a rule as adjoining cell segments.
+                levels.insert(levels.begin() + 1, 370);
+                horizontal.push_back({150, 370, 250, 370});
+                horizontal.push_back({250, 370, 350, 370});
+            }
+            auto table = build_table(levels, horizontal, vertical, cache);
+            bool separates = mode == 1 || mode == 2 || mode == 5;
+            CHECK(table.rows.size() == (separates ? 10u : 9u));
+            if (separates) {
+                CHECK(table.rows[1][1] == "B");
+                CHECK(table.rows[2][1] == "C C");
+            } else {
+                CHECK(table.rows[1][1] == "B C C");
+                if (mode == 4) {
+                    CHECK(table.rows[3][1] == "E");
+                    CHECK(table.rows[4][1] == "F F");
+                }
+            }
+        }
+    }
+
     std::cout << "\n=== All tests passed ===\n";
     return 0;
 }

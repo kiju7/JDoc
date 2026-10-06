@@ -529,6 +529,7 @@ TableData build_table(const std::vector<double>& row_ys,
     }
 
     std::vector<double> actual_ys;
+    std::vector<double> split_centers;
     bool merge_wrap_rows = false;
     bool rows_are_drawn = true;   // rows are the drawn rule intervals
     {
@@ -605,6 +606,7 @@ TableData build_table(const std::vector<double>& row_ys,
         if (use_text_rows && !grid_centers.empty()) {
             rows_are_drawn = false;
             std::sort(grid_centers.begin(), grid_centers.end());
+            split_centers = grid_centers;
             double half = std::min(row_h / 2.0, 10.0);
             // Clamp to h-line grid boundaries — don't extend beyond the table
             double grid_top = row_ys.back() + half;
@@ -703,6 +705,11 @@ TableData build_table(const std::vector<double>& row_ys,
     // would swallow the whole row. Such grids keep one cell per column.
     const bool spans_from_vlines = internal_vline_count > 0;
 
+    // Keep physical boundary evidence alongside text-derived rows. After a
+    // continuation is removed, the next row still needs its original rule
+    // evidence, not an index into the now-shorter text matrix.
+    std::vector<std::vector<bool>> rule_above(
+        n_rows, std::vector<bool>(total_cols, false));
     table.rows.resize(n_rows);
     table.cell_bold.assign(n_rows, {});
     for (int r = 0; r < n_rows; r++) {
@@ -721,9 +728,35 @@ TableData build_table(const std::vector<double>& row_ys,
             double bottom = actual_ys[r];
             double top    = actual_ys[r + 1];
 
+            auto separated_above = [&](double left, double right) {
+                if (!merge_wrap_rows || r + 1 >= n_rows) return false;
+                // Reading order is reversed below. A rule between this line
+                // and the line above it prohibits continuation in this cell.
+                // Use the actual text centers: the rule need not coincide
+                // with the midpoint chosen for text extraction.
+                std::vector<std::pair<double, double>> intervals;
+                for (const auto& line : h_lines) {
+                    double y = (line.y0 + line.y1) * 0.5;
+                    if (y <= split_centers[r] || y >= split_centers[r + 1])
+                        continue;
+                    double lo = std::max(left, double(std::min(line.x0, line.x1)));
+                    double hi = std::min(right, double(std::max(line.x0, line.x1)));
+                    if (hi > lo) intervals.push_back({lo, hi});
+                }
+                std::sort(intervals.begin(), intervals.end());
+                double coverage = 0, end = left;
+                for (const auto& interval : intervals) {
+                    coverage += std::max(0.0, interval.second -
+                                              std::max(end, interval.first));
+                    end = std::max(end, interval.second);
+                }
+                return coverage >= (right - left) * 0.8;
+            };
+
             // A cell set entirely in a bold face keeps the emphasis (mask
             // only; the text stays bare for the shape heuristics below).
             auto fill_cell = [&](int col, double l, double t, double rt, double b) {
+                rule_above[r][col] = separated_above(l, rt);
                 bool bold = false;
                 table.rows[r][col] = cache.get_text_in_rect(l, t, rt, b, &bold);
                 table.cell_bold[r][col] = bold && !table.rows[r][col].empty();
@@ -757,10 +790,12 @@ TableData build_table(const std::vector<double>& row_ys,
 
     std::reverse(table.rows.begin(), table.rows.end());
     std::reverse(table.cell_bold.begin(), table.cell_bold.end());
+    std::reverse(rule_above.begin(), rule_above.end());
 
     // Text-row splitting of an under-segmented grid separates the wrap
     // lines of multi-line cells into their own rows; a row with a single
-    // filled cell under a filled cell is such a fragment.
+    // filled cell under a filled cell may be such a fragment, but never
+    // across a horizontal rule that closes that cell.
     if (merge_wrap_rows) {
         for (size_t r = 1; r < table.rows.size(); ) {
             auto& row = table.rows[r];
@@ -768,7 +803,8 @@ TableData build_table(const std::vector<double>& row_ys,
             for (int c = 0; c < (int)row.size(); c++)
                 if (!row[c].empty()) { filled++; fc = c; }
             auto& prev = table.rows[r - 1];
-            if (filled == 1 && fc < (int)prev.size() && !prev[fc].empty()) {
+            if (filled == 1 && fc < (int)prev.size() && !prev[fc].empty() &&
+                !rule_above[r][fc]) {
                 bool digit_wrap = prev[fc].size() >= 2 &&
                                   prev[fc].back() == '-' &&
                                   prev[fc][prev[fc].size() - 2] >= '0' &&
@@ -777,6 +813,7 @@ TableData build_table(const std::vector<double>& row_ys,
                 if (!digit_wrap) prev[fc] += " ";
                 prev[fc] += row[fc];
                 table.rows.erase(table.rows.begin() + r);
+                rule_above.erase(rule_above.begin() + r);
                 mask_erase_row(table, r);
             } else {
                 r++;
