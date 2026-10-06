@@ -838,6 +838,39 @@ TableData build_table(const std::vector<double>& row_ys,
 
     trim_table(table);
 
+    // Key/description tables can contain whole paragraphs. Accept their
+    // length only when every logical band is drawn and the divider covers
+    // the band, with a populated short key beside each description.
+    if (drawn_rules && n_cols == 2 && actual_ys == row_ys &&
+        table.rows.size() >= 3 && text_boundaries.empty()) {
+        bool verified = !level_coverage.empty();
+        for (double coverage : level_coverage)
+            if (coverage < 0.8) verified = false;
+        for (int r = 0; verified && r < n_rows; ++r) {
+            double lo = actual_ys[r], hi = actual_ys[r + 1];
+            std::vector<std::pair<double, double>> spans;
+            for (const auto& line : v_lines) {
+                if (std::abs((line.x0 + line.x1) * 0.5 - col_xs[1]) > 4) continue;
+                double a = std::max(lo, double(std::min(line.y0, line.y1)));
+                double b = std::min(hi, double(std::max(line.y0, line.y1)));
+                if (b > a) spans.push_back({a, b});
+            }
+            std::sort(spans.begin(), spans.end());
+            double covered = 0, end = lo;
+            for (const auto& span : spans) {
+                covered += std::max(0.0, span.second - std::max(end, span.first));
+                end = std::max(end, span.second);
+            }
+            if (covered < (hi - lo) * 0.8) verified = false;
+        }
+        int paired_keys = 0;
+        for (const auto& row : table.rows)
+            if (row.size() == 2 && !row[0].empty() && row[0].size() <= 100 &&
+                !row[1].empty()) ++paired_keys;
+        if (verified && paired_keys * 5 >= int(table.rows.size()) * 4)
+            table.wrapped_closed_grid = true;
+    }
+
     // Extract title rows: rows at top where only one cell has content,
     // the table has 3+ columns, and the text is long (form titles inside table borders).
     // Skip for 2-column tables where single-fill rows are normal (key-value pairs).
@@ -1435,6 +1468,117 @@ std::vector<TableData> detect_tables(const std::vector<PdfLineSegment>& lines,
         }
     }
 
+    // Extract compact grids before global endpoint grouping. Nearby plot
+    // bars and ticks must not enlarge a table with repeated full-width rules.
+    std::vector<TableData> isolated_grids;
+    std::vector<bool> consumed(h_lines.size(), false);
+    for (size_t seed = 0; seed < h_lines.size(); ++seed) {
+        if (consumed[seed]) continue;
+        double left = std::min(h_lines[seed].x0, h_lines[seed].x1);
+        double right = std::max(h_lines[seed].x0, h_lines[seed].x1);
+        std::vector<size_t> matching;
+        std::vector<double> ys;
+        for (size_t i = 0; i < h_lines.size(); ++i) {
+            if (consumed[i]) continue;
+            if (std::abs(std::min(h_lines[i].x0, h_lines[i].x1) - left) > 2 ||
+                std::abs(std::max(h_lines[i].x0, h_lines[i].x1) - right) > 2) continue;
+            matching.push_back(i);
+            ys.push_back((h_lines[i].y0 + h_lines[i].y1) * 0.5);
+        }
+        auto levels = cluster_values(ys, 3.0);
+        if (levels.size() < 4 || levels.size() > 8 ||
+            levels.back() - levels.front() > 150) continue;
+        // A shorter rule can be a rowspan boundary inside a larger grid.
+        // Never carve that subgrid away from its surrounding table.
+        bool independent = true;
+        for (const auto& line : h_lines) {
+            double y = (line.y0 + line.y1) * 0.5;
+            double lo = std::min(line.x0, line.x1), hi = std::max(line.x0, line.x1);
+            if (y < levels.front() - 2 || y > levels.back() + 2 ||
+                hi <= left + 2 || lo >= right - 2) continue;
+            if (std::abs(lo - left) > 2 || std::abs(hi - right) > 2)
+                independent = false;
+        }
+        if (!independent) continue;
+        std::vector<PdfLineSegment> local_h, local_v;
+        for (size_t i : matching) local_h.push_back(h_lines[i]);
+        for (const auto& line : v_lines) {
+            double x = (line.x0 + line.x1) * 0.5;
+            double lo = std::min(line.y0, line.y1), hi = std::max(line.y0, line.y1);
+            if (x < left - 2 || x > right + 2 || lo < levels.front() - 2 ||
+                hi > levels.back() + 2) continue;
+            local_v.push_back(line);
+        }
+        std::vector<double> xs;
+        for (const auto& line : local_v) {
+            double x = (line.x0 + line.x1) * 0.5;
+            if (x > left + 5 && x < right - 5) xs.push_back(x);
+        }
+        auto dividers = cluster_values(xs, 3.0);
+        if (dividers.size() < 2) continue;
+        bool closed = true;
+        for (const auto& line : v_lines) {
+            double x = (line.x0 + line.x1) * 0.5;
+            double lo = std::min(line.y0, line.y1), hi = std::max(line.y0, line.y1);
+            if (x < left - 2 || x > right + 2) continue;
+            // Adjacent border fragments belong to preceding/following rows,
+            // even when the horizontal outer rule has a different width.
+            if ((lo < levels.front() - 2 && hi >= levels.front() - 2) ||
+                (hi > levels.back() + 2 && lo <= levels.back() + 2)) closed = false;
+        }
+        // Multiple physical records inside a band still need the existing
+        // sparse-rule row inference; this pass only isolates simple grids.
+        for (size_t r = 0; r + 1 < levels.size(); ++r) {
+            std::vector<double> text_ys;
+            for (const auto& ch : cache.chars) {
+                double x = (ch.left + ch.right) * 0.5;
+                if (x > left && x < right && ch.y > levels[r] && ch.y < levels[r + 1] &&
+                    ch.unicode != ' ' && ch.unicode != '\t' && ch.unicode != 0xA0)
+                    text_ys.push_back(ch.y);
+            }
+            if (cluster_values(text_ys, 3.0).size() != 1) closed = false;
+        }
+        for (double x : dividers) {
+            for (size_t r = 0; r + 1 < levels.size(); ++r) {
+                double lo = levels[r], hi = levels[r + 1], end = lo, covered = 0;
+                std::vector<std::pair<double,double>> spans;
+                for (const auto& line : local_v) {
+                    if (std::abs((line.x0 + line.x1) * 0.5 - x) > 3) continue;
+                    double a = std::max(lo, double(std::min(line.y0, line.y1)));
+                    double b = std::min(hi, double(std::max(line.y0, line.y1)));
+                    if (b > a) spans.push_back({a,b});
+                }
+                std::sort(spans.begin(), spans.end());
+                for (const auto& span : spans) {
+                    covered += std::max(0.0, span.second - std::max(end, span.first));
+                    end = std::max(end, span.second);
+                }
+                if (covered < (hi - lo) * 0.8) closed = false;
+            }
+        }
+        if (!closed) continue;
+        auto table = build_table(levels, local_h, local_v, cache);
+        if (table.rows.size() != levels.size() - 1) continue;
+        bool populated = true;
+        for (const auto& row : table.rows)
+            for (const auto& cell : row)
+                if (cell.empty() || cell.size() > 300) populated = false;
+        if (!populated) continue;
+        isolated_grids.push_back(std::move(table));
+        for (size_t i : matching) consumed[i] = true;
+        v_lines.erase(std::remove_if(v_lines.begin(), v_lines.end(),
+            [&](const PdfLineSegment& line) {
+                double x = (line.x0 + line.x1) * 0.5;
+                return x >= left - 2 && x <= right + 2 &&
+                    std::min(line.y0, line.y1) >= levels.front() - 2 &&
+                    std::max(line.y0, line.y1) <= levels.back() + 2;
+            }), v_lines.end());
+    }
+    std::vector<PdfLineSegment> remaining_h;
+    for (size_t i = 0; i < h_lines.size(); ++i)
+        if (!consumed[i]) remaining_h.push_back(h_lines[i]);
+    h_lines = std::move(remaining_h);
+
     std::vector<double> h_ys;
     for (auto& hl : h_lines) h_ys.push_back((hl.y0 + hl.y1) / 2.0);
     auto row_ys = cluster_values(h_ys, 3.0);
@@ -1473,7 +1617,7 @@ std::vector<TableData> detect_tables(const std::vector<PdfLineSegment>& lines,
         }
         std::sort(row_ys.begin(), row_ys.end());
     }
-    if (row_ys.size() < 3) return {};
+    if (row_ys.size() < 3) return isolated_grids;
 
     int n_levels = (int)row_ys.size();
 
@@ -1675,7 +1819,7 @@ std::vector<TableData> detect_tables(const std::vector<PdfLineSegment>& lines,
         table_groups = std::move(merged);
     }
 
-    if (table_groups.empty()) return {};
+    if (table_groups.empty()) return isolated_grids;
 
     // Split groups where v-line column structure changes significantly
     std::vector<std::vector<double>> final_groups;
@@ -1732,7 +1876,7 @@ std::vector<TableData> detect_tables(const std::vector<PdfLineSegment>& lines,
         if (last.size() >= 3) final_groups.push_back(last);
     }
 
-    std::vector<TableData> result;
+    std::vector<TableData> result = std::move(isolated_grids);
     for (auto& group : final_groups) {
         for (auto& part : split_group_at_gutter(group, h_lines, v_lines,
                                                 cache)) {
@@ -1740,8 +1884,8 @@ std::vector<TableData> detect_tables(const std::vector<PdfLineSegment>& lines,
                                       part.v_lines, cache);
             if (t.rows.empty()) continue;
             // Reject grids that swallowed page prose (stacked separate
-            // tables bridged across body text): no real cell holds a whole
-            // paragraph. Rejecting lets the band's lines flow back as text.
+            // tables bridged across body text). Verified ruled prose cells
+            // are exempt; rejecting other candidates restores their text.
             size_t max_cell = 0;
             for (auto& row : t.rows)
                 for (auto& c : row)

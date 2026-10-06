@@ -552,6 +552,65 @@ int main(int argc, char* argv[]) {
         CHECK(tables[0].rows[1][0] == "Stub");
     }
 
+    // Long descriptions require a complete divider and populated short keys.
+    // A nearby plot must not supply columns or row levels to a compact grid.
+    {
+        using namespace jdoc::pdf_detail;
+        auto make_cache = [](bool prose) {
+            PageCharCache cache;
+            auto put = [&](double x, double y, const std::string& text) {
+                for (unsigned char u : text) {
+                    cache.chars.push_back({x,y,x,x+4,y+6,y-2,8,unsigned(u),0,false});
+                    x += 4;
+                }
+            };
+            if (prose) {
+                for (int r=0;r<3;++r) {
+                    put(55,690-r*200,"Description");
+                    for (int k=0;k<15;++k)
+                        put(155,690-r*200-k*12,"A paragraph inside a ruled cell");
+                }
+            } else {
+                for (int r=0;r<3;++r)
+                    for (int c=0;c<3;++c)
+                        put(55+c*100,290-r*20,"Value");
+            }
+            for (size_t i=0;i<cache.chars.size();++i) cache.y_sorted.push_back(i);
+            std::stable_sort(cache.y_sorted.begin(),cache.y_sorted.end(),
+                [&](size_t a,size_t b){return cache.chars[a].y<cache.chars[b].y;});
+            return cache;
+        };
+        for (bool complete : {true,false}) {
+            auto cache=make_cache(true);
+            std::vector<PdfLineSegment> rules;
+            for (float y : {100.f,300.f,500.f,700.f}) rules.push_back({40,y,440,y});
+            rules.push_back({140,complete?100.f:600.f,140,700});
+            auto tables=detect_tables(rules,cache,600,800);
+            if (complete) {
+                CHECK(tables.size()==1);
+                CHECK(tables[0].rows.size()==3);
+                CHECK(tables[0].rows[0][1].size()>300);
+            } else {
+                for (const auto& table:tables) CHECK(!table.wrapped_closed_grid);
+            }
+        }
+        auto cache=make_cache(false);
+        std::vector<PdfLineSegment> rules;
+        for (float y : {240.f,260.f,280.f,300.f}) rules.push_back({40,y,340,y});
+        for (float x : {140.f,240.f})
+            for (float y : {240.f,260.f,280.f}) rules.push_back({x,y+.2f,x,y+19.8f});
+        // Plot axes and bars directly above the table, with different spans.
+        rules.push_back({40,320,360,320});
+        rules.push_back({40,320,40,450});
+        for (float x : {80.f,100.f,180.f,200.f,280.f,300.f})
+            rules.push_back({x,320,x,400});
+        auto tables=detect_tables(rules,cache,600,800);
+        CHECK(tables.size()==1);
+        CHECK(tables[0].rows.size()==3);
+        CHECK(tables[0].rows[0].size()==3);
+        CHECK(tables[0].y1==300);
+    }
+
     // Compact ruled headers need body evidence for an omitted stub; a frame
     // without a header separator or mismatched body alignment is insufficient.
     std::cout << "[39] Testing compact tables with blank header stubs...\n";
