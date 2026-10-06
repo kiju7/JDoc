@@ -4,6 +4,9 @@
 // legends and panel titles align as well as any table's cells. What tells
 // them apart is what is drawn around them: a chart holds marks no table
 // draws, so its text is a figure's and never a table's.
+#include <map>
+#include <cstdlib>
+#include <cstdio>
 #include "pdf_content.h"
 
 #include <algorithm>
@@ -97,6 +100,7 @@ std::vector<PageBox> drawing_regions(const ContentParseResult& pr,
         double hx0 = 1e300, hy0 = 1e300, hx1 = -1e300, hy1 = -1e300;
         double image_area = 0;
         std::vector<long> bar_heights;  // quantised to 2pt: bars encode data by their length
+        size_t full_h = 0, full_v = 0;  // rules spanning the whole hull: a drawn grid
     };
     std::vector<Cluster> clusters(marks.size());
     for (size_t i = 0; i < marks.size(); i++) {
@@ -115,6 +119,32 @@ std::vector<PageBox> drawing_regions(const ContentParseResult& pr,
             c.image_area += (m.x1 - m.x0) * (m.y1 - m.y0);
         }
     }
+    // Rules running the full width or height of their cluster's hull: a
+    // table's grid draws several of each, a chart's frame two at most.
+    // A grid's column rules are often drawn cell by cell, so vertical
+    // pieces at one x are joined before measuring their run.
+    std::map<std::pair<size_t, long>, std::vector<std::pair<double, double>>> v_runs;
+    for (size_t i = 0; i < marks.size(); i++) {
+        const Mark& m = marks[i];
+        size_t root = sets.find(i);
+        Cluster& c = clusters[root];
+        double w = m.x1 - m.x0, h = m.y1 - m.y0, hw = c.hx1 - c.hx0;
+        if (m.nonortho || m.bar || m.image) continue;
+        if (h <= 1.5 && w >= 0.9 * hw) c.full_h++;
+        if (w <= 1.5 && h > 0) v_runs[{root, std::lround((m.x0 + m.x1) / 4.0)}].push_back({m.y0, m.y1});
+    }
+    for (auto& [key, spans] : v_runs) {
+        Cluster& c = clusters[key.first];
+        std::sort(spans.begin(), spans.end());
+        double covered = 0, end = c.hy0;
+        for (const auto& sp : spans) {
+            // A gap of a rule's width or two still reads as one stroke.
+            double start = sp.first <= end + 2.0 ? std::max(end, sp.first) : sp.first;
+            covered += std::max(0.0, sp.second - start);
+            end = std::max(end, sp.second);
+        }
+        if (covered >= 0.9 * (c.hy1 - c.hy0)) c.full_v++;
+    }
     // Every cluster, with evidence or without: a legend's colour swatches
     // and the tick marks of an axis are small marks standing a little apart
     // from the plot, and they belong to it.
@@ -127,12 +157,14 @@ std::vector<PageBox> drawing_regions(const ContentParseResult& pr,
     // over its gridlines, and the panels of one figure sit side by side a
     // gutter apart. Hulls within three ems of one another are one drawing.
     const double near = 3.0 * em;
-    // A cluster of rules alone that frames a block of text is a table or a
-    // text box set near the drawing, not a part of it: legend swatches and
-    // axis ticks hold no text. Keep it out of the proximity merge, or the
-    // drawing's region swallows the table's text.
+    // A drawn grid of rules alone around a block of text is a table set
+    // near the drawing, not a part of it: legend swatches and axis ticks
+    // hold no text, and a chart's frame or a text box is no grid. Keep it
+    // out of the proximity merge, or the drawing's region swallows the
+    // table's text.
     auto framed_text = [&](const Cluster& c) {
         if (c.nonortho || c.bars || c.images) return false;
+        if (c.full_h < 3 || c.full_v < 2) return false;
         size_t glyphs = 0;
         for (const auto& ch : chars) {
             if (ch.unicode == ' ' || ch.unicode == 0xA0) continue;
@@ -143,6 +175,11 @@ std::vector<PageBox> drawing_regions(const ContentParseResult& pr,
     };
     std::vector<char> framed(live.size());
     for (size_t i = 0; i < live.size(); i++) framed[i] = framed_text(live[i]);
+    if (std::getenv("JDOC_FIG_DEBUG"))
+        for (size_t i = 0; i < live.size(); i++)
+            fprintf(stderr, "[fig-cluster] x %.0f..%.0f y %.0f..%.0f nonortho %zu bars %zu images %zu full_h %zu full_v %zu framed %d\n",
+                    live[i].hx0, live[i].hx1, live[i].hy0, live[i].hy1, live[i].nonortho, live[i].bars, live[i].images,
+                    live[i].full_h, live[i].full_v, (int)framed[i]);
     for (bool merged = true; merged;) {
         merged = false;
         for (size_t a = 0; a < live.size() && !merged; a++)
