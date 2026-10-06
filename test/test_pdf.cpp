@@ -696,6 +696,27 @@ int main(int argc, char* argv[]) {
         CHECK(independent.size() == 1);
         CHECK(independent[0].rows.size() == 6);
     }
+    std::cout << "[41] Testing closed recording forms and single-column grids...\n";
+    {
+        auto blank = jdoc::pdf_to_markdown("test/fixtures/pdf/closed_blank_form.pdf");
+        CHECK(blank.find("| Heading | Record | Record |") != std::string::npos);
+        CHECK(blank.find("| Item 5") != std::string::npos);
+        auto single = jdoc::pdf_to_markdown("test/fixtures/pdf/closed_single_column.pdf");
+        CHECK(single.find("| Heading |") != std::string::npos);
+        CHECK(single.find("| Item 7") != std::string::npos);
+        auto fragments = jdoc::pdf_to_markdown("test/fixtures/pdf/closed_single_fragments.pdf");
+        CHECK(fragments == single);
+        auto aligned = jdoc::pdf_to_markdown("test/fixtures/pdf/closed_text_columns.pdf");
+        CHECK(aligned.find("| Country") != std::string::npos);
+        CHECK(aligned.find("| Domestic") != std::string::npos);
+        auto lists = jdoc::pdf_to_markdown("test/fixtures/pdf/closed_two_row_lists.pdf");
+        CHECK(lists.find("Material item 0 Material item 1") != std::string::npos);
+        CHECK(lists.find("Equipment item 6 Equipment item 7") != std::string::npos);
+        for (const char* name : {"closed_callout", "closed_paragraph"}) {
+            auto md = jdoc::pdf_to_markdown(std::string("test/fixtures/pdf/")+name+".pdf");
+            CHECK(md.find('|') == std::string::npos);
+        }
+    }
     std::cout << "\n=== All tests passed ===\n";
     return 0;
 }

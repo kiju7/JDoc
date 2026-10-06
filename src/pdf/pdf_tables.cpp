@@ -350,12 +350,13 @@ std::vector<double> infer_columns_from_text(const PageCharCache& cache,
                                              double left, double right,
                                              const std::vector<double>& row_ys);
 
-TableData build_table(const std::vector<double>& row_ys,
+TableData build_table(const std::vector<double>& input_row_ys,
                        const std::vector<PdfLineSegment>& h_lines,
                        const std::vector<PdfLineSegment>& v_lines,
                        const PageCharCache& cache,
                        bool drawn_rules) {
     TableData table;
+    auto row_ys = input_row_ys;
     double table_top = row_ys.back();
     double table_bot = row_ys.front();
 
@@ -405,6 +406,69 @@ TableData build_table(const std::vector<double>& row_ys,
     auto col_xs = find_column_boundaries(v_lines, h_lines, table_left, table_right,
                                           table_bot, table_top, row_ys);
 
+    auto closed_grid = [&](const std::vector<double>& columns) {
+        if (!drawn_rules || row_ys.size() < 3 || columns.size() < 2) return false;
+        auto covered = [](std::vector<std::pair<double,double>> spans, double lo) {
+            std::sort(spans.begin(), spans.end());
+            double total = 0, end = lo;
+            for (const auto& span : spans) {
+                total += std::max(0.0, span.second - std::max(end, span.first));
+                end = std::max(end, span.second);
+            }
+            return total;
+        };
+        for (double y : row_ys) {
+            std::vector<std::pair<double,double>> spans;
+            for (const auto& line : h_lines) {
+                if (std::abs((line.y0 + line.y1) * 0.5 - y) > 3) continue;
+                double lo = std::max(columns.front(), double(std::min(line.x0,line.x1)));
+                double hi = std::min(columns.back(), double(std::max(line.x0,line.x1)));
+                if (hi > lo) spans.push_back({lo,hi});
+            }
+            if (covered(spans,columns.front()) < (columns.back()-columns.front())*.8) return false;
+        }
+        for (double x : columns) {
+            for (size_t r = 0; r+1 < row_ys.size(); ++r) {
+                double lo = row_ys[r], hi = row_ys[r+1];
+                std::vector<std::pair<double,double>> spans;
+                for (const auto& line : v_lines) {
+                    if (std::abs((line.x0+line.x1)*.5-x)>3) continue;
+                    double a=std::max(lo,double(std::min(line.y0,line.y1)));
+                    double b=std::min(hi,double(std::max(line.y0,line.y1)));
+                    if (b>a) spans.push_back({a,b});
+                }
+                if (covered(spans,lo)<(hi-lo)*.8) return false;
+            }
+        }
+        return true;
+    };
+    // Segmented rectangle borders also contribute vertical endpoints inside
+    // each cell. In a verified one-column grid only its horizontal divisions
+    // are row boundaries; retain the original levels if outer closure fails.
+    if (drawn_rules && col_xs.size() == 2) {
+        std::vector<double> drawn_levels;
+        for (double y : row_ys) {
+            bool ruled = false;
+            for (const auto& line : h_lines)
+                if (std::abs((line.y0+line.y1)*.5-y)<3 &&
+                    std::min(line.x0,line.x1)<=table_left+2 &&
+                    std::max(line.x0,line.x1)>=table_right-2) ruled = true;
+            if (ruled) drawn_levels.push_back(y);
+        }
+        if (drawn_levels.size() >= 4) {
+            auto original = row_ys;
+            row_ys = std::move(drawn_levels);
+            if (!closed_grid(col_xs)) row_ys = std::move(original);
+        }
+    }
+    bool drawn_single_column = row_ys.size() >= 4 && col_xs.size() == 2 && closed_grid(col_xs);
+    if (std::getenv("JDOC_TABLE_DEBUG")) {
+        fprintf(stderr, "[ruled-columns] drawn %d single %d x %.1f..%.1f cols %zu levels",
+                drawn_rules, drawn_single_column, table_left, table_right, col_xs.size());
+        for (double y : row_ys) fprintf(stderr, " %.1f", y);
+        fprintf(stderr, "\n");
+    }
+
     int internal_vline_count = 0;
     for (auto& vl : v_lines) {
         double vx = (vl.x0 + vl.x1) / 2.0;
@@ -417,7 +481,11 @@ TableData build_table(const std::vector<double>& row_ys,
     }
 
     if (col_xs.size() < 3 && internal_vline_count == 0) {
-        col_xs = infer_columns_from_text(cache, table_left, table_right, row_ys);
+        auto inferred = infer_columns_from_text(cache, table_left, table_right, row_ys);
+        if (!drawn_single_column || inferred.size() >= 3) {
+            col_xs = std::move(inferred);
+            drawn_single_column = false;
+        }
     }
 
     // A drawn grid may omit single rules (a subdivided header cell whose
@@ -467,7 +535,7 @@ TableData build_table(const std::vector<double>& row_ys,
         }
     }
 
-    if (col_xs.size() < 3) {
+    if (col_xs.size() < 3 && !drawn_single_column) {
         table.rows.clear();
         return table;
     }
@@ -508,6 +576,56 @@ TableData build_table(const std::vector<double>& row_ys,
         level_coverage.push_back(grid_width > 0 ? coverage / grid_width : 0.0);
     }
 
+    // Sparse text is expected in recording forms. Preserve empty cells only
+    // with full drawn row divisions and outer borders, never with inferred
+    // columns or a single framed prose box.
+    bool structural_form = closed_grid(col_xs) && text_boundaries.empty();
+    if (structural_form) {
+        int populated_rows = 0, paired_rows = 0, keys = 0;
+        for (size_t r = 0; r+1 < row_ys.size(); ++r) {
+            int filled = 0;
+            for (size_t c = 0; c+1 < col_xs.size(); ++c)
+                if (!cache.get_text_in_rect(col_xs[c], row_ys[r+1],
+                                            col_xs[c+1], row_ys[r]).empty()) ++filled;
+            populated_rows += filled > 0;
+            paired_rows += filled >= 2;
+            keys += !cache.get_text_in_rect(col_xs[0], row_ys[r+1],
+                                            col_xs[1], row_ys[r]).empty();
+        }
+        structural_form = populated_rows >= 3 && paired_rows < 3 &&
+                          keys * 5 >= int(row_ys.size()-1) * 4;
+        if (structural_form && col_xs.size() == 2) {
+            int multi_column_rows = 0;
+            for (size_t r=0;r+1<row_ys.size();++r) {
+                std::vector<const PageCharCache::CharInfo*> glyphs;
+                for (const auto& ch : cache.chars)
+                    if (ch.y > row_ys[r] && ch.y < row_ys[r+1] &&
+                        ch.left >= col_xs.front() && ch.right <= col_xs.back() &&
+                        ch.unicode != ' ' && ch.unicode != '\t' && ch.unicode != 0xA0)
+                        glyphs.push_back(&ch);
+                std::sort(glyphs.begin(),glyphs.end(),
+                    [](const auto* a,const auto* b){return a->left<b->left;});
+                int gaps = 0;
+                for (size_t i=1;i<glyphs.size();++i)
+                    if (std::abs(glyphs[i]->y-glyphs[i-1]->y)<3 &&
+                        glyphs[i]->left-glyphs[i-1]->right >
+                        std::max(glyphs[i]->font_size,glyphs[i-1]->font_size)*1.5) ++gaps;
+                if (gaps>=2) ++multi_column_rows;
+            }
+            if (multi_column_rows >= 3) structural_form = false;
+        }
+    }
+
+    // A header and one fully boxed data row can contain lists. Continuous
+    // outer and inner borders distinguish it from a booktabs data section.
+    bool boxed_two_row = row_ys.size() == 3 && col_xs.size() >= 3 &&
+                         text_boundaries.empty() && closed_grid(col_xs);
+    for (size_t c=1; boxed_two_row && c+1<col_xs.size();++c)
+        for (const auto& ch : cache.chars)
+            if (ch.y > row_ys.front() && ch.y < row_ys.back() &&
+                ch.unicode != ' ' && ch.left+ch.font_size*.2 < col_xs[c] &&
+                ch.right-ch.font_size*.2 > col_xs[c]) boxed_two_row = false;
+    if (boxed_two_row) table.wrapped_closed_grid = true;
     std::vector<double> actual_ys;
     bool merge_wrap_rows = false;
     {
@@ -654,11 +772,15 @@ TableData build_table(const std::vector<double>& row_ys,
             }
             if (prose_cells < 2) wrapped_grid = false;
         }
-        table.wrapped_closed_grid = wrapped_grid;
+        table.wrapped_closed_grid = wrapped_grid || boxed_two_row;
         if (wrapped_grid) use_text_rows = false;
         merge_wrap_rows = under_segmented && !wrapped_grid;
 
 
+        if (structural_form || boxed_two_row) {
+            use_text_rows = false;
+            merge_wrap_rows = false;
+        }
         if (use_text_rows && !grid_centers.empty()) {
             std::sort(grid_centers.begin(), grid_centers.end());
             double half = std::min(row_h / 2.0, 10.0);
@@ -690,8 +812,9 @@ TableData build_table(const std::vector<double>& row_ys,
     table.y1 = actual_ys.back();
 
     int last_col_idx = n_cols - 1;
-    auto sub_boundaries = detect_response_boundaries(cache,
-        col_xs[last_col_idx], col_xs[last_col_idx + 1], actual_ys);
+    auto sub_boundaries = (structural_form || boxed_two_row) ? std::vector<double>{} :
+        detect_response_boundaries(cache,
+            col_xs[last_col_idx], col_xs[last_col_idx + 1], actual_ys);
     int n_sub = sub_boundaries.empty() ? 0 : (int)sub_boundaries.size() - 1;
     int total_cols = (n_sub > 1) ? (n_cols - 1 + n_sub) : n_cols;
 
@@ -732,7 +855,7 @@ TableData build_table(const std::vector<double>& row_ys,
     // which makes the crossing heuristic below reject otherwise complete
     // rectangular tables.  Require both horizontal and vertical coverage so
     // diagram boxes do not receive the exemption.
-    bool dense_closed_grid = n_rows >= 3 && n_cols >= 2;
+    bool dense_closed_grid = structural_form || boxed_two_row || (n_rows >= 3 && n_cols >= 2);
     if (dense_closed_grid) {
         int ruled_levels = 0;
         for (double c : level_coverage)
@@ -836,7 +959,7 @@ TableData build_table(const std::vector<double>& row_ys,
         }
     }
 
-    trim_table(table);
+    if (!structural_form) trim_table(table);
 
     // Key/description tables can contain whole paragraphs. Accept their
     // length only when every logical band is drawn and the divider covers
@@ -908,7 +1031,7 @@ TableData build_table(const std::vector<double>& row_ys,
         small_closed_grid = all_ruled && vline_total > 0 &&
                             vline_present * 3 >= vline_total * 2;
     }
-    if (meaningful_rows < (small_closed_grid ? 2 : 3)) table.rows.clear();
+    if (!structural_form && meaningful_rows < ((small_closed_grid || boxed_two_row) ? 2 : 3)) table.rows.clear();
 
     // Text running THROUGH a drawn v-line marks a drawing, not a table: a
     // table author never lays text across a rule, while diagram boxes (ERD
