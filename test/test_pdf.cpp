@@ -1,5 +1,6 @@
 // test_pdf.cpp — Test PDF to Markdown conversion using PDFium backend
 #include "jdoc/pdf.h"
+#include "pdf/pdf_extract.h"
 
 #include <iostream>
 #include <fstream>
@@ -466,6 +467,176 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    // Closed cells with a one-line stub and several wrapped prose columns
+    // retain their drawn row bands, including a last line in just one cell.
+    // The same sparse rules around groups of numeric records still split.
+    std::cout << "[38] Testing closed grids with wrapped cell text...\n";
+    {
+        using namespace jdoc::pdf_detail;
+        for (int mode = 0; mode < 5; ++mode) {
+            const bool numeric = mode == 1, spaced_records = mode == 2, repeated_stub = mode == 3;
+            PageCharCache cache;
+            auto put = [&](double x, double y, const std::string& text) {
+                for (unsigned char u : text) {
+                    cache.chars.push_back({x, y, x, x + 5, y + 8, y - 2,
+                                           10, unsigned(u), 0, false});
+                    x += 5;
+                }
+            };
+            put(55, 650, "Group");
+            for (int c = 0; c < 3; ++c) put(130 + 110 * c, 650, "Heading");
+            for (int band = 0; band < 2; ++band) {
+                put(55, 600 - 90 * band, band ? "Beta" : "Alpha");
+                for (int row = 0; row < 4; ++row)
+                    for (int c = 0; c < 3; ++c)
+                        put(130 + 110 * c, 621 - 90 * band - row * (spaced_records ? 22 : 14),
+                            numeric ? "123456789123456789" : "Wrapped sample text");
+                if (repeated_stub)
+                    for (int row = 0; row < 4; ++row)
+                        put(55, 621 - 90 * band - row * 14, "Item");
+                if (!numeric && !spaced_records && !repeated_stub)
+                    put(350, band ? 460 : 560, "Final continuation");
+            }
+            for (size_t i = 0; i < cache.chars.size(); ++i) cache.y_sorted.push_back(i);
+            std::stable_sort(cache.y_sorted.begin(), cache.y_sorted.end(),
+                [&](size_t a, size_t b) { return cache.chars[a].y < cache.chars[b].y; });
+            std::vector<double> levels = {445, 545, 635, 665};
+            std::vector<PdfLineSegment> h, v;
+            for (double y : levels) h.push_back({40, float(y), 440, float(y)});
+            for (float x : {40.f, 110.f, 220.f, 330.f, 440.f}) v.push_back({x, 445, x, 665});
+            auto table = build_table(levels, h, v, cache, mode != 4);
+            if (numeric || spaced_records || repeated_stub || mode == 4) {
+                CHECK(table.rows.size() > 3);
+            } else {
+                CHECK(table.rows.size() == 3);
+                CHECK(table.rows[1][0] == "Alpha");
+                CHECK(table.rows[2][0] == "Beta");
+                CHECK(table.rows[1][3].find("Final continuation") != std::string::npos);
+                CHECK(table.rows[2][3].find("Final continuation") != std::string::npos);
+            }
+        }
+    }
+
+
+
+    // The detector must keep a verified wrapped grid past its paragraph-size
+    // filter, so the text fallback cannot replace four drawn columns by three.
+    {
+        using namespace jdoc::pdf_detail;
+        PageCharCache cache;
+        auto put = [&](double x, double y, const std::string& text) {
+            for (unsigned char u : text) {
+                cache.chars.push_back({x, y, x, x + 5, y + 8, y - 2,
+                                       10, unsigned(u), 0, false});
+                x += 5;
+            }
+        };
+        for (int c = 0; c < 4; ++c) put(c ? 130 + (c - 1) * 110 : 55, 707, "Header");
+        for (int b = 0; b < 2; ++b) {
+            put(55, 550 - b * 300, "Stub");
+            for (int r = 0; r < 20; ++r)
+                for (int c = 0; c < 3; ++c)
+                    put(130 + c * 110, 685 - b * 300 - r * 14, "Wrapped sample text");
+        }
+        for (size_t i = 0; i < cache.chars.size(); ++i) cache.y_sorted.push_back(i);
+        std::stable_sort(cache.y_sorted.begin(), cache.y_sorted.end(),
+            [&](size_t a, size_t b) { return cache.chars[a].y < cache.chars[b].y; });
+        std::vector<PdfLineSegment> rules;
+        for (float y : {100.f, 400.f, 700.f, 720.f}) rules.push_back({40, y, 440, y});
+        for (float x : {40.f, 110.f, 220.f, 330.f, 440.f}) rules.push_back({x, 100, x, 720});
+        auto tables = detect_tables(rules, cache, 600, 800);
+        CHECK(tables.size() == 1);
+        CHECK(tables[0].rows.size() == 3);
+        CHECK(tables[0].rows[1].size() == 4);
+        CHECK(tables[0].rows[1][1].size() > 300);
+        CHECK(tables[0].rows[1][0] == "Stub");
+    }
+
+    // Compact ruled headers need body evidence for an omitted stub; a frame
+    // without a header separator or mismatched body alignment is insufficient.
+    std::cout << "[39] Testing compact tables with blank header stubs...\n";
+    {
+        using namespace jdoc::pdf_detail;
+        auto put = [](PageCharCache& cache, double x, double y, const std::string& text) {
+            for (unsigned char u : text) {
+                cache.chars.push_back({x, y, x, x + 5, y + 8, y - 2,
+                                       10, unsigned(u), 0, false});
+                x += 5;
+            }
+        };
+        PageCharCache cache;
+        put(cache, 110, 650, "Average estimate");
+        put(cache, 220, 650, "Maximum value");
+        put(cache, 50, 630, "Alpha"); put(cache, 150, 630, "-0.51"); put(cache, 250, 630, "1.52");
+        put(cache, 50, 610, "Beta"); put(cache, 150, 610, "0.008"); put(cache, 250, 610, "0.031");
+        for (size_t i = 0; i < cache.chars.size(); ++i) cache.y_sorted.push_back(i);
+        std::stable_sort(cache.y_sorted.begin(), cache.y_sorted.end(),
+            [&](size_t a, size_t b) { return cache.chars[a].y < cache.chars[b].y; });
+        std::vector<PdfLineSegment> rules = {
+            {40, 660, 300, 660}, {40, 640, 300, 640}, {40, 600, 300, 600}};
+        auto tables = detect_text_tables(cache, {}, 600, 800, 0, &rules);
+        CHECK(tables.size() == 1);
+        CHECK(tables[0].rows.size() == 3);
+        CHECK(tables[0].rows[0].size() == 3);
+        CHECK(tables[0].rows[0][0].empty());
+        CHECK(tables[0].rows[0][1] == "Average estimate");
+        CHECK(tables[0].rows[1][0] == "Alpha");
+        CHECK(tables[0].rows[2][2] == "0.031");
+        CHECK(detect_text_tables(cache, {}, 600, 800).empty());
+        rules.erase(rules.begin() + 1);
+        CHECK(detect_text_tables(cache, {}, 600, 800, 0, &rules).empty());
+    }
+
+
+    // A blank stub under a filled one is a two-line cell only when actual
+    // rules enclose exactly those two physical rows, with vertical separators.
+    std::cout << "[40] Testing two-line numeric cells inside ruled bands...\n";
+    {
+        using namespace jdoc::pdf_detail;
+        PageCharCache cache;
+        auto put = [&](double x, double y, const std::string& text) {
+            for (unsigned char u : text) {
+                cache.chars.push_back({x, y, x, x + 4, y + 8, y - 2,
+                                       10, unsigned(u), 0, false});
+                x += 4;
+            }
+        };
+        for (int c = 0; c < 4; ++c) put(55 + c * 100, 390, "Header");
+        put(55, 370, "Size");
+        for (int c = 1; c < 4; ++c) {
+            put(55 + c * 100, 370, "3M pix");
+            put(55 + c * 100, 359, "1440x1920");
+        }
+        for (int r = 0; r < 3; ++r) {
+            put(55, 340 - r * 11, "Item" + std::to_string(r));
+            for (int c = 1; c < 4; ++c) put(55 + c * 100, 340 - r * 11, "12345");
+        }
+        for (size_t i = 0; i < cache.chars.size(); ++i) cache.y_sorted.push_back(i);
+        std::stable_sort(cache.y_sorted.begin(), cache.y_sorted.end(),
+            [&](size_t a, size_t b) { return cache.chars[a].y < cache.chars[b].y; });
+        std::vector<PdfLineSegment> rules;
+        for (float y : {310.f, 350.f, 380.f, 400.f}) rules.push_back({40, y, 440, y});
+        // Inferred columns fall at the whitespace midpoints near these rules.
+        for (float x : {116.f, 224.f, 324.f}) {
+            rules.push_back({x, 350, x, 365});
+            rules.push_back({x, 365, x, 380});
+        }
+        auto tables = detect_text_tables(cache, {}, 600, 800, 0, &rules);
+        CHECK(tables.size() == 1);
+        CHECK(tables[0].rows.size() == 5);
+        CHECK(tables[0].rows[1][0] == "Size");
+        CHECK(tables[0].rows[1][1] == "3M pix 1440x1920");
+        CHECK(tables[0].rows[2][0] == "Item0");
+        CHECK(tables[0].rows[4][0] == "Item2");
+        auto no_rules = detect_text_tables(cache, {}, 600, 800);
+        CHECK(no_rules.size() == 1);
+        CHECK(no_rules[0].rows.size() == 6);
+        auto separated = rules;
+        separated.push_back({40, 365, 440, 365});
+        auto independent = detect_text_tables(cache, {}, 600, 800, 0, &separated);
+        CHECK(independent.size() == 1);
+        CHECK(independent[0].rows.size() == 6);
+    }
     std::cout << "\n=== All tests passed ===\n";
     return 0;
 }

@@ -9,6 +9,8 @@ struct TableData {
     std::string title;  // full-width title row extracted from top of table
     double x0, y0, x1, y1;
     int page = 0;
+    // Full drawn cells with verified wrapped text, safe from prose-size rejection.
+    bool wrapped_closed_grid = false;
     // What the detection keyed on. Ruled/shading tables are drawn geometry
     // (their paths must not be mistaken for a vector figure); text tables
     // are alignment-only and own no paths.
@@ -40,7 +42,8 @@ std::vector<double> find_column_boundaries(
 TableData build_table(const std::vector<double>& row_ys,
                       const std::vector<PdfLineSegment>& h_lines,
                       const std::vector<PdfLineSegment>& v_lines,
-                      const PageCharCache& cache);
+                      const PageCharCache& cache,
+                      bool drawn_rules = true);
 
 // Heading-classification helpers (pdf_markdown.cpp), exposed the same way
 // so the section-number and standalone-emphasis rules can be tested directly.
@@ -205,7 +208,8 @@ std::vector<TableData> detect_shading_tables(
 std::vector<TableData> detect_text_tables(const PageCharCache& cache,
                                           const std::vector<TableData>& existing_tables,
                                           double page_width, double page_height,
-                                          double col_boundary = 0.0);
+                                          double col_boundary = 0.0,
+                                          const std::vector<PdfLineSegment>* rules = nullptr);
 std::string format_table(const TableData& table);
 std::vector<ExtractedImage> extract_page_images(PdfDoc& doc, const PdfObj& resources,
                                                 const ContentParseResult& parse_result,
