@@ -242,6 +242,16 @@ std::vector<ExtractedImage> extract_page_images(PdfDoc& doc, const PdfObj& resou
                                                 PageRenderDiag* diag = nullptr,
                                                 const std::vector<size_t>* only = nullptr,
                                                 int name_base = 0);
+// Render the whole visible page. `view` is the page's visible area (its
+// CropBox) [x0,y0,x1,y1] in viewing coordinates; the canvas covers exactly
+// that area, so trim margins outside the CropBox never pad the output.
+ImageData render_page_composite(PdfDoc& doc, const PdfObj& resources,
+                                const ContentParseResult& parse_result,
+                                int page_num, const double view[4],
+                                const std::string& output_dir,
+                                int img_idx = 0,
+                                PageRenderDiag* diag = nullptr);
+// Same, over the area [0,0,page_w,page_h].
 ImageData render_page_composite(PdfDoc& doc, const PdfObj& resources,
                                 const ContentParseResult& parse_result,
                                 int page_num, double page_w, double page_h,

@@ -2588,13 +2588,24 @@ static ImageData render_composite_view(
 
 ImageData render_page_composite(PdfDoc& doc, const PdfObj& resources,
                                 const ContentParseResult& parse_result,
-                                int page_num, double page_w, double page_h,
+                                int page_num, const double view[4],
                                 const std::string& output_dir,
                                 int img_idx,
                                 PageRenderDiag* diag) {
     return render_composite_view(doc, resources, parse_result, nullptr, nullptr,
-                                 0, 0, page_num, page_w, page_h, output_dir,
-                                 img_idx, diag);
+                                 view[0], view[1], page_num, view[2] - view[0],
+                                 view[3] - view[1], output_dir, img_idx, diag);
+}
+
+ImageData render_page_composite(PdfDoc& doc, const PdfObj& resources,
+                                const ContentParseResult& parse_result,
+                                int page_num, double page_w, double page_h,
+                                const std::string& output_dir,
+                                int img_idx,
+                                PageRenderDiag* diag) {
+    const double view[4] = {0, 0, page_w, page_h};
+    return render_page_composite(doc, resources, parse_result, page_num, view,
+                                 output_dir, img_idx, diag);
 }
 
 ImageData render_region_composite(PdfDoc& doc, const PdfObj& resources,

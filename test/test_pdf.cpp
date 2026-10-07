@@ -1963,6 +1963,28 @@ int main(int argc, char* argv[]) {
             CHECK(md.find('|') == std::string::npos);
         }
     }
+    // [42] A whole-page composite covers the visible page (CropBox), not the
+    // sheet (MediaBox) around it (make_cropbox_scan_fixtures.py). A scan in
+    // two abutting halves on an A4 sheet shows a 400x600 pt window; the
+    // composite has that window's shape, also when the page is rotated.
+    std::cout << "[42] Testing whole-page composites against the CropBox...\n";
+    for (auto [fx, want] : {std::pair<const char*, double>{"test/fixtures/pdf/cropbox_scan.pdf", 400.0 / 600.0},
+                            std::pair<const char*, double>{"test/fixtures/pdf/cropbox_scan_rot90.pdf", 600.0 / 400.0}}) {
+        std::ifstream f(fx);
+        if (!f.good()) {
+            std::cout << "    SKIP: " << fx << "\n";
+            continue;
+        }
+        f.close();
+        auto chunks = jdoc::pdf_to_markdown_chunks(fx);
+        CHECK(chunks.size() == 1);
+        CHECK(chunks[0].images.size() == 1);
+        const auto& img = chunks[0].images[0];
+        double aspect = img.height > 0 ? double(img.width) / img.height : 0;
+        std::cout << "    " << fx << ": " << img.width << "x" << img.height
+                  << " (expected aspect " << want << ")\n";
+        CHECK(std::abs(aspect - want) < 0.01);
+    }
     std::cout << "\n=== All tests passed ===\n";
     return 0;
 }

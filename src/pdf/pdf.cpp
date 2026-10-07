@@ -772,6 +772,23 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
             page_view_ctm(page_rotate, page_w, page_h, mb_llx, mb_lly, base_ctm);
             initial_ctm = base_ctm;
         }
+        // The visible area (CropBox) in viewing coordinates: the page-space
+        // box through the same base CTM the content is parsed with. A
+        // whole-page composite covers exactly this area; trim margins
+        // outside it would pad the image with blank paper no viewer shows.
+        double view_box[4] = {crop_x0, crop_y0, crop_x1, crop_y1};
+        if (initial_ctm) {
+            double vx[2] = {1e300, -1e300}, vy[2] = {1e300, -1e300};
+            for (double cx : {crop_x0 + mb_llx, crop_x1 + mb_llx})
+                for (double cy : {crop_y0 + mb_lly, crop_y1 + mb_lly}) {
+                    double tx = base_ctm[0] * cx + base_ctm[2] * cy + base_ctm[4];
+                    double ty = base_ctm[1] * cx + base_ctm[3] * cy + base_ctm[5];
+                    vx[0] = std::min(vx[0], tx); vx[1] = std::max(vx[1], tx);
+                    vy[0] = std::min(vy[0], ty); vy[1] = std::max(vy[1], ty);
+                }
+            view_box[0] = vx[0]; view_box[1] = vy[0];
+            view_box[2] = vx[1]; view_box[3] = vy[1];
+        }
         if (page_rotate == 90 || page_rotate == 270)
             std::swap(page_w, page_h);
         result.page_widths[p] = page_w;
@@ -890,10 +907,11 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
         // Image extraction
         if (opts.images) {
             auto render_composite = [&]() {
-                const size_t memory_cost = composite_memory_cost(page_w, page_h);
+                const size_t memory_cost = composite_memory_cost(
+                    view_box[2] - view_box[0], view_box[3] - view_box[1]);
                 CompositeMemoryLease lease(composite_memory, memory_cost);
                 return render_page_composite(
-                    doc, resources, parse_result, p, page_w, page_h, image_dir,
+                    doc, resources, parse_result, p, view_box, image_dir,
                     0, &result.page_diags[p]);
             };
 
