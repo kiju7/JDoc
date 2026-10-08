@@ -390,6 +390,31 @@ static std::vector<std::array<double, 4>> fragment_regions(
         rest.push_back(u);
         clusters_in.swap(rest);
     }
+    // Hairlines: one dimension a stroke wide, the other much longer.
+    std::vector<char> path_rule(path_boxes.size(), 0);
+    for (size_t pi = 0; pi < path_boxes.size(); pi++) {
+        const auto& b = path_boxes[pi];
+        double w = b[2] - b[0], h = b[3] - b[1];
+        path_rule[pi] = (h <= 2.0 && w >= 10.0 * std::max(h, 1.0)) ||
+                        (w <= 2.0 && h >= 10.0 * std::max(w, 1.0));
+    }
+    // Whether box b spans the full width (a horizontal rule) or height (a
+    // vertical one) of a cluster other than own, overlapping it.
+    auto spans_other = [&](const std::array<double, 4>& b,
+                           const std::array<double, 4>& own) {
+        bool horiz = b[2] - b[0] >= b[3] - b[1];
+        for (auto& o : clusters_in) {
+            if (&o == &own) continue;
+            if (horiz) {
+                if (b[0] <= o[0] + 1 && b[2] >= o[2] - 1 &&
+                    b[1] <= o[3] + 2 && b[3] >= o[1] - 2) return true;
+            } else {
+                if (b[1] <= o[1] + 1 && b[3] >= o[3] - 1 &&
+                    b[0] <= o[2] + 2 && b[2] >= o[0] - 2) return true;
+            }
+        }
+        return false;
+    };
     for (auto& c : clusters_in) {
         double rg[4] = {c[0], c[1], c[2], c[3]};
         // Grow over touching paths until the region is stable: a drawing
@@ -407,6 +432,12 @@ static std::vector<std::array<double, 4>> fragment_regions(
                 // and frames.
                 if (path_ground[pi] && b[0] <= c[0] + 1 && b[1] <= c[1] + 1 &&
                     b[2] >= c[2] - 1 && b[3] >= c[3] - 1) continue;
+                // A rule run right across another picture (the line under a
+                // row of charts, a divider between panels) belongs to the
+                // layout, not to this picture: following it would grow the
+                // region over its neighbours. A connector that only reaches
+                // another picture's edge (an arrow in a diagram) is followed.
+                if (path_rule[pi] && spans_other(b, c)) continue;
                 double n0 = std::min(g[0], b[0]), n1 = std::min(g[1], b[1]);
                 double n2 = std::max(g[2], b[2]), n3 = std::max(g[3], b[3]);
                 if ((n2 - n0) * (n3 - n1) > 0.6 * page_w * page_h) continue;
@@ -485,6 +516,16 @@ static std::vector<std::array<double, 4>> fragment_regions(
                 // is not taken in over the top or bottom edge.
                 bool over_edge = ly0 >= R[3] - 0.5 * fs || ly1 <= R[1] + 0.5 * fs;
                 if (over_edge && lw > 0.25 * (R[2] - R[0])) continue;
+                // A line reaching into another picture is not this one's
+                // label: two panels' notes set on one baseline read as one
+                // line, and taking it would grow the region over the next.
+                bool into_other = false;
+                for (auto& O : regions) {
+                    if (&O == &R) continue;
+                    if (ln.x_right > O[0] + 1 && ln.x_left < O[2] - 1 &&
+                        ly1 > O[1] && ly0 < O[3]) { into_other = true; break; }
+                }
+                if (into_other) continue;
                 R[0] = std::min(R[0], ln.x_left); R[2] = std::max(R[2], ln.x_right);
                 R[1] = std::min(R[1], ly0);       R[3] = std::max(R[3], ly1);
                 grew = true;
@@ -941,6 +982,9 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
                 int obj_num;            // resolved ref; -1 for name/inline
                 bool masked;            // stencil/1-bit or /SMask//Mask-backed
                 int px_w, px_h;         // source raster size, /Width x /Height
+                // Pixels per point along x and y for an upright placement
+                // (no rotation or skew), 0 otherwise.
+                double dens_x, dens_y;
             };
             std::vector<PlacementInfo> infos;
             auto xobjects = doc.resolve(resources.get("XObject"));
@@ -991,9 +1035,14 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
                               xobj.get("BitsPerComponent").as_int() == 1 ||
                               !xobj.get("SMask").is_none() ||
                               !xobj.get("Mask").is_none();
+                const int pw = xobj.get("Width").as_int();
+                const int ph = xobj.get("Height").as_int();
+                const bool upright = m[1] == 0 && m[2] == 0 &&
+                                     m[0] != 0 && m[3] != 0;
                 infos.push_back({i, bx0, by0, bx1, by1, ip.xobj_ref, masked,
-                                 xobj.get("Width").as_int(),
-                                 xobj.get("Height").as_int()});
+                                 pw, ph,
+                                 upright ? pw / std::abs(m[0]) : 0.0,
+                                 upright ? ph / std::abs(m[3]) : 0.0});
             }
 
             const size_t n_inf = infos.size();
@@ -1028,6 +1077,21 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
                             if (xov >= 0.5 * std::min(wa, wb))
                                 eps_y = std::max(eps, 0.02 * page_h);
                         }
+                        // Two pieces of one raster cut along a seam keep its
+                        // pixel density across the seam: halves cut side by
+                        // side share pixels per point vertically, bands cut
+                        // one above the other share them horizontally. Two
+                        // pictures that merely abut (two charts set edge to
+                        // edge) were scaled on their own and rarely agree.
+                        auto density_differs = [](double a, double b) {
+                            return a > 0 && b > 0 &&
+                                   std::abs(a - b) > 0.02 * std::max(a, b);
+                        };
+                        bool abut_x = gx > -eps && gy < 0;   // side by side
+                        bool abut_y = gy > -eps && gx < 0;   // one above the other
+                        if ((abut_x && density_differs(infos[a].dens_y, infos[b].dens_y)) ||
+                            (abut_y && density_differs(infos[a].dens_x, infos[b].dens_x)))
+                            continue;
                         if (gx <= eps && gy <= eps_y &&
                             !separate_titled_pictures(
                                 page_runs, infos[a].x0, infos[a].y0,

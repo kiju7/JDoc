@@ -1985,6 +1985,30 @@ int main(int argc, char* argv[]) {
                   << " (expected aspect " << want << ")\n";
         CHECK(std::abs(aspect - want) < 0.01);
     }
+    // [43] Pictures that abut or share a layout rule stay separate, pieces
+    // of one raster still composite (make_fragment_separation_fixtures.py).
+    // Two charts edge to edge at different pixel densities are two images; a
+    // raster cut down the middle at one density is one. Charts cut into
+    // bands under one rule across the row stay one image each; two strip
+    // pictures joined by a connector stay one. A note line running from one
+    // card into the next is not the first card's label.
+    std::cout << "[43] Testing separation of abutting pictures...\n";
+    for (auto [name, want] : {std::pair<const char*, size_t>{"abut_two_charts", 2},
+                              {"abut_split_raster", 1}, {"strip_row_rule", 3},
+                              {"strip_arrow_diagram", 1}, {"strip_shared_notes", 2}}) {
+        std::string fx = std::string("test/fixtures/pdf/") + name + ".pdf";
+        std::ifstream f(fx);
+        if (!f.good()) {
+            std::cout << "    SKIP: " << fx << "\n";
+            continue;
+        }
+        f.close();
+        auto chunks = jdoc::pdf_to_markdown_chunks(fx);
+        CHECK(chunks.size() == 1);
+        std::cout << "    " << name << ": " << chunks[0].images.size()
+                  << " image(s), expected " << want << "\n";
+        CHECK(chunks[0].images.size() == want);
+    }
     std::cout << "\n=== All tests passed ===\n";
     return 0;
 }
