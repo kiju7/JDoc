@@ -4800,7 +4800,8 @@ static std::vector<TableData> detect_text_tables_range(
         const DotLeaders& leaders,
         double gutter_x = 0.0,
         const std::vector<std::array<double, 4>>* figures = nullptr,
-        const std::vector<PdfLineSegment>* rules = nullptr) {
+        const std::vector<PdfLineSegment>* rules = nullptr,
+        const std::vector<std::array<double, 4>>* excluded = nullptr) {
     const std::vector<bool>& is_leader = leaders.is_leader;
     using namespace text_tables;
     if (cache.chars.size() < 10) return {};
@@ -4813,6 +4814,12 @@ static std::vector<TableData> detect_text_tables_range(
         if (is_leader[ci]) continue;
         if (ch.x < 0 || ch.x > page_width || ch.y < 0 || ch.y > page_height) continue;
         if (ch.x < x_lo || ch.x >= x_hi) continue;
+        if (excluded) {
+            bool out = false;
+            for (const auto& b : *excluded)
+                out |= ch.x >= b[0] && ch.x <= b[2] && ch.y >= b[1] && ch.y <= b[3];
+            if (out) continue;
+        }
         chars.push_back({ch.x, ch.y, ch.left, ch.right, ch.top, ch.bot,
                          ch.unicode, ch.rot, ch.is_bold});
     }
@@ -5625,14 +5632,15 @@ std::vector<TableData> detect_text_tables(const PageCharCache& cache,
                                            double page_width, double page_height,
                                            double col_boundary,
                                            const std::vector<std::array<double, 4>>& figures,
-                                           const std::vector<PdfLineSegment>* rules) {
+                                           const std::vector<PdfLineSegment>* rules,
+                                           const std::vector<std::array<double, 4>>* excluded) {
     // Leaders are found once for the page: the per-column passes below
     // would otherwise sort every period of the page again.
     const DotLeaders leaders = dot_leader_mask(cache);
     auto result = detect_text_tables_range(cache, existing_tables,
                                            page_width, page_height,
                                            0.0, page_width, leaders,
-                                           col_boundary, &figures, rules);
+                                           col_boundary, &figures, rules, excluded);
 
     // Two-column pages: rows built across the gutter glue a column's table
     // to the prose beside it, so the full-width pass misses column-local
@@ -5646,7 +5654,7 @@ std::vector<TableData> detect_text_tables(const PageCharCache& cache,
             double x_hi = side == 0 ? col_boundary : page_width;
             auto part = detect_text_tables_range(cache, known,
                                                  page_width, page_height,
-                                                 x_lo, x_hi, leaders, 0.0, &figures, rules);
+                                                 x_lo, x_hi, leaders, 0.0, &figures, rules, excluded);
             for (auto& t : part) {
                 known.push_back(t);
                 result.push_back(std::move(t));

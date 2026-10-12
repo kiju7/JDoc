@@ -2634,15 +2634,37 @@ constexpr double kBandMinColumnEm = 10.0;
 constexpr double kBandAlignEm = 0.3;
 constexpr double kBandRowGapEm = 2.5;
 constexpr int kBandMinRows = 3;
+// A second kind of band: two flows set side by side whose baselines do not
+// meet, as in a patent gazette's bibliographic block (classification codes
+// and dates in one column, applicant and inventor with their addresses in
+// the other, each at its own line pitch). Neither side need be prose, so the
+// running-text tests above do not apply. What marks them is that the rows
+// interleave: row after row holds text on one side only, its baseline lying
+// between two lines of the other side. A table's cells share their rows; at
+// most half the band's rows may hold text on both sides, and each side needs
+// kStaggerMinRows rows that fall between the other's lines. A side's lines
+// may indent under its first line (label, then indented values). Rows that
+// share the band need not share a line: two flows at near the same leading
+// pair up row by row, but their baselines drift apart (kStaggerBaselineEm)
+// where a table's cells sit on one. Prose is left out: when most lines of
+// either side fill it (kStaggerFullLine) the side is running text.
+constexpr double kStaggerGutterEm = 2.0;
+constexpr double kStaggerMinColumnEm = 8.0;
+constexpr double kStaggerIndentEm = 4.0;
+constexpr double kStaggerBaselineEm = 0.05;
+constexpr double kStaggerFullLine = 0.85;
+constexpr int kStaggerMinRows = 3;
 
 struct BandCut {
     double split = 0;  // x the row is cut at; 0 = not in a band
     int band = -1;
+    bool staggered = false;
 };
 
 static std::vector<BandCut> find_column_bands(
         const std::vector<TextChar>& chars, const std::vector<size_t>& idx,
-        const std::vector<int>& row_of, double median_fs, double col_boundary) {
+        const std::vector<int>& row_of, double median_fs, double col_boundary,
+        bool upright) {
     int nrows = row_of.empty() ? 0 : row_of.back() + 1;
     std::vector<BandCut> cut(nrows);
     if (nrows < kBandMinRows) return cut;
@@ -2651,6 +2673,8 @@ static std::vector<BandCut> find_column_bands(
     std::vector<std::vector<std::pair<double, double>>> ink(nrows);
     // Glyph centres of each row, and whether each is a letter.
     std::vector<std::vector<std::pair<double, bool>>> letters(nrows);
+    // Glyph centres of each row with their baselines.
+    std::vector<std::vector<std::pair<double, double>>> base(nrows);
     auto is_letter = [](uint32_t cp) {
         if (cp < 0x80) return (cp | 0x20) - 'a' < 26u;
         return cp >= 0xC0 && !(cp >= 0x2000 && cp <= 0x2BFF) &&
@@ -2663,6 +2687,7 @@ static std::vector<BandCut> find_column_bands(
         if (c.unicode == ' ' || c.unicode == 0xA0 || c.right <= c.left) continue;
         ink[r].emplace_back(c.left, c.right);
         letters[r].emplace_back((c.left + c.right) / 2, is_letter(c.unicode));
+        base[r].emplace_back((c.left + c.right) / 2, c.y);
     }
     for (auto& v : ink) {
         std::sort(v.begin(), v.end());
@@ -2692,6 +2717,176 @@ static std::vector<BandCut> find_column_bands(
     // Channels already grown from a row above and rejected: a table's
     // gutter must not be grown again from each of its rows.
     std::vector<std::vector<std::pair<double, double>>> tried(nrows);
+
+    // Two independent flows (see kStaggerMinRows): grown from row s, which
+    // sets text both sides of a gutter. Returns the band's last row and its
+    // channel, or -1.
+    auto staggered_band = [&](int s, std::pair<double, double>& out) -> int {
+        if (!upright) return -1;
+        const auto& row = ink[s];
+        for (size_t k = 0; k + 1 < row.size(); k++) {
+            double a = row[k].second, b = row[k + 1].first;
+            if (b - a < median_fs * kStaggerGutterEm) continue;
+            std::pair<double, double> ch{a, b};
+            const double left_at = row.front().first, right_at = b;
+            // A side's lines start at its first line's x or indented under
+            // it (a label over its indented values), never left of it.
+            auto starts_ok = [&](double x, double at) {
+                return x >= at - median_fs * 0.5 && x <= at + median_fs * kStaggerIndentEm;
+            };
+            int end = s;
+            // Each side's last line so far: a line far below its own side's
+            // last one starts a new block, however close the other side.
+            double last_y[2] = {row_y[s], row_y[s]};
+            for (int r = s + 1; r < nrows; r++) {
+                if (row_y[r - 1] - row_y[r] > median_fs * kBandRowGapEm) break;
+                if (ink[r].empty()) break;
+                auto e = empty_part(r, ch.first, ch.second);
+                if (e.second - e.first < median_fs * kStaggerGutterEm) break;
+                const auto& v = ink[r];
+                const bool has_left = v.front().first < e.first;
+                if (has_left && !starts_ok(v.front().first, left_at)) break;
+                auto rp = std::find_if(v.begin(), v.end(),
+                                       [&](const std::pair<double, double>& g) { return g.first >= e.second; });
+                if (rp != v.end() && !starts_ok(rp->first, right_at)) break;
+                if ((has_left && last_y[0] - row_y[r] > median_fs * kBandRowGapEm) ||
+                    (rp != v.end() && last_y[1] - row_y[r] > median_fs * kBandRowGapEm))
+                    break;
+                if (has_left) last_y[0] = row_y[r];
+                if (rp != v.end()) last_y[1] = row_y[r];
+                ch = e;
+                end = r;
+            }
+            if (end - s + 1 < 2 * kStaggerMinRows) continue;
+            // Side of each row: 1 left only, 2 right only, 3 both; and for a
+            // row with both, whether the two sides share a baseline.
+            std::vector<int> side;
+            int both = 0, offset = 0;
+            double L0 = 1e18, L1 = -1e18, R0 = 1e18, R1 = -1e18;
+            for (int r = s; r <= end; r++) {
+                int m = 0;
+                for (const auto& g : ink[r]) {
+                    if (g.second <= ch.first) { m |= 1; L0 = std::min(L0, g.first); L1 = std::max(L1, g.second); }
+                    else { m |= 2; R0 = std::min(R0, g.first); R1 = std::max(R1, g.second); }
+                }
+                side.push_back(m);
+                if (m != 3) continue;
+                both++;
+                std::vector<double> yl, yr;
+                for (const auto& [x, y] : base[r]) (x < ch.first ? yl : yr).push_back(y);
+                if (yl.empty() || yr.empty()) continue;
+                std::nth_element(yl.begin(), yl.begin() + yl.size() / 2, yl.end());
+                std::nth_element(yr.begin(), yr.begin() + yr.size() / 2, yr.end());
+                if (std::abs(yl[yl.size() / 2] - yr[yr.size() / 2]) >= median_fs * kStaggerBaselineEm)
+                    offset++;
+            }
+            if (L1 - L0 < median_fs * kStaggerMinColumnEm ||
+                R1 - R0 < median_fs * kStaggerMinColumnEm)
+                continue;
+            // The band holds the whole of both flows: no more than a line or
+            // two starting where either side starts (a right-aligned note,
+            // "examiner: ...", does not) between the band and the nearest
+            // rows above and below that cross its gutter (between the
+            // band's two sides, not the channel its first row opened). A side that runs
+            // on past the band is a page column, or a column of the layout
+            // around it, read whole by the page split. When
+            // the page's own boundary lies in this gutter the page split
+            // reads the band's rows right, but it also pulls every line down
+            // to the next full-width one into the left column, ahead of the
+            // band's right side; this test is what lets the band win there.
+            {
+                // -1 crosses the gutter; else bit 1 left text, bit 2 right.
+                auto side_of = [&](int r) {
+                    int m = 0;
+                    for (const auto& g : ink[r]) {
+                        if (g.first < R0 - median_fs * 0.5 && g.second > L1 + median_fs * 0.5) return -1;
+                        if (g.second <= ch.first && g.first == ink[r].front().first &&
+                            starts_ok(g.first, left_at)) m |= 1;
+                        if (g.first >= ch.second && starts_ok(g.first, right_at)) m |= 2;
+                    }
+                    return m;
+                };
+                int outside[2] = {0, 0};
+                auto count = [&](int r) {
+                    int t = side_of(r);
+                    if (t < 0) return false;
+                    outside[0] += t & 1;
+                    outside[1] += (t >> 1) & 1;
+                    return true;
+                };
+                for (int r = s - 1; r >= 0 && count(r); r--) {}
+                for (int r = end + 1; r < nrows && count(r); r++) {}
+                if (outside[0] >= kStaggerMinRows || outside[1] >= kStaggerMinRows) continue;
+            }
+            // Running text fills its column line after line; columns of
+            // prose are the page split's and the prose band's to read.
+            int full[2] = {0, 0}, lines_on[2] = {0, 0};
+            for (int r = s; r <= end; r++) {
+                double l0 = 1e18, l1 = -1e18, r0 = 1e18, r1 = -1e18;
+                for (const auto& g : ink[r])
+                    if (g.second <= ch.first) { l0 = std::min(l0, g.first); l1 = std::max(l1, g.second); }
+                    else { r0 = std::min(r0, g.first); r1 = std::max(r1, g.second); }
+                if (l1 > l0) { lines_on[0]++; full[0] += l1 - l0 >= kStaggerFullLine * (L1 - L0); }
+                if (r1 > r0) { lines_on[1]++; full[1] += r1 - r0 >= kStaggerFullLine * (R1 - R0); }
+            }
+            if (full[0] * 2 >= lines_on[0] || full[1] * 2 >= lines_on[1]) continue;
+            // Each side is a flow of words: most of its lines hold letters
+            // (axis ticks and columns of amounts do not), and no gutter of
+            // its own runs down it (a side that is itself two columns, or
+            // the columns of a table).
+            bool flows = true;
+            for (int k = 0; k < 2 && flows; k++) {
+                const double lo = k == 0 ? L0 : R0, hi = k == 0 ? L1 : R1;
+                int worded = 0;
+                for (int r = s; r <= end; r++) {
+                    int lt = 0;
+                    for (const auto& [x, letter] : letters[r])
+                        lt += letter && (k == 0 ? x < ch.first : x > ch.second);
+                    worded += lt >= 2;
+                }
+                if (worded * 3 < lines_on[k] * 2) flows = false;
+                // Inner gutter: an x stretch at least a gutter wide that most
+                // of the side's lines leave empty, with text either side of it
+                // on several lines.
+                for (double x = lo + gutter; x + gutter <= hi && flows; x += median_fs * 0.25) {
+                    int clear = 0, split = 0;
+                    for (int r = s; r <= end; r++) {
+                        bool any = false, hit = false, before = false, after = false;
+                        for (const auto& g : ink[r]) {
+                            if (g.second < lo - 0.5 || g.first > hi + 0.5) continue;
+                            any = true;
+                            hit |= g.first < x + gutter && g.second > x;
+                            before |= g.second <= x;
+                            after |= g.first >= x + gutter;
+                        }
+                        if (!any) continue;
+                        clear += !hit;
+                        split += !hit && before && after;
+                    }
+                    if (clear * 5 >= lines_on[k] * 4 && split >= kStaggerMinRows) flows = false;
+                }
+            }
+            if (!flows) continue;
+            int between[3] = {0, 0, 0};
+            const int n = static_cast<int>(side.size());
+            for (int i = 0; i < n; i++) {
+                if (side[i] == 3) continue;
+                // A one-sided row with the other side's text above and below
+                // it: its baseline falls between two lines of the other flow.
+                const int other = 3 - side[i];
+                bool above = false, below = false;
+                for (int j = 0; j < i; j++) above |= (side[j] & other) != 0;
+                for (int j = i + 1; j < n; j++) below |= (side[j] & other) != 0;
+                if (above && below) between[side[i]]++;
+            }
+            if (between[1] + between[2] + offset < 2 * kStaggerMinRows ||
+                (both - offset) * 2 > n)
+                continue;
+            out = ch;
+            return end;
+        }
+        return -1;
+    };
     int next_band = 0;
     int s = 0;
     while (s < nrows) {
@@ -2790,9 +2985,14 @@ static std::vector<BandCut> find_column_bands(
             }
             if (end > best_end) { best_end = end; best_ch = ch; }
         }
+        bool staggered = false;
+        if (best_end < 0) {
+            best_end = staggered_band(s, best_ch);
+            staggered = best_end >= 0;
+        }
         if (best_end < 0) { s++; continue; }
         double split = (best_ch.first + best_ch.second) / 2;
-        for (int r = s; r <= best_end; r++) cut[r] = BandCut{split, next_band};
+        for (int r = s; r <= best_end; r++) cut[r] = BandCut{split, next_band, staggered};
         next_band++;
         s = best_end + 1;
     }
@@ -2861,7 +3061,8 @@ static std::vector<TextLine> lines_from_upright_chars(
         row_of[ii] = static_cast<int>(r);
     }
     const std::vector<BandCut> band_cut =
-        find_column_bands(*vote_chars, idx, row_of, median_fs, col_boundary);
+        find_column_bands(*vote_chars, idx, row_of, median_fs, col_boundary,
+                          out_col_boundary != nullptr);
     std::vector<double> band_split;
     for (const auto& b : band_cut)
         if (b.band >= static_cast<int>(band_split.size())) band_split.push_back(b.split);
@@ -2983,7 +3184,10 @@ static std::vector<TextLine> lines_from_upright_chars(
             flush();
             cur_y = ch.y;
         }
-        if (cur.text.empty()) cur.band = bc.band;
+        if (cur.text.empty()) {
+            cur.band = bc.band;
+            cur.staggered = bc.staggered;
+        }
 
         // Split line at column boundary when a large gap crosses it.
         // Skip the split when the right side has multiple distinct cell

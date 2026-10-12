@@ -217,6 +217,9 @@ struct TextLine {
     // are already in reading order, left column first; the page-wide column
     // reordering leaves them where they are.
     int band = -1;
+    // The band is two staggered flows (kStaggerMinRows), not running text:
+    // its region is kept from the table and layout-block detectors.
+    bool staggered = false;
     // Byte ranges [first, second) of `text` set in a bold face, for inline
     // emphasis in the Markdown body. `is_bold` above stays the line-level
     // flag the heading logic reads; these only change how a body line that

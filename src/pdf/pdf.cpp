@@ -907,6 +907,30 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
         // Extract annotations (text notes, links)
         result.all_annots[p] = extract_annotations(doc, page_obj, page_h, initial_ctm);
 
+        // Staggered column bands (find_column_bands) are two flows of
+        // lines, read column by column; no table or layout block may claim
+        // their glyphs across the gutter.
+        std::vector<PageBox> stagger_boxes;
+        for (const auto& l : result.all_lines[p]) {
+            if (!l.staggered) continue;
+            size_t k = static_cast<size_t>(l.band / 2);
+            if (k >= stagger_boxes.size())
+                stagger_boxes.resize(k + 1, PageBox{1e18, 1e18, -1e18, -1e18});
+            auto& b = stagger_boxes[k];
+            b[0] = std::min(b[0], l.x_left);
+            b[1] = std::min(b[1], l.y_center - 0.5 * l.font_size);
+            b[2] = std::max(b[2], l.x_right);
+            b[3] = std::max(b[3], l.y_center + l.font_size);
+        }
+        if (std::getenv("JDOC_BAND_DEBUG"))
+            for (const auto& l : result.all_lines[p])
+                if (l.staggered)
+                    fprintf(stderr, "[stagger] page %d band %d x %.0f-%.0f y %.1f %s\n", p + 1,
+                            l.band, l.x_left, l.x_right, l.y_center, l.text.c_str());
+        stagger_boxes.erase(std::remove_if(stagger_boxes.begin(), stagger_boxes.end(),
+                                           [](const PageBox& b) { return b[0] > b[2]; }),
+                            stagger_boxes.end());
+
         if (need_tables) {
             result.all_tables[p] = std::move(ruled_tables);
             auto shade_tables = detect_shading_tables(parse_result.fill_rects,
@@ -914,7 +938,8 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
             for (auto& st : shade_tables)
                 result.all_tables[p].push_back(std::move(st));
             auto text_tables = detect_text_tables(cache, result.all_tables[p],
-                page_w, page_h, result.col_boundaries[p], figures, &parse_result.segments);
+                page_w, page_h, result.col_boundaries[p], figures, &parse_result.segments,
+                &stagger_boxes);
             for (auto& tt : text_tables)
                 result.all_tables[p].push_back(std::move(tt));
             for (auto& t : result.all_tables[p])
@@ -928,6 +953,7 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
                                        std::max(t.x0, t.x1), std::max(t.y0, t.y1)});
             // A drawing's labels keep no layout block either.
             table_boxes.insert(table_boxes.end(), figures.begin(), figures.end());
+            table_boxes.insert(table_boxes.end(), stagger_boxes.begin(), stagger_boxes.end());
             result.all_fallbacks[p] = find_layout_fallbacks(
                 parse_result.chars, result.col_boundaries[p], table_boxes,
                 sparse_grids, &parse_result.segments);
