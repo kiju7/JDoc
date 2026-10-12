@@ -34,6 +34,14 @@ struct TableData {
     // (rules across the grid above and below) and a column rule runs beside
     // it. Set by build_table.
     size_t open_cell_max = 0;
+    // Grid column edges, left to right, when the columns are the drawn grid
+    // (build_table, lead_grid_row); empty otherwise. Two pieces of a table
+    // split over a page break share them (join_split_tables).
+    std::vector<double> col_xs;
+    // The rows continue the previous page's table and are printed there;
+    // the table stays on its own page only so its lines are not printed
+    // again as prose.
+    bool continued = false;
 };
 
 // Fold physical header rows into one: a second row whose first cell is
@@ -198,6 +206,7 @@ struct ExtractResult {
     std::vector<std::vector<double>> all_image_x;  // per-page image X positions
     std::vector<double> col_boundaries;  // per-page column boundary (0 if single-column)
     std::vector<std::vector<TableData>> all_tables;
+    std::vector<TableData> lead_grids;  // per page: lead_grid_row
     // Per-page layout blocks for tabular regions no detector claimed
     // (markdown with tables on only; find_layout_fallbacks).
     std::vector<std::vector<LayoutFallback>> all_fallbacks;
@@ -235,6 +244,13 @@ std::vector<TableData> detect_text_tables(const PageCharCache& cache,
                                            const std::vector<PdfLineSegment>* rules = nullptr,
                                            const std::vector<std::array<double, 4>>* excluded = nullptr);
 std::string format_table(const TableData& table);
+// The top row of a page when it is a closed box of drawn rules (rules over
+// and under it at one width, a column rule at each end and at least one
+// inside), with its cells' text; rows empty when there is none. A table
+// split over a page break leaves such a lone row on the next page, too
+// short for detect_tables to accept as a table of its own.
+TableData lead_grid_row(const std::vector<PdfLineSegment>& segments,
+                        const PageCharCache& cache, double page_width);
 std::vector<ExtractedImage> extract_page_images(PdfDoc& doc, const PdfObj& resources,
                                                 const ContentParseResult& parse_result,
                                                 int page_num,

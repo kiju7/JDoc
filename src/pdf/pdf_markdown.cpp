@@ -1266,6 +1266,7 @@ std::string page_to_markdown(const std::vector<TextLine>& raw_lines,
     };
     std::vector<InlineInsert> inserts;
     for (size_t ti = 0; ti < tables.size(); ti++) {
+        if (tables[ti].continued) continue;  // printed with the previous page's
         double tx = (tables[ti].x0 + tables[ti].x1) / 2.0;
         inserts.push_back({std::max(tables[ti].y0, tables[ti].y1), tx, ti, false});
     }

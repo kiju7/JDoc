@@ -860,6 +860,7 @@ TableData build_table(const std::vector<double>& input_row_ys,
             col_xs[last_col_idx], col_xs[last_col_idx + 1], actual_ys);
     int n_sub = sub_boundaries.empty() ? 0 : (int)sub_boundaries.size() - 1;
     int total_cols = (n_sub > 1) ? (n_cols - 1 + n_sub) : n_cols;
+    if (n_sub <= 1) table.col_xs = col_xs;
 
     // Detect merged cells: check v-line presence at each internal boundary per row
     // has_vline[r][b] = true if a v-line exists near col_xs[b] spanning row r
@@ -937,6 +938,8 @@ TableData build_table(const std::vector<double>& input_row_ys,
     // evidence, not an index into the now-shorter text matrix.
     std::vector<std::vector<bool>> rule_above(
         n_rows, std::vector<bool>(total_cols, false));
+    // Cells that are one grid column wide, for the row-span pass below.
+    std::vector<std::vector<char>> single(n_rows, std::vector<char>(total_cols, 0));
     table.rows.resize(n_rows);
     table.cell_bold.assign(n_rows, {});
     for (int r = 0; r < n_rows; r++) {
@@ -1029,7 +1032,81 @@ TableData build_table(const std::vector<double>& input_row_ys,
             if (!(ruled_side && drawn_row))
                 table.open_cell_max = std::max(table.open_cell_max,
                                                table.rows[r][c].size());
+            if (span == 1 && n_sub <= 1) single[r][c] = 1;
             c += span;
+        }
+    }
+
+    // Row spans: a drawn level that rules the other columns but stops short
+    // of one leaves that column's cell open across it ("Decoding" beside
+    // the two decoding parameters). The cell's text sits wherever the
+    // producer centred it, often in a middle row; it belongs to the span's
+    // first row, the others left empty. Rows from text alignment, and
+    // levels that rule no column at all (an open body between a header
+    // and a bottom rule), are not spans. Nor is the top row's lower level:
+    // a header rule is often drawn cell by cell, and a cell's piece too
+    // short to count as a rule must not join the header to the body.
+    if (rows_are_drawn && n_rows >= 3 && n_sub <= 1) {
+        auto covered = [&](double y, double lo, double hi) {
+            std::vector<std::pair<double, double>> iv;
+            for (const auto& hl : h_lines) {
+                if (std::abs((hl.y0 + hl.y1) / 2.0 - y) > 4.0) continue;
+                double a = std::max(lo, double(std::min(hl.x0, hl.x1)));
+                double b = std::min(hi, double(std::max(hl.x0, hl.x1)));
+                if (b > a) iv.push_back({a, b});
+            }
+            std::sort(iv.begin(), iv.end());
+            double cov = 0, end = lo;
+            for (const auto& [a, b] : iv) {
+                cov += std::max(0.0, b - std::max(end, a));
+                end = std::max(end, b);
+            }
+            return cov >= (hi - lo) * 0.5;
+        };
+        // Level k parts rows k-1 and k (bottom first): ruled per column.
+        std::vector<std::vector<char>> ruled(n_rows, std::vector<char>(n_cols, 0));
+        std::vector<char> any_ruled(n_rows, 0);
+        for (int k = 1; k < n_rows; k++)
+            for (int c = 0; c < n_cols; c++) {
+                ruled[k][c] = covered(actual_ys[k], col_xs[c], col_xs[c + 1]);
+                any_ruled[k] |= ruled[k][c];
+            }
+        for (int c = 0; c < n_cols; c++) {
+            for (int a = 0; a < n_rows; ) {
+                int b = a;
+                while (b + 1 < n_rows - 1 && any_ruled[b + 1] && !ruled[b + 1][c] &&
+                       single[b][c] && single[b + 1][c])
+                    b++;
+                // One cell's text, in one row of the run: rows that each
+                // hold a value are rows of their own whatever the rules.
+                // Every row of the span is a row of the table beside it (a
+                // spacer row is not), and its first row is not a header
+                // the label would be pulled into (all bold where the
+                // label's row is not).
+                int filled = 0, at = -1;
+                for (int r = a; r <= b; r++)
+                    if (!table.rows[r][c].empty()) { filled++; at = r; }
+                auto others = [&](int r, bool bold_only) {
+                    int n = 0, bold = 0;
+                    for (int k = 0; k < n_cols; k++)
+                        if (k != c && !table.rows[r][k].empty()) {
+                            n++;
+                            bold += table.cell_bold[r][k] != 0;
+                        }
+                    return bold_only ? n > 0 && bold == n : n > 0;
+                };
+                bool rows_ok = true;
+                for (int r = a; r <= b; r++) rows_ok = rows_ok && others(r, false);
+                if (rows_ok && at >= 0 && others(b, true) && !others(at, true)) rows_ok = false;
+                if (b > a && filled == 1 && at != b && rows_ok) {
+                    // Rows a..b, bottom first: the top row is b.
+                    table.rows[b][c] = std::move(table.rows[at][c]);
+                    table.rows[at][c].clear();
+                    table.cell_bold[b][c] = table.cell_bold[at][c];
+                    table.cell_bold[at][c] = 0;
+                }
+                a = b + 1;
+            }
         }
     }
 
@@ -1295,8 +1372,40 @@ TableData build_table(const std::vector<double>& input_row_ys,
                 if (letters[0] >= 2 && letters[1] >= 2) worded++;
             }
             const bool word_grid = n_cols_t == 2 && worded * 2 >= checked;
-            int tight_rows = word_grid ? 0 : checked;
-            for (int r = 0; word_grid && r < n_rows; r++) {
+            // A grid of three columns is measured the same way: a word that
+            // ends one cell and a word that starts the next ("Retrieval |
+            // Top-k") are not a word running on unless they nearly touch.
+            // Unless its cells hold columns of their own (values set apart
+            // on one baseline, "31   38" under a group header): then the
+            // rules are only the table's outline, and the text alignment
+            // detector finds its columns in full. A gap of most of an em
+            // is wider than any word space.
+            int inner_gaps = 0;
+            if (n_cols_t == 3)
+                for (int r = 0; r < n_rows; r++)
+                    for (int c = 0; c < n_cols; c++) {
+                        double lo = col_xs[c], hi = col_xs[c + 1];
+                        double row_bot = std::min(actual_ys[r], actual_ys[r + 1]);
+                        double row_top = std::max(actual_ys[r], actual_ys[r + 1]);
+                        std::vector<const PageCharCache::CharInfo*> g;
+                        for (auto& ch : cache.chars)
+                            if (ch.unicode != ' ' && ch.unicode != 0xA0 && ch.unicode != '\t' &&
+                                ch.x > lo && ch.x < hi && ch.y > row_bot && ch.y < row_top)
+                                g.push_back(&ch);
+                        std::sort(g.begin(), g.end(), [](auto* x, auto* y) {
+                            return std::abs(x->y - y->y) > 2.0 ? x->y > y->y : x->left < y->left;
+                        });
+                        bool gap = false;
+                        for (size_t i = 1; i < g.size() && !gap; i++) {
+                            if (std::abs(g[i]->y - g[i - 1]->y) > 2.0) continue;
+                            double fs = std::max(4.0, double(g[i]->font_size));
+                            gap = g[i]->left - g[i - 1]->right > 0.7 * fs;
+                        }
+                        inner_gaps += gap;
+                    }
+            const bool measure = word_grid || (n_cols_t == 3 && inner_gaps < 2);
+            int tight_rows = measure ? 0 : checked;
+            for (int r = 0; measure && r < n_rows; r++) {
                 double row_bot = std::min(actual_ys[r], actual_ys[r + 1]);
                 double row_top = std::max(actual_ys[r], actual_ys[r + 1]);
                 bool tight = false;
@@ -5761,6 +5870,86 @@ std::string format_table(const TableData& table) {
     if (n_cols == 0) return "";
 
     return util::format_padded_markdown_table(filtered, n_cols);
+}
+
+TableData lead_grid_row(const std::vector<PdfLineSegment>& segments,
+                        const PageCharCache& cache, double page_width) {
+    TableData none;
+    // Horizontal rules, collinear pieces joined (borders drawn per cell).
+    struct Rule { double y, x0, x1; };
+    std::vector<Rule> pieces;
+    for (const auto& l : segments)
+        if (l.is_horizontal())
+            pieces.push_back({(l.y0 + l.y1) / 2.0, std::min<double>(l.x0, l.x1),
+                              std::max<double>(l.x0, l.x1)});
+    std::sort(pieces.begin(), pieces.end(), [](const Rule& a, const Rule& b) {
+        return a.y != b.y ? a.y > b.y : a.x0 < b.x0;
+    });
+    std::vector<Rule> rules;
+    for (size_t i = 0; i < pieces.size();) {
+        size_t j = i;
+        std::vector<std::pair<double, double>> iv;
+        while (j < pieces.size() && pieces[i].y - pieces[j].y <= 1.5)
+            iv.push_back({pieces[j].x0, pieces[j].x1}), j++;
+        std::sort(iv.begin(), iv.end());
+        double lo = iv[0].first, hi = iv[0].second;
+        for (size_t k = 1; k <= iv.size(); k++) {
+            if (k < iv.size() && iv[k].first <= hi + 3.0) {
+                hi = std::max(hi, iv[k].second);
+                continue;
+            }
+            if (hi - lo >= 0.3 * page_width) rules.push_back({pieces[i].y, lo, hi});
+            if (k < iv.size()) { lo = iv[k].first; hi = iv[k].second; }
+        }
+        i = j;
+    }
+    // The topmost pair of rules of one width with a closed row between them.
+    for (size_t a = 0; a + 1 < rules.size(); a++) {
+        const Rule& top = rules[a];
+        for (size_t b = a + 1; b < rules.size(); b++) {
+            const Rule& bot = rules[b];
+            double h = top.y - bot.y;
+            if (h < 8.0) continue;
+            if (std::abs(top.x0 - bot.x0) > 3.0 || std::abs(top.x1 - bot.x1) > 3.0) break;
+            std::vector<double> xs;
+            for (const auto& l : segments) {
+                if (!l.is_vertical()) continue;
+                double lo = std::min<double>(l.y0, l.y1), hi = std::max<double>(l.y0, l.y1);
+                if (lo > bot.y + 2.0 || hi < top.y - 2.0) continue;
+                double x = (l.x0 + l.x1) / 2.0;
+                if (x < top.x0 - 3.0 || x > top.x1 + 3.0) continue;
+                xs.push_back(x);
+            }
+            std::sort(xs.begin(), xs.end());
+            std::vector<double> cols;
+            for (double x : xs)
+                if (cols.empty() || x - cols.back() > 2.0) cols.push_back(x);
+            if (cols.size() < 3 || std::abs(cols.front() - top.x0) > 3.0 ||
+                std::abs(cols.back() - top.x1) > 3.0)
+                break;
+            TableData t;
+            t.kind = TableData::RULED;
+            t.col_xs = cols;
+            t.x0 = cols.front();
+            t.x1 = cols.back();
+            t.y0 = bot.y;
+            t.y1 = top.y;
+            t.rows.emplace_back();
+            t.cell_bold.emplace_back();
+            int filled = 0;
+            for (size_t c = 0; c + 1 < cols.size(); c++) {
+                bool bold = false;
+                std::string cell = cache.get_text_in_rect(cols[c], top.y, cols[c + 1], bot.y, &bold);
+                filled += !cell.empty();
+                t.cell_bold.back().push_back(bold && !cell.empty());
+                t.rows.back().push_back(std::move(cell));
+            }
+            if (filled < 2) break;
+            return t;
+        }
+        break;  // only the page's first rule opens its lead row
+    }
+    return none;
 }
 
 // ── CCITTFax Decoder (lookup-table based, algorithm from ITU-T T.4/T.6) ──

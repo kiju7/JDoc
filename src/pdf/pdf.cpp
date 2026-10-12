@@ -605,6 +605,103 @@ static std::vector<PageBox> rule_stack_boxes(const std::vector<PdfLineSegment>& 
     return out;
 }
 
+// A ruled table broken by a page break continues at the top of the next
+// page with the same drawn columns. The pieces join when the table is the
+// last thing on its page and its continuation the first on the next (a
+// running head or foot of a line or two aside), and every column edge
+// matches. The continuation is the next page's first ruled table, or its
+// lead row (lead_grid_row) when only one row carried over, which no
+// detector accepts as a table by itself; a text table read out of that
+// row's cells gives way to it. A header row repeated at the top of the
+// continuation is dropped. The continuation stays on its page marked
+// `continued`, so its lines are still recognised as table text there.
+static void join_split_tables(ExtractResult& r, const std::vector<int>& pages) {
+    constexpr int kMarginLines = 2;
+    auto box = [](const TableData& t) {
+        return std::array<double, 4>{std::min(t.x0, t.x1), std::min(t.y0, t.y1),
+                                     std::max(t.x0, t.x1), std::max(t.y0, t.y1)};
+    };
+    auto same_columns = [](const TableData& a, const TableData& b) {
+        if (a.col_xs.size() < 3 || a.col_xs.size() != b.col_xs.size()) return false;
+        for (size_t i = 0; i < a.col_xs.size(); i++)
+            if (std::abs(a.col_xs[i] - b.col_xs[i]) > 3.0) return false;
+        return true;
+    };
+    // A continuation joined on the page before, and the table printing it:
+    // a table over three pages joins its third piece to the first.
+    const TableData* carried = nullptr;
+    TableData* owner = nullptr;
+    for (size_t k = 1; k < pages.size(); k++) {
+        const int p = pages[k], q = pages[k - 1];
+        const TableData* prev_carried = carried;
+        TableData* prev_owner = owner;
+        carried = nullptr;
+        owner = nullptr;
+        if (q != p - 1) continue;
+        // The previous page's lowest table, with no more than a footer below.
+        TableData* last = nullptr;
+        for (auto& t : r.all_tables[q])
+            if (!last || box(t)[1] < box(*last)[1]) last = &t;
+        if (!last || last->kind != TableData::RULED || last->rows.empty()) continue;
+        int below = 0;
+        for (const auto& l : r.all_lines[q]) below += l.y_center < box(*last)[1] - 2.0;
+        if (below > kMarginLines) continue;
+        // This page's highest ruled table, or its lead row above it.
+        TableData* first = nullptr;
+        for (auto& t : r.all_tables[p])
+            if (t.kind == TableData::RULED && !t.rows.empty() &&
+                (!first || box(t)[3] > box(*first)[3]))
+                first = &t;
+        TableData& lead = r.lead_grids[p];
+        bool use_lead = !lead.rows.empty() && (!first || box(lead)[3] > box(*first)[3] + 2.0);
+        TableData* cont = use_lead ? &lead : first;
+        if (!cont || !same_columns(*last, *cont)) continue;
+        TableData* into = last->continued && last == prev_carried ? prev_owner : last;
+        if (last->continued && !into) continue;
+        const auto cb = box(*cont);
+        int above = 0;
+        for (const auto& l : r.all_lines[p]) above += l.y_center > cb[3] + 2.0;
+        if (above > kMarginLines) continue;
+        for (const auto& t : r.all_tables[p])
+            if (&t != cont && t.kind != TableData::TEXT && box(t)[3] > cb[3] + 2.0) above = -1;
+        if (above < 0) continue;
+
+        size_t from = 0;
+        if (cont->rows[0] == into->rows[0] && cont->rows.size() > 1) from = 1;
+        for (size_t i = from; i < cont->rows.size(); i++) {
+            into->rows.push_back(cont->rows[i]);
+            if (into->cell_bold.size() + 1 == into->rows.size())
+                into->cell_bold.push_back(i < cont->cell_bold.size() ? cont->cell_bold[i]
+                                                                     : std::vector<uint8_t>{});
+        }
+        into->cell_bold.resize(std::min(into->cell_bold.size(), into->rows.size()));
+        owner = into;
+        if (use_lead) {
+            // Text tables and layout blocks read out of the row's cells.
+            auto overlaps = [&](const std::array<double, 4>& b) {
+                return std::min(b[2], cb[2]) > std::max(b[0], cb[0]) &&
+                       std::min(b[3], cb[3]) > std::max(b[1], cb[1]);
+            };
+            auto& tables = r.all_tables[p];
+            tables.erase(std::remove_if(tables.begin(), tables.end(), [&](const TableData& t) {
+                return t.kind == TableData::TEXT && overlaps(box(t));
+            }), tables.end());
+            auto& fbs = r.all_fallbacks[p];
+            fbs.erase(std::remove_if(fbs.begin(), fbs.end(), [&](const LayoutFallback& f) {
+                return overlaps({std::min(f.x0, f.x1), std::min(f.y0, f.y1),
+                                 std::max(f.x0, f.x1), std::max(f.y0, f.y1)});
+            }), fbs.end());
+            lead.continued = true;
+            tables.push_back(std::move(lead));
+            lead = TableData{};
+            carried = &tables.back();
+        } else {
+            cont->continued = true;
+            carried = cont;
+        }
+    }
+}
+
 static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
                                         const std::string& pdf_path,
                                         const ConvertOptions& opts,
@@ -681,6 +778,7 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
     result.all_image_x.resize(tp);
     result.col_boundaries.resize(tp, 0);
     result.all_tables.resize(tp);
+    result.lead_grids.resize(tp);
     result.all_annots.resize(tp);
     if (opts.format == OutputFormat::PLAINTEXT) result.layout_text.resize(tp);
     else result.all_fallbacks.resize(tp);
@@ -944,6 +1042,7 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
                 result.all_tables[p].push_back(std::move(tt));
             for (auto& t : result.all_tables[p])
                 merge_header_rows(t);
+            result.lead_grids[p] = lead_grid_row(parse_result.segments, cache, page_w);
 
             // Tabular regions no detector accepted keep their layout as a
             // fenced block in the markdown (find_layout_fallbacks).
@@ -2135,6 +2234,8 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
         for (auto& w : workers) w.join();
         if (first_error) std::rethrow_exception(first_error);
     }
+
+    join_split_tables(result, page_indices);
 
     collect_attachments(doc, root, result.attachments);
 
