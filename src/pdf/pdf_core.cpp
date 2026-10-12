@@ -1117,6 +1117,68 @@ static const uint32_t kMacRoman[256] = {
 };
 
 
+// HancomEQN, the equation font of Hancom Office (HWP): its ToUnicode maps
+// most glyphs into the Private Use Area, so the letters of every equation
+// are dropped as unportable. The PUA values are the font's own fixed codes,
+// not a per-document numbering: across thirteen documents from different
+// producers (journals, theses, reports, subsets renumbered or not) each
+// code drew the same glyph. Read from the glyph outlines, the codes run in
+// alphabet order: upright A-Z from E000, digits 1-9 and 0 from E034, Greek
+// capitals from E085 and small letters from E09D, double-struck capitals
+// from E0CB, italic a-z from E0E5, between them ASCII punctuation, the
+// operators and the pieces of tall brackets. Codes inside a run take the
+// run's order (several seen in every run); a code no outline confirmed
+// outside the runs stays unmapped.
+static uint32_t hancom_eqn_unicode(uint32_t pua) {
+    if (pua >= 0xE000 && pua <= 0xE019) return 'A' + (pua - 0xE000);
+    if (pua >= 0xE034 && pua <= 0xE03C) return '1' + (pua - 0xE034);
+    if (pua == 0xE03D) return '0';
+    if (pua >= 0xE085 && pua <= 0xE09C) {
+        static const uint16_t caps[24] = {
+            0x391, 0x392, 0x393, 0x394, 0x395, 0x396, 0x397, 0x398, 0x399, 0x39A, 0x39B, 0x39C,
+            0x39D, 0x39E, 0x39F, 0x3A0, 0x3A1, 0x3A3, 0x3A4, 0x3A5, 0x3A6, 0x3A7, 0x3A8, 0x3A9};
+        return caps[pua - 0xE085];
+    }
+    if (pua >= 0xE09D && pua <= 0xE0B4) {
+        static const uint16_t small[24] = {
+            0x3B1, 0x3B2, 0x3B3, 0x3B4, 0x3F5, 0x3B6, 0x3B7, 0x3B8, 0x3B9, 0x3BA, 0x3BB, 0x3BC,
+            0x3BD, 0x3BE, 0x3BF, 0x3C0, 0x3C1, 0x3C3, 0x3C4, 0x3C5, 0x3C6, 0x3C7, 0x3C8, 0x3C9};
+        return small[pua - 0xE09D];
+    }
+    if (pua >= 0xE0CB && pua <= 0xE0E4) {
+        // Mathematical double-struck capitals, with the letterlike symbols
+        // that stand in for the holes of that block.
+        const uint32_t i = pua - 0xE0CB;
+        switch ('A' + i) {
+            case 'C': return 0x2102; case 'H': return 0x210D; case 'N': return 0x2115;
+            case 'P': return 0x2119; case 'Q': return 0x211A; case 'R': return 0x211D;
+            case 'Z': return 0x2124;
+            default: return 0x1D538 + i;
+        }
+    }
+    if (pua >= 0xE0E5 && pua <= 0xE0FE) return 'a' + (pua - 0xE0E5);
+    switch (pua) {
+        case 0xE03E: return '!';    case 0xE03F: return '@';    case 0xE043: return '*';
+        case 0xE044: return '(';    case 0xE045: return ')';    case 0xE046: return 0x2212;
+        case 0xE047: return '=';    case 0xE048: return '+';    case 0xE049: return '[';
+        case 0xE04A: return ']';    case 0xE04B: return '{';    case 0xE04C: return '}';
+        case 0xE04D: return '|';    case 0xE052: return ',';    case 0xE053: return '.';
+        case 0xE054: return '/';    case 0xE055: return '<';    case 0xE056: return '>';
+        case 0xE05B: return 0x222B; case 0xE05C: return 0x221A; case 0xE063: return 0x2C6;
+        case 0xE066: return 0x2DC;  case 0xE067: return 0x2211; case 0xE06B: return 0x222A;
+        case 0xE06D: return 0x2212; case 0xE06E: return 0x2192;
+        // Pieces of tall braces, parentheses and brackets.
+        case 0xE078: return 0x23A7; case 0xE079: return 0x23A8; case 0xE07A: return 0x23A9;
+        case 0xE07B: return 0x23AA; case 0xE07C: return 0x239B; case 0xE07D: return 0x239C;
+        case 0xE07E: return 0x239D; case 0xE07F: return 0x239E; case 0xE080: return 0x239F;
+        case 0xE081: return 0x23A0; case 0xE100: return 0x23A1; case 0xE101: return 0x23A2;
+        case 0xE102: return 0x23A4; case 0xE103: return 0x23A3; case 0xE104: return 0x23A6;
+        case 0xE105: return 0x23A5;
+        case 0xE0C2: return 0x3C6;  case 0xE10E: return 0x3B5;
+        default: return 0;
+    }
+}
+
 void parse_tounicode_cmap(PdfDoc& doc, const PdfObj& tu_obj, PdfFont& font) {
     auto resolved = doc.resolve(tu_obj);
     std::vector<uint8_t> cmap_data;
@@ -1552,6 +1614,13 @@ PdfFont load_font(PdfDoc& doc, const PdfObj& font_ref) {
     // ToUnicode CMap (may be an indirect reference)
     auto tu = doc.resolve(fobj.get("ToUnicode"));
     if (!tu.is_none()) parse_tounicode_cmap(doc, tu, font);
+    if (font.name.find("HancomEQN") != std::string::npos) {
+        for (auto& [code, u] : font.to_unicode)
+            if (uint32_t m = hancom_eqn_unicode(u)) u = m;
+        for (auto& [code, seq] : font.to_unicode_multi)
+            for (auto& u : seq)
+                if (uint32_t m = hancom_eqn_unicode(u)) u = m;
+    }
 
     // Simple fonts (everything but Type0 composite fonts) index glyphs with
     // single-byte codes, whatever the ToUnicode CMap's codespacerange claims.
