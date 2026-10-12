@@ -20,8 +20,10 @@ package com.jiran.jdoc;
  */
 public final class Options {
 
-    /** Render tables as markdown tables. */
+    /** Render tables as markdown tables; false keeps their layout (aligned columns). */
     public boolean tables = true;
+    /** Text format only: read multi-column pages column by column; false keeps the page's physical lines (PDF). */
+    public boolean columns = true;
     /** Extract images embedded in the document. */
     public boolean images = true;
     /** Image output directory; null keeps images in memory. */
@@ -52,6 +54,8 @@ public final class Options {
     // ── fluent setters ────────────────────────────────────────
 
     public Options tables(boolean v) { this.tables = v; return this; }
+
+    public Options columns(boolean v) { this.columns = v; return this; }
 
     public Options images(boolean v) { this.images = v; return this; }
 
@@ -95,6 +99,7 @@ public final class Options {
 
         JdocLibrary.JDocOptions o = new JdocLibrary.JDocOptions();
         o.tables = opts.tables ? 1 : 0;
+        o.columns = opts.columns ? 1 : 0;
         o.images = opts.images ? 1 : 0;
         o.image_dir = o.retain(opts.imageDir);
         o.image_ref_prefix = o.retain(opts.imageRefPrefix);

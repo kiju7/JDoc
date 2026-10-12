@@ -1,6 +1,7 @@
 // test_office.cpp - Basic tests for Office document to Markdown conversion
 // License: MIT
 
+#include "jdoc/jdoc.h"
 #include "jdoc/office.h"
 #include "jdoc/archive.h"
 #include "jdoc/detect.h"
@@ -1972,6 +1973,52 @@ void test_markdown_and_chunk_apis_agree() {
     TEST_END
 }
 
+void test_table_and_image_options() {
+    std::cerr << "\nTables off and unsaved images:\n";
+
+    TEST(markdown_tables_to_layout)
+        const std::string md =
+            "Intro\n\n| 구분 | Value |\n| --- | --- |\n| 중앙공원 | 42 |\n\nAfter | not a table\n";
+        const std::string out = jdoc::util::markdown_tables_to_layout(md);
+        ASSERT(out.find("```text\n구분      Value\n중앙공원  42\n```\n") != std::string::npos);
+        ASSERT(out.find("| 구분") == std::string::npos);
+        ASSERT(out.find("Intro") == 0);
+        ASSERT(out.find("After | not a table") != std::string::npos);
+    TEST_END
+
+    TEST(drop_image_refs)
+        const std::string t =
+            "Text\n\n![page1_img0](page1_img0.png)\n\nMore ![x](http://e.com/x.png) end\n[image: fig]\nLast\n";
+        const std::string out = jdoc::util::drop_image_refs(t);
+        ASSERT(out.find("page1_img0") == std::string::npos);
+        ASSERT(out.find("[image:") == std::string::npos);
+        ASSERT(out.find("![x](http://e.com/x.png)") != std::string::npos);
+        ASSERT(out.find("\n\n\n") == std::string::npos);
+        ASSERT(out.find("Last") != std::string::npos);
+    TEST_END
+
+    // An HTML table with tables off keeps its cells as a layout block; an
+    // embedded (data URI) image with no image_dir is neither saved nor
+    // linked, while a remote image stays as the author linked it.
+    TEST(html_tables_off_and_images)
+        const std::string html =
+            "<html><body><p>Before</p>"
+            "<table><tr><th>Name</th><th>Score</th></tr>"
+            "<tr><td>Kim</td><td>90</td></tr></table>"
+            "<img src=\"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==\" alt=\"dot\">"
+            "<img src=\"https://example.com/remote.png\" alt=\"remote\">"
+            "</body></html>";
+        jdoc::ConvertOptions o;
+        o.tables = false;
+        const std::string md = jdoc::convert(html.data(), html.size(), "t.html", o);
+        ASSERT(md.find("```text") != std::string::npos);
+        ASSERT(md.find("| Name") == std::string::npos);
+        ASSERT(md.find("Kim") != std::string::npos && md.find("90") != std::string::npos);
+        ASSERT(md.find("![dot]") == std::string::npos);
+        ASSERT(md.find("https://example.com/remote.png") != std::string::npos);
+    TEST_END
+}
+
 int main() {
     std::cerr << "=== jdoc office tests ===\n\n";
 
@@ -1997,6 +2044,7 @@ int main() {
     test_html_images();
     test_table_display_width();
     test_pptx_linebreak();
+    test_table_and_image_options();
 
     std::cerr << "\n=== Results: " << tests_passed << " passed, "
               << tests_failed << " failed ===\n";

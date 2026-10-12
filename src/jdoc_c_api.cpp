@@ -30,6 +30,7 @@ static jdoc::ConvertOptions to_cpp_opts(const JDocOptions* opts) {
     jdoc::ConvertOptions o;
     if (!opts) return o;
     o.tables = (opts->tables != 0);
+    o.columns = (opts->columns != 0);
     o.images = (opts->images != 0);
     if (opts->image_dir)
         o.image_dir = opts->image_dir;
@@ -46,7 +47,7 @@ static jdoc::ConvertOptions to_cpp_opts(const JDocOptions* opts) {
         } else if (opts->format[0] != '\0' &&
                    strcmp(opts->format, "markdown") != 0) {
             throw std::invalid_argument(
-                "format must be markdown, text, plaintext, or plain");
+                "format must be markdown or text");
         }
     }
     // Archive limits: 0 keeps the library default; negative disables the
@@ -278,6 +279,7 @@ extern "C" {
 JDocOptions jdoc_default_options(void) {
     JDocOptions o = {};
     o.tables = 1;
+    o.columns = 1;
     o.images = 1;
     o.min_image_size = 50;
     return o;

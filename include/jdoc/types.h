@@ -80,7 +80,15 @@ struct ArchiveLimits {
 
 struct ConvertOptions {
     std::vector<int> pages;
+    // Tables as markdown tables. Off, a table keeps its layout instead: a
+    // fenced block of space-aligned columns in markdown, aligned columns in
+    // text. Its text is never dropped.
     bool tables = true;
+    // Plain text (format PLAINTEXT) of multi-column pages (PDF) reads column
+    // by column. Off, every line keeps the page's physical row across the
+    // columns, as `pdftotext -layout` prints it. Markdown always reads
+    // column by column; tabular regions keep their layout there regardless.
+    bool columns = true;
     bool page_chunks = false;
     bool images = true;
     std::string image_dir;

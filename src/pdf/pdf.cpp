@@ -961,7 +961,9 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
 
         // Extract text lines
         bool plaintext = (opts.format == OutputFormat::PLAINTEXT);
-        bool need_tables = opts.tables && !plaintext;
+        // Tables off still finds them in markdown: their regions become
+        // layout blocks (below), not prose with the columns glued together.
+        bool need_tables = !plaintext;
         bool need_graphics = need_tables || opts.images;
 
         ContentParseOptions parse_options;
@@ -998,9 +1000,11 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
         }
         result.all_lines[p] = chars_to_lines(parse_result.chars, &result.col_boundaries[p],
                                              &ruled_boxes);
+        // Columns off (ConvertOptions::columns, plain text only) keeps the
+        // page's physical lines across the gutter.
         if (plaintext)
-            result.layout_text[p] = layout_page_text(parse_result.chars,
-                                                     result.col_boundaries[p]);
+            result.layout_text[p] = layout_page_text(
+                parse_result.chars, opts.columns ? result.col_boundaries[p] : 0.0);
 
         // Extract annotations (text notes, links)
         result.all_annots[p] = extract_annotations(doc, page_obj, page_h, initial_ctm);
@@ -2183,6 +2187,34 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
                     discard_image_payload(img);
                 }
             }
+        }
+
+        // Tables off: each table region is a layout block of its glyphs,
+        // laid out on a grid of its own, in place of the markdown table. The
+        // tables stayed until now for the image pass, which keeps a table's
+        // rules out of the figures.
+        if (need_tables && !opts.tables) {
+            for (const auto& t : result.all_tables[p]) {
+                LayoutFallback fb;
+                fb.x0 = std::min(t.x0, t.x1);
+                fb.x1 = std::max(t.x0, t.x1);
+                fb.y0 = std::min(t.y0, t.y1);
+                fb.y1 = std::max(t.y0, t.y1);
+                std::vector<TextChar> inside;
+                for (const auto& ch : parse_result.chars) {
+                    double cx = (ch.left + ch.right) / 2, cy = (ch.top + ch.bot) / 2;
+                    if (ch.rot == 0 && cx >= fb.x0 - 1 && cx <= fb.x1 + 1 &&
+                        cy >= fb.y0 - 1 && cy <= fb.y1 + 1)
+                        inside.push_back(ch);
+                }
+                if (inside.empty()) continue;
+                fb.text = layout_page_text(inside, 0.0);
+                while (!fb.text.empty() && fb.text.back() == '\n') fb.text.pop_back();
+                fb.text += '\n';
+                result.all_fallbacks[p].push_back(std::move(fb));
+            }
+            result.all_tables[p].clear();
+            result.lead_grids[p] = TableData{};
         }
 
         // Set after the image pipeline: the per-attempt diag resets above must

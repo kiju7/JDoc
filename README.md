@@ -54,11 +54,12 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j
 ```bash
 jdoc input.pdf                              # 마크다운을 stdout으로 출력
 jdoc input.pdf output.md                    # 파일로 저장
-jdoc input.docx --format text               # 일반 텍스트 출력
+jdoc input.docx --format text               # 일반 텍스트 출력 (배치 보존)
+jdoc input.pdf --format text --no-columns   # 다단을 나누지 않고 원본 줄 그대로
+jdoc input.pdf --no-tables                  # 표를 마크다운 표 대신 열 맞춘 배치 블록으로
 jdoc input.pdf --pages 0,1,2                # 페이지 선택 (0부터 시작)
 jdoc input.pdf --chunks                     # 페이지별 출력
-jdoc input.pdf --images ./imgs              # 기본 추출 이미지를 디스크에도 저장
-jdoc input.pdf --no-images                   # 이미지 추출 비활성화
+jdoc input.pdf --images ./imgs              # 이미지를 저장하고 링크 (없으면 이미지 링크 없음)
 jdoc input.pdf --images ./imgs --min-image-size 100   # 100px 미만 이미지 제외
 jdoc input.pdf --images ./imgs --min-image-size 0     # 모든 이미지 추출
 
@@ -249,13 +250,14 @@ CLI는 각 환경의 관례에 맞는 대응 필드·플래그를 제공한다.
 | 옵션 | 기본값 | 설명 | CLI |
 |---|---|---|---|
 | `pages` | 전체 | 추출할 페이지 번호 목록 (0부터 시작) | `--pages 0,1,2` |
-| `tables` | `true` | 표를 마크다운 표로 추출 | `--no-tables` (비활성화) |
+| `tables` | `true` | 표를 마크다운 표로 추출. `false`면 표 내용을 열 맞춘 배치 블록(```` ```text ````)으로 출력 | `--no-tables` |
+| `columns` | `true` | `text` 형식에서 다단 페이지를 단별로 읽음. `false`면 원본 줄 그대로(`pdftotext -layout`과 같음). 마크다운에는 영향 없음 | `--no-columns` |
 | `page_chunks` | `false` | 페이지/슬라이드/시트별 청크로 출력 | `--chunks` |
-| `images` | `true` | 이미지 추출 | `--no-images` (비활성화) |
-| `image_dir` | `""` (메모리 유지) | 이미지 저장 디렉토리. 빈 값이면 바이트로만 반환 | `--images DIR` |
+| `images` | `true` | 이미지 추출 | — |
+| `image_dir` | `""` | 이미지 저장 디렉토리. 빈 값이면 본문에 이미지 링크를 넣지 않음. 문자열 변환(`convert`)은 이미지를 추출하지 않고, 페이지별 변환(`convert_pages`)은 이미지를 메모리로만 돌려줌 | `--images DIR` |
 | `image_ref_prefix` | `""` | 마크다운 이미지 참조 경로 앞에 붙일 접두사 | — |
 | `min_image_size` | `50` | 문서에 포함된 이미지 중 N×N px 미만 제외 (`0` = 필터 없음). 이미지 파일 자체를 변환하는 경우에는 적용되지 않음 | `--min-image-size N` |
-| `format` | `markdown` | `markdown` 또는 `text` | `--format F` |
+| `format` | `markdown` | `markdown` 또는 `text` (예전 이름 `plaintext`, `--text`, `--plaintext`는 경고와 함께 계속 받음) | `--format F` |
 
 ### 아카이브 한도 (`ConvertOptions::archive`)
 

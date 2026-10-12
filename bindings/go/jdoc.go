@@ -161,7 +161,8 @@ func goFormatInfo(info *C.JDocFormatInfo) FormatInfo {
 // and -1 disables that guard entirely. Only disable a guard for trusted input
 // — archive-bomb protection goes with it.
 type Options struct {
-	Tables         bool   // render tables as markdown tables
+	Tables         bool   // render tables as markdown tables; false keeps their layout
+	Columns        bool   // text format only: false keeps a page's physical lines across columns
 	Images         bool   // extract images
 	ImageDir       string // where to write images; "" keeps them in memory
 	ImageRefPrefix string // prepended to image references in the markdown
@@ -180,7 +181,7 @@ type Options struct {
 // DefaultOptions returns the library defaults: tables and image extraction on,
 // markdown output, all pages, 50px minimum image size, standard archive limits.
 func DefaultOptions() Options {
-	return Options{Tables: true, Images: true, MinImageSize: 50}
+	return Options{Tables: true, Columns: true, Images: true, MinImageSize: 50}
 }
 
 func cbool(b bool) C.int {
@@ -206,6 +207,7 @@ func (o Options) toC() (*C.JDocOptions, func()) {
 	}
 
 	c.tables = cbool(o.Tables)
+	c.columns = cbool(o.Columns)
 	c.images = cbool(o.Images)
 	c.image_dir = cstr(o.ImageDir)
 	c.image_ref_prefix = cstr(o.ImageRefPrefix)
@@ -373,13 +375,13 @@ func convertArchiveWith(path string, opts *C.JDocOptions) ([]Member, error) {
 
 // Image is one image extracted from a page.
 type Image struct {
-	PageNumber   int
-	Name         string
-	Width        uint
-	Height       uint
-	Components   int
-	Data         []byte // encoded image bytes (jpeg/png/bmp)
-	Pixels       []byte // raw pixels (width * height * components), when retained
+	PageNumber int
+	Name       string
+	Width      uint
+	Height     uint
+	Components int
+	Data       []byte // encoded image bytes (jpeg/png/bmp)
+	Pixels     []byte // raw pixels (width * height * components), when retained
 	// Format is a format name, not a file extension: the file is written with
 	// the extension the source container declared, so "jpeg" lands as .jpg and
 	// a .webp part reports "bin". Never build a filename from it.
@@ -387,7 +389,7 @@ type Image struct {
 	// SavedPath is the file that was written, when ImageDir was set — the only
 	// correct source for the name on disk, collision suffix included. Empty
 	// when nothing was written, and the bytes are then in Data.
-	SavedPath string
+	SavedPath    string
 	EmbeddedText string // text recovered from an EMF/WMF image
 }
 

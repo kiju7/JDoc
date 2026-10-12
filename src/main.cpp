@@ -1,5 +1,6 @@
 // jdoc CLI - Universal document to Markdown converter
-// Usage: jdoc <input_file> [output.md] [--pages 0,1,2] [--no-tables] [--chunks] [--images DIR]
+// Usage: jdoc <input_file> [output.md] [--format markdown|text] [--no-tables]
+//            [--no-columns] [--pages 0,1,2] [--chunks] [--images DIR]
 // Supports: PDF, DOCX, XLSX, PPTX, DOC, XLS, PPT, RTF, HWP, HWPX
 
 #include "jdoc/jdoc.h"
@@ -21,13 +22,16 @@ void print_usage(const char* prog) {
               << "  Images (extracted as-is with --images): JPEG, PNG, GIF, BMP, WEBP, TIFF\n"
               << "  Archives (parsed in memory, no extraction): ZIP, GZ, BZ2, TAR, TAR.GZ, TAR.BZ2, 7Z, ALZ, EGG, RAR\n"
               << "\nOptions:\n"
-              << "  --pages N,N,N   Page numbers (0-based, comma-separated)\n"
-              << "  --no-tables     Disable table detection\n"
-              << "  --chunks        Output per-page/slide/sheet chunks\n"
-              << "  --images DIR    Save extracted images to directory\n"
-              << "  --no-images     Disable image extraction (enabled by default)\n"
-              << "  --min-image-size N  Skip images smaller than NxN pixels (default: 50, 0=no filter)\n"
               << "  --format F      Output format: markdown (default) or text\n"
+              << "  --no-tables     Keep tables as laid out (aligned columns) instead of\n"
+              << "                  markdown tables\n"
+              << "  --no-columns    With --format text: do not split multi-column pages\n"
+              << "                  into columns; keep the page's physical lines (PDF)\n"
+              << "  --pages N,N,N   Page numbers (0-based, comma-separated)\n"
+              << "  --chunks        Output per-page/slide/sheet chunks\n"
+              << "  --images DIR    Save images to DIR and link them in the output\n"
+              << "                  (without it no images are extracted or linked)\n"
+              << "  --min-image-size N  Skip images smaller than NxN pixels (default: 50, 0=no filter)\n"
               << "\nArchive options:\n"
               << "  --max-depth N        Max nested-archive depth (default: 3, -1 = unlimited)\n"
               << "  --max-member-mb N    Per-member uncompressed cap in MiB (default: 512, -1 = unlimited)\n"
@@ -79,6 +83,8 @@ int main(int argc, char* argv[]) {
                 return 0;
             } else if (arg == "--pages") {
                 opts.pages = parse_pages(value());
+            } else if (arg == "--no-columns") {
+                opts.columns = false;
             } else if (arg == "--no-tables") {
                 opts.tables = false;
             } else if (arg == "--chunks") {
@@ -98,11 +104,15 @@ int main(int argc, char* argv[]) {
                 opts.min_image_size = static_cast<unsigned>(size);
             } else if (arg == "--format") {
                 std::string format = value();
+                if (format == "plaintext")
+                    std::cerr << "Warning: --format plaintext is deprecated; use --format text\n";
                 if (format == "text" || format == "plaintext")
                     opts.format = jdoc::OutputFormat::PLAINTEXT;
                 else if (format != "markdown")
-                    throw std::invalid_argument("Invalid --format: " + format);
+                    throw std::invalid_argument("Invalid --format: " + format +
+                                                " (markdown or text)");
             } else if (arg == "--plaintext" || arg == "--text") {
+                std::cerr << "Warning: " << arg << " is deprecated; use --format text\n";
                 opts.format = jdoc::OutputFormat::PLAINTEXT;
             } else if (arg == "--max-depth") {
                 opts.archive.max_depth = std::stoi(value());
@@ -153,6 +163,8 @@ int main(int argc, char* argv[]) {
         std::cerr << "Error: No input file specified.\n";
         return 1;
     }
+    if (!opts.columns && opts.format != jdoc::OutputFormat::PLAINTEXT)
+        std::cerr << "Warning: --no-columns applies to --format text only\n";
 
     // Compute image reference prefix: relative path from md file dir to image dir
     if (opts.images && !opts.image_dir.empty()) {

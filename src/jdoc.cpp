@@ -394,6 +394,48 @@ static PageChunk image_to_chunk(const uint8_t* data, size_t size,
     return chunk;
 }
 
+// Tables off (ConvertOptions::tables) keeps every table's text with its
+// layout. PDF lays the table region out from its glyphs (pdf.cpp); the other
+// formats know their tables as cells, so they convert with tables on and
+// each markdown table becomes a fenced block of aligned columns. Plain text
+// already prints tables as aligned columns.
+bool tables_as_layout(FileFormat fmt, const ConvertOptions& opts) {
+    return !opts.tables && fmt != FileFormat::PDF;
+}
+
+std::string layout_tables(std::string md, const ConvertOptions& opts) {
+    if (opts.format == OutputFormat::MARKDOWN)
+        md = util::markdown_tables_to_layout(md);
+    return md;
+}
+
+// Images reach the page only when they are written somewhere: with no
+// image_dir a reference would name a file that does not exist. The string
+// APIs skip extracting them altogether; the chunk APIs still hand the images
+// over in memory (PageChunk::images) but drop their references from the text.
+bool images_unsaved(const ConvertOptions& opts) {
+    return opts.images && opts.image_dir.empty();
+}
+
+// The chunk APIs' post-pass: options to run the format's converter with, and
+// what to do to each chunk it yields.
+struct ChunkPass {
+    ConvertOptions run;
+    bool layout = false, drop_refs = false;
+    ChunkPass(FileFormat fmt, const ConvertOptions& opts) : run(opts) {
+        layout = tables_as_layout(fmt, opts);
+        drop_refs = images_unsaved(opts);
+        if (layout) run.tables = true;
+    }
+    void apply(PageChunk& c, const ConvertOptions& opts) const {
+        if (layout) {
+            c.text = layout_tables(std::move(c.text), opts);
+            c.tables.clear();
+        }
+        if (drop_refs) c.text = util::drop_image_refs(c.text);
+    }
+};
+
 } // anonymous namespace
 
 // Extension → format, shared by path- and memory-based detection.
@@ -561,6 +603,16 @@ std::string convert_from_memory_as(FileFormat fmt,
                                    const uint8_t* data, size_t size,
                                    const std::string& name_hint,
                                    const ConvertOptions& opts) {
+    if (images_unsaved(opts)) {
+        ConvertOptions o = opts;
+        o.images = false;
+        return convert_from_memory_as(fmt, data, size, name_hint, o);
+    }
+    if (tables_as_layout(fmt, opts)) {
+        ConvertOptions o = opts;
+        o.tables = true;
+        return layout_tables(convert_from_memory_as(fmt, data, size, name_hint, o), opts);
+    }
     switch (fmt) {
         case FileFormat::PDF:    return pdf_to_markdown_mem(data, size, opts);
         case FileFormat::OFFICE: return office_to_markdown_mem(data, size, name_hint, opts);
@@ -582,7 +634,13 @@ std::string convert_from_memory_as(FileFormat fmt,
 
 std::string convert(const std::string& file_path, ConvertOptions opts) {
     validate_options(opts);
+    if (images_unsaved(opts)) opts.images = false;
     auto fmt = detect_format(file_path);
+    if (tables_as_layout(fmt, opts)) {
+        ConvertOptions o = opts;
+        o.tables = true;
+        return layout_tables(convert(file_path, o), opts);
+    }
     switch (fmt) {
         case FileFormat::PDF:    return pdf_to_markdown(file_path, opts);
         case FileFormat::OFFICE: return office_to_markdown(file_path, opts);
@@ -617,10 +675,9 @@ std::string convert(const void* data, size_t size, const std::string& name_hint,
                                name_hint, opts);
 }
 
-std::vector<PageChunk> convert_chunks(const std::string& file_path,
-                                       ConvertOptions opts) {
-    validate_options(opts);
-    auto fmt = detect_format(file_path);
+static std::vector<PageChunk> convert_chunks_impl(FileFormat fmt,
+                                                  const std::string& file_path,
+                                                  const ConvertOptions& opts) {
     switch (fmt) {
         case FileFormat::PDF:    return pdf_to_markdown_chunks(file_path, opts);
         case FileFormat::OFFICE: return office_to_markdown_chunks(file_path, opts);
@@ -652,10 +709,18 @@ std::vector<PageChunk> convert_chunks(const std::string& file_path,
     }
 }
 
-void for_each_chunk(const std::string& file_path, const ConvertOptions& opts,
-                    const PageSink& sink) {
+std::vector<PageChunk> convert_chunks(const std::string& file_path,
+                                       ConvertOptions opts) {
     validate_options(opts);
     auto fmt = detect_format(file_path);
+    const ChunkPass pass(fmt, opts);
+    auto chunks = convert_chunks_impl(fmt, file_path, pass.run);
+    for (auto& c : chunks) pass.apply(c, opts);
+    return chunks;
+}
+
+static void for_each_chunk_impl(FileFormat fmt, const std::string& file_path,
+                                const ConvertOptions& opts, const PageSink& sink) {
     switch (fmt) {
         case FileFormat::PDF:    pdf_to_markdown_chunks_stream(file_path, opts, sink); return;
         case FileFormat::OFFICE: office_to_markdown_chunks_stream(file_path, opts, sink); return;
@@ -690,12 +755,20 @@ void for_each_chunk(const std::string& file_path, const ConvertOptions& opts,
     }
 }
 
-void for_each_chunk(const void* data, size_t size, const std::string& name_hint,
-                    const ConvertOptions& opts, const PageSink& sink) {
-    validate_memory_input(data, size);
+void for_each_chunk(const std::string& file_path, const ConvertOptions& opts,
+                    const PageSink& sink) {
     validate_options(opts);
-    const uint8_t* bytes = static_cast<const uint8_t*>(data);
-    auto fmt = detect_format_mem(bytes, size, name_hint);
+    auto fmt = detect_format(file_path);
+    const ChunkPass pass(fmt, opts);
+    for_each_chunk_impl(fmt, file_path, pass.run, [&](PageChunk&& c) {
+        pass.apply(c, opts);
+        return sink(std::move(c));
+    });
+}
+
+static void for_each_chunk_impl(FileFormat fmt, const uint8_t* bytes, size_t size,
+                                const std::string& name_hint,
+                                const ConvertOptions& opts, const PageSink& sink) {
     switch (fmt) {
         case FileFormat::PDF:
             pdf_to_markdown_chunks_mem_stream(bytes, size, opts, sink);
@@ -735,6 +808,19 @@ void for_each_chunk(const void* data, size_t size, const std::string& name_hint,
     }
 }
 
+void for_each_chunk(const void* data, size_t size, const std::string& name_hint,
+                    const ConvertOptions& opts, const PageSink& sink) {
+    validate_memory_input(data, size);
+    validate_options(opts);
+    const uint8_t* bytes = static_cast<const uint8_t*>(data);
+    auto fmt = detect_format_mem(bytes, size, name_hint);
+    const ChunkPass pass(fmt, opts);
+    for_each_chunk_impl(fmt, bytes, size, name_hint, pass.run, [&](PageChunk&& c) {
+        pass.apply(c, opts);
+        return sink(std::move(c));
+    });
+}
+
 std::vector<PageChunk> convert_chunks(const void* data, size_t size,
                                       const std::string& name_hint,
                                       ConvertOptions opts) {
@@ -755,6 +841,7 @@ bool is_archive_file(const std::string& file_path) {
 void convert_archive(const std::string& file_path, const MemberCallback& cb,
                      ConvertOptions opts) {
     validate_options(opts);
+    if (images_unsaved(opts)) opts.images = false;
     auto fmt = detect_format(file_path);
 
     if (!is_archive_format(fmt)) {

@@ -352,6 +352,113 @@ inline std::string format_padded_markdown_table(
     return md;
 }
 
+// Markdown tables in `md` as layout blocks: each table (a run of '|' lines
+// whose second line is the header separator) becomes a fenced "text" block
+// of the same cells in space-aligned columns (render_text_table). Used when
+// tables are off: the table's text and its columns stay, the markdown table
+// syntax goes. Everything else passes through unchanged.
+inline std::string markdown_tables_to_layout(const std::string& md) {
+    std::string out;
+    out.reserve(md.size());
+    size_t i = 0, len = md.size();
+    auto line_at = [&](size_t s) {
+        size_t e = md.find('\n', s);
+        return md.substr(s, (e == std::string::npos ? len : e) - s);
+    };
+    while (i < len) {
+        size_t e = md.find('\n', i);
+        size_t next = e == std::string::npos ? len : e + 1;
+        if (md[i] == '|' && next < len && md[next] == '|' &&
+            is_markdown_separator_row(line_at(next))) {
+            std::vector<std::string> block;
+            while (i < len && md[i] == '|') {
+                block.push_back(line_at(i));
+                size_t f = md.find('\n', i);
+                i = f == std::string::npos ? len : f + 1;
+            }
+            std::string grid = render_text_table(block);
+            size_t ticks = 3;
+            for (size_t run = 0, k = 0; k < grid.size(); k++) {
+                run = grid[k] == '`' ? run + 1 : 0;
+                ticks = std::max(ticks, run + 1);
+            }
+            std::string fence(ticks, '`');
+            out += fence + "text\n" + grid + fence + "\n";
+            continue;
+        }
+        out.append(md, i, next - i);
+        i = next;
+    }
+    return out;
+}
+
+// Text without references to images that were never written anywhere: the
+// "![alt](ref)" a parser emits for an extracted image, and the
+// "[image: alt]" plain text makes of it. A reference to a URL ("://") names a
+// file outside the document and stays. A line that held nothing but such
+// references goes, and so does the blank line it leaves doubled; blank lines
+// the document itself had stay.
+inline std::string drop_image_refs(const std::string& text) {
+    auto strip_line = [](const std::string& line, bool& removed) {
+        std::string out;
+        size_t i = 0, len = line.size();
+        while (i < len) {
+            if (line.compare(i, 2, "![") == 0) {
+                size_t close = line.find("](", i + 2);
+                size_t end = close == std::string::npos ? std::string::npos
+                                                        : line.find(')', close + 2);
+                if (end != std::string::npos &&
+                    line.substr(close + 2, end - close - 2).find("://") == std::string::npos) {
+                    i = end + 1;
+                    removed = true;
+                    continue;
+                }
+            }
+            if (line.compare(i, 8, "[image: ") == 0) {
+                size_t end = line.find(']', i + 8);
+                if (end != std::string::npos) {
+                    i = end + 1;
+                    removed = true;
+                    continue;
+                }
+            }
+            out += line[i++];
+        }
+        return out;
+    };
+    auto blank = [](const std::string& l) {
+        return l.find_first_not_of(" \t\r") == std::string::npos;
+    };
+    std::vector<std::string> lines;
+    for (size_t pos = 0; pos <= text.size();) {
+        size_t nl = text.find('\n', pos);
+        if (nl == std::string::npos) nl = text.size();
+        lines.push_back(text.substr(pos, nl - pos));
+        pos = nl + 1;
+    }
+    std::vector<std::string> kept;
+    bool skip_blank = false;
+    for (auto& line : lines) {
+        bool removed = false;
+        std::string rest = strip_line(line, removed);
+        if (removed && blank(rest)) {
+            // The line was only references: drop it, and the blank line after
+            // it when one already stands before it.
+            skip_blank = !kept.empty() && blank(kept.back());
+            continue;
+        }
+        if (skip_blank && blank(rest)) { skip_blank = false; continue; }
+        skip_blank = false;
+        kept.push_back(removed ? rest : line);
+    }
+    std::string out;
+    for (size_t i = 0; i < kept.size(); i++) {
+        if (i) out += '\n';
+        out += kept[i];
+    }
+    return out;
+}
+
 // Strip markdown formatting from text, returning plain text.
 // Removes: # headings, **bold**, *italic*, ![img](ref), --- separators; table
 // blocks become aligned columns (render_text_table).

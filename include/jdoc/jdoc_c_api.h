@@ -11,7 +11,8 @@ extern "C" {
  * valid default (tables would be off). */
 typedef struct {
     /* conversion */
-    int tables;              /* 1 = tables as markdown tables (default 1) */
+    int tables;              /* 1 = tables as markdown tables (default 1);
+                              * 0 = tables keep their layout (aligned columns) */
     int images;              /* 0 = skip images, 1 = extract (default 1) */
     const char* image_dir;           /* image output directory; NULL = keep in memory */
     const char* image_ref_prefix;    /* prepended to image refs in markdown; NULL = none */
@@ -28,6 +29,10 @@ typedef struct {
     int max_entries;                 /* members visited; default 200000 */
     int max_ratio;                   /* bomb-suspect compression ratio; default 10000 */
     int include_unsupported;         /* 1 = report unsupported members */
+    /* Appended after the archive limits so the fields above keep their
+     * offsets. Text format only: 1 = read multi-column pages column by
+     * column (default 1); 0 = keep the page's physical lines (PDF). */
+    int columns;
 } JDocOptions;
 
 /* Returns default options: images on, markdown, all pages, min_size=50. */

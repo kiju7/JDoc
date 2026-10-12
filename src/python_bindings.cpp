@@ -32,7 +32,7 @@ static jdoc::OutputFormat parse_output_format(const std::string& format) {
     if (format == "text" || format == "plaintext" || format == "plain")
         return jdoc::OutputFormat::PLAINTEXT;
     throw std::invalid_argument(
-        "format must be 'markdown', 'text', 'plaintext', or 'plain'");
+        "format must be 'markdown' or 'text'");
 }
 
 // Lazy page iterator backing convert_pages_stream(). A background thread runs
@@ -279,7 +279,7 @@ PYBIND11_MODULE(_jdoc, m) {
     m.def("convert", [](const std::string& file_path,
                          const std::string& format,
                          const std::vector<int>& pages,
-                         bool tables,
+                         bool tables, bool columns,
                          bool images,
                          const std::string& image_dir,
                          const std::string& image_ref_prefix,
@@ -287,6 +287,7 @@ PYBIND11_MODULE(_jdoc, m) {
         jdoc::ConvertOptions opts;
         opts.pages = pages;
         opts.tables = tables;
+        opts.columns = columns;
         opts.images = images;
         opts.image_dir = image_dir;
         opts.image_ref_prefix = image_ref_prefix;
@@ -297,7 +298,7 @@ PYBIND11_MODULE(_jdoc, m) {
     py::arg("file_path"),
     py::arg("format") = "markdown",
     py::arg("pages") = std::vector<int>{},
-    py::arg("tables") = true,
+    py::arg("tables") = true, py::arg("columns") = true,
     py::arg("images") = true,
     py::arg("image_dir") = "",
     py::arg("image_ref_prefix") = "",
@@ -307,8 +308,10 @@ PYBIND11_MODULE(_jdoc, m) {
 
 Args:
     file_path: Path to the document file (PDF, DOCX, XLSX, PPTX, DOC, XLS, PPT, RTF, HWP, HWPX)
-    format: Output format - "markdown" (default) or "text"/"plaintext"
+    format: Output format - "markdown" (default) or "text"
     pages: List of page numbers (0-based). Empty = all pages.
+    tables: True = markdown tables; False = tables keep their layout (aligned columns)
+    columns: format="text" only. True = read multi-column pages column by column; False = keep the page's physical lines (PDF)
     images: Whether to extract images
     image_dir: Directory to save extracted images (if empty, images kept in memory only)
     min_image_size: Skip images smaller than NxN pixels (default: 50, 0=no filter)
@@ -320,7 +323,7 @@ Returns:
     m.def("convert_pages", [](const std::string& file_path,
                                const std::string& format,
                                const std::vector<int>& pages,
-                               bool tables,
+                               bool tables, bool columns,
                                bool images,
                                const std::string& image_dir,
                                const std::string& image_ref_prefix,
@@ -329,6 +332,7 @@ Returns:
         jdoc::ConvertOptions opts;
         opts.pages = pages;
         opts.tables = tables;
+        opts.columns = columns;
         opts.images = images;
         opts.image_dir = image_dir;
         opts.image_ref_prefix = image_ref_prefix;
@@ -339,7 +343,7 @@ Returns:
     py::arg("file_path"),
     py::arg("format") = "markdown",
     py::arg("pages") = std::vector<int>{},
-    py::arg("tables") = true,
+    py::arg("tables") = true, py::arg("columns") = true,
     py::arg("images") = true,
     py::arg("image_dir") = "",
     py::arg("image_ref_prefix") = "",
@@ -349,8 +353,10 @@ Returns:
 
 Args:
     file_path: Path to the document file
-    format: Output format - "markdown" (default) or "text"/"plaintext"
+    format: Output format - "markdown" (default) or "text"
     pages: List of page numbers (0-based). Empty = all pages.
+    tables: True = markdown tables; False = tables keep their layout (aligned columns)
+    columns: format="text" only. True = read multi-column pages column by column; False = keep the page's physical lines (PDF)
     images: Whether to extract images (accessible via chunk.images)
     image_dir: Directory to save images (if empty, images available via ImageData.data bytes)
     min_image_size: Skip images smaller than NxN pixels (default: 50, 0=no filter)
@@ -369,7 +375,7 @@ Returns:
     m.def("convert_pages_stream", [](const std::string& file_path,
                                      const std::string& format,
                                      const std::vector<int>& pages,
-                                     bool tables,
+                                     bool tables, bool columns,
                                      bool images,
                                      const std::string& image_dir,
                                      const std::string& image_ref_prefix,
@@ -378,6 +384,7 @@ Returns:
         jdoc::ConvertOptions opts;
         opts.pages = pages;
         opts.tables = tables;
+        opts.columns = columns;
         opts.images = images;
         opts.image_dir = image_dir;
         opts.image_ref_prefix = image_ref_prefix;
@@ -390,7 +397,7 @@ Returns:
     py::arg("file_path"),
     py::arg("format") = "markdown",
     py::arg("pages") = std::vector<int>{},
-    py::arg("tables") = true,
+    py::arg("tables") = true, py::arg("columns") = true,
     py::arg("images") = true,
     py::arg("image_dir") = "",
     py::arg("image_ref_prefix") = "",
@@ -414,12 +421,13 @@ Yields:
     m.def("convert_pages_bytes_stream",
           [](py::bytes data, const std::string& name_hint,
              const std::string& format, const std::vector<int>& pages,
-             bool tables, bool images, const std::string& image_dir,
+             bool tables, bool columns, bool images, const std::string& image_dir,
              const std::string& image_ref_prefix, unsigned min_image_size,
              unsigned buffer_size) {
               jdoc::ConvertOptions opts;
               opts.pages = pages;
               opts.tables = tables;
+              opts.columns = columns;
               opts.images = images;
               opts.image_dir = image_dir;
               opts.image_ref_prefix = image_ref_prefix;
@@ -436,7 +444,7 @@ Yields:
           },
           py::arg("data"), py::arg("name_hint") = "",
           py::arg("format") = "markdown",
-          py::arg("pages") = std::vector<int>{}, py::arg("tables") = true,
+          py::arg("pages") = std::vector<int>{}, py::arg("tables") = true, py::arg("columns") = true,
           py::arg("images") = true, py::arg("image_dir") = "",
           py::arg("image_ref_prefix") = "", py::arg("min_image_size") = 50,
           py::arg("buffer_size") = 4,
@@ -476,7 +484,7 @@ Yields:
     m.def("convert_archive", [](const std::string& file_path,
                                  const std::string& format,
                                  const std::vector<int>& pages,
-                                 bool tables,
+                                 bool tables, bool columns,
                                  bool images,
                                  const std::string& image_dir,
                                  const std::string& image_ref_prefix,
@@ -492,6 +500,7 @@ Yields:
         opts.format = parse_output_format(format);
         opts.pages = pages;
         opts.tables = tables;
+        opts.columns = columns;
         opts.images = images;
         opts.image_dir = image_dir;
         opts.image_ref_prefix = image_ref_prefix;
@@ -512,7 +521,7 @@ Yields:
     py::arg("file_path"),
     py::arg("format") = "markdown",
     py::arg("pages") = std::vector<int>{},
-    py::arg("tables") = true,
+    py::arg("tables") = true, py::arg("columns") = true,
     py::arg("images") = true,
     py::arg("image_dir") = "",
     py::arg("image_ref_prefix") = "",
@@ -545,13 +554,14 @@ Returns:
 
     m.def("convert_bytes", [](py::bytes data, const std::string& name_hint,
                                const std::string& format,
-                               const std::vector<int>& pages, bool tables,
+                               const std::vector<int>& pages, bool tables, bool columns,
                                bool images, const std::string& image_dir,
                                const std::string& image_ref_prefix,
                                unsigned min_image_size) -> std::string {
         jdoc::ConvertOptions opts;
         opts.pages = pages;
         opts.tables = tables;
+        opts.columns = columns;
         opts.images = images;
         opts.image_dir = image_dir;
         opts.image_ref_prefix = image_ref_prefix;
@@ -566,7 +576,7 @@ Returns:
                              name_hint, opts);
     },
     py::arg("data"), py::arg("name_hint") = "", py::arg("format") = "markdown",
-    py::arg("pages") = std::vector<int>{}, py::arg("tables") = true,
+    py::arg("pages") = std::vector<int>{}, py::arg("tables") = true, py::arg("columns") = true,
     py::arg("images") = true, py::arg("image_dir") = "",
     py::arg("image_ref_prefix") = "", py::arg("min_image_size") = 50,
     "Convert a document held in bytes (no file I/O).");
@@ -574,11 +584,12 @@ Returns:
     m.def("convert_pages_bytes",
           [](py::bytes data, const std::string& name_hint,
              const std::string& format, const std::vector<int>& pages,
-             bool tables, bool images, const std::string& image_dir,
+             bool tables, bool columns, bool images, const std::string& image_dir,
              const std::string& image_ref_prefix, unsigned min_image_size) {
               jdoc::ConvertOptions opts;
               opts.pages = pages;
               opts.tables = tables;
+              opts.columns = columns;
               opts.images = images;
               opts.image_dir = image_dir;
               opts.image_ref_prefix = image_ref_prefix;
@@ -594,7 +605,7 @@ Returns:
           },
           py::arg("data"), py::arg("name_hint") = "",
           py::arg("format") = "markdown",
-          py::arg("pages") = std::vector<int>{}, py::arg("tables") = true,
+          py::arg("pages") = std::vector<int>{}, py::arg("tables") = true, py::arg("columns") = true,
           py::arg("images") = true, py::arg("image_dir") = "",
           py::arg("image_ref_prefix") = "", py::arg("min_image_size") = 50,
           "Convert an in-memory document to per-page chunks.");

@@ -1156,11 +1156,18 @@ int main(int argc, char* argv[]) {
             CHECK(count(md, "| Spain ") == 1);
             CHECK(md.find("Germany Spain") == std::string::npos);
 
+            // Tables off: each table keeps its layout as a fenced block, a
+            // row's cells on one line in column order, padded apart.
             jdoc::ConvertOptions no_tables;
             no_tables.tables = false;
             std::string plain = jdoc::pdf_to_markdown(fx, no_tables);
-            CHECK(plain.find("Small 3 2.8 0.5") != std::string::npos);
-            CHECK(plain.find("10 pm 25.2 25.9 0.7") != std::string::npos);
+            std::string squeezed;
+            for (char c : plain)
+                if (c != ' ' || squeezed.empty() || squeezed.back() != ' ') squeezed += c;
+            CHECK(plain.find("```text") != std::string::npos);
+            CHECK(plain.find("| Small") == std::string::npos);
+            CHECK(squeezed.find("Small 3 2.8 0.5") != std::string::npos);
+            CHECK(squeezed.find("10 pm 25.2 25.9 0.7") != std::string::npos);
         }
     }
 

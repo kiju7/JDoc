@@ -34,7 +34,8 @@ public interface JdocLibrary extends Library {
     @Structure.FieldOrder({"tables", "images", "image_dir", "image_ref_prefix",
                            "min_image_size", "pages", "page_count", "format",
                            "max_depth", "max_member_bytes", "max_total_bytes",
-                           "max_entries", "max_ratio", "include_unsupported"})
+                           "max_entries", "max_ratio", "include_unsupported",
+                           "columns"})
     class JDocOptions extends Structure {
         public int tables;
         public int images;
@@ -50,6 +51,7 @@ public interface JdocLibrary extends Library {
         public int max_entries;
         public int max_ratio;
         public int include_unsupported;
+        public int columns;
 
         // Native buffers behind the pointer fields above. Held here so they
         // stay alive as long as the struct does (JNA frees Memory once it
