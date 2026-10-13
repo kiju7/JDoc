@@ -2999,6 +2999,130 @@ static std::vector<BandCut> find_column_bands(
     return cut;
 }
 
+// Small glyphs set above or below the baseline of the word they touch
+// (exponents, footnote marks, citation numbers "[9]") moved onto that
+// word's baseline. Line grouping joins glyphs within 0.4 em, and a mark
+// raised a little more than that became a line of its own: "distH2" read
+// as "distH" under a stray line "2", "적용하였다[9]." as "적용하였다 ." under
+// a line "[9]". A run of such glyphs moves when
+//  - its first glyph touches a word at least a quarter larger on its left,
+//    or its last glyph touches one on its right;
+//  - the word's baseline lies 0.3 to 0.6 of the word's size away, and
+//    within the mark's own size (a mark closer to it already joins the
+//    word's line);
+//  - nothing on the run's own baseline touches it (then it is the end of a
+//    line set in a smaller size, not a mark);
+//  - no other glyph between the two baselines, or on the word's, sits over
+//    or under the run (a stacked fraction, limits over an operator, a small
+//    line above another).
+void settle_raised_marks(std::vector<TextChar>& chars) {
+    constexpr double kMarkMaxRatio = 0.8;    // mark size / word size
+    constexpr double kMarkMinShiftEm = 0.3;  // baseline shift, word em
+    constexpr double kMarkMaxShiftEm = 0.6;
+    constexpr double kMarkTouchEm = 0.5;     // gap to a neighbour, em
+    constexpr size_t kMarkMaxRun = 8;
+
+    std::vector<size_t> vis;
+    for (size_t i = 0; i < chars.size(); i++)
+        if (chars[i].rot == 0 && chars[i].unicode != ' ' && chars[i].unicode != 0xA0 &&
+            chars[i].font_size > 1)
+            vis.push_back(i);
+    if (vis.size() < 2) return;
+    std::sort(vis.begin(), vis.end(), [&](size_t a, size_t b) {
+        if (chars[a].y != chars[b].y) return chars[a].y > chars[b].y;
+        return chars[a].left < chars[b].left;
+    });
+    double max_fs = 0;
+    for (size_t i : vis) max_fs = std::max(max_fs, chars[i].font_size);
+
+    // The range of vis whose baselines lie within [y - below, y + above].
+    auto rows_near = [&](double y, double below, double above) {
+        auto lo = std::lower_bound(vis.begin(), vis.end(), y + above,
+                                   [&](size_t i, double v) { return chars[i].y > v; });
+        auto hi = std::upper_bound(vis.begin(), vis.end(), y - below,
+                                   [&](double v, size_t i) { return v > chars[i].y; });
+        return std::make_pair(lo, hi);
+    };
+    // The word glyph `mark` touches on its left (side < 0) or right.
+    auto touching = [&](const TextChar& mark, int side) -> const TextChar* {
+        double reach = std::min(kMarkMaxShiftEm * max_fs, mark.font_size);
+        auto [lo, hi] = rows_near(mark.y, reach, reach);
+        const TextChar* best = nullptr;
+        double best_gap = 1e18;
+        for (auto it = lo; it != hi; ++it) {
+            const TextChar& w = chars[*it];
+            if (mark.font_size > kMarkMaxRatio * w.font_size) continue;
+            double shift = std::abs(mark.y - w.y);
+            if (shift < kMarkMinShiftEm * w.font_size || shift > kMarkMaxShiftEm * w.font_size ||
+                shift > mark.font_size)
+                continue;
+            double gap = side < 0 ? mark.left - w.right : w.left - mark.right;
+            if (gap < -0.5 * (w.right - w.left) || gap > kMarkTouchEm * w.font_size) continue;
+            if (std::abs(gap) < best_gap) {
+                best_gap = std::abs(gap);
+                best = &w;
+            }
+        }
+        return best;
+    };
+
+    std::vector<std::pair<size_t, double>> moves;
+    for (size_t a = 0; a < vis.size();) {
+        // A run: glyphs on one baseline, of one size, each touching the next.
+        const TextChar& first = chars[vis[a]];
+        double fs = first.font_size;
+        size_t b = a + 1;
+        while (b < vis.size()) {
+            const TextChar& p = chars[vis[b - 1]];
+            const TextChar& q = chars[vis[b]];
+            double gap = q.left - p.right;
+            if (std::abs(q.y - first.y) > 0.05 * fs ||
+                std::abs(q.font_size - fs) > 0.05 * fs || gap > kMarkTouchEm * fs ||
+                gap < -0.5 * (p.right - p.left))
+                break;
+            b++;
+        }
+        size_t run_a = a, run_b = b;
+        a = b;
+        if (run_b - run_a > kMarkMaxRun) continue;
+        const TextChar& last = chars[vis[run_b - 1]];
+        // Neighbours on the run's own baseline, another size or not touching
+        // each other: whatever touches the run there makes it part of a line.
+        bool in_line = false;
+        if (run_a > 0) {
+            const TextChar& l = chars[vis[run_a - 1]];
+            double gap = first.left - l.right;
+            in_line = std::abs(l.y - first.y) <= 0.05 * fs && gap <= kMarkTouchEm * fs &&
+                      gap >= -0.5 * (l.right - l.left);
+        }
+        if (!in_line && run_b < vis.size()) {
+            const TextChar& r = chars[vis[run_b]];
+            double gap = r.left - last.right;
+            in_line = std::abs(r.y - first.y) <= 0.05 * fs && gap <= kMarkTouchEm * fs &&
+                      gap >= -0.5 * (last.right - last.left);
+        }
+        if (in_line) continue;
+        const TextChar* word = touching(first, -1);
+        if (!word) word = touching(last, +1);
+        if (!word) continue;
+        double run_left = first.left, run_right = last.right;
+        double wy = word->y, wfs = word->font_size;
+        auto [lo, hi] = rows_near(wy, kMarkMaxShiftEm * wfs, kMarkMaxShiftEm * wfs);
+        bool covered = false;
+        for (auto it = lo; it != hi && !covered; ++it) {
+            const TextChar& w = chars[*it];
+            if (std::abs(w.y - first.y) <= 0.05 * fs && w.font_size == fs &&
+                w.left >= run_left - 0.01 && w.right <= run_right + 0.01)
+                continue;  // the run itself
+            double overlap = std::min(run_right, w.right) - std::max(run_left, w.left);
+            covered = overlap > 0.5 * std::min(w.right - w.left, run_right - run_left);
+        }
+        if (covered) continue;
+        for (size_t k = run_a; k < run_b; k++) moves.emplace_back(vis[k], wy);
+    }
+    for (const auto& [i, y] : moves) chars[i].y = y;
+}
+
 // Group chars that all share one writing direction into lines. Callers reach
 // this through chars_to_lines(), which rotates each non-upright direction into
 // this function's frame first.

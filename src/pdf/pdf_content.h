@@ -528,6 +528,11 @@ constexpr double kWrittenSpaceMinEm = 0.02;
 // and draw outlined or shadowed headlines as a stack of copies; the copies
 // add ink, not text. The first glyph of each stack stays, in stream order.
 void drop_overprinted_chars(std::vector<TextChar>& chars);
+
+// Moves exponents, footnote marks and citation numbers set off the baseline
+// onto the baseline of the word they touch (definition explains when).
+void settle_raised_marks(std::vector<TextChar>& chars);
+
 // Append one glyph's text; ligature presentation forms are spelt out.
 void append_glyph_text(std::string& out, uint32_t cp);
 // Whether a code point is a spacing accent (U+02DC small tilde, ...).

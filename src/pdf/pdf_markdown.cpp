@@ -364,7 +364,19 @@ static bool line_words_in_cells(const std::string& line_text,
             std::string tok = alnum_only(line_text.substr(i, j - i));
             if (tok.size() >= 2) {
                 total += tok.size();
-                if (cap.find(tok) != std::string::npos) {
+                bool hit = cap.find(tok) != std::string::npos;
+                // A footnote mark set on the word's baseline in the line
+                // ("경제성장률1)", "2024년e)") may sit in a cell of its own:
+                // the word without its trailing digits, or one lowercase
+                // letter, is the word the cell holds.
+                if (!hit) {
+                    size_t k = tok.size();
+                    while (k > 0 && tok[k - 1] >= '0' && tok[k - 1] <= '9') k--;
+                    if (k == tok.size() && tok[k - 1] >= 'a' && tok[k - 1] <= 'z') k--;
+                    hit = k >= 2 && k < tok.size() &&
+                          cap.find(tok.substr(0, k)) != std::string::npos;
+                }
+                if (hit) {
                     found += tok.size();
                     if (tok.size() >= 3) found_word = true;
                 }

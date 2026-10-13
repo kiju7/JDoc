@@ -998,7 +998,12 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
             for (auto& b : rule_stack_boxes(parse_result.segments, parse_result.chars, page_w))
                 ruled_boxes.push_back(b);
         }
-        result.all_lines[p] = chars_to_lines(parse_result.chars, &result.col_boundaries[p],
+        // Prose lines read raised marks on their word's baseline
+        // (settle_raised_marks). The table detectors keep the glyphs where
+        // they were drawn: they are tuned on those positions.
+        std::vector<TextChar> line_chars = parse_result.chars;
+        settle_raised_marks(line_chars);
+        result.all_lines[p] = chars_to_lines(line_chars, &result.col_boundaries[p],
                                              &ruled_boxes);
         // Columns off (ConvertOptions::columns, plain text only) keeps the
         // page's physical lines across the gutter.
