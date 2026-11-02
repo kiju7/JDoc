@@ -1272,7 +1272,92 @@ TableData build_table(const std::vector<double>& input_row_ys,
         }
         small_closed_grid = ruled_cells && evidence;
     }
-    if (!structural_form && meaningful_rows < ((small_closed_grid || boxed_two_row) ? 2 : 3)) {
+    // A single boxed row of two or more cells (a form's total line, a
+    // reference number box): rules above and below across its width, a
+    // rule down both edges and between every pair of cells, and text in
+    // every cell. A one-cell box (a notice) is not a table.
+    bool single_box = false;
+    if ((int)row_ys.size() == 2 && drawn_rules && n_cols >= 2 && n_rows == 1 &&
+        table.rows.size() == 1 && text_boundaries.empty() &&
+        level_coverage.size() == 2 && level_coverage[0] >= 0.9 &&
+        level_coverage[1] >= 0.9 && vline_total > 0 && vline_present == vline_total) {
+        single_box = true;
+        for (auto& cell : table.rows[0]) if (cell.empty()) single_box = false;
+        // A band of a larger table (a shaded row of a striped table) has
+        // rows of the same columns right above or below it: a line within
+        // one row height that sets text in two of the box's columns.
+        if (single_box) {
+            // Look only as far as the nearest rule across the box's columns:
+            // text past it belongs to another ruled table.
+            double rh = row_ys[1] - row_ys[0];
+            double up = row_ys[1] + rh, down = row_ys[0] - rh;
+            for (const auto& hl : h_lines) {
+                double hy = (hl.y0 + hl.y1) * 0.5;
+                double lo = std::min(hl.x0, hl.x1), hi = std::max(hl.x0, hl.x1);
+                if (hi <= col_xs.front() + 2 || lo >= col_xs.back() - 2) continue;
+                if (hy > row_ys[1] + 1.0 && hy < up) up = hy;
+                if (hy < row_ys[0] - 1.0 && hy > down) down = hy;
+            }
+            std::vector<std::pair<double, std::vector<bool>>> lines;
+            for (auto& ch : cache.chars) {
+                if (ch.unicode == ' ' || ch.unicode == 0xA0 || ch.unicode == '\t') continue;
+                bool near = (ch.y > row_ys[1] && ch.y < up) ||
+                            (ch.y < row_ys[0] && ch.y > down);
+                if (!near || ch.x < col_xs.front() || ch.x > col_xs.back()) continue;
+                int c = 0;
+                while (c + 1 < (int)col_xs.size() && ch.x > col_xs[c + 1]) ++c;
+                std::vector<bool>* hit = nullptr;
+                for (auto& l : lines)
+                    if (std::abs(l.first - ch.y) < 3.0) { hit = &l.second; break; }
+                if (!hit) { lines.push_back({ch.y, std::vector<bool>(n_cols, false)}); hit = &lines.back().second; }
+                if (c < n_cols) (*hit)[c] = true;
+            }
+            for (auto& l : lines) {
+                int cols_hit = 0;
+                for (bool b : l.second) cols_hit += b;
+                if (cols_hit >= 2) single_box = false;
+            }
+        }
+        // A section number boxed beside its title ("II | Education") is a
+        // numbered heading, not a row of data.
+        if (single_box && n_cols == 2) {
+            const std::string& first = table.rows[0][0];
+            size_t i = 0, chars = 0;
+            bool numeral = !first.empty();
+            while (i < first.size() && numeral) {
+                unsigned char c = first[i];
+                uint32_t cp; int len;
+                if (c < 0x80) { cp = c; len = 1; }
+                else if ((c >> 5) == 6) { cp = c & 0x1F; len = 2; }
+                else if ((c >> 4) == 14) { cp = c & 0x0F; len = 3; }
+                else { cp = c & 0x07; len = 4; }
+                for (int k = 1; k < len && i + k < first.size(); k++)
+                    cp = (cp << 6) | (first[i + k] & 0x3F);
+                i += len;
+                if (cp == ' ' || cp == '*') continue;   // markdown bold marks
+                ++chars;
+                bool ok = (cp >= '0' && cp <= '9') || cp == 'I' || cp == 'V' || cp == 'X' ||
+                          cp == '.' || cp == ')' || (cp >= 0x2160 && cp <= 0x217F) ||
+                          (cp >= 0x2460 && cp <= 0x24FF);
+                if (!ok) numeral = false;
+            }
+            if (numeral && chars <= 4) single_box = false;
+        }
+        double lo = row_ys[0], hi = row_ys[1];
+        for (double ex : {col_xs.front(), col_xs.back()}) {
+            double covered = 0;
+            for (auto& vl : v_lines) {
+                if (std::abs((vl.x0 + vl.x1) * 0.5 - ex) > 3.0) continue;
+                double a = std::max(lo, (double)std::min(vl.y0, vl.y1));
+                double b = std::min(hi, (double)std::max(vl.y0, vl.y1));
+                covered = std::max(covered, b - a);
+            }
+            if (covered < (hi - lo) * 0.8) single_box = false;
+        }
+    }
+    table.single_box = single_box;
+    if (!structural_form && !single_box &&
+        meaningful_rows < ((small_closed_grid || boxed_two_row) ? 2 : 3)) {
         table.rows.clear();
         table.too_sparse = true;
     }
@@ -2037,6 +2122,28 @@ static void detect_ruled_in_zone(
         return !connected[i] && i > 0 && i + 1 < n_levels - 1 &&
                framed[i - 1] && framed[i + 1];
     };
+    // Vertical rules that run through the rows above and below but stop at
+    // an interval holding no text leave white space between two ruled
+    // tables, not a row: a blank row of one grid keeps its rules running.
+    auto blank_between_grids = [&](int i) {
+        if (connected[i] || i == 0 || i + 1 >= n_levels - 1 ||
+            !connected[i - 1] || !connected[i + 1]) return false;
+        double y_lo = row_ys[i], y_hi = row_ys[i + 1];
+        double lo = 1e9, hi = -1e9;
+        for (auto& hl : h_lines) {
+            double hy = (hl.y0 + hl.y1) / 2.0;
+            if (std::abs(hy - y_lo) >= 4.0 && std::abs(hy - y_hi) >= 4.0) continue;
+            lo = std::min(lo, (double)std::min(hl.x0, hl.x1));
+            hi = std::max(hi, (double)std::max(hl.x0, hl.x1));
+        }
+        if (hi <= lo) return false;
+        for (auto& ch : cache.chars) {
+            if (ch.unicode == ' ' || ch.unicode == 0xA0 || ch.unicode == '\t') continue;
+            if (ch.x < lo || ch.x > hi) continue;
+            if (ch.y > y_lo + 2 && ch.y < y_hi - 2) return false;
+        }
+        return true;
+    };
 
     std::vector<std::vector<double>> table_groups;
     std::vector<double> current_group;
@@ -2050,12 +2157,13 @@ static void detect_ruled_in_zone(
         // Without the text check, stacked tables whose rules share the same
         // x-span get bridged across whole blocks of unrelated content.
         bool h_span_ok = x_overlap[i] && close_enough && !frame_break(i) &&
+                         !blank_between_grids(i) &&
                          bridge_gap_ok(row_ys[i], row_ys[i + 1], true);
         if (connected[i] || h_span_ok) {
             current_group.push_back(row_ys[i + 1]);
             if (connected[i]) group_vline_connections++;
         } else if (close_enough && group_vline_connections > 0 &&
-                   !frame_break(i)) {
+                   !frame_break(i) && !blank_between_grids(i)) {
             // No v-line and no x-overlap, but we're already in a connected group.
             // Check if the next row's h-lines share x-range with the group's h-lines.
             double g_left = 1e9, g_right = 0;
@@ -2087,7 +2195,7 @@ static void detect_ruled_in_zone(
                 bridge_gap_ok(row_ys[i], row_ys[i + 1], true)) {
                 current_group.push_back(row_ys[i + 1]);
             } else {
-                if (current_group.size() >= 3 &&
+                if ((current_group.size() >= 3 || current_group.size() == 2) &&
                     (group_vline_connections > 0 || current_group.size() >= 7))
                     table_groups.push_back(current_group);
                 current_group.clear();
@@ -2095,7 +2203,7 @@ static void detect_ruled_in_zone(
                 current_group.push_back(row_ys[i + 1]);
             }
         } else {
-            if (current_group.size() >= 3 &&
+            if ((current_group.size() >= 3 || current_group.size() == 2) &&
                 (group_vline_connections > 0 || current_group.size() >= 7))
                 table_groups.push_back(current_group);
             current_group.clear();
@@ -2103,7 +2211,7 @@ static void detect_ruled_in_zone(
             current_group.push_back(row_ys[i + 1]);
         }
     }
-    if (current_group.size() >= 3 &&
+    if ((current_group.size() >= 3 || current_group.size() == 2) &&
         (group_vline_connections > 0 || current_group.size() >= 7))
         table_groups.push_back(current_group);
 
@@ -2145,6 +2253,14 @@ static void detect_ruled_in_zone(
                 if (std::abs(row_ys[i] - merged.back().back()) < 0.01 &&
                     std::abs(row_ys[i + 1] - table_groups[g].front()) < 0.01)
                     frames_apart = frame_break(i);
+            // White space between two ruled grids anywhere in the gap (a
+            // one-row table sitting between the groups has its own) keeps
+            // the groups apart.
+            for (int i = 0; i + 1 < n_levels && !frames_apart; i++)
+                if (row_ys[i] >= merged.back().back() - 0.01 &&
+                    row_ys[i + 1] <= table_groups[g].front() + 0.01 &&
+                    blank_between_grids(i))
+                    frames_apart = true;
             if (extent > 50 && overlap >= extent * 0.7 && y_gap < 100 &&
                 !frames_apart &&
                 bridge_gap_ok(merged.back().back(), table_groups[g].front(),
@@ -2221,6 +2337,9 @@ static void detect_ruled_in_zone(
             if (keep_part && !keep_part(part)) continue;
             TableData t = build_table(part.levels, part.h_lines,
                                       part.v_lines, cache);
+            // A group of two rule levels is kept only as a boxed row of
+            // drawn cells; such a band holds nothing else of a table.
+            if (part.levels.size() == 2 && !t.single_box) continue;
             if (std::getenv("JDOC_TABLE_DEBUG")) {
                 fprintf(stderr, "[rule-group]");
                 for (double y : part.levels) fprintf(stderr, " %.1f", y);
@@ -2475,6 +2594,8 @@ std::vector<TableData> detect_tables(const std::vector<PdfLineSegment>& lines,
     // Rules drawn per cell (each border segment one column wide) or dashed
     // fall under the length cut fragment by fragment. Touching fragments on
     // one y level merge into a run, and a run of rule length is a rule.
+    struct ShortRun { double lo, hi, y; };
+    std::vector<ShortRun> short_runs;
     if (!h_frags.empty()) {
         std::vector<double> frag_ys;
         for (auto& l : h_frags) frag_ys.push_back((l.y0 + l.y1) / 2.0);
@@ -2494,6 +2615,8 @@ std::vector<TableData> detect_tables(const std::vector<PdfLineSegment>& lines,
                                        static_cast<float>(ly),
                                        static_cast<float>(hi),
                                        static_cast<float>(ly)});
+                else
+                    short_runs.push_back({lo, hi, ly});
             };
             for (size_t i = 1; i < iv.size(); i++) {
                 if (iv[i].first <= hi + kFragJoinTol) {
@@ -2508,6 +2631,40 @@ std::vector<TableData> detect_tables(const std::vector<PdfLineSegment>& lines,
         }
     }
 
+
+    // A narrow cell's border pieces stay under the length cut even when
+    // joined, and a table would lose that column. A short run that touches
+    // a rule on its level (it ends where the rule begins, or begins where it
+    // ends) and is boxed by vertical rules at both ends is part of that
+    // ruled row: keep it as a rule of its own, so the rule's end stays where
+    // the cell border meets it.
+    {
+        // Both ends must meet a vertical rule running up or down from the
+        // level, as a cell's corners do; a tick on a chart axis has a free
+        // end.
+        auto cornered = [&](double x, double y) {
+            for (const auto& v : v_lines) {
+                if (std::abs((v.x0 + v.x1) * 0.5 - x) > 2.0) continue;
+                double lo = std::min(v.y0, v.y1), hi = std::max(v.y0, v.y1);
+                if (hi - lo < 6.0) continue;
+                if (lo <= y + 2.0 && hi >= y - 2.0) return true;
+            }
+            return false;
+        };
+        std::vector<PdfLineSegment> kept_runs;
+        for (const auto& sr : short_runs) {
+            if (!cornered(sr.lo, sr.y) || !cornered(sr.hi, sr.y)) continue;
+            for (const auto& l : h_lines) {
+                if (std::abs((l.y0 + l.y1) / 2.0 - sr.y) > 1.0) continue;
+                double lo = std::min(l.x0, l.x1), hi = std::max(l.x0, l.x1);
+                if (std::abs(sr.hi - lo) > 3.0 && std::abs(sr.lo - hi) > 3.0) continue;
+                kept_runs.push_back({static_cast<float>(sr.lo), static_cast<float>(sr.y),
+                                     static_cast<float>(sr.hi), static_cast<float>(sr.y)});
+                break;
+            }
+        }
+        for (auto& r : kept_runs) h_lines.push_back(r);
+    }
 
     // Extract compact grids before global endpoint grouping. Nearby plot
     // bars and ticks must not enlarge a table with repeated full-width rules.

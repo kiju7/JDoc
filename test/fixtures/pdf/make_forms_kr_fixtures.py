@@ -1,4 +1,4 @@
-"""Regenerate the form fixtures used by test_pdf ([44] ...).
+"""Regenerate the form fixtures used by test_pdf ([44], [45]).
 
   form_party_boxes.pdf   the head of a trade statement: two boxed tables side
       by side (supplier, buyer), a label column beside a wide value column,
@@ -6,6 +6,12 @@
       prints a table). Values of different lengths leave a whitespace stretch
       inside the wide column on the short rows only; the long values run
       over it. Each value is one cell.
+  form_stacked_boxes.pdf  a statement page of boxed tables of one width
+      stacked 6 pt apart: a numbered section box ("II | Supplies", a
+      heading), an item table whose first column (No.) is narrower than a
+      rule fragment, a one-row total box, a two-row balance table, and a
+      one-cell notice box. Three tables, each on its own, the No. column
+      kept; the section box and the notice are text.
 
 The PDFs are written by hand (base-14 Helvetica, no font files) so the
 fixtures are the same on every OS. Run from the repo root:
@@ -54,5 +60,39 @@ def make_party_boxes():
     pg.save("form_party_boxes.pdf")
 
 
+def grid(pg, x_edges, top, rows, rh=18.0, head=0):
+    """A table of boxed cells; rows of (text, colspan) cells, top rows shaded."""
+    y = top
+    for r, row in enumerate(rows):
+        c = 0
+        for text, span in row:
+            x0, x1 = x_edges[c], x_edges[c + span]
+            box(pg, x0, y, x1, y + rh, fill=0.93 if r < head else None)
+            if text:
+                pg.text(x0 + 4, y + 12.5, text, "F2" if r < head else "F1", 9)
+            c += span
+        y += rh
+    return y
+
+
+def make_stacked_boxes():
+    pg = Page()
+    L, R = 60.0, 540.0
+    pg.text(240, 70, "STATEMENT", "F2", 16)
+    y = grid(pg, [L, 90.0, R], 90, [[("II", 1), ("Supplies", 1)]])
+    xs = [L, 86.0, 230.0, 330.0, 380.0, 460.0, R]
+    y = grid(pg, xs, y + 14, [[("No.", 1), ("Item", 1), ("Spec", 1), ("Qty", 1), ("Price", 1), ("Amount", 1)],
+                              [("1", 1), ("GPU server", 1), ("48 GB", 1), ("2", 1), ("9,800", 1), ("19,600", 1)],
+                              [("2", 1), ("NVMe drive", 1), ("4 TB", 1), ("3", 1), ("520", 1), ("1,560", 1)],
+                              [("3", 1), ("Rack kit", 1), ("2U", 1), ("1", 1), ("95", 1), ("95", 1)]], head=1)
+    y = grid(pg, [L, 180.0, R], y + 6, [[("Total", 1), ("21,255 (tax included)", 1)]], head=1)
+    xb = [L, 130.0, 240.0, 310.0, 420.0, 470.0, R]
+    y = grid(pg, xb, y + 6, [[("Balance", 1), ("0", 1), ("Paid", 1), ("0", 1), ("Due", 1), ("21,255", 1)],
+                             [("Note", 1), ("Contract C-0388", 3), ("Signed", 1), ("(seal)", 1)]])
+    y = grid(pg, [L, R], y + 34, [[("Notice: issued electronically, valid without a seal.", 1)]])
+    pg.save("form_stacked_boxes.pdf")
+
+
 if __name__ == "__main__":
     make_party_boxes()
+    make_stacked_boxes()

@@ -28,6 +28,8 @@ struct TableData {
     // two filled cells (a ruled box around wrapped text, a label column
     // beside long cells). Read only by detect_tables' sparse_grids output.
     bool too_sparse = false;
+    // build_table took a single boxed row of drawn cells (two rule levels).
+    bool single_box = false;
     // Longest cell text (bytes) among cells the author did not rule off:
     // there a whole paragraph in a cell means page prose swallowed by a
     // ruled group. A cell is ruled off when its row is a drawn interval
