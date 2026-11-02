@@ -2016,6 +2016,26 @@ int main(int argc, char* argv[]) {
                   << " image(s), expected " << want << "\n";
         CHECK(chunks[0].images.size() == want);
     }
+    // [44] Form boxes (make_forms_kr_fixtures.py). A wide value column of
+    // a drawn grid is one column when its long values run over the
+    // whitespace that its short values leave: no boundary is guessed there,
+    // and each value stays whole in one cell.
+    std::cout << "[44] Testing values of boxed form cells...\n";
+    {
+        const std::string fx = "test/fixtures/pdf/form_party_boxes.pdf";
+        std::ifstream f(fx);
+        if (!f.good()) {
+            std::cout << "    SKIP: " << fx << "\n";
+        } else {
+            f.close();
+            std::string md = jdoc::pdf_to_markdown(fx);
+            for (const char* cell : {"| 314-86-00000 ", "| Hangyeol TechSolutions Co. ",
+                                     "| 000 Daehak-ro, Yuseong-gu, Daejeon ", "| 042-000-7788 "})
+                CHECK(md.find(cell) != std::string::npos);
+            CHECK(md.find("Prof. Yoon") == md.rfind("Prof. Yoon"));
+            std::cout << "    values whole, last row not repeated OK\n";
+        }
+    }
     std::cout << "\n=== All tests passed ===\n";
     return 0;
 }

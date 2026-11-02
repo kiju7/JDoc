@@ -545,6 +545,39 @@ TableData build_table(const std::vector<double>& input_row_ys,
                     right_rows += has_r;
                 }
                 if (left_rows == 0 || right_rows == 0) continue;
+                // An omitted rule has whitespace under it. Lines whose run of
+                // glyphs passes over tx with no more than a word space say tx
+                // is inside one cell's text; when several lines do and no
+                // line leaves a gap at tx, nothing in the column is split
+                // there and tx is not between two cells. (A wide header over
+                // two columns crosses while the body lines leave the gap.)
+                bool crossed = false;
+                {
+                    struct LineAt { double y, fs, l_right, r_left; bool over; };
+                    std::vector<LineAt> lines;
+                    for (auto& ch : cache.chars) {
+                        if (ch.unicode == ' ' || ch.unicode == 0xA0 ||
+                            ch.unicode == '\t') continue;
+                        if (ch.y <= row_ys.front() || ch.y >= row_ys.back()) continue;
+                        if (ch.right < lo || ch.left > hi) continue;
+                        double fs = std::max(ch.font_size, 4.0);
+                        LineAt* ln = nullptr;
+                        for (auto& l : lines)
+                            if (std::abs(l.y - ch.y) < std::max(l.fs, fs) * 0.3) { ln = &l; break; }
+                        if (!ln) { lines.push_back({ch.y, fs, -1e9, 1e9, false}); ln = &lines.back(); }
+                        if (ch.left < tx - 0.5 && ch.right > tx + 0.5) ln->over = true;
+                        else if (ch.right <= tx + 0.5) ln->l_right = std::max(ln->l_right, (double)ch.right);
+                        else ln->r_left = std::min(ln->r_left, (double)ch.left);
+                    }
+                    int over = 0, gapped = 0;
+                    for (const auto& l : lines) {
+                        if (l.over) { ++over; continue; }
+                        if (l.l_right < -1e8 || l.r_left > 1e8) continue;
+                        if (l.r_left - l.l_right < l.fs * 0.6) ++over; else ++gapped;
+                    }
+                    crossed = over >= 2 && gapped == 0;
+                }
+                if (crossed) continue;
                 text_boundaries.push_back(tx);
             }
             if (!text_boundaries.empty()) {
