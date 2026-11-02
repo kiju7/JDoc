@@ -9,7 +9,8 @@
   form_stacked_boxes.pdf  a statement page of boxed tables of one width
       stacked 6 pt apart: a numbered section box ("II | Supplies", a
       heading), an item table whose first column (No.) is narrower than a
-      rule fragment, a one-row total box, a two-row balance table, and a
+      rule fragment, a one-row total box (its label on two lines), a
+      two-row balance table, and a
       one-cell notice box. Three tables, each on its own, the No. column
       kept; the section box and the notice are text.
 
@@ -85,7 +86,13 @@ def make_stacked_boxes():
                               [("1", 1), ("GPU server", 1), ("48 GB", 1), ("2", 1), ("9,800", 1), ("19,600", 1)],
                               [("2", 1), ("NVMe drive", 1), ("4 TB", 1), ("3", 1), ("520", 1), ("1,560", 1)],
                               [("3", 1), ("Rack kit", 1), ("2U", 1), ("1", 1), ("95", 1), ("95", 1)]], head=1)
-    y = grid(pg, [L, 180.0, R], y + 6, [[("Total", 1), ("21,255 (tax included)", 1)]], head=1)
+    # The total box's label runs to two lines beside a one-line value.
+    box(pg, L, y + 6, 180.0, y + 36, fill=0.93)
+    box(pg, 180.0, y + 6, R, y + 36)
+    pg.text(L + 4, y + 18, "Total", "F2", 9)
+    pg.text(L + 4, y + 30, "(with tax)", "F1", 8)
+    pg.text(184.0, y + 24, "Twenty-two thousand one hundred (22,100)", "F1", 9)
+    y += 36
     xb = [L, 130.0, 240.0, 310.0, 420.0, 470.0, R]
     y = grid(pg, xb, y + 6, [[("Balance", 1), ("0", 1), ("Paid", 1), ("0", 1), ("Due", 1), ("21,255", 1)],
                              [("Note", 1), ("Contract C-0388", 3), ("Signed", 1), ("(seal)", 1)]])

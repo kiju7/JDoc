@@ -2041,8 +2041,9 @@ int main(int argc, char* argv[]) {
     // between two ruled grids is not a row, nor is a one-row box between
     // them a row of either. A narrow first column whose rule pieces are each
     // shorter than a rule stays in its table. A one-row box of two cells is
-    // a table; a section number boxed beside its title, and a one-cell
-    // notice, are text.
+    // a table, its text printed once even where a two-line label and its
+    // value read as one line; a section number boxed beside its title, and
+    // a one-cell notice, are text.
     std::cout << "[45] Testing stacked form boxes...\n";
     {
         const std::string fx = "test/fixtures/pdf/form_stacked_boxes.pdf";
@@ -2059,7 +2060,11 @@ int main(int argc, char* argv[]) {
             CHECK(tables == 3);
             CHECK(md.find("| **No.** ") != std::string::npos);
             CHECK(md.find("| 3       | Rack kit ") != std::string::npos);
-            CHECK(md.find("| **Total** | **21,255 (tax included)** |") != std::string::npos);
+            size_t total = md.find("Twenty-two thousand one hundred (22,100)");
+            CHECK(total != std::string::npos);
+            CHECK(md.rfind("Twenty-two thousand one hundred (22,100)") == total);
+            CHECK(md.rfind('\n', total) != std::string::npos &&
+                  md[md.rfind('\n', total) + 1] == '|');
             CHECK(md.find("| Balance | 0 ") != std::string::npos);
             CHECK(md.find("\nII Supplies") != std::string::npos);
             CHECK(md.find("\nNotice: issued electronically") != std::string::npos);

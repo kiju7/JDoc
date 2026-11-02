@@ -387,6 +387,33 @@ static bool line_words_in_cells(const std::string& line_text,
     return total >= 3 && found_word && found * 100 >= total * 75;
 }
 
+// Text of a line that several cells of one boxed row feed (a two-line label
+// beside its value) is printed as one run, with the cells' words glued at
+// their seams ("(W3,740,000)Total"), so the word test above misses it.
+// Without spaces or bold marks, a line made of pieces of at least three
+// bytes that are all in the cells' text, covering 90% of it, was captured.
+static bool line_pieces_in_cells(const std::string& line_text,
+                                 const std::string& cells_text) {
+    auto compact = [](const std::string& s) {
+        std::string out;
+        for (char c : s)
+            if (c != ' ' && c != '\t' && c != '\n' && c != '*') out += c;
+        return out;
+    };
+    std::string l = compact(line_text), c = compact(cells_text);
+    if (l.size() < 6 || c.empty()) return false;
+    size_t i = 0, covered = 0;
+    while (i < l.size()) {
+        size_t best = 0;
+        for (size_t len = l.size() - i; len >= 3; --len) {
+            if (c.find(l.data() + i, 0, len) != std::string::npos) { best = len; break; }
+        }
+        if (best) { covered += best; i += best; }
+        else ++i;
+    }
+    return covered * 10 >= l.size() * 9;
+}
+
 bool line_in_table(const TextLine& line, const std::vector<TableData>& tables) {
     for (auto& t : tables) {
         double t_bottom = std::min(t.y0, t.y1) - 10.0;
@@ -450,6 +477,9 @@ bool line_swallowed_by_table(const TextLine& line,
         // row is printed twice. Compare alphanumerics only, token by token:
         // a line whose words are nearly all in the cells was captured.
         if (ti < captured.size() && line_words_in_cells(line.text, captured[ti]))
+            return true;
+        if (t.single_box && ti < captured.size() &&
+            line_pieces_in_cells(line.text, captured[ti]))
             return true;
         // geometric hit but text not captured: check other tables too before
         // deciding to keep the line.
