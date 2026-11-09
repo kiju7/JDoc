@@ -1,7 +1,7 @@
 // hwp3_parser.cpp - HWP 3.x (Hangul Word Processor legacy binary) parser
 // File layout: 30-byte signature, 128-byte document info, 1008-byte summary,
 // optional info block, then the body (raw-deflate-compressed when the doc
-// info compression flag is set): 7 font-name lists, style table, paragraph
+// info compression flag is set): 7 font-name lists (5 in V2.00), style table, paragraph
 // list. Paragraph text is a stream of 16-bit words: values < 32 are inline
 // control codes with code-specific payloads, everything else is a 2-byte
 // johab/KS character code.
@@ -30,7 +30,6 @@ constexpr size_t kSignatureLen = 30;
 constexpr size_t kDocInfoLen = 128;
 constexpr size_t kSummaryLen = 1008;   // 9 fields x 112 bytes, 2-byte chars
 constexpr size_t kFontNameLen = 40;
-constexpr size_t kCharShapeLen = 31;
 constexpr size_t kParaShapeLen = 187;
 constexpr size_t kLineInfoLen = 14;
 constexpr size_t kStyleNameLen = 20;
@@ -318,15 +317,25 @@ private:
     Reader body_;                    // body stream (fonts/styles/paragraphs)
     std::string out_;                // markdown output
     std::string para_;               // current paragraph accumulator
+    int font_langs_ = 7;             // font-name lists (languages) by version
+    size_t char_shape_len_ = 31;     // char shape record size by version
 
     // ── Header / body setup ─────────────────────────────
 
     void parse_header() {
         const uint8_t* sig = file_.block(kSignatureLen);
-        if (memcmp(sig, "HWP Document File V3.0", 22) != 0) {
-            // V2.x and other variants use a different in-body layout.
-            fail("unsupported HWP legacy version (only V3.0x is supported)");
+        // V2.10 lays the body out as 3.0 does. V2.00 keeps font lists for
+        // 5 languages instead of 7, so its char shape (size, then font,
+        // ratio and spacing per language, then 8 bytes) is 25 bytes, not 31.
+        if (memcmp(sig, "HWP Document File V3.0", 22) == 0 ||
+            memcmp(sig, "HWP Document File V2.10", 23) == 0) {
+            font_langs_ = 7;
+        } else if (memcmp(sig, "HWP Document File V2.00", 23) == 0) {
+            font_langs_ = 5;
+        } else {
+            fail("unsupported HWP legacy version (V2.00, V2.10 and V3.0x are supported)");
         }
+        char_shape_len_ = 2 + size_t(font_langs_) * 3 + 8;
 
         const uint8_t* info = file_.block(kDocInfoLen);
         if (util::read_u16_le(info + 0x60) != 0)
@@ -389,12 +398,12 @@ private:
     // ── Font / style tables ─────────────────────────────
 
     void skip_font_and_styles() {
-        for (int i = 0; i < 7; i++) {
+        for (int i = 0; i < font_langs_; i++) {
             uint16_t n = body_.u16();
             body_.skip(size_t(n) * kFontNameLen);
         }
         uint16_t styles = body_.u16();
-        body_.skip(size_t(styles) * (kStyleNameLen + kCharShapeLen +
+        body_.skip(size_t(styles) * (kStyleNameLen + char_shape_len_ +
                                      kParaShapeLen));
     }
 
@@ -435,19 +444,19 @@ private:
         if (nch == 0) {
             // Null paragraph (list terminator). It still carries its char
             // shape and line info; tolerate truncation at end of stream.
-            size_t tail = kCharShapeLen + size_t(nline) * kLineInfoLen;
+            size_t tail = char_shape_len_ + size_t(nline) * kLineInfoLen;
             body_.skip(std::min(tail, body_.size - body_.pos));
             return false;
         }
 
-        body_.skip(kCharShapeLen);                 // paragraph char shape
+        body_.skip(char_shape_len_);               // paragraph char shape
         if (!reuse_shape) body_.skip(kParaShapeLen);
         body_.skip(size_t(nline) * kLineInfoLen);  // line segments
 
         if (contain_cshape) {
             for (uint16_t i = 0; i < nch; i++) {
                 if (body_.u8() == 0)               // 0 = explicit shape
-                    body_.skip(kCharShapeLen);
+                    body_.skip(char_shape_len_);
             }
         }
 

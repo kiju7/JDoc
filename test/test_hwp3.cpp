@@ -41,6 +41,18 @@ namespace {
 
 using Bytes = std::vector<uint8_t>;
 
+// The version the builders write: its signature, font-list languages and
+// char shape size (V3.00 and V2.10: 7 and 31; V2.00: 5 and 25).
+const char* g_version = "3.00";
+int g_langs = 7;
+size_t g_char_shape = 31;
+
+void use_version(const char* v) {
+    g_version = v;
+    g_langs = strcmp(v, "2.00") == 0 ? 5 : 7;
+    g_char_shape = 2 + size_t(g_langs) * 3 + 8;
+}
+
 void put_u16(Bytes& b, uint16_t v) {
     b.push_back(uint8_t(v & 0xFF));
     b.push_back(uint8_t(v >> 8));
@@ -104,7 +116,7 @@ void put_para_header(Bytes& b, uint16_t nch, uint16_t nline = 1) {
     b.push_back(0);          // etc flag
     put_u32(b, 0);           // control mask
     b.push_back(0);          // style index
-    put_zeros(b, 31);        // char shape (present even in null paragraphs)
+    put_zeros(b, g_char_shape);  // char shape (present even in null paragraphs)
     if (nch != 0) put_zeros(b, 187);       // para shape
     put_zeros(b, size_t(nline) * 14);      // line info
 }
@@ -151,12 +163,11 @@ void put_table_para(Bytes& b, const std::string cells[4]) {
 // Assemble a full document around the given body (fonts/styles/paragraphs).
 Bytes build_hwp3_file(const Bytes& body, bool compressed) {
     Bytes f;
-    static const uint8_t kSig[30] = {'H', 'W', 'P', ' ', 'D',  'o',  'c',
-                                     'u', 'm', 'e', 'n', 't',  ' ',  'F',
-                                     'i', 'l', 'e', ' ', 'V',  '3',  '.',
-                                     '0', '0', ' ', 0x1A, 0x01, 0x02, 0x03,
-                                     0x04, 0x05};
-    f.insert(f.end(), kSig, kSig + 30);
+    uint8_t sig[30] = {'H', 'W', 'P', ' ', 'D', 'o', 'c', 'u', 'm', 'e', 'n',
+                       't', ' ', 'F', 'i', 'l', 'e', ' ', 'V', '3', '.', '0',
+                       '0', ' ', 0x1A, 0x01, 0x02, 0x03, 0x04, 0x05};
+    memcpy(sig + 19, g_version, 4);
+    f.insert(f.end(), sig, sig + 30);
     Bytes docinfo(128, 0);
     docinfo[124] = compressed ? 1 : 0;
     f.insert(f.end(), docinfo.begin(), docinfo.end());
@@ -190,14 +201,14 @@ Bytes build_hwp3_file(const Bytes& body, bool compressed) {
 
 // Standard body: font tables (1 dummy font per language), 1 style.
 void put_tables(Bytes& b) {
-    for (int i = 0; i < 7; i++) {
+    for (int i = 0; i < g_langs; i++) {
         put_u16(b, 1);
         Bytes name(40, 0);
         memcpy(name.data(), "System", 6);
         b.insert(b.end(), name.begin(), name.end());
     }
     put_u16(b, 1);               // style count
-    put_zeros(b, 20 + 31 + 187); // style name + char shape + para shape
+    put_zeros(b, 20 + g_char_shape + 187); // style name + char shape + para shape
 }
 
 Bytes simple_doc(bool compressed) {
@@ -232,6 +243,55 @@ static void test_detection() {
         ASSERT(!jdoc::is_hwp3_signature(doc.data(), 4));
         const uint8_t ole[8] = {0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1};
         ASSERT(!jdoc::is_hwp3_signature(ole, 8));
+    TEST_END
+}
+
+// HWP 2.x: V2.10 shares 3.0's layout; V2.00 has 5 font lists and 25-byte
+// char shapes. Both read, in compressed and plain bodies, with tables.
+static void test_v2_versions() {
+    std::cerr << "\nHWP 2.x:\n";
+    for (const char* v : {"2.10", "2.00"}) {
+        use_version(v);
+        TEST(v2_text)
+            for (bool comp : {false, true}) {
+                auto md = convert_mem(simple_doc(comp));
+                ASSERT(md.find("Hello HWP3") != std::string::npos);
+                ASSERT(md.find("대한민국 한글 문서") != std::string::npos);
+            }
+        TEST_END
+        TEST(v2_per_char_shapes_and_table)
+            Bytes body;
+            put_tables(body);
+            // A paragraph whose characters each carry an explicit shape.
+            std::string t = "가나";
+            put_para_header(body, uint16_t(text_words(t) + 1));
+            body[body.size() - 14 - 187 - g_char_shape - 7] = 1;  // contain_cshape
+            for (size_t k = 0; k < text_words(t) + 1; k++) {
+                body.push_back(0);
+                put_zeros(body, g_char_shape);
+            }
+            put_text(body, t);
+            put_u16(body, 13);
+            const std::string cells[4] = {"홍길동", "A1", "B2", "끝"};
+            put_table_para(body, cells);
+            put_null_para(body);
+            auto md = convert_mem(build_hwp3_file(body, true));
+            ASSERT(md.find("가나") != std::string::npos);
+            ASSERT(md.find("홍길동") != std::string::npos);
+            ASSERT(md.find("끝") != std::string::npos);
+        TEST_END
+    }
+    use_version("3.00");
+
+    TEST(other_versions_rejected_by_name)
+        use_version("1.20");
+        auto doc = simple_doc(false);
+        use_version("3.00");
+        bool threw = false;
+        try { convert_mem(doc); } catch (const std::exception& e) {
+            threw = std::string(e.what()).find("V2.00, V2.10 and V3.0x") != std::string::npos;
+        }
+        ASSERT(threw);
     TEST_END
 }
 
@@ -391,6 +451,7 @@ int main() {
     std::cerr << "=== HWP 3.x Tests ===\n\n";
 
     test_detection();
+    test_v2_versions();
     test_text_extraction();
     test_tables();
     test_robustness();
