@@ -266,6 +266,7 @@ std::string OdfParser::object_text(const pugi::xml_node& obj, const ConvertOptio
                                    int depth) {
     std::string href = xml_attr(obj, "href");
     if (href.rfind("./", 0) == 0) href = href.substr(2);
+    while (!href.empty() && href.back() == '/') href.pop_back();   // "Object 1/"
     if (href.empty() || href.find("://") != std::string::npos || depth > kMaxDepth)
         return "";
     std::string part = prefix_ + href;
