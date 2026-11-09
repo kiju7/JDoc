@@ -2963,10 +2963,12 @@ static std::vector<BandCut> find_column_bands(
                 end = r;
                 if (ink[r].front().first < ch.first && ink[r].back().second > ch.second) paired++;
             }
-            if (paired < kBandMinRows) continue;
-            if (col_boundary > 0 && col_boundary > ch.first - median_fs &&
-                col_boundary < ch.second + median_fs)
+            if (paired < kBandMinRows ||
+                (col_boundary > 0 && col_boundary > ch.first - median_fs &&
+                 col_boundary < ch.second + median_fs)) {
+                for (int r = s + 1; r <= end; r++) tried[r].push_back(ch);
                 continue;
+            }
             // Running text on both sides (see the comment above).
             struct P { double l0, l1, r0, r1; bool runs; };
             std::vector<P> ps;
