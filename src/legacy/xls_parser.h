@@ -44,6 +44,9 @@ private:
     struct Sheet {
         std::string name;
         std::vector<Cell> cells;
+        // Text printed on the sheet outside its cells: the page header and
+        // footer, text boxes and notes (TXO).
+        std::vector<std::string> texts;
     };
 
     // Shared String Table.
@@ -88,6 +91,7 @@ private:
 
     // Build a markdown table from sheet cells.
     static std::string sheet_to_markdown(const Sheet& sheet, int sheet_num);
+    static std::string sheet_table(const Sheet& sheet);
 
     // Extract images from MSODRAWING records.
     std::vector<ImageData> extract_images(unsigned min_image_size = 0);

@@ -38,6 +38,62 @@ static constexpr uint16_t RT_XF         = 0x00E0;
 static constexpr uint16_t RT_FILEPASS   = 0x002F;
 static constexpr uint16_t RT_FONT      = 0x0031;
 static constexpr uint16_t RT_MSODRAWING = 0x00EC;
+static constexpr uint16_t RT_HEADER     = 0x0014;
+static constexpr uint16_t RT_FOOTER     = 0x0015;
+static constexpr uint16_t RT_TXO        = 0x01B6;
+
+// An XLUnicodeString (cch, flags, characters) — 8-bit or UTF-16LE.
+static std::string xl_unicode_string(const char* d, size_t n) {
+    if (n < 3) return "";
+    size_t cch = util::read_u16_le(d);
+    bool wide = (static_cast<uint8_t>(d[2]) & 0x01) != 0;
+    size_t bytes = std::min(wide ? cch * 2 : cch, n - 3);
+    if (wide) return util::utf16le_to_utf8(d + 3, bytes & ~size_t(1));
+    std::string out;
+    for (size_t i = 0; i < bytes; ++i) util::append_cp1252(out, static_cast<uint8_t>(d[3 + i]));
+    return out;
+}
+
+// The header/footer string with its &-codes (&L &C &R sections, &"font",
+// sizes, fields like &P) reduced to the printed text.
+static std::string header_footer_text(const std::string& code) {
+    std::string out;
+    for (size_t i = 0; i < code.size(); ++i) {
+        char c = code[i];
+        if (c != '&' || i + 1 >= code.size()) { out += c; continue; }
+        char k = code[++i];
+        if (k == '&') out += '&';
+        else if (k == 'L' || k == 'C' || k == 'R') { if (!out.empty()) out += ' '; }
+        else if (k == '"') { size_t e = code.find('"', i + 1); i = e == std::string::npos ? code.size() : e; }
+        else if (k >= '0' && k <= '9') { while (i + 1 < code.size() && code[i + 1] >= '0' && code[i + 1] <= '9') ++i; }
+        else if (k == 'K') i = std::min(code.size() - 1, i + 6);
+    }
+    return util::trim(out);
+}
+
+// The text of a TXO record (a text box, a note): cchText characters carried
+// by the CONTINUE records that follow it, each opening with its own
+// 8-bit/UTF-16 flag byte.
+static std::string txo_text(const std::vector<char>& wb, size_t txo_pos, size_t txo_size) {
+    if (txo_size < 12) return "";
+    size_t left = util::read_u16_le(wb.data() + txo_pos + 10);
+    std::string out;
+    size_t pos = txo_pos + txo_size;
+    while (left > 0 && pos + 4 <= wb.size() &&
+           util::read_u16_le(wb.data() + pos) == RT_CONTINUE) {
+        size_t size = util::read_u16_le(wb.data() + pos + 2);
+        const char* d = wb.data() + pos + 4;
+        pos += 4 + size;
+        if (pos > wb.size() || size < 1) break;
+        bool wide = (static_cast<uint8_t>(d[0]) & 0x01) != 0;
+        size_t n = std::min(left, (size - 1) / (wide ? 2 : 1));
+        if (wide) out += util::utf16le_to_utf8(d + 1, n * 2);
+        else for (size_t i = 0; i < n; ++i) util::append_cp1252(out, static_cast<uint8_t>(d[1 + i]));
+        left -= n;
+    }
+    for (auto& ch : out) if (ch == '\r' || ch == '\n') ch = ' ';
+    return util::trim(out);
+}
 
 // ---------- XlsParser --------------------------------------------------------
 
@@ -534,6 +590,7 @@ void XlsParser::parse_workbook() {
     // Pass 2: sheet cell data (LABELSST, LABEL, NUMBER, RK, MULRK, FORMULA).
     pos = 0;
     bof_count = 0;
+    int bof_depth = 0, sheet_index = -1;
     int current_sheet = -1;
     bool expect_string = false;  // true after FORMULA with string result
     uint16_t formula_row = 0, formula_col = 0;
@@ -546,11 +603,13 @@ void XlsParser::parse_workbook() {
         if (pos + rec_size > wb.size()) break;
         const char* rec_data = wb.data() + pos;
 
+        // Substreams nest: a chart embedded in a worksheet opens its own
+        // BOF..EOF inside the sheet's, and is not a sheet of the workbook.
         if (rec_type == RT_BOF) {
-            ++bof_count;
-            if (bof_count > 1) {
-                current_sheet = bof_count - 2;
-            }
+            if (++bof_depth == 1 && ++bof_count > 1) sheet_index = bof_count - 2;
+            current_sheet = bof_depth == 1 ? sheet_index : -1;
+        } else if (rec_type == RT_EOF && bof_depth > 0) {
+            if (--bof_depth == 1) current_sheet = sheet_index;
         }
 
         // STRING record follows FORMULA when result is a string.
@@ -596,7 +655,13 @@ void XlsParser::parse_workbook() {
         if (current_sheet >= 0 && current_sheet < static_cast<int>(sheets_.size())) {
             Sheet& sheet = sheets_[current_sheet];
 
-            if (rec_type == RT_LABELSST && rec_size >= 10) {
+            if ((rec_type == RT_HEADER || rec_type == RT_FOOTER) && rec_size >= 3) {
+                std::string t = header_footer_text(xl_unicode_string(rec_data, rec_size));
+                if (!t.empty()) sheet.texts.push_back(std::move(t));
+            } else if (rec_type == RT_TXO) {
+                std::string t = txo_text(wb, pos, rec_size);
+                if (!t.empty()) sheet.texts.push_back(std::move(t));
+            } else if (rec_type == RT_LABELSST && rec_size >= 10) {
                 uint16_t row = util::read_u16_le(rec_data);
                 uint16_t col = util::read_u16_le(rec_data + 2);
                 uint16_t xf_idx = util::read_u16_le(rec_data + 4);
@@ -731,6 +796,16 @@ void XlsParser::parse_workbook() {
 // ---------- sheet to markdown ------------------------------------------------
 
 std::string XlsParser::sheet_to_markdown(const Sheet& sheet, int sheet_num) {
+    std::string md = sheet_table(sheet);
+    for (const auto& t : sheet.texts) md += t + "\n\n";
+    if (md.empty()) return "";
+    std::string display_name = sheet.name.empty()
+        ? ("Sheet " + std::to_string(sheet_num))
+        : sheet.name;
+    return "## " + display_name + "\n\n" + md;
+}
+
+std::string XlsParser::sheet_table(const Sheet& sheet) {
     if (sheet.cells.empty()) return "";
 
     // Determine grid dimensions.
@@ -768,10 +843,6 @@ std::string XlsParser::sheet_to_markdown(const Sheet& sheet, int sheet_num) {
 
     // Render markdown table.
     std::ostringstream out;
-    std::string display_name = sheet.name.empty()
-        ? ("Sheet " + std::to_string(sheet_num))
-        : sheet.name;
-    out << "## " << display_name << "\n\n";
 
     for (int r = 0; r < used_rows; ++r) {
         out << "|";
