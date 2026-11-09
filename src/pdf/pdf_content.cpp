@@ -3067,37 +3067,85 @@ void settle_raised_marks(std::vector<TextChar>& chars) {
         if (chars[a].y != chars[b].y) return chars[a].y > chars[b].y;
         return chars[a].left < chars[b].left;
     });
-    double max_fs = 0;
-    for (size_t i : vis) max_fs = std::max(max_fs, chars[i].font_size);
+    // max_w bounds the x window of the scans below; the rare glyph wider
+    // than two of its ems (a stretched rule, a broken metric) would widen
+    // every window to the page, so those few are checked on their own.
+    double max_fs = 0, max_w = 0;
+    std::vector<size_t> wide;
+    for (size_t i : vis) {
+        const TextChar& c = chars[i];
+        max_fs = std::max(max_fs, c.font_size);
+        if (c.right - c.left > 2 * c.font_size) wide.push_back(i);
+        else max_w = std::max(max_w, c.right - c.left);
+    }
 
-    // The range of vis whose baselines lie within [y - below, y + above].
-    auto rows_near = [&](double y, double below, double above) {
-        auto lo = std::lower_bound(vis.begin(), vis.end(), y + above,
+    // Glyphs whose baselines lie within [y - below, y + above] and whose
+    // left edge lies within [xlo, xhi], row by row: vis is sorted by row,
+    // then by x, so each row is cut to the x window by binary search rather
+    // than walked across the page (a table's rows are long). fn returns
+    // true to stop.
+    auto for_near = [&](double y, double below, double above, double xlo, double xhi,
+                        auto&& fn) {
+        auto it = std::lower_bound(vis.begin(), vis.end(), y + above,
                                    [&](size_t i, double v) { return chars[i].y > v; });
-        auto hi = std::upper_bound(vis.begin(), vis.end(), y - below,
+        auto hi = std::upper_bound(it, vis.end(), y - below,
                                    [&](double v, size_t i) { return v > chars[i].y; });
-        return std::make_pair(lo, hi);
+        while (it != hi) {
+            double row_y = chars[*it].y;
+            auto row_end = std::upper_bound(it, hi, row_y,
+                                            [&](double v, size_t i) { return v > chars[i].y; });
+            auto w = std::lower_bound(it, row_end, xlo,
+                                      [&](size_t i, double v) { return chars[i].left < v; });
+            for (; w != row_end && chars[*w].left <= xhi; ++w)
+                if (chars[*w].right - chars[*w].left <= 2 * chars[*w].font_size &&
+                    fn(chars[*w]))
+                    return;
+            it = row_end;
+        }
+        for (size_t i : wide)
+            if (chars[i].y <= y + above && chars[i].y >= y - below && fn(chars[i])) return;
     };
-    // The word glyph `mark` touches on its left (side < 0) or right.
-    auto touching = [&](const TextChar& mark, int side) -> const TextChar* {
+    // Each position's row (glyphs of one baseline) in vis: [row_lo, row_hi).
+    std::vector<uint32_t> row_lo(vis.size()), row_hi(vis.size());
+    for (size_t i = 0; i < vis.size();) {
+        size_t j = i + 1;
+        while (j < vis.size() && chars[vis[j]].y == chars[vis[i]].y) j++;
+        for (size_t k = i; k < j; k++) {
+            row_lo[k] = static_cast<uint32_t>(i);
+            row_hi[k] = static_cast<uint32_t>(j);
+        }
+        i = j;
+    }
+
+    // The word glyph `mark` (at position pos of vis) touches on its left
+    // (side < 0) or right. A word sits at least kMarkMinShiftEm off the
+    // mark's baseline, so with no other row within reach there is none.
+    auto touching = [&](const TextChar& mark, size_t pos, int side) -> const TextChar* {
         double reach = std::min(kMarkMaxShiftEm * max_fs, mark.font_size);
-        auto [lo, hi] = rows_near(mark.y, reach, reach);
+        bool row_above = row_lo[pos] > 0 && chars[vis[row_lo[pos] - 1]].y <= mark.y + reach;
+        bool row_below = row_hi[pos] < vis.size() && chars[vis[row_hi[pos]]].y >= mark.y - reach;
+        if (!row_above && !row_below && wide.empty()) return nullptr;
+        // Where a touching glyph's left edge can lie (the gap test below
+        // bounds it by the widest glyph and the largest size).
+        double xlo = side < 0 ? mark.left - kMarkTouchEm * max_fs - max_w
+                              : mark.right - 0.5 * max_w;
+        double xhi = side < 0 ? mark.left : mark.right + kMarkTouchEm * max_fs;
         const TextChar* best = nullptr;
         double best_gap = 1e18;
-        for (auto it = lo; it != hi; ++it) {
-            const TextChar& w = chars[*it];
-            if (mark.font_size > kMarkMaxRatio * w.font_size) continue;
+        for_near(mark.y, reach, reach, xlo, xhi, [&](const TextChar& w) {
+            if (mark.font_size > kMarkMaxRatio * w.font_size) return false;
             double shift = std::abs(mark.y - w.y);
             if (shift < kMarkMinShiftEm * w.font_size || shift > kMarkMaxShiftEm * w.font_size ||
                 shift > mark.font_size)
-                continue;
+                return false;
             double gap = side < 0 ? mark.left - w.right : w.left - mark.right;
-            if (gap < -0.5 * (w.right - w.left) || gap > kMarkTouchEm * w.font_size) continue;
+            if (gap < -0.5 * (w.right - w.left) || gap > kMarkTouchEm * w.font_size) return false;
             if (std::abs(gap) < best_gap) {
                 best_gap = std::abs(gap);
                 best = &w;
             }
-        }
+            return false;
+        });
         return best;
     };
 
@@ -3137,21 +3185,21 @@ void settle_raised_marks(std::vector<TextChar>& chars) {
                       gap >= -0.5 * (last.right - last.left);
         }
         if (in_line) continue;
-        const TextChar* word = touching(first, -1);
-        if (!word) word = touching(last, +1);
+        const TextChar* word = touching(first, run_a, -1);
+        if (!word) word = touching(last, run_b - 1, +1);
         if (!word) continue;
         double run_left = first.left, run_right = last.right;
         double wy = word->y, wfs = word->font_size;
-        auto [lo, hi] = rows_near(wy, kMarkMaxShiftEm * wfs, kMarkMaxShiftEm * wfs);
         bool covered = false;
-        for (auto it = lo; it != hi && !covered; ++it) {
-            const TextChar& w = chars[*it];
+        for_near(wy, kMarkMaxShiftEm * wfs, kMarkMaxShiftEm * wfs, run_left - max_w, run_right,
+                 [&](const TextChar& w) {
             if (std::abs(w.y - first.y) <= 0.05 * fs && w.font_size == fs &&
                 w.left >= run_left - 0.01 && w.right <= run_right + 0.01)
-                continue;  // the run itself
+                return false;  // the run itself
             double overlap = std::min(run_right, w.right) - std::max(run_left, w.left);
             covered = overlap > 0.5 * std::min(w.right - w.left, run_right - run_left);
-        }
+            return covered;
+        });
         if (covered) continue;
         for (size_t k = run_a; k < run_b; k++) moves.emplace_back(vis[k], wy);
     }
