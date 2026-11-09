@@ -2599,7 +2599,12 @@ std::vector<int> explicit_word_spaces(const std::vector<TextChar>& chars) {
             between = sp.rot == 0 && cs > ca && cs < cb &&
                       std::abs(sp.y - b.y) <= fs;
         }
-        if (between) sep[k] = static_cast<int>(i - 1);
+        // A space the next glyph is moved back over entirely is a break
+        // opportunity, not a space. Measured from the space itself: the
+        // previous glyph's box may run past it (an advance that already
+        // includes the space), so its right edge says nothing here.
+        if (between && b.left - chars[i].left > kWrittenSpaceMinEm * fs)
+            sep[k] = static_cast<int>(i - 1);
     }
     return sep;
 }
@@ -3368,12 +3373,9 @@ static std::vector<TextLine> lines_from_upright_chars(
             // A space the producer wrote in the stream between this glyph
             // and the one just placed (explicit_word_spaces) separates them
             // even when the space itself sits off the baseline and missed
-            // this line, as long as some gap is left. A space the next glyph
-            // is moved back over entirely is a line-break opportunity, not a
-            // space.
+            // this line.
             bool written = !after_space && word_sep[idx[ii]] >= 0 &&
-                           word_sep[idx[ii]] == prev_glyph &&
-                           ch.left - word_end > kWrittenSpaceMinEm * ch.font_size;
+                           word_sep[idx[ii]] == prev_glyph;
             if ((gap > word_gap || written) && cur.text.back() != ' ')
                 cur.text += ' ';
         }

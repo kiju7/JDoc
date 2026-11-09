@@ -509,8 +509,9 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
 // Word spaces the producer wrote. A space glyph drawn in the content stream
 // between two upright glyphs of one baseline, the second further right and
 // the spaces between them, separates the two even where the gap measures
-// less than a word space (but more than kWrittenSpaceMinEm — a space kerned
-// out entirely is a break opportunity, not a space): justified or kerned
+// less than a word space (unless the second glyph starts within
+// kWrittenSpaceMinEm of the space itself — a space kerned out entirely is a
+// break opportunity, not a space): justified or kerned
 // text can close it below a word space ("2 Excludes",
 // the E kerned back over the space), and a space set in another font or
 // rise lies off the baseline and is lost to line grouping (a 6.6-pt space

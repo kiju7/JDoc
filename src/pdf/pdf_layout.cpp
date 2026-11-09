@@ -545,13 +545,12 @@ std::string render_row(const LayoutLine& ln, double margin, double unit,
             // pick up stray double spaces wherever its proportional
             // advances drift off the pitch.
             // A space glyph the producer wrote between them is a word
-            // space even where kerning or justification closed the gap,
-            // unless it closed entirely (see chars_to_lines).
+            // space even where kerning or justification closed the gap
+            // (explicit_word_spaces).
             double gap = g->left - ink_right(prev);
             double word_gap = std::max(1.0, fs * 0.15);
             if (gap < word_gap)
-                col = (spaces && gap > kWrittenSpaceMinEm * fs &&
-                       spaces->between(prev, g)) ? cursor + 1 : cursor;
+                col = (spaces && spaces->between(prev, g)) ? cursor + 1 : cursor;
             else if (gap < fs * kSnapGapEm)
                 col = cursor + 1;
             else
