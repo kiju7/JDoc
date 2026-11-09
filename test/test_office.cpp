@@ -1536,6 +1536,76 @@ void test_xlsx_streaming() {
     TEST_END
 }
 
+// Cells as de-identification and export tools write them: shared strings
+// under a name of the tool's choosing, cells and rows without r=, an inline
+// string without t="inlineStr", a formula's text result under a date style.
+void test_xlsx_cell_values() {
+    std::cerr << "\nXLSX cell values from other writers:\n";
+
+    const std::string sheet =
+        "<row r=\"1\"><c t=\"s\"><v>0</v></c><c><is><t>inline no type</t></is></c>"
+        "<c t=\"str\" s=\"1\"><f>A1</f><v>010-1234-5678</v></c></row>"
+        "<row><c><v>7</v></c><c t=\"s\"><v>1</v></c></row>";
+    const std::string sst =
+        "<?xml version=\"1.0\"?><sst xmlns=\"http://schemas.openxmlformats.org/"
+        "spreadsheetml/2006/main\"><si><r><t>홍</t></r><r><t>길동</t></r>"
+        "<rPh sb=\"0\" eb=\"1\"><t>ホン</t></rPh></si><si><t>second</t></si></sst>";
+    const std::string styles =
+        "<?xml version=\"1.0\"?><styleSheet xmlns=\"http://schemas.openxmlformats.org/"
+        "spreadsheetml/2006/main\"><cellXfs count=\"2\"><xf numFmtId=\"0\"/>"
+        "<xf numFmtId=\"14\" applyNumberFormat=\"1\"/></cellXfs></styleSheet>";
+
+    auto check = [](const std::string& md) {
+        return md.find("홍길동") != std::string::npos &&
+               md.find("ホン") == std::string::npos &&
+               md.find("inline no type") != std::string::npos &&
+               md.find("010-1234-5678") != std::string::npos &&
+               md.find("| 7 | second |") != std::string::npos;
+    };
+
+    // Shared strings found ignoring case, as OPC part names compare.
+    auto cased = make_xlsx("worksheets/sheet1.xml", sheet,
+                           {{"xl/SharedStrings.xml", sst}, {"xl/styles.xml", styles}});
+    // Shared strings named by the workbook's relationships.
+    auto named = make_zip({
+        {"[Content_Types].xml",
+         "<?xml version=\"1.0\"?><Types xmlns=\"http://schemas.openxmlformats.org/"
+         "package/2006/content-types\"/>"},
+        {"xl/workbook.xml",
+         "<?xml version=\"1.0\"?><workbook xmlns=\"http://schemas.openxmlformats.org/"
+         "spreadsheetml/2006/main\" xmlns:r=\"http://schemas.openxmlformats.org/"
+         "officeDocument/2006/relationships\"><sheets>"
+         "<sheet name=\"Sheet1\" sheetId=\"1\" r:id=\"rId1\"/></sheets></workbook>"},
+        {"xl/_rels/workbook.xml.rels",
+         "<?xml version=\"1.0\"?><Relationships xmlns=\"http://schemas.openxmlformats.org/"
+         "package/2006/relationships\"><Relationship Id=\"rId1\" Type=\""
+         "http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\""
+         " Target=\"worksheets/sheet1.xml\"/><Relationship Id=\"rId2\" Type=\""
+         "http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings\""
+         " Target=\"/xl/strings.xml\"/><Relationship Id=\"rId3\" Type=\""
+         "http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles\""
+         " Target=\"style.xml\"/></Relationships>"},
+        {"xl/strings.xml", sst},
+        {"xl/style.xml", styles},
+        {"xl/worksheets/sheet1.xml",
+         "<?xml version=\"1.0\"?><worksheet xmlns=\"http://schemas.openxmlformats.org/"
+         "spreadsheetml/2006/main\"><sheetData>" + sheet + "</sheetData></worksheet>"},
+    });
+
+    TEST(cell_values_dom)
+        unset_env("JDOC_XLSX_STREAM_THRESHOLD");
+        ASSERT(check(convert_xlsx(cased)));
+        ASSERT(check(convert_xlsx(named)));
+    TEST_END
+
+    TEST(cell_values_streamed)
+        set_env("JDOC_XLSX_STREAM_THRESHOLD", "0");
+        bool ok = check(convert_xlsx(cased)) && check(convert_xlsx(named));
+        unset_env("JDOC_XLSX_STREAM_THRESHOLD");
+        ASSERT(ok);
+    TEST_END
+}
+
 // ── XLS SST CONTINUE-boundary decoding ───────────────────────
 
 void test_xls_sst_continue() {
@@ -2038,6 +2108,7 @@ int main() {
     test_rtf_images();
     test_markdown_and_chunk_apis_agree();
     test_xlsx_streaming();
+    test_xlsx_cell_values();
     test_xls_sst_continue();
     test_xlsb_sparse_cells();
     test_html_charset();

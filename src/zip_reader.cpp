@@ -285,12 +285,8 @@ std::vector<const ZipReader::Entry*> ZipReader::entries_with_prefix(const std::s
 }
 
 std::vector<char> ZipReader::read_entry(const std::string& name) const {
-    for (auto& e : entries_) {
-        if (e.name == name) {
-            return read_entry(e);
-        }
-    }
-    return {};
+    const Entry* e = find_entry(name);
+    return e ? read_entry(*e) : std::vector<char>{};
 }
 
 std::vector<char> ZipReader::read_entry(const Entry& entry) const {
@@ -346,9 +342,18 @@ bool ZipReader::has_entry(const std::string& name) const {
     return find_entry(name) != nullptr;
 }
 
+// Exact name first; failing that, ignoring ASCII case, as OPC (OOXML) and
+// ODF part names are compared — "xl/SharedStrings.xml" is the same part.
 const ZipReader::Entry* ZipReader::find_entry(const std::string& name) const {
     for (auto& e : entries_) {
         if (e.name == name) return &e;
+    }
+    auto lower = [](unsigned char c) { return c >= 'A' && c <= 'Z' ? c + 32 : c; };
+    for (auto& e : entries_) {
+        if (e.name.size() != name.size()) continue;
+        size_t i = 0;
+        while (i < name.size() && lower(e.name[i]) == lower(name[i])) ++i;
+        if (i == name.size()) return &e;
     }
     return nullptr;
 }
