@@ -5476,17 +5476,25 @@ static std::vector<TableData> detect_text_tables_range(
         // on its shape.
         bool hidden_cells = false;
         {
+            // In one sorted pass per row: a range wholly inside a column
+            // that starts a cell gap after the previous such range there.
             size_t hidden = 0, checked = 0;
+            std::vector<std::pair<double, double>> sorted;
+            std::vector<double> last_end(bounds.size());
             for (size_t r = ext.first_row; r <= ext.last_row; r++) {
                 checked++;
+                sorted.assign(rows[r].char_ranges.begin(), rows[r].char_ranges.end());
+                std::sort(sorted.begin(), sorted.end());
+                std::fill(last_end.begin(), last_end.end(), -1e18);
                 bool hid = false;
-                for (size_t c = 0; c + 1 < bounds.size() && !hid; c++) {
-                    std::vector<std::pair<double, double>> in;
-                    for (auto& cr : rows[r].char_ranges)
-                        if (cr.first >= bounds[c] && cr.second <= bounds[c + 1]) in.push_back(cr);
-                    std::sort(in.begin(), in.end());
-                    for (size_t k = 1; k < in.size(); k++)
-                        if (in[k].first - in[k - 1].second >= cell_merge_gap) { hid = true; break; }
+                for (const auto& cr : sorted) {
+                    for (size_t c = 0; c + 1 < bounds.size(); c++) {
+                        if (cr.first < bounds[c] || cr.second > bounds[c + 1]) continue;
+                        if (last_end[c] > -1e17 && cr.first - last_end[c] >= cell_merge_gap)
+                            hid = true;
+                        last_end[c] = cr.second;
+                    }
+                    if (hid) break;
                 }
                 if (hid) hidden++;
             }
