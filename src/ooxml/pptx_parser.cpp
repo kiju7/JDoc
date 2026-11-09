@@ -794,7 +794,7 @@ std::string PptxParser::to_markdown(const ConvertOptions& opts) {
         if (!body.empty() && body.back() != '\n') body += "\n";
         body += extra;
     }
-    body += format_embedded_parts(zip_);
+    body += format_embedded_parts(zip_, opts);
     return body;
 }
 
@@ -901,7 +901,7 @@ std::vector<PageChunk> PptxParser::to_chunks(const ConvertOptions& opts) {
         chunks.push_back(std::move(c));
         return true;
     });
-    append_embedded_parts(zip_, chunks);
+    append_embedded_parts(zip_, opts, chunks);
     return chunks;
 }
 

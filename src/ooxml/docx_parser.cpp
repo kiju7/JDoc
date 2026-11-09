@@ -767,7 +767,7 @@ std::string DocxParser::to_markdown(const ConvertOptions& opts) {
 
     std::string rendered = out.str();
     rendered += format_header_footer_block(rendered);
-    rendered += format_embedded_parts(zip_);
+    rendered += format_embedded_parts(zip_, opts);
     return rendered;
 }
 
@@ -955,11 +955,11 @@ std::vector<PageChunk> DocxParser::to_chunks(
                 }
             }
         }
-        append_embedded_parts(zip_, filtered);
+        append_embedded_parts(zip_, opts, filtered);
         return filtered;
     }
 
-    append_embedded_parts(zip_, chunks);
+    append_embedded_parts(zip_, opts, chunks);
     return chunks;
 }
 

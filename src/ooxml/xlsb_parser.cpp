@@ -595,7 +595,7 @@ std::string XlsbParser::to_markdown(const ConvertOptions& opts) {
         }
         out << format_sheet_as_table(sheet) << "\n";
     }
-    return out.str() + format_embedded_parts(zip_);
+    return out.str() + format_embedded_parts(zip_, opts);
 }
 
 std::vector<PageChunk> XlsbParser::to_chunks(const ConvertOptions& opts) {
@@ -627,7 +627,7 @@ std::vector<PageChunk> XlsbParser::to_chunks(const ConvertOptions& opts) {
         chunk.text = text;
         chunks.push_back(std::move(chunk));
     }
-    append_embedded_parts(zip_, chunks);
+    append_embedded_parts(zip_, opts, chunks);
     return chunks;
 }
 

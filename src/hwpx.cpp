@@ -11,6 +11,7 @@
 #include "common/string_utils.h"
 #include "xml_utils.h"
 #include "zip_reader.h"
+#include "common/embedded.h"
 #include <pugixml.hpp>
 #include <algorithm>
 #include <map>
@@ -770,6 +771,10 @@ private:
     // visited twice.
     void collect_shape_text(pugi::xml_node shape, std::string& out, int depth) {
         if (depth > kMaxShapeDepth) return;
+        if (std::string(shape.name()) == "hp:ole") {
+            append_ole_text(shape, out);
+            return;
+        }
         for (auto child : shape.children()) {
             std::string cn = child.name();
             if (cn == "hp:drawText") {
@@ -781,6 +786,25 @@ private:
                 collect_shape_text(child, out, depth + 1);
             }
         }
+    }
+
+    // An OLE object's own text (a spreadsheet or document pasted in): its
+    // BinData part holds the embedded document.
+    void append_ole_text(pugi::xml_node ole, std::string& out) {
+        auto it = bin_data_map_.find(ole.attribute("binaryItemIDRef").as_string());
+        if (it == bin_data_map_.end() || !zip_->has_entry(it->second.href)) return;
+        auto bytes = zip_->read_entry(it->second.href);
+        ConvertOptions o = opts_;
+        o.format = OutputFormat::PLAINTEXT;
+        std::string text;
+        for (char c : embedded_document_text(reinterpret_cast<const uint8_t*>(bytes.data()),
+                                             bytes.size(), it->second.href, o)) {
+            if (c != '\n') text += c;
+            else if (!text.empty() && text.back() != '\n') text += '\n';
+        }
+        if (text.empty()) return;
+        if (!out.empty()) out += "\n";
+        out += text;
     }
 
     void extract_sublist_text(pugi::xml_node sublist, std::string& out,
