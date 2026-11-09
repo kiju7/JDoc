@@ -217,7 +217,8 @@ std::string DocxParser::extract_headers_footers() {
 std::string DocxParser::extract_footnotes() {
     std::vector<char> data;
     pugi::xml_document doc;
-    if (!xml_load_part(zip_, "word/footnotes.xml", doc, data)) return "";
+    if (!xml_load_part(zip_, "word/footnotes.xml", doc, data,
+                           pugi::parse_default | pugi::parse_ws_pcdata)) return "";
 
     std::string result;
     std::vector<pugi::xml_node> footnotes;
@@ -245,7 +246,8 @@ std::string DocxParser::extract_footnotes() {
 std::string DocxParser::extract_endnotes() {
     std::vector<char> data;
     pugi::xml_document doc;
-    if (!xml_load_part(zip_, "word/endnotes.xml", doc, data)) return "";
+    if (!xml_load_part(zip_, "word/endnotes.xml", doc, data,
+                           pugi::parse_default | pugi::parse_ws_pcdata)) return "";
 
     std::string result;
     std::vector<pugi::xml_node> endnotes;

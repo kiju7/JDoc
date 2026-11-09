@@ -313,7 +313,8 @@ private:
     void parse_section(const std::string& section_path, PageChunk& chunk) {
         std::vector<char> data;
         pugi::xml_document doc;
-        if (!xml_load_part(*zip_, section_path, doc, data)) return;
+        if (!xml_load_part(*zip_, section_path, doc, data,
+                           pugi::parse_default | pugi::parse_ws_pcdata)) return;
 
         // Find <hs:sec> root
         auto sec = doc.first_child();
