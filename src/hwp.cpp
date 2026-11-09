@@ -1154,8 +1154,15 @@ private:
                 break;
 
             case hwp::HWPCharType::ControlChar:
+                // Line breaks, and the characters HWP stores as controls: a
+                // hyphen (24), a non-breaking space (30), a fixed-width space
+                // (31). Dropping those ran the words they join together.
                 if (code == 13 || code == 10) {
                     para.text.push_back(u'\n');
+                } else if (code == 24) {
+                    para.text.push_back(u'-');
+                } else if (code == 30 || code == 31) {
+                    para.text.push_back(u' ');
                 } else {
                     para.text.push_back(0);  // placeholder
                 }

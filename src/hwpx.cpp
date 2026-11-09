@@ -619,9 +619,16 @@ private:
             if (cn == "hp:t") {
                 out += extract_text(child);
             } else {
+                if (cn == "hp:p") space_before(out);
                 collect_note_text(child, out);
             }
         }
+    }
+
+    // Blocks flattened into one line (paragraphs, a nested table or shape in
+    // a cell) are kept apart by a space so their words do not run together.
+    static void space_before(std::string& out) {
+        if (!out.empty() && out.back() != ' ' && out.back() != '\n') out += ' ';
     }
 
     // ── Table processing ────────────────────────────────────
@@ -814,7 +821,7 @@ private:
         if (depth > kMaxShapeDepth) return;
         for (auto para : sublist.children()) {
             if (std::string(para.name()) != "hp:p") continue;
-            if (!out.empty()) out += " ";
+            space_before(out);
             for (auto run : para.children()) {
                 std::string rname = run.name();
                 if (rname == "hp:run") {
@@ -825,9 +832,13 @@ private:
                         } else if (iname == "hp:pic" && cell_pics) {
                             cell_pics->push_back(item);
                         } else if (iname == "hp:tbl") {
+                            space_before(out);
                             flatten_table_text(item, out, cell_pics, depth + 1);
+                            space_before(out);
                         } else if (is_shape_element(iname)) {
+                            space_before(out);
                             collect_shape_text(item, out, depth + 1);
+                            space_before(out);
                         } else if (iname == "hp:ctrl") {
                             for (auto ctrl_child : item.children()) {
                                 std::string cn = ctrl_child.name();
