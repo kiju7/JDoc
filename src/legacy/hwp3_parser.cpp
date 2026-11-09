@@ -5,14 +5,18 @@
 // list. Paragraph text is a stream of 16-bit words: values < 32 are inline
 // control codes with code-specific payloads, everything else is a 2-byte
 // johab/KS character code.
+// Tagged blocks after the paragraph list carry embedded pictures and one
+// compound file holding every OLE object.
 // Reference: HWP 3.0 file format spec (Hancom); framing cross-checked
 // against the LibreOffice hwpfilter implementation and real documents.
 // License: MIT
 
 #include "legacy/hwp3_parser.h"
 #include "common/binary_utils.h"
+#include "common/embedded.h"
 #include "common/file_utils.h"
 #include "common/string_utils.h"
+#include "legacy/ole_reader.h"
 
 #include <zlib.h>
 
@@ -34,6 +38,11 @@ constexpr size_t kParaShapeLen = 187;
 constexpr size_t kLineInfoLen = 14;
 constexpr size_t kStyleNameLen = 20;
 constexpr size_t kCellLen = 27;
+constexpr size_t kPictureLen = 348;
+constexpr size_t kPictureTypeOff = 74;   // 1 = OLE object, 3 = drawing
+constexpr size_t kPictureNameOff = 83;   // file name; OLE: its storage
+constexpr size_t kDrawCommonLen = 88;    // drawing object common header
+constexpr size_t kDrawFlagOff = 84;      // property flags in the common header
 constexpr int kMaxParaListDepth = 16;
 constexpr size_t kMaxBodySize = 256u << 20;  // inflate guard (256 MiB)
 
@@ -195,7 +204,9 @@ void append_hwp_char(std::string& out, uint16_t ch) {
         util::append_utf8(out, kLogo[ch - 0x37C0]);
         return;
     }
-    util::append_utf8(out, 0xFFFD);
+    // Codes outside the 3.0 tables are written by newer Hancom versions as
+    // the Unicode value itself (middle dot 0x00B7, arrows, Latin letters).
+    util::append_utf8(out, ch < 0x3000 ? ch : 0xFFFD);
 }
 
 // ── Inline control codes ────────────────────────────────────
@@ -299,7 +310,10 @@ std::string render_table(std::vector<CellText>& cells) {
 
 class Hwp3Doc {
 public:
-    Hwp3Doc(const uint8_t* data, size_t size) : file_{data, size, 0} {}
+    Hwp3Doc(const uint8_t* data, size_t size, const ConvertOptions& opts)
+        : file_{data, size, 0}, opts_(opts) {
+        opts_.format = OutputFormat::MARKDOWN;   // the whole output is stripped later
+    }
 
     // Parse the document; the extracted markdown is available via text().
     void parse() {
@@ -307,6 +321,7 @@ public:
         skip_font_and_styles();
         parse_para_list(0);
         flush_paragraph();
+        insert_ole_texts();
     }
 
     std::string& text() { return out_; }
@@ -317,6 +332,8 @@ private:
     Reader body_;                    // body stream (fonts/styles/paragraphs)
     std::string out_;                // markdown output
     std::string para_;               // current paragraph accumulator
+    ConvertOptions opts_;            // for embedded OLE documents
+    std::vector<std::pair<size_t, std::string>> oles_;  // out_ offset, storage
     int font_langs_ = 7;             // font-name lists (languages) by version
     size_t char_shape_len_ = 31;     // char shape record size by version
 
@@ -695,10 +712,127 @@ private:
 
     void parse_picture(int depth) {
         // 348-byte picture info; the trailing-data length is its first dword.
-        const uint8_t* info = body_.block(348);
+        const uint8_t* info = body_.block(kPictureLen);
         uint32_t follow = util::read_u32_le(info + 0);
-        body_.skip(follow);                        // drawing/hyperlink data
+        uint8_t type = info[kPictureTypeOff];
+        if (type == 1) {
+            // The object lives in the OLE container after the body; its text
+            // goes where captions go once that container has been read.
+            const char* name = reinterpret_cast<const char*>(info + kPictureNameOff);
+            oles_.emplace_back(out_.size(), std::string(name, strnlen(name, 256)));
+        }
+        body_.need(follow);
+        if (type == 3 && follow) parse_drawing(follow, depth);
+        else body_.skip(follow);                   // hyperlink data
         emit_caption(depth);
+    }
+
+    // ── Drawing objects ─────────────────────────────────
+
+    // A drawing (picture type 3) is a header and a tree of shapes. Each shape
+    // is a sized common header, then two sized private blocks; text sits at
+    // the end of the common header (any shape marked as a text box) or in the
+    // second private block (the text box shape). A malformed drawing loses
+    // only its own text.
+    void parse_drawing(uint32_t len, int depth) {
+        Reader outer = body_;
+        std::string para = para_;
+        body_ = Reader{outer.data + outer.pos, len, 0};
+        try {
+            body_.skip(body_.u32());               // header (z-order, bounds)
+            parse_shapes(depth);
+        } catch (const std::runtime_error&) {
+            para_ = std::move(para);
+        }
+        body_ = outer;
+        body_.skip(len);
+    }
+
+    void parse_shapes(int depth) {
+        if (depth > kMaxParaListDepth) fail("drawing nesting too deep");
+        constexpr uint32_t kRotation = 0x20000, kGradation = 0x10000,
+                           kBitmap = 0x40000, kTextBox = 0x80000,
+                           kWatermark = 0x100000;
+        constexpr uint16_t kHasNext = 1, kHasChild = 2, kTextBoxShape = 6;
+        uint16_t link = 0;
+        do {
+            uint32_t size = body_.u32();
+            if (size < kDrawCommonLen) fail("drawing object header too short");
+            body_.need(size);
+            size_t start = body_.pos;
+            uint16_t type = util::read_u16_le(body_.data + start);
+            link = util::read_u16_le(body_.data + start + 2);
+            uint32_t flag = util::read_u32_le(body_.data + start + kDrawFlagOff);
+            if (flag & kTextBox) {
+                // Optional property blocks precede the text, each present
+                // only when flagged and when the header is long enough. The
+                // text ([reserved][length][paragraphs]) ends the header; the
+                // watermark block is 3 bytes, or 5 from some writers, so the
+                // length that reaches the end picks the start.
+                size_t off = kDrawCommonLen;
+                if ((flag & kRotation) && size >= off + 32) off += 32;
+                if ((flag & kGradation) && size >= off + 28) off += 28;
+                if ((flag & kBitmap) && size >= off + 278) off += 278;
+                if ((flag & kWatermark) && size >= off + 3) off += 3;
+                for (size_t at : {off, off + 2}) {
+                    if (size < at + 8 ||
+                        util::read_u32_le(body_.data + start + at + 4) != size - at - 8)
+                        continue;
+                    body_.pos = start + at + 8;
+                    emit_shape_text(depth);
+                    break;
+                }
+            }
+            body_.pos = start + size;
+            for (int b = 0; b < 2; b++) {
+                uint32_t n = body_.u32();
+                body_.need(n);
+                size_t p = body_.pos;
+                if (b == 1 && type == kTextBoxShape && n) emit_shape_text(depth);
+                body_.pos = p + n;
+            }
+            if (link & kHasChild) parse_shapes(depth + 1);
+        } while (link & kHasNext);
+    }
+
+    // A shape's text is its own paragraph in the body and part of the
+    // cell (or note, header...) that holds the shape elsewhere.
+    void emit_shape_text(int depth) {
+        if (depth == 0) {
+            parse_sub_list(depth);
+            return;
+        }
+        std::string t = util::trim(collect_sub_list(depth));
+        if (t.empty()) return;
+        if (!para_.empty()) para_ += " ";
+        para_ += t;
+    }
+
+    // ── OLE objects ─────────────────────────────────────
+
+    // Tagged blocks follow the body's paragraph list; tag 2 holds every OLE
+    // object as a storage of one compound file (after a 4-byte signature).
+    // Each object's text goes where its picture was.
+    void insert_ole_texts() {
+        if (oles_.empty()) return;
+        constexpr uint32_t kOleTag = 2;
+        while (body_.size - body_.pos >= 8) {
+            uint32_t tag = body_.u32();
+            uint32_t len = body_.u32();
+            if (tag == 0 || len > body_.size - body_.pos) return;
+            const uint8_t* data = body_.data + body_.pos;
+            body_.skip(len);
+            if (tag != kOleTag || len <= 4) continue;
+            try {
+                OleReader ole(data + 4, len - 4);
+                for (auto it = oles_.rbegin(); it != oles_.rend(); ++it) {
+                    std::string text = embedded_storage_text(ole, it->second, opts_);
+                    if (!text.empty()) out_.insert(it->first, text + "\n\n");
+                }
+            } catch (const std::exception&) {
+            }
+            return;
+        }
     }
 
     // Read the always-present caption paragraph list; emit non-empty text.
@@ -747,7 +881,7 @@ Hwp3Parser::Hwp3Parser(const uint8_t* data, size_t size)
     : data_(data), size_(size) {}
 
 std::string Hwp3Parser::to_markdown(const ConvertOptions& opts) {
-    Hwp3Doc doc(data_, size_);
+    Hwp3Doc doc(data_, size_, opts);
     doc.parse();
     std::string md = std::move(doc.text());
     while (!md.empty() && md.back() == '\n') md.pop_back();

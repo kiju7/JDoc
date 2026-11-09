@@ -353,6 +353,85 @@ static void test_text_extraction() {
     TEST_END
 }
 
+// A paragraph holding a drawing (picture type 3) of two linked shapes: a
+// rectangle marked as a text box (with a 3-byte watermark block before its
+// text) and a text box shape (text in its second private block).
+Bytes drawing_doc() {
+    auto para_list = [](const std::string& text) {
+        Bytes l;
+        put_text_para(l, text);
+        put_null_para(l);
+        return l;
+    };
+    Bytes draw;
+    put_u32(draw, 24);                     // header: z-order, count, bounds
+    put_zeros(draw, 24);
+
+    Bytes rect = para_list("Rect text");
+    Bytes common(88, 0);
+    common[0] = 2;                         // rectangle
+    common[2] = 1;                         // has next
+    common.resize(84);                     // flags close the 88-byte header
+    put_u32(common, 0x80000 | 0x100000);   // text box + watermark
+    put_zeros(common, 3);                  // watermark
+    put_u32(common, 0);
+    put_u32(common, uint32_t(rect.size()));
+    common.insert(common.end(), rect.begin(), rect.end());
+    put_u32(draw, uint32_t(common.size()));
+    draw.insert(draw.end(), common.begin(), common.end());
+    put_u32(draw, 0);                      // private blocks
+    put_u32(draw, 0);
+
+    Bytes box = para_list("Box text");
+    Bytes common2(88, 0);
+    common2[0] = 6;                        // text box shape, last
+    put_u32(draw, 88);
+    draw.insert(draw.end(), common2.begin(), common2.end());
+    put_u32(draw, 0);
+    put_u32(draw, uint32_t(box.size()));
+    draw.insert(draw.end(), box.begin(), box.end());
+
+    Bytes body;
+    put_tables(body);
+    put_para_header(body, 4 + 1);
+    put_u16(body, 11);                     // CH_PICTURE
+    put_u32(body, 0);
+    put_u16(body, 11);
+    Bytes info(348, 0);
+    info[0] = uint8_t(draw.size());
+    info[1] = uint8_t(draw.size() >> 8);
+    info[74] = 3;                          // drawing
+    body.insert(body.end(), info.begin(), info.end());
+    body.insert(body.end(), draw.begin(), draw.end());
+    put_null_para(body);                   // empty caption
+    put_u16(body, 13);
+    put_text_para(body, "After");
+    put_null_para(body);
+    return build_hwp3_file(body, false);
+}
+
+static void test_drawings() {
+    std::cerr << "\nDrawings:\n";
+
+    TEST(shape_text_boxes)
+        auto md = convert_mem(drawing_doc());
+        ASSERT(md.find("Rect text\n\nBox text") != std::string::npos);
+        ASSERT(md.find("After") != std::string::npos);
+    TEST_END
+
+    TEST(unicode_codes_from_newer_writers)
+        Bytes body;
+        put_tables(body);
+        put_para_header(body, 3);
+        put_u16(body, 0x00B7);       // middle dot
+        put_u16(body, 0x2192);       // rightwards arrow
+        put_u16(body, 13);
+        put_null_para(body);
+        auto md = convert_mem(build_hwp3_file(body, false));
+        ASSERT(md.find("·→") != std::string::npos);
+    TEST_END
+}
+
 static void test_tables() {
     std::cerr << "\nTables:\n";
 
@@ -454,6 +533,7 @@ int main() {
     test_v2_versions();
     test_text_extraction();
     test_tables();
+    test_drawings();
     test_robustness();
 
     std::cerr << "\n=== Results: " << tests_passed << " passed, "

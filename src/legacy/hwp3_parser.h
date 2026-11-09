@@ -1,10 +1,10 @@
 #pragma once
 // .hwp 3.x (Hangul Word Processor 2.x/3.x legacy binary) parser.
-// Extracts body text (paragraphs, table cells, header/footer, footnotes)
-// as markdown. Images and complex formatting are skipped.
+// Extracts body text (paragraphs, table cells, header/footer, footnotes,
+// drawing text boxes, embedded OLE documents) as markdown. Images and
+// complex formatting are skipped.
 // Reference: HWP 3.0 file format spec (Hancom); cross-checked against
 // the LibreOffice hwpfilter implementation.
-// Does NOT depend on OLE reader (HWP 3.x is a flat binary stream).
 
 #include "jdoc/types.h"
 
