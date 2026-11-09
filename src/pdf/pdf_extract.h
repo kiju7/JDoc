@@ -1,8 +1,17 @@
 #pragma once
+#include <cstdlib>
 // pdf_extract.h — internal: aggregate result types and per-cluster entry points.
 #include "pdf_content.h"
 
 namespace jdoc { namespace pdf_detail {
+
+// JDOC_TABLE_DEBUG traces table detection to stderr. Read once: the checks
+// sit in per-row loops, and getenv walks the whole environment each call.
+inline bool table_debug() {
+    static const bool on = std::getenv("JDOC_TABLE_DEBUG") != nullptr;
+    return on;
+}
+
 
 struct TableData {
     std::vector<std::vector<std::string>> rows;

@@ -1066,7 +1066,7 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
                 parse_result.chars, result.col_boundaries[p], table_boxes,
                 sparse_grids, &parse_result.segments);
             // JDOC_TABLE_DEBUG: dump every table as detected, to stderr.
-            if (std::getenv("JDOC_TABLE_DEBUG")) {
+            if (table_debug()) {
                 for (auto& t : result.all_tables[p]) {
                     fprintf(stderr, "[table] page %d kind %d x %.1f..%.1f y %.1f..%.1f rows %zu\n",
                             p + 1, (int)t.kind, t.x0, t.x1, t.y0, t.y1, t.rows.size());

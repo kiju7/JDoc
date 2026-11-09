@@ -463,7 +463,7 @@ TableData build_table(const std::vector<double>& input_row_ys,
         }
     }
     bool drawn_single_column = row_ys.size() >= 4 && col_xs.size() == 2 && closed_grid(col_xs);
-    if (std::getenv("JDOC_TABLE_DEBUG")) {
+    if (table_debug()) {
         fprintf(stderr, "[ruled-columns] drawn %d single %d x %.1f..%.1f cols %zu levels",
                 drawn_rules, drawn_single_column, table_left, table_right, col_xs.size());
         for (double y : row_ys) fprintf(stderr, " %.1f", y);
@@ -872,7 +872,7 @@ TableData build_table(const std::vector<double>& input_row_ys,
         }
     }
 
-    if (std::getenv("JDOC_TABLE_DEBUG")) {
+    if (table_debug()) {
         fprintf(stderr, "[ruled-build] x %.1f..%.1f y %.1f..%.1f wrapped %d cols", table_left, table_right, table_bot, table_top, table.wrapped_closed_grid);
         for (double x : col_xs) fprintf(stderr, " %.1f", x);
         fprintf(stderr, " rows");
@@ -2340,7 +2340,7 @@ static void detect_ruled_in_zone(
             // A group of two rule levels is kept only as a boxed row of
             // drawn cells; such a band holds nothing else of a table.
             if (part.levels.size() == 2 && !t.single_box) continue;
-            if (std::getenv("JDOC_TABLE_DEBUG")) {
+            if (table_debug()) {
                 fprintf(stderr, "[rule-group]");
                 for (double y : part.levels) fprintf(stderr, " %.1f", y);
                 fprintf(stderr, " -> rows %zu%s\n", t.rows.size(),
@@ -2513,7 +2513,7 @@ static void detect_ruled_zoned(const std::vector<PdfLineSegment>& h_lines,
                              out, nullptr);
         return;
     }
-    if (std::getenv("JDOC_TABLE_DEBUG"))
+    if (table_debug())
         fprintf(stderr, "[rule-gutter] depth %d x %.1f..%.1f\n", depth, g.a, g.b);
     constexpr double kEdgeTol = 0.5;
     std::vector<PdfLineSegment> hl, hr, hc, vl, vr;
@@ -3697,7 +3697,7 @@ static std::vector<double> infer_columns_in_band(
     if (cands.empty()) return {};
     std::sort(cands.begin(), cands.end(),
               [](const Cand& a, const Cand& b) { return a.e < b.e; });
-    if (std::getenv("JDOC_TABLE_DEBUG")) {
+    if (table_debug()) {
         fprintf(stderr, "[band-cols] x %.1f..%.1f runs", x_lo, x_hi);
         for (auto& r : empty_runs) fprintf(stderr, " [%.1f,%.1f]", r.first, r.second);
         fprintf(stderr, " cands");
@@ -3840,7 +3840,7 @@ static std::vector<double> infer_columns_in_band(
                 }
                 straddled = crossing * 10 <= all;
             }
-            if (std::getenv("JDOC_TABLE_DEBUG")) {
+            if (table_debug()) {
                 fprintf(stderr, "[fig-gutter] %.1f-%.1f straddle %d fig %d ticks %d:",
                         ed.lo, ed.hi, straddle, fig, (int)ticks(right_vals));
                 for (double v : right_vals) fprintf(stderr, " %g", v);
@@ -4121,7 +4121,7 @@ static TableData build_table_from_band(
         // the line to the prose flow. Above the first data row the same
         // shape is a spanning header, which tears by construction; it is
         // kept, and its tears are not evidence against the boundaries.
-        if (std::getenv("JDOC_TABLE_DEBUG")) {
+        if (table_debug()) {
             std::string dbg;
             for (size_t idx : ci) util::append_utf8(dbg, chars[idx].unicode);
             fprintf(stderr, "[text-row] y %.1f torn %d n %zu: %s\n",
@@ -5287,7 +5287,7 @@ static std::vector<TableData> detect_text_tables_range(
         }
     }
     auto bands = find_y_bands(rows, chars, gutter_x <= 0, cell_merge_gap, gutter_x);
-    if (std::getenv("JDOC_TABLE_DEBUG"))
+    if (table_debug())
         for (auto& b : bands) {
             size_t multi = 0;
             for (size_t k = b.first_row; k <= b.last_row; k++) multi += rows[k].is_multi_cell;
@@ -5590,7 +5590,7 @@ static std::vector<TableData> detect_text_tables_range(
                     bool found = coverage >= upper - lower - 0.5;
                     columns_ruled &= found;
                 }
-                if (std::getenv("JDOC_TABLE_DEBUG")) {
+                if (table_debug()) {
                     fprintf(stderr, "[cell-wrap] y %.1f..%.1f ruled %d bounds", lower, upper, columns_ruled);
                     for (double x : bounds) fprintf(stderr, " %.1f", x);
                     fprintf(stderr, "\n");
@@ -5818,7 +5818,7 @@ static std::vector<TableData> detect_text_tables_range(
                     !glyph_stack && !prose_across &&
                     (narrow_label || ragged_pairs || (!in_margin && bold_header));
             (void)bold_first; (void)glyphs_first;
-            if (std::getenv("JDOC_TABLE_DEBUG"))
+            if (table_debug())
                 fprintf(stderr, "[band-shape] rows %zu withL %zu withLR %zu lw %.1f rw %.1f ragl %.2f ragr %.2f pair %.2f boldLR %.2f/%.2f body %.2f hidden %d -> %s%s%s%s%s first='%s'\n", n, withL, withLR, lw, rw, rag_l, rag_r, pair, bold_first_l, bold_first_r, body_bold, (int)hidden_cells,
                         narrow_label ? "narrow " : "", ragged_pairs ? "ragged " : "", bold_header ? "bold" : "", in_margin ? " MARGIN" : (sideways ? " SIDEWAYS" : (cut_off ? " CUT" : (glyph_stack ? " STACK" : (prose_across ? " ACROSS" : "")))), caption_first ? " CAPTION" : (twin_lists ? " TWIN" : ""), table.rows.empty() || table.rows[0].empty() ? "" : table.rows[0][0].substr(0, 24).c_str());
         }
@@ -5833,7 +5833,7 @@ static std::vector<TableData> detect_text_tables_range(
         // a table nor change which lines a table keeps.
         TableData table;
         auto bounds = infer_columns_in_band(rows, band, median_fs, false, chars, gutter_x);
-        if (std::getenv("JDOC_TABLE_DEBUG")) {
+        if (table_debug()) {
             fprintf(stderr, "[band-bounds] rows %zu..%zu:", band.first_row, band.last_row);
             for (double b : bounds) fprintf(stderr, " %.0f", b);
             fprintf(stderr, "\n");
@@ -5869,7 +5869,7 @@ static std::vector<TableData> detect_text_tables_range(
             if (enclosed.size() < 4 || !build_band(enclosed, table)) continue;
             bounds = std::move(enclosed);
         }
-        if (std::getenv("JDOC_TABLE_DEBUG"))
+        if (table_debug())
             fprintf(stderr, "[band-accepted] rows %zu..%zu cols %zu rows %zu\n", band.first_row, band.last_row, bounds.size() - 1, table.rows.size());
         auto refined = infer_columns_in_band(rows, band, median_fs, true, chars, gutter_x);
         if (refined != bounds) {
