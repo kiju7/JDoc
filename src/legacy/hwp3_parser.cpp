@@ -306,6 +306,12 @@ std::string render_table(std::vector<CellText>& cells) {
     return md;
 }
 
+// An OLE object met in the body: where its text goes and its storage name.
+struct OleRef {
+    size_t at = 0;           // offset in the output
+    std::string storage;
+};
+
 // ── Document parser ─────────────────────────────────────────
 
 class Hwp3Doc {
@@ -333,7 +339,7 @@ private:
     std::string out_;                // markdown output
     std::string para_;               // current paragraph accumulator
     ConvertOptions opts_;            // for embedded OLE documents
-    std::vector<std::pair<size_t, std::string>> oles_;  // out_ offset, storage
+    std::vector<OleRef> oles_;       // OLE objects in body order
     int font_langs_ = 7;             // font-name lists (languages) by version
     size_t char_shape_len_ = 31;     // char shape record size by version
 
@@ -719,7 +725,7 @@ private:
             // The object lives in the OLE container after the body; its text
             // goes where captions go once that container has been read.
             const char* name = reinterpret_cast<const char*>(info + kPictureNameOff);
-            oles_.emplace_back(out_.size(), std::string(name, strnlen(name, 256)));
+            oles_.push_back({out_.size(), std::string(name, strnlen(name, 256))});
         }
         body_.need(follow);
         if (type == 3 && follow) parse_drawing(follow, depth);
@@ -824,11 +830,21 @@ private:
             body_.skip(len);
             if (tag != kOleTag || len <= 4) continue;
             try {
+                // One pass over the output: offsets are in body order.
                 OleReader ole(data + 4, len - 4);
-                for (auto it = oles_.rbegin(); it != oles_.rend(); ++it) {
-                    std::string text = embedded_storage_text(ole, it->second, opts_);
-                    if (!text.empty()) out_.insert(it->first, text + "\n\n");
+                std::string merged;
+                merged.reserve(out_.size());
+                size_t from = 0;
+                for (auto& ref : oles_) {
+                    merged.append(out_, from, ref.at - from);
+                    from = ref.at;
+                    std::string text = embedded_storage_text(ole, ref.storage, opts_);
+                    if (text.empty()) continue;
+                    merged += text;
+                    merged += "\n\n";
                 }
+                merged.append(out_, from, std::string::npos);
+                out_.swap(merged);
             } catch (const std::exception&) {
             }
             return;
