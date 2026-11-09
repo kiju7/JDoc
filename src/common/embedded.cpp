@@ -48,11 +48,16 @@ bool ole10_native_payload(std::vector<char>& s, std::string& name) {
 }
 
 // The document an OLE object holds as one stream: an OOXML or other file
-// (Package), an ODF package (EmbeddedOdf), or a packaged file (Ole10Native).
+// (Package), an ODF package (EmbeddedOdf; package_stream as LibreOffice
+// writes it), or a packaged file (Ole10Native).
 bool ole_payload(const OleReader& ole, std::vector<char>& out, std::string& name) {
-    if (ole.has_stream("Package")) out = ole.read_stream("Package");
-    else if (ole.has_stream("EmbeddedOdf")) out = ole.read_stream("EmbeddedOdf");
-    else if (ole.has_stream("\x01Ole10Native")) {
+    for (const char* s : {"Package", "EmbeddedOdf", "package_stream"}) {
+        if (ole.has_stream(s)) {
+            out = ole.read_stream(s);
+            return !out.empty();
+        }
+    }
+    if (ole.has_stream("\x01Ole10Native")) {
         out = ole.read_stream("\x01Ole10Native");
         if (!ole10_native_payload(out, name)) out.clear();
     }

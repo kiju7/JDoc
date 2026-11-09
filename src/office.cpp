@@ -73,6 +73,10 @@ static DocFormat classify_odf_zip(const ZipReader& zip) {
     if (s.find("opendocument.text")         != std::string::npos) return DocFormat::ODT;
     if (s.find("opendocument.spreadsheet")   != std::string::npos) return DocFormat::ODS;
     if (s.find("opendocument.presentation")  != std::string::npos) return DocFormat::ODP;
+    // A chart, drawing or formula package (most often an embedded object):
+    // the ODF reader walks whatever body it has.
+    if (s.find("application/vnd.oasis.opendocument.") != std::string::npos)
+        return DocFormat::ODT;
     return DocFormat::UNKNOWN;
 }
 
