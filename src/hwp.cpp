@@ -657,10 +657,28 @@ private:
         } else if (ctrl_str == "gso ") {
             std::string dummy;
             read_gso(cur, ctrl_level, para, false, dummy);
-        } else if (ctrl_str == "head" || ctrl_str == "foot") {
+        } else if (ctrl_str == "head" || ctrl_str == "foot" || ctrl_str == "secd") {
             // Page furniture: hoisted to the top of the section rather than
-            // emitted at the anchor paragraph, which sits mid-prose.
+            // emitted at the anchor paragraph, which sits mid-prose. A
+            // section definition holds its master pages (바탕쪽) as lists.
             read_list_control_text(cur, ctrl_level, section_header_texts_);
+        } else if (ctrl_str == "tdut") {
+            // 덧말: the base text and the text set over or under it, two
+            // length-prefixed UTF-16 strings after the control id.
+            std::string text;
+            size_t off = 4;
+            for (int k = 0; k < 2 && r.data && off + 2 <= r.size; k++) {
+                size_t len = util::read_u16_le(r.data + off);
+                off += 2;
+                if (off + len * 2 > r.size) break;
+                std::string part = util::utf16le_to_utf8(r.data + off, len * 2);
+                off += len * 2;
+                if (part.empty()) continue;
+                if (!text.empty()) text += ' ';
+                text += part;
+            }
+            if (!text.empty()) para.shape_texts.push_back(std::move(text));
+            skip_control(cur, ctrl_level);
         } else if (ctrl_str == "fn  " || ctrl_str == "en  ") {
             // Notes stay with the paragraph that references them
             read_list_control_text(cur, ctrl_level, para.note_texts);
