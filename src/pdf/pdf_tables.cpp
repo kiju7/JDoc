@@ -3984,17 +3984,24 @@ static TableData build_table_from_band(
     std::vector<std::string> pending_header;
     std::vector<int> pending_spans, pending_near, pending_torn;
 
+    // Per-row scratch, reused across rows.
+    std::vector<size_t> ci;
+    std::vector<std::pair<double,double>> gap_runs;
+    std::vector<double> row_bounds, last_right;
+    std::vector<int> row_near, row_torn_at, glyphs, bold_glyphs;
+    std::vector<int16_t> last_rot;
+
     for (size_t k = band.first_row; k <= band.last_row; k++) {
         const auto& tr = rows[k];
         // gather chars sorted by x (use char_indices into the per-page chars[])
-        std::vector<size_t> ci = tr.char_indices;
+        ci = tr.char_indices;
         std::sort(ci.begin(), ci.end(), [&](size_t a, size_t b) {
             return chars[a].x < chars[b].x;
         });
 
         // Find natural gap midpoints in this row (gaps between consecutive chars
         // ≥ min_split_gap), used for snapping column boundaries.
-        std::vector<std::pair<double,double>> gap_runs;   // (gap_start, gap_end)
+        gap_runs.clear();   // (gap_start, gap_end)
         for (size_t i = 1; i < ci.size(); i++) {
             double prev_r = chars[ci[i-1]].right;
             double cur_l  = chars[ci[i]].left;
@@ -4004,7 +4011,7 @@ static TableData build_table_from_band(
         }
 
         // For each inner boundary, snap to nearest gap midpoint within snap_tol.
-        std::vector<double> row_bounds(col_bounds.size());
+        row_bounds.assign(col_bounds.size(), 0.0);
         row_bounds.front() = col_bounds.front();
         row_bounds.back()  = col_bounds.back();
         for (int c = 1; c < (int)col_bounds.size() - 1; c++) {
@@ -4065,7 +4072,8 @@ static TableData build_table_from_band(
             continue;
         }
         int row_torn = 0, row_overflow = 0;
-        std::vector<int> row_near(n_cols + 1, 0), row_torn_at(n_cols + 1, 0);
+        row_near.assign(n_cols + 1, 0);
+        row_torn_at.assign(n_cols + 1, 0);
         // The row's own type size: a display title's word spaces scale with
         // it, so the gap that separates an overflowing label from the next
         // cell is measured against the row, not the page median.
@@ -4152,9 +4160,10 @@ static TableData build_table_from_band(
         if (row_torn >= 2) continue;
 
         std::vector<std::string> cells(n_cols);
-        std::vector<double> last_right(n_cols, -1e9);
-        std::vector<int16_t> last_rot(n_cols, 0);
-        std::vector<int> glyphs(n_cols, 0), bold_glyphs(n_cols, 0);
+        last_right.assign(n_cols, -1e9);
+        last_rot.assign(n_cols, 0);
+        glyphs.assign(n_cols, 0);
+        bold_glyphs.assign(n_cols, 0);
         int run_col = 0;
         double run_right = -1e9;
 
