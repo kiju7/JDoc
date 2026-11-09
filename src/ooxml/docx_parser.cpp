@@ -12,6 +12,7 @@
 #include <fstream>
 #include <map>
 #include <set>
+#include <functional>
 #include <sstream>
 
 namespace jdoc {
@@ -338,72 +339,30 @@ static std::string find_image_rid(const pugi::xml_node& para) {
 
 // ── Check for page break ────────────────────────────────
 
+// A page break in the paragraph's own runs; a text box drawn in it has
+// paragraphs (and breaks) of its own.
 static bool has_page_break(const pugi::xml_node& para) {
-    // Check <w:r><w:br w:type="page"/>
-    std::vector<pugi::xml_node> brs;
-    xml_find_all(para, "br", brs);
-    for (auto& br : brs) {
-        const char* type = xml_attr(br, "type");
-        if (std::string(type) == "page") return true;
-    }
-
-    // Check <w:r><w:lastRenderedPageBreak/> (soft page break from Word's layout engine)
-    std::vector<pugi::xml_node> lrpbs;
-    xml_find_all(para, "lastRenderedPageBreak", lrpbs);
-    if (!lrpbs.empty()) return true;
-
-    // Check <w:pPr><w:pageBreakBefore/>
     auto pPr = xml_child(para, "pPr");
-    if (pPr) {
-        auto pbb = xml_child(pPr, "pageBreakBefore");
-        if (pbb) return true;
-    }
-    return false;
+    if (pPr && xml_child(pPr, "pageBreakBefore")) return true;
+    std::function<bool(const pugi::xml_node&, int)> scan = [&](const pugi::xml_node& n,
+                                                               int depth) {
+        if (depth > kXmlMaxDepth) return false;
+        for (auto c = n.first_child(); c; c = c.next_sibling()) {
+            const char* l = xml_local_name(c);
+            if (!strcmp(l, "txbxContent") || !strcmp(l, "Fallback")) continue;
+            // <w:br w:type="page"/>, or the soft break Word's layout recorded
+            if ((!strcmp(l, "br") && !strcmp(xml_attr(c, "type"), "page")) ||
+                !strcmp(l, "lastRenderedPageBreak"))
+                return true;
+            if (scan(c, depth + 1)) return true;
+        }
+        return false;
+    };
+    return scan(para, 0);
 }
 
 // ── Main document parsing ───────────────────────────────
 
-static std::vector<std::vector<std::string>> parse_table_node(
-    const pugi::xml_node& tbl, std::vector<std::string>& image_rids) {
-
-    std::vector<std::vector<std::string>> rows;
-    std::vector<pugi::xml_node> tr_nodes;
-    xml_find_all(tbl, "tr", tr_nodes);
-
-    for (auto& tr : tr_nodes) {
-        std::vector<std::string> row;
-        std::vector<pugi::xml_node> tc_nodes;
-        xml_find_all(tr, "tc", tc_nodes);
-
-        for (auto& tc : tc_nodes) {
-            // Collect all text from the cell's paragraphs
-            std::string cell_text;
-            std::vector<pugi::xml_node> paras;
-            xml_find_all(tc, "p", paras);
-            for (size_t i = 0; i < paras.size(); ++i) {
-                if (i > 0) cell_text += " ";
-                std::vector<pugi::xml_node> runs;
-                xml_find_all(paras[i], "t", runs);
-                for (auto& t : runs) {
-                    cell_text += xml_text_content(t);
-                }
-                // Collect image references from cell paragraphs
-                std::string rid = find_image_rid(paras[i]);
-                if (!rid.empty()) {
-                    image_rids.push_back(rid);
-                }
-            }
-            // Replace pipe characters to avoid markdown table issues
-            for (auto& ch : cell_text) {
-                if (ch == '|') ch = '/';
-                if (ch == '\n') ch = ' ';
-            }
-            row.push_back(cell_text);
-        }
-        rows.push_back(std::move(row));
-    }
-    return rows;
-}
 
 struct DocxElement {
     enum Type { PARAGRAPH, TABLE, PAGE_BREAK };
@@ -421,12 +380,121 @@ struct DocxElement {
     std::vector<std::string> table_image_rids;
 };
 
-static std::vector<DocxElement> parse_body(
-    const pugi::xml_node& body,
-    const std::map<std::string, int>& style_heading_map,
-    const std::map<int, int>& num_to_abstract,
-    const std::map<int, std::map<int, std::string>>& abstract_num_formats,
-    const std::map<std::string, std::string>& hyperlink_targets = {}) {
+// The body-level parsers below share their maps through this bundle.
+struct DocxBodyContext {
+    const std::map<std::string, int>& style_heading_map;
+    const std::map<int, int>& num_to_abstract;
+    const std::map<int, std::map<int, std::string>>& abstract_num_formats;
+    const std::map<std::string, std::string>& hyperlink_targets;
+};
+
+static std::vector<DocxElement> parse_body(const pugi::xml_node& body,
+                                           const DocxBodyContext& ctx, bool plain);
+
+// Text boxes drawn under n (a drawing, a VML shape): the outermost
+// w:txbxContent of each, never a Fallback copy of the same box.
+static void find_text_boxes(const pugi::xml_node& n, std::vector<pugi::xml_node>& out,
+                            int depth = 0) {
+    if (depth > kXmlMaxDepth) return;
+    for (auto c = n.first_child(); c; c = c.next_sibling()) {
+        const char* l = xml_local_name(c);
+        if (!strcmp(l, "Fallback")) continue;
+        if (!strcmp(l, "txbxContent")) out.push_back(c);
+        else find_text_boxes(c, out, depth + 1);
+    }
+}
+
+// A run's text in order: tabs as spaces, breaks as newlines; deleted text
+// and field codes are left out. A text box drawn in the run is not part of
+// its line, so its content goes to `boxes` to be read as blocks of its own.
+static std::string run_text(const pugi::xml_node& run, std::vector<pugi::xml_node>& boxes) {
+    std::string out;
+    for (auto c = run.first_child(); c; c = c.next_sibling()) {
+        const char* l = xml_local_name(c);
+        if (!strcmp(l, "t")) out += xml_text_content(c);
+        else if (!strcmp(l, "tab") || !strcmp(l, "ptab")) out += ' ';
+        else if (!strcmp(l, "br") || !strcmp(l, "cr")) out += '\n';
+        else if (!strcmp(l, "noBreakHyphen")) out += '-';
+        else if (!strcmp(l, "drawing") || !strcmp(l, "pict") || !strcmp(l, "object") ||
+                 !strcmp(l, "AlternateContent"))
+            find_text_boxes(c, boxes);
+    }
+    return out;
+}
+
+// Paragraph-level wrappers whose runs belong to the paragraph's line:
+// insertions, content controls, smart tags, simple fields. Deletions
+// (del, moveFrom) are not among them.
+static bool is_run_container(const char* l) {
+    return !strcmp(l, "ins") || !strcmp(l, "moveTo") || !strcmp(l, "smartTag") ||
+           !strcmp(l, "customXml") || !strcmp(l, "fldSimple") || !strcmp(l, "sdt") ||
+           !strcmp(l, "sdtContent") || !strcmp(l, "dir") || !strcmp(l, "bdo");
+}
+
+// Rows of a table: the cells directly in it, each read as a body of its own
+// and flattened to one line — a nested table reads as text inside its cell.
+static std::vector<std::vector<std::string>> parse_table_node(
+    const pugi::xml_node& tbl, std::vector<std::string>& image_rids,
+    const DocxBodyContext& ctx) {
+    auto children = [](const pugi::xml_node& n, const char* name,
+                       std::vector<pugi::xml_node>& out) {
+        std::vector<pugi::xml_node> stack{n};
+        while (!stack.empty()) {
+            auto cur = stack.back();
+            stack.pop_back();
+            std::vector<pugi::xml_node> wrapped;
+            for (auto c = cur.first_child(); c; c = c.next_sibling()) {
+                const char* l = xml_local_name(c);
+                if (!strcmp(l, name)) out.push_back(c);
+                else if (!strcmp(l, "sdt") || !strcmp(l, "sdtContent") ||
+                         !strcmp(l, "customXml"))
+                    wrapped.push_back(c);
+            }
+            for (auto it = wrapped.rbegin(); it != wrapped.rend(); ++it) stack.push_back(*it);
+        }
+    };
+    std::vector<std::vector<std::string>> rows;
+    std::vector<pugi::xml_node> trs;
+    children(tbl, "tr", trs);
+    for (auto& tr : trs) {
+        std::vector<std::string> row;
+        std::vector<pugi::xml_node> tcs;
+        children(tr, "tc", tcs);
+        for (auto& tc : tcs) {
+            std::string cell_text;
+            auto add = [&](const std::string& t) {
+                if (t.empty()) return;
+                if (!cell_text.empty()) cell_text += ' ';
+                cell_text += t;
+            };
+            for (auto& el : parse_body(tc, ctx, true)) {
+                if (el.type == DocxElement::PARAGRAPH) {
+                    add(el.text);
+                    if (!el.image_rid.empty()) image_rids.push_back(el.image_rid);
+                } else if (el.type == DocxElement::TABLE) {
+                    for (auto& r : el.table_rows)
+                        for (auto& c : r) add(c);
+                    image_rids.insert(image_rids.end(), el.table_image_rids.begin(),
+                                      el.table_image_rids.end());
+                }
+            }
+            for (auto& ch : cell_text) {
+                if (ch == '|') ch = '/';
+                if (ch == '\n') ch = ' ';
+            }
+            row.push_back(std::move(cell_text));
+        }
+        rows.push_back(std::move(row));
+    }
+    return rows;
+}
+
+static std::vector<DocxElement> parse_body(const pugi::xml_node& body,
+                                           const DocxBodyContext& ctx, bool plain) {
+    const auto& style_heading_map = ctx.style_heading_map;
+    const auto& num_to_abstract = ctx.num_to_abstract;
+    const auto& abstract_num_formats = ctx.abstract_num_formats;
+    const auto& hyperlink_targets = ctx.hyperlink_targets;
 
     std::vector<DocxElement> elements;
 
@@ -508,6 +576,7 @@ static std::vector<DocxElement> parse_body(
                 RunStyle style;
             };
 
+            std::vector<pugi::xml_node> boxes;   // text boxes drawn in the runs
             auto extract_run = [&](const pugi::xml_node& run) -> StyledRun {
                 auto rPr = xml_child(run, "rPr");
                 bool bold = false, italic = false;
@@ -515,15 +584,11 @@ static std::vector<DocxElement> parse_body(
                     bold = xml_child(rPr, "b") ? true : false;
                     italic = xml_child(rPr, "i") ? true : false;
                 }
-                std::string run_text;
-                std::vector<pugi::xml_node> t_nodes;
-                xml_find_all(run, "t", t_nodes);
-                for (auto& t : t_nodes) run_text += xml_text_content(t);
                 RunStyle s = PLAIN;
                 if (bold && italic) s = BOLD_ITALIC;
                 else if (bold) s = BOLD;
                 else if (italic) s = ITALIC;
-                return {std::move(run_text), s};
+                return {run_text(run, boxes), s};
             };
 
             // Merge consecutive same-style runs and apply markdown formatting
@@ -565,51 +630,60 @@ static std::vector<DocxElement> parse_body(
             };
 
             bool is_heading = (elem.heading_level > 0);
+            bool skip_format = is_heading || plain;
             std::vector<StyledRun> runs;
 
-            for (auto pchild = child.first_child(); pchild; pchild = pchild.next_sibling()) {
-                const char* plocal = xml_local_name(pchild);
+            std::function<void(const pugi::xml_node&)> walk_runs =
+                [&](const pugi::xml_node& parent) {
+                for (auto pchild = parent.first_child(); pchild; pchild = pchild.next_sibling()) {
+                    const char* plocal = xml_local_name(pchild);
 
-                if (strcmp(plocal, "r") == 0) {
-                    auto sr = extract_run(pchild);
-                    if (!sr.text.empty())
-                        runs.push_back(std::move(sr));
-                } else if (strcmp(plocal, "hyperlink") == 0) {
-                    auto link_runs = collect_runs(pchild);
-                    std::string link_text = merge_and_format(link_runs, is_heading);
-                    const char* rid = xml_attr(pchild, "id");
-                    if (rid[0] && !link_text.empty()) {
-                        auto hit = hyperlink_targets.find(rid);
-                        if (hit != hyperlink_targets.end())
+                    if (strcmp(plocal, "r") == 0) {
+                        auto sr = extract_run(pchild);
+                        if (!sr.text.empty())
+                            runs.push_back(std::move(sr));
+                    } else if (strcmp(plocal, "hyperlink") == 0) {
+                        auto link_runs = collect_runs(pchild);
+                        std::string link_text = merge_and_format(link_runs, skip_format);
+                        const char* rid = xml_attr(pchild, "id");
+                        auto hit = rid[0] ? hyperlink_targets.find(rid) : hyperlink_targets.end();
+                        if (link_text.empty()) continue;
+                        if (!plain && hit != hyperlink_targets.end())
                             runs.push_back({"[" + link_text + "](" + hit->second + ")", PLAIN});
                         else
                             runs.push_back({link_text, PLAIN});
-                    } else if (!link_text.empty()) {
-                        runs.push_back({link_text, PLAIN});
+                    } else if (is_run_container(plocal)) {
+                        walk_runs(pchild);
                     }
                 }
-            }
+            };
+            walk_runs(child);
 
-            elem.text = merge_and_format(runs, is_heading);
+            elem.text = util::trim(merge_and_format(runs, skip_format));
 
             // Check for embedded image references
             elem.image_rid = find_image_rid(child);
 
             elements.push_back(std::move(elem));
 
+            // Text boxes anchored here read as blocks after the paragraph.
+            // A box's paragraphs record where Word laid out page breaks
+            // inside the box; they say nothing about the document's pages.
+            for (auto& box : boxes)
+                for (auto& el : parse_body(box, ctx, plain))
+                    if (el.type != DocxElement::PAGE_BREAK) elements.push_back(std::move(el));
+
         } else if (strcmp(local, "tbl") == 0) {
             DocxElement elem;
             elem.type = DocxElement::TABLE;
-            elem.table_rows = parse_table_node(child, elem.table_image_rids);
+            elem.table_rows = parse_table_node(child, elem.table_image_rids, ctx);
             elements.push_back(std::move(elem));
 
         } else if (strcmp(local, "sdt") == 0) {
             // Structured Document Tag (TOC, bibliography, etc.)
             auto content = xml_child(child, "sdtContent");
             if (content) {
-                auto inner = parse_body(content, style_heading_map,
-                                         num_to_abstract, abstract_num_formats,
-                                         hyperlink_targets);
+                auto inner = parse_body(content, ctx, plain);
                 elements.insert(elements.end(),
                     std::make_move_iterator(inner.begin()),
                     std::make_move_iterator(inner.end()));
@@ -619,9 +693,7 @@ static std::vector<DocxElement> parse_body(
             // Process mc:Choice only, skip mc:Fallback
             auto choice = xml_child(child, "Choice");
             if (choice) {
-                auto inner = parse_body(choice, style_heading_map,
-                                         num_to_abstract, abstract_num_formats,
-                                         hyperlink_targets);
+                auto inner = parse_body(choice, ctx, plain);
                 elements.insert(elements.end(),
                     std::make_move_iterator(inner.begin()),
                     std::make_move_iterator(inner.end()));
@@ -651,9 +723,8 @@ std::string DocxParser::to_markdown(const ConvertOptions& opts) {
     }
     if (!body) return "";
 
-    auto elements = parse_body(body, style_heading_map_,
-                               num_to_abstract_, abstract_num_formats_,
-                               hyperlink_targets_);
+    auto elements = parse_body(body, {style_heading_map_, num_to_abstract_,
+                                      abstract_num_formats_, hyperlink_targets_}, false);
 
     std::string footnotes = extract_footnotes();
     std::string endnotes = extract_endnotes();
@@ -814,9 +885,8 @@ std::vector<PageChunk> DocxParser::to_chunks(
     }
     if (!body) return {};
 
-    auto elements = parse_body(body, style_heading_map_,
-                               num_to_abstract_, abstract_num_formats_,
-                               hyperlink_targets_);
+    auto elements = parse_body(body, {style_heading_map_, num_to_abstract_,
+                                      abstract_num_formats_, hyperlink_targets_}, false);
 
     auto all_images = extract_images(opts);
 
