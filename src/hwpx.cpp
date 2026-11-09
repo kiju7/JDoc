@@ -483,7 +483,10 @@ private:
                     // Drawing object (글상자/도형): its <hp:drawText> body is a
                     // paragraph list of its own, unrelated to the run's text.
                     std::string shape_text;
-                    collect_shape_text(item, shape_text, 0);
+                    if (in == "hp:ole")
+                        append_ole_text(item, shape_text, opts_.format);
+                    else
+                        collect_shape_text(item, shape_text, 0);
                     shape_text = util::trim(shape_text);
                     if (!shape_text.empty()) {
                         // Flush preceding text so the shape reads as its own block
@@ -798,17 +801,20 @@ private:
 
     // An OLE object's own text (a spreadsheet or document pasted in): its
     // BinData part holds the embedded document.
-    void append_ole_text(pugi::xml_node ole, std::string& out) {
+    // `format` is the output's in the body, where markdown keeps the
+    // document's tables; plain text inside shapes and cells.
+    void append_ole_text(pugi::xml_node ole, std::string& out,
+                         OutputFormat format = OutputFormat::PLAINTEXT) {
         auto it = bin_data_map_.find(ole.attribute("binaryItemIDRef").as_string());
         if (it == bin_data_map_.end() || !zip_->has_entry(it->second.href)) return;
         auto bytes = zip_->read_entry(it->second.href);
         ConvertOptions o = opts_;
-        o.format = OutputFormat::PLAINTEXT;
+        o.format = format;
+        bool flat = format == OutputFormat::PLAINTEXT;
         std::string text;
         for (char c : embedded_document_text(reinterpret_cast<const uint8_t*>(bytes.data()),
                                              bytes.size(), it->second.href, o)) {
-            if (c != '\n') text += c;
-            else if (!text.empty() && text.back() != '\n') text += '\n';
+            if (c != '\n' || !flat || (!text.empty() && text.back() != '\n')) text += c;
         }
         if (text.empty()) return;
         if (!out.empty()) out += "\n";

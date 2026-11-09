@@ -978,12 +978,14 @@ private:
         auto* entry = find_image_entry(bin_id);
         if (!entry) return;
         auto bytes = load_bin_data(entry->name);
+        // In the body the document keeps the output's format (markdown keeps
+        // its tables); in a table cell it is flattened to plain lines.
         ConvertOptions o = opts_;
-        o.format = OutputFormat::PLAINTEXT;
+        if (in_cell) o.format = OutputFormat::PLAINTEXT;
         std::string text;
         for (char c : embedded_document_text(bytes.data(), bytes.size(), entry->name, o)) {
             if (c != '\n') text += c;
-            else if (!text.empty() && text.back() != '\x02') text += '\x02';
+            else if (!in_cell || (!text.empty() && text.back() != '\x02')) text += '\x02';
         }
         if (text.empty()) return;
         if (in_cell) {
