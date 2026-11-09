@@ -417,6 +417,12 @@ bool images_unsaved(const ConvertOptions& opts) {
     return opts.images && opts.image_dir.empty();
 }
 
+// With images off nothing is written, so a reference a parser still emits
+// would point nowhere.
+std::string without_image_refs(std::string md, const ConvertOptions& opts) {
+    return opts.images ? md : util::drop_image_refs(md);
+}
+
 // The chunk APIs' post-pass: options to run the format's converter with, and
 // what to do to each chunk it yields.
 struct ChunkPass {
@@ -599,6 +605,11 @@ std::string convert_from_memory(const uint8_t* data, size_t size,
     return convert_from_memory_as(fmt, data, size, name_hint, opts);
 }
 
+static std::string convert_mem_dispatch(FileFormat, const uint8_t*, size_t,
+                                        const std::string&, const ConvertOptions&);
+static std::string convert_file_dispatch(FileFormat, const std::string&,
+                                         const ConvertOptions&);
+
 std::string convert_from_memory_as(FileFormat fmt,
                                    const uint8_t* data, size_t size,
                                    const std::string& name_hint,
@@ -613,6 +624,13 @@ std::string convert_from_memory_as(FileFormat fmt,
         o.tables = true;
         return layout_tables(convert_from_memory_as(fmt, data, size, name_hint, o), opts);
     }
+    return without_image_refs(convert_mem_dispatch(fmt, data, size, name_hint, opts), opts);
+}
+
+static std::string convert_mem_dispatch(FileFormat fmt,
+                                        const uint8_t* data, size_t size,
+                                        const std::string& name_hint,
+                                        const ConvertOptions& opts) {
     switch (fmt) {
         case FileFormat::PDF:    return pdf_to_markdown_mem(data, size, opts);
         case FileFormat::OFFICE: return office_to_markdown_mem(data, size, name_hint, opts);
@@ -641,6 +659,11 @@ std::string convert(const std::string& file_path, ConvertOptions opts) {
         o.tables = true;
         return layout_tables(convert(file_path, o), opts);
     }
+    return without_image_refs(convert_file_dispatch(fmt, file_path, opts), opts);
+}
+
+static std::string convert_file_dispatch(FileFormat fmt, const std::string& file_path,
+                                         const ConvertOptions& opts) {
     switch (fmt) {
         case FileFormat::PDF:    return pdf_to_markdown(file_path, opts);
         case FileFormat::OFFICE: return office_to_markdown(file_path, opts);
