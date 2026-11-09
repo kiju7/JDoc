@@ -97,7 +97,10 @@ void OleReader::parse_header_and_fat() {
         throw std::runtime_error("Invalid OLE sector size");
     sector_size_ = uint32_t{1} << sector_pow;
     mini_sector_size_ = uint32_t{1} << mini_pow;
-    if (source_size_ < sector_size_ || source_size_ % sector_size_ != 0)
+    // Bytes past the last whole sector (some writers and transfers append a
+    // few) are not part of any sector and are ignored; a chain that needs a
+    // sector the file does not hold whole still fails below.
+    if (source_size_ < 2 * uint64_t{sector_size_})
         throw std::runtime_error("Truncated OLE sector data");
     sector_count_ = source_size_ / sector_size_ - 1;
 
