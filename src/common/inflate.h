@@ -27,4 +27,8 @@ std::vector<uint8_t> inflate_raw(const uint8_t* in, size_t in_size, size_t hint)
 // Used by PDF FlateDecode, whose streams carry the 2-byte zlib header.
 std::vector<uint8_t> inflate_zlib(const uint8_t* in, size_t in_size, size_t hint);
 
+// zlib stream that may be damaged or cut short (no adler32 trailer, a wrong
+// length): whole when it decodes, else the output that precedes the damage.
+std::vector<uint8_t> inflate_zlib_lenient(const uint8_t* in, size_t in_size);
+
 } // namespace jdoc

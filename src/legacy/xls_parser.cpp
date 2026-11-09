@@ -1,6 +1,7 @@
 // .xls (BIFF8) parser implementation.
 
 #include "xls_parser.h"
+#include "common/embedded.h"
 #include "common/emf_text.h"
 #include "common/file_utils.h"
 #include "common/image_utils.h"
@@ -957,7 +958,7 @@ std::string XlsParser::to_markdown(const ConvertOptions& opts) {
         }
     }
 
-    return md;
+    return md + ole_storage_attachments(ole_, opts);
 }
 
 std::vector<PageChunk> XlsParser::to_chunks(const ConvertOptions& opts) {
@@ -1039,6 +1040,8 @@ std::vector<PageChunk> XlsParser::to_chunks(const ConvertOptions& opts) {
         chunks.push_back(std::move(chunk));
     }
 
+    std::string att = ole_storage_attachments(ole_, opts);
+    if (!att.empty() && !chunks.empty()) chunks.back().text += att;
     return chunks;
 }
 

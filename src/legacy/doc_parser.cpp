@@ -2,6 +2,7 @@
 // Supports Word 6/95 and Word 97-2003 formats.
 
 #include "doc_parser.h"
+#include "common/embedded.h"
 #include "common/string_utils.h"
 #include "common/binary_utils.h"
 #include "common/emf_text.h"
@@ -1493,9 +1494,9 @@ std::string DocParser::to_markdown(const ConvertOptions& opts) {
 
     // No images and no object markers → nothing to rewrite; avoid a full copy
     // of a potentially large body.
-    if (images.empty() && md.find("\xEF\xBF\xBC") == std::string::npos)
-        return md;
-    return replace_image_markers(md, images, refs, opts.image_ref_prefix);
+    if (!images.empty() || md.find("\xEF\xBF\xBC") != std::string::npos)
+        md = replace_image_markers(md, images, refs, opts.image_ref_prefix);
+    return md + ole_storage_attachments(ole_, opts);
 }
 
 std::vector<PageChunk> DocParser::to_chunks(const ConvertOptions& opts) {
@@ -1538,6 +1539,7 @@ std::vector<PageChunk> DocParser::to_chunks(const ConvertOptions& opts) {
     chunk.page_height = 792.0;
     chunk.body_font_size = 12.0;
 
+    chunk.text += ole_storage_attachments(ole_, opts);
     chunks.push_back(std::move(chunk));
     return chunks;
 }

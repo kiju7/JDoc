@@ -16,6 +16,7 @@
 #include "html/html_parser.h"
 #include "mail/msg_parser.h"
 #include "odf/odf_parser.h"
+#include "convert_internal.h"
 
 #include <fstream>
 #include <cstring>
@@ -323,6 +324,10 @@ struct DocInput {
     const uint8_t* data = nullptr;
     size_t size = 0;
 
+    // Or a storage of another OLE file (an object embedded in a .doc/.xls).
+    const OleReader* host = nullptr;
+    std::string storage;
+
     std::string display() const { return path ? *path : "<memory>"; }
 
     std::unique_ptr<ZipReader> open_zip() const {
@@ -330,6 +335,11 @@ struct DocInput {
                     : std::make_unique<ZipReader>(data, size);
     }
     std::unique_ptr<OleReader> open_ole() const {
+        if (host) {
+            auto sub = host->open_storage(storage);
+            if (!sub) throw std::runtime_error("Missing OLE storage: " + storage);
+            return sub;
+        }
         return path ? std::make_unique<OleReader>(*path)
                     : std::make_unique<OleReader>(data, size);
     }
@@ -466,6 +476,21 @@ std::string office_to_markdown(const std::string& file_path, ConvertOptions opts
     DocInput in;
     in.path = &file_path;
     return to_markdown_impl(detect_office_format(file_path), in, opts);
+}
+
+std::string office_storage_to_markdown(const OleReader& host, const std::string& storage,
+                                      const ConvertOptions& opts) {
+    auto sub = host.open_storage(storage);
+    if (!sub) return "";
+    DocFormat fmt = sub->has_stream("WordDocument") ? DocFormat::DOC
+                  : sub->has_stream("Workbook") || sub->has_stream("Book") ? DocFormat::XLS
+                  : sub->has_stream("PowerPoint Document") ? DocFormat::PPT
+                  : DocFormat::UNKNOWN;
+    if (fmt == DocFormat::UNKNOWN) return "";
+    DocInput in;
+    in.host = &host;
+    in.storage = storage;
+    return to_markdown_impl(fmt, in, opts);
 }
 
 std::vector<PageChunk> office_to_markdown_chunks(const std::string& file_path,

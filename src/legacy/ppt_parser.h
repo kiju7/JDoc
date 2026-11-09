@@ -37,6 +37,8 @@ private:
 
     // Parse the "PowerPoint Document" stream and extract slide text.
     void parse_document();
+    // "## Attachments" with the text of each embedded OLE object ("" if none).
+    std::string embedded_objects(const ConvertOptions& opts);
 
     // Extract images from the "Pictures" stream.
     std::vector<ImageData> extract_images(unsigned min_image_size = 0);

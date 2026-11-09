@@ -3,6 +3,8 @@
 // record type (0x3EE=slide, 0x3F8=master, 0x3F0=notes) → extract text per slide.
 
 #include "ppt_parser.h"
+#include "common/embedded.h"
+#include "common/inflate.h"
 #include "common/emf_text.h"
 #include "common/string_utils.h"
 #include "common/binary_utils.h"
@@ -300,6 +302,36 @@ static SlideText extract_slide_text(const char* data, size_t size,
     }
 
     return result;
+}
+
+// ── Embedded objects ────────────────────────────────────────
+
+// An embedded OLE object is an ExOleObjStg record at the top level of the
+// document stream: the object's compound file, zlib-compressed behind its
+// size when the record instance is 1.
+std::string PptParser::embedded_objects(const ConvertOptions& opts) {
+    constexpr uint16_t RT_EX_OLE_OBJ_STG = 0x1011;
+    std::vector<char> stream = ole_.read_stream("PowerPoint Document");
+    const char* data = stream.data();
+    size_t size = stream.size(), pos = 0;
+    std::string out;
+    int n = 0;
+    RecordHeader hdr;
+    while (read_header(data, size, pos, hdr) && hdr.rec_len <= size - pos - 8) {
+        const uint8_t* body = reinterpret_cast<const uint8_t*>(data + pos + 8);
+        if (hdr.rec_type == RT_EX_OLE_OBJ_STG) {
+            std::vector<uint8_t> obj;
+            if ((hdr.ver_inst >> 4) == 1 && hdr.rec_len > 4)
+                obj = inflate_zlib_lenient(body + 4, hdr.rec_len - 4);
+            else
+                obj.assign(body, body + hdr.rec_len);
+            std::string text = embedded_document_text(obj.data(), obj.size(), "", opts);
+            if (!text.empty())
+                out += "- Embedded object " + std::to_string(++n) + "\n\n" + text + "\n\n";
+        }
+        pos += 8 + hdr.rec_len;
+    }
+    return out.empty() ? out : "\n\n## Attachments\n\n" + out;
 }
 
 // ── Main document parsing ───────────────────────────────────
@@ -730,7 +762,7 @@ std::string PptParser::to_markdown(const ConvertOptions& opts) {
         }
     }
 
-    return md;
+    return md + embedded_objects(opts);
 }
 
 std::vector<PageChunk> PptParser::to_chunks(const ConvertOptions& opts) {
@@ -782,6 +814,8 @@ std::vector<PageChunk> PptParser::to_chunks(const ConvertOptions& opts) {
         chunks.push_back(std::move(chunk));
     }
 
+    std::string att = embedded_objects(opts);
+    if (!att.empty() && !chunks.empty()) chunks.back().text += att;
     return chunks;
 }
 

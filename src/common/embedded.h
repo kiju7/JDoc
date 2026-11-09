@@ -12,11 +12,23 @@
 
 namespace jdoc {
 
-// The embedded payload converted in opts.format, or "" when it is not a document jdoc
-// reads (an equation, a chart's cache, an unknown object), it fails to parse,
-// or nesting goes deeper than opts.archive.max_depth. Never throws.
+class OleReader;
+
+// The embedded payload converted in opts.format, or "" when it is not a
+// document jdoc reads (an equation, a chart's cache, an unknown object), it
+// fails to parse, or nesting goes deeper than opts.archive.max_depth.
+// Never throws.
 std::string embedded_document_text(const uint8_t* data, size_t size,
                                    const std::string& name_hint,
                                    const ConvertOptions& opts);
+
+// The same for an object a legacy Office file keeps as one of its storages
+// (ObjectPool/_123 in .doc, MBD0001 in .xls).
+std::string embedded_storage_text(const OleReader& host, const std::string& storage,
+                                  const ConvertOptions& opts);
+
+// "## Attachments" with the text of each embedded object storage of a .doc
+// (ObjectPool/*) or .xls (MBD* at the root); "" when none has text.
+std::string ole_storage_attachments(const OleReader& host, const ConvertOptions& opts);
 
 } // namespace jdoc

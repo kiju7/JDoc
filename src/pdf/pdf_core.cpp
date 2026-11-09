@@ -154,47 +154,7 @@ PdfObj PdfLexer::parse_object(int depth) {
 
 
 std::vector<uint8_t> decode_flate(const uint8_t* src, size_t src_len) {
-    std::vector<uint8_t> out;
-    if (src_len == 0) return out;
-
-    // Fast path: libdeflate decodes a well-formed FlateDecode stream whole.
-    auto whole = inflate_zlib(src, src_len, src_len * 3);
-    if (!whole.empty()) return whole;
-
-    // Fallback: many real PDFs have truncated/malformed streams (missing the
-    // adler32 trailer, wrong /Length). zlib's streaming inflate recovers the
-    // PARTIAL output that precedes the damage, where libdeflate returns nothing.
-    out.reserve(src_len * 3);
-
-    z_stream zs = {};
-    if (inflateInit(&zs) != Z_OK) return {};
-    zs.next_in = const_cast<Bytef*>(src);
-    zs.avail_in = static_cast<uInt>(src_len);
-
-    uint8_t buf[8192];
-    int ret;
-    do {
-        zs.next_out = buf;
-        zs.avail_out = sizeof(buf);
-        uInt prev_in = zs.avail_in;
-        ret = inflate(&zs, Z_NO_FLUSH);
-        size_t have = sizeof(buf) - zs.avail_out;
-        out.insert(out.end(), buf, buf + have);
-        if (ret == Z_STREAM_END) break;
-        if (ret == Z_STREAM_ERROR || ret == Z_DATA_ERROR || ret == Z_MEM_ERROR
-            || ret == Z_NEED_DICT) {
-            inflateEnd(&zs);
-            return out; // return partial
-        }
-        // Z_BUF_ERROR or Z_OK with no progress (e.g. truncated stream missing
-        // adler32 trailer) — bail out instead of looping forever.
-        if (have == 0 && zs.avail_in == prev_in) {
-            inflateEnd(&zs);
-            return out;
-        }
-    } while (true);
-    inflateEnd(&zs);
-    return out;
+    return inflate_zlib_lenient(src, src_len);
 }
 
 bool flate_encoded_size(const uint8_t* src, size_t src_len,
