@@ -7,6 +7,7 @@
 // License: MIT
 
 #include "common/wmf_text.h"
+#include "common/emf_text.h"
 #include "common/string_utils.h"
 
 #include <algorithm>
@@ -40,7 +41,7 @@ inline uint32_t rd_u32(const uint8_t* p) {
            uint32_t(p[3]) << 24;
 }
 
-struct Run { int32_t x = 0; int32_t y = 0; std::string text; };
+using Run = MetafileRun;
 
 // Decode an ANSI string of `count` bytes at parm+off, if in range.
 void take_text(const uint8_t* parm, size_t parm_len, size_t off, size_t count,
@@ -48,7 +49,12 @@ void take_text(const uint8_t* parm, size_t parm_len, size_t off, size_t count,
     if (count == 0 || off > parm_len || count > parm_len - off) return;
     std::string t = util::plain_text_to_utf8(
         std::string(reinterpret_cast<const char*>(parm + off), count));
-    if (!t.empty()) out.push_back({x, y, std::move(t)});
+    if (t.empty()) return;
+    Run run;
+    run.x = x;
+    run.y = y;
+    run.text = std::move(t);
+    out.push_back(std::move(run));
 }
 
 // DIB-carrying WMF records → byte offset of the DIB within rdParm.
@@ -176,21 +182,7 @@ MetafileContent wmf_extract(const uint8_t* data, size_t size,
         ++seen;
     }
 
-    if (want_text && !runs.empty()) {
-        std::stable_sort(runs.begin(), runs.end(), [](const Run& a, const Run& b) {
-            if (a.y != b.y) return a.y < b.y;
-            return a.x < b.x;
-        });
-        int32_t prev_y = runs.front().y;
-        bool first = true;
-        for (auto& r : runs) {
-            if (!first && r.y != prev_y) content.text += '\n';
-            content.text += r.text;
-            prev_y = r.y;
-            first = false;
-            if (content.text.size() > MAX_OUTPUT) break;
-        }
-    }
+    if (want_text) content.text = metafile_runs_text(runs, MAX_OUTPUT);
     return content;
 }
 

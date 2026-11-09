@@ -15,6 +15,7 @@
 #include "common/string_utils.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -50,11 +51,7 @@ inline uint32_t rd_u32(const uint8_t* p) {
 inline int32_t rd_i32(const uint8_t* p) { return int32_t(rd_u32(p)); }
 
 // One decoded text run, tagged with its reference point for reading-order sort.
-struct Run {
-    int32_t x = 0;
-    int32_t y = 0;
-    std::string text;
-};
+using Run = MetafileRun;
 
 // Decode a text-out record whose common 8-byte header starts at `rec`
 // (rec_size bytes, already bounds-checked against the buffer). Appends at most
@@ -123,11 +120,28 @@ void decode_text_record(const uint8_t* rec, size_t rec_size, uint32_t type,
     if (!in_bounds(str_off, str_bytes)) return;
 
     const char* s = reinterpret_cast<const char*>(rec + str_off);
-    std::string text = ansi
+    Run run;
+    run.x = x;
+    run.y = y;
+    run.text = ansi
         ? util::plain_text_to_utf8(std::string(s, str_bytes))  // UTF-8 else CP949
         : util::utf16le_to_utf8(s, str_bytes);
-    if (!text.empty())
-        out.push_back({x, y, std::move(text)});
+    if (run.text.empty()) return;
+    // EXTTEXTOUT's EMRTEXT ends with offDx: one advance per character, from
+    // the record start. Their sum is where the run ends.
+    if (type == EMR_EXTTEXTOUTW || type == EMR_EXTTEXTOUTA) {
+        size_t dx_off = rec_size >= 76 ? rd_u32(rec + 72) : 0;
+        if (dx_off && in_bounds(dx_off, size_t(chars) * 4)) {
+            int64_t w = 0;
+            for (uint32_t i = 0; i < chars; ++i) w += rd_i32(rec + dx_off + i * 4);
+            if (w > 0 && w < (int64_t(1) << 30)) {
+                run.has_end = true;
+                run.end_x = int32_t(x + w);
+                run.char_width = double(w) / chars;
+            }
+        }
+    }
+    out.push_back(std::move(run));
 }
 
 // Byte offsets (from the record start, incl. the 8-byte header) of the DIB
@@ -233,24 +247,35 @@ MetafileContent emf_extract(const uint8_t* data, size_t size,
         ++seen;
     }
 
-    if (want_text && !runs.empty()) {
-        // Reading order: top-to-bottom, then left-to-right. stable_sort keeps
-        // the record order among runs that share a reference point.
-        std::stable_sort(runs.begin(), runs.end(), [](const Run& a, const Run& b) {
-            if (a.y != b.y) return a.y < b.y;
-            return a.x < b.x;
-        });
-        int32_t prev_y = runs.front().y;
-        bool first = true;
-        for (auto& r : runs) {
-            if (!first && r.y != prev_y) content.text += '\n';  // new baseline
-            content.text += r.text;
-            prev_y = r.y;
-            first = false;
-            if (content.text.size() > MAX_OUTPUT) break;
-        }
-    }
+    if (want_text) content.text = metafile_runs_text(runs, MAX_OUTPUT);
     return content;
+}
+
+std::string metafile_runs_text(std::vector<MetafileRun>& runs, size_t max_output) {
+    // Reading order: top-to-bottom, then left-to-right. stable_sort keeps
+    // the record order among runs that share a reference point.
+    std::stable_sort(runs.begin(), runs.end(), [](const Run& a, const Run& b) {
+        if (a.y != b.y) return a.y < b.y;
+        return a.x < b.x;
+    });
+    std::string text;
+    const Run* prev = nullptr;
+    for (auto& r : runs) {
+        if (prev && r.y != prev->y) {
+            text += '\n';  // new baseline
+        } else if (prev && text.back() != ' ' && r.text.front() != ' ') {
+            // A run that starts within a third of a character of where the
+            // previous one ended continues its word. One that starts well
+            // before that point was drawn over it (a clipped table cell).
+            bool touches = prev->has_end &&
+                           std::abs(r.x - prev->end_x) <= prev->char_width / 3;
+            if (!touches) text += ' ';
+        }
+        text += r.text;
+        prev = &r;
+        if (text.size() > max_output) break;
+    }
+    return text;
 }
 
 std::string emf_extract_text(const uint8_t* data, size_t size) {
