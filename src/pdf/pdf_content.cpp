@@ -2268,44 +2268,55 @@ uint32_t compose_spacing_accent(uint32_t base, uint32_t accent) {
 }
 
 void drop_overprinted_chars(std::vector<TextChar>& chars) {
-    // Bucket by character and a 2pt grid; a copy lies in a neighbouring cell.
-    auto key = [](uint32_t u, int16_t rot, long gx, long gy) {
-        return (static_cast<uint64_t>(u) << 40) ^ (static_cast<uint64_t>(rot & 0xFF) << 32) ^
-               (static_cast<uint64_t>(gx & 0xFFFF) << 16) ^ static_cast<uint64_t>(gy & 0xFFFF);
-    };
-    std::unordered_map<uint64_t, std::vector<uint32_t>> seen;
-    seen.reserve(chars.size());
-    size_t out = 0;
-    for (size_t i = 0; i < chars.size(); i++) {
-        const TextChar& c = chars[i];
-        // Along the line a copy sits within 0.12 em: overprints are struck
-        // within about 0.08 em (faked bold, outline stacks), while a doubled
-        // letter sits a whole advance on, at least 0.22 em even for "ll" or
-        // "II". Across the line, within a fifth of the type size.
-        double tol_x = std::max(c.font_size * 0.12, 0.3);
-        double tol = std::max(c.font_size * 0.2, 0.5);
-        long gx = std::lround(c.x / 2.0), gy = std::lround(c.y / 2.0);
-        long reach = static_cast<long>(std::ceil(tol / 2.0));
-        bool copy = false;
-        for (long dx = -reach; dx <= reach && !copy; dx++)
-            for (long dy = -reach; dy <= reach && !copy; dy++) {
-                auto it = seen.find(key(c.unicode, c.rot, gx + dx, gy + dy));
-                if (it == seen.end()) continue;
-                for (uint32_t k : it->second) {
-                    const TextChar& o = chars[k];
-                    if (std::abs(o.x - c.x) < tol_x && std::abs(o.y - c.y) < tol &&
-                        std::min(o.font_size, c.font_size) >
-                            std::max(o.font_size, c.font_size) * 0.8) {
-                        copy = true;
-                        break;
-                    }
-                }
-            }
-        if (copy) continue;
-        if (out != i) chars[out] = c;
-        seen[key(c.unicode, c.rot, gx, gy)].push_back(static_cast<uint32_t>(out));
-        out++;
+    // Along the line a copy sits within 0.12 em: overprints are struck
+    // within about 0.08 em (faked bold, outline stacks), while a doubled
+    // letter sits a whole advance on, at least 0.22 em even for "ll" or
+    // "II". Across the line, within a fifth of the type size. A glyph is a
+    // copy when it matches an earlier glyph that was kept.
+    auto tol_x = [](const TextChar& c) { return std::max(c.font_size * 0.12, 0.3); };
+    auto tol_y = [](const TextChar& c) { return std::max(c.font_size * 0.2, 0.5); };
+    const size_t n = chars.size();
+    if (n < 2) return;
+
+    // Candidate pairs: same character and direction, close in y. One sort,
+    // then a scan over the few glyphs within reach of each.
+    std::vector<uint32_t> order(n);
+    double reach = 0;
+    for (size_t i = 0; i < n; i++) {
+        order[i] = static_cast<uint32_t>(i);
+        reach = std::max(reach, tol_y(chars[i]));
     }
+    std::sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) {
+        const TextChar& ca = chars[a];
+        const TextChar& cb = chars[b];
+        if (ca.unicode != cb.unicode) return ca.unicode < cb.unicode;
+        if (ca.rot != cb.rot) return ca.rot < cb.rot;
+        return ca.y < cb.y;
+    });
+    std::vector<std::pair<uint32_t, uint32_t>> pairs;   // (later, earlier)
+    for (size_t p = 0; p < n; p++) {
+        const TextChar& a = chars[order[p]];
+        for (size_t q = p + 1; q < n; q++) {
+            const TextChar& b = chars[order[q]];
+            if (b.unicode != a.unicode || b.rot != a.rot || b.y - a.y >= reach) break;
+            uint32_t later = std::max(order[p], order[q]);
+            uint32_t earlier = std::min(order[p], order[q]);
+            const TextChar& c = chars[later];
+            const TextChar& o = chars[earlier];
+            if (std::abs(o.x - c.x) < tol_x(c) && std::abs(o.y - c.y) < tol_y(c) &&
+                std::min(o.font_size, c.font_size) > std::max(o.font_size, c.font_size) * 0.8)
+                pairs.push_back({later, earlier});
+        }
+    }
+    if (pairs.empty()) return;
+
+    std::sort(pairs.begin(), pairs.end());
+    std::vector<char> kept(n, 1);
+    for (auto& [later, earlier] : pairs)
+        if (kept[earlier]) kept[later] = 0;
+    size_t out = 0;
+    for (size_t i = 0; i < n; i++)
+        if (kept[i]) chars[out++] = chars[i];
     chars.resize(out);
 }
 
