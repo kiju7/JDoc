@@ -2737,12 +2737,19 @@ static std::vector<BandCut> find_column_bands(
     // Two independent flows (see kStaggerMinRows): grown from row s, which
     // sets text both sides of a gutter. Returns the band's last row and its
     // channel, or -1.
+    // Channels a staggered band was grown along from a row above and
+    // rejected; as with `tried`, the rows below do not grow them again.
+    std::vector<std::vector<std::pair<double, double>>> stagger_tried(nrows);
     auto staggered_band = [&](int s, std::pair<double, double>& out) -> int {
         if (!upright) return -1;
         const auto& row = ink[s];
         for (size_t k = 0; k + 1 < row.size(); k++) {
             double a = row[k].second, b = row[k + 1].first;
             if (b - a < median_fs * kStaggerGutterEm) continue;
+            double mid = (a + b) / 2;
+            bool seen = false;
+            for (const auto& t : stagger_tried[s]) seen |= t.first <= mid && mid <= t.second;
+            if (seen) continue;
             std::pair<double, double> ch{a, b};
             const double left_at = row.front().first, right_at = b;
             // A side's lines start at its first line's x or indented under
@@ -2773,6 +2780,17 @@ static std::vector<BandCut> find_column_bands(
                 ch = e;
                 end = r;
             }
+            // Every way out below but the last rejects the channel.
+            struct Reject {
+                std::vector<std::vector<std::pair<double, double>>>& tried;
+                const std::pair<double, double>& ch;
+                int s, end;
+                bool accepted = false;
+                ~Reject() {
+                    if (!accepted)
+                        for (int r = s + 1; r <= end; r++) tried[r].push_back(ch);
+                }
+            } reject{stagger_tried, ch, s, end};
             if (end - s + 1 < 2 * kStaggerMinRows) continue;
             // Side of each row: 1 left only, 2 right only, 3 both; and for a
             // row with both, whether the two sides share a baseline.
@@ -2898,6 +2916,7 @@ static std::vector<BandCut> find_column_bands(
             if (between[1] + between[2] + offset < 2 * kStaggerMinRows ||
                 (both - offset) * 2 > n)
                 continue;
+            reject.accepted = true;
             out = ch;
             return end;
         }
