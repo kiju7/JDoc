@@ -49,7 +49,11 @@ static std::string resolve_package_path(std::string target,
 // pugixml; the hard cap bounds decompression of a part whose header lies
 // (nothing legitimate approaches it — Excel itself cannot save a part that
 // large).
-constexpr uint64_t kDefaultStreamThreshold = 256ull << 20;  // 256 MiB
+// A DOM costs about 14 times its sheet XML (the XML itself, pugixml's nodes,
+// the cell vector), so 8 MiB of XML (~1 MiB zipped) already holds ~110 MiB;
+// above it the streaming path's memory tracks the output instead. A streamed
+// sheet gives no structured chunk.tables (its markdown is the same).
+constexpr uint64_t kDefaultStreamThreshold = 8ull << 20;    // 8 MiB
 constexpr uint64_t kMaxStreamPartBytes = 16ull << 30;       // 16 GiB
 // Excel grid limits, used to clamp attacker-controlled row/col references so
 // a lying r="..." attribute cannot force a multi-gigabyte gap fill.

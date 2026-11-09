@@ -420,7 +420,10 @@ bool images_unsaved(const ConvertOptions& opts) {
 // With images off nothing is written, so a reference a parser still emits
 // would point nowhere.
 std::string without_image_refs(std::string md, const ConvertOptions& opts) {
-    return opts.images ? md : util::drop_image_refs(md);
+    if (opts.images || (md.find("![") == std::string::npos &&
+                        md.find("[image: ") == std::string::npos))
+        return md;
+    return util::drop_image_refs(md);
 }
 
 // The chunk APIs' post-pass: options to run the format's converter with, and
