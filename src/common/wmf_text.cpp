@@ -43,17 +43,28 @@ inline uint32_t rd_u32(const uint8_t* p) {
 
 using Run = MetafileRun;
 
-// Decode an ANSI string of `count` bytes at parm+off, if in range.
+// An 8-bit string of `count` bytes at parm+off, if in range (decoded with
+// the metafile's other runs, see metafile_runs_text). When the record
+// carries advances (META_EXTTEXTOUT's Dx: one int16 per byte after the
+// word-padded string), the run's right edge comes with it.
 void take_text(const uint8_t* parm, size_t parm_len, size_t off, size_t count,
-               int32_t x, int32_t y, std::vector<Run>& out) {
+               int32_t x, int32_t y, std::vector<Run>& out, bool with_dx = false) {
     if (count == 0 || off > parm_len || count > parm_len - off) return;
-    std::string t = util::plain_text_to_utf8(
-        std::string(reinterpret_cast<const char*>(parm + off), count));
-    if (t.empty()) return;
     Run run;
     run.x = x;
     run.y = y;
-    run.text = std::move(t);
+    run.ansi = true;
+    run.text.assign(reinterpret_cast<const char*>(parm + off), count);
+    size_t dx = off + ((count + 1) & ~size_t(1));
+    if (with_dx && dx <= parm_len && (parm_len - dx) / 2 >= count) {
+        int32_t w = 0;
+        for (size_t i = 0; i < count; ++i) w += rd_i16(parm + dx + i * 2);
+        if (w > 0) {
+            run.has_end = true;
+            run.end_x = x + w;
+            run.char_width = double(w) / count;
+        }
+    }
     out.push_back(std::move(run));
 }
 
@@ -168,7 +179,7 @@ MetafileContent wmf_extract(const uint8_t* data, size_t size,
                 uint16_t opts = rd_u16(parm + 6);
                 size_t str_off = 8;
                 if (opts & (ETO_OPAQUE | ETO_CLIPPED)) str_off += 8;
-                take_text(parm, parm_len, str_off, count, x, y, runs);
+                take_text(parm, parm_len, str_off, count, x, y, runs, true);
             }
         } else if (want_images) {
             if (const DibRecord* dr = dib_record(func)) {

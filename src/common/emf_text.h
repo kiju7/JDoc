@@ -33,13 +33,16 @@ struct MetafileRun {
     bool has_end = false;
     int32_t end_x = 0;
     double char_width = 0;   // average advance, with has_end
+    bool ansi = false;       // text holds the record's 8-bit bytes, undecoded
     std::string text;
 };
 
 // Runs in reading order (top-to-bottom, then left-to-right), a line per
-// baseline. Runs on one line are joined with a space when a gap lies
-// between them — or when, lacking advances, nothing says they touch — so
-// table cells and labels drawn apart do not run together. Sorts `runs`.
+// baseline. Runs on one line are joined with a space when their advances
+// show a gap between them, so table cells and labels drawn apart do not run
+// together; without advances nothing says so, and they join. 8-bit runs are
+// decoded together: UTF-8 when all of them are, else CP949 — one short run
+// can pass for either ("홍" in CP949 is "ȫ" in UTF-8). Sorts `runs`.
 std::string metafile_runs_text(std::vector<MetafileRun>& runs, size_t max_output);
 
 // Single-pass EMF extraction: walk the record stream once, collecting text

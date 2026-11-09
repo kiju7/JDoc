@@ -123,9 +123,8 @@ void decode_text_record(const uint8_t* rec, size_t rec_size, uint32_t type,
     Run run;
     run.x = x;
     run.y = y;
-    run.text = ansi
-        ? util::plain_text_to_utf8(std::string(s, str_bytes))  // UTF-8 else CP949
-        : util::utf16le_to_utf8(s, str_bytes);
+    run.ansi = ansi;
+    run.text = ansi ? std::string(s, str_bytes) : util::utf16le_to_utf8(s, str_bytes);
     if (run.text.empty()) return;
     // EXTTEXTOUT's EMRTEXT ends with offDx: one advance per character, from
     // the record start. Their sum is where the run ends.
@@ -258,16 +257,24 @@ std::string metafile_runs_text(std::vector<MetafileRun>& runs, size_t max_output
         if (a.y != b.y) return a.y < b.y;
         return a.x < b.x;
     });
+    bool utf8 = true;
+    for (const auto& r : runs)
+        if (r.ansi && !util::is_valid_utf8(r.text)) utf8 = false;
+    if (!utf8)
+        for (auto& r : runs)
+            if (r.ansi) r.text = util::cp949_string_to_utf8(r.text);
     std::string text;
     const Run* prev = nullptr;
     for (auto& r : runs) {
+        if (r.text.empty()) continue;
         if (prev && r.y != prev->y) {
             text += '\n';  // new baseline
         } else if (prev && text.back() != ' ' && r.text.front() != ' ') {
             // A run that starts within a third of a character of where the
             // previous one ended continues its word. One that starts well
             // before that point was drawn over it (a clipped table cell).
-            bool touches = prev->has_end &&
+            // Without advances nothing shows a gap, and the runs join.
+            bool touches = !prev->has_end ||
                            std::abs(r.x - prev->end_x) <= prev->char_width / 3;
             if (!touches) text += ' ';
         }

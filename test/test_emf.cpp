@@ -148,9 +148,9 @@ void test_reading_order() {
         append(emf, exttextout(0x54, 10,  100, 1, b));   // x=10 → first
         append(emf, emf_eof());
         auto out = jdoc::emf_extract_text(emf.data(), emf.size());
-        // Far apart on one line (and no advances say otherwise): one line,
-        // the runs kept apart.
-        ASSERT(out == "1 2");
+        // One line. Without advances nothing shows a gap, so the runs join
+        // (a formula or a word set one glyph per record must not split).
+        ASSERT(out == "12");
     TEST_END
 
     TEST("runs whose advances meet join; overlapping ones stay apart")
