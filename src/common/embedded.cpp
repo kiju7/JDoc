@@ -77,6 +77,7 @@ std::string nested(const ConvertOptions& opts, Fn&& fn) {
     o.image_dir.clear();
     o.pages.clear();
     o.page_chunks = false;
+    o.metadata = false;
     ++g_depth;
     std::string md;
     try {

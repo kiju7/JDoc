@@ -62,6 +62,7 @@ jdoc input.pdf --chunks                     # 페이지별 출력
 jdoc input.pdf --images ./imgs              # 이미지를 저장하고 링크 (없으면 이미지 링크 없음)
 jdoc input.pdf --images ./imgs --min-image-size 100   # 100px 미만 이미지 제외
 jdoc input.pdf --images ./imgs --min-image-size 0     # 모든 이미지 추출
+jdoc input.hwp --metadata                   # 문서 맨 앞에 요약정보(제목·작성자·날짜 등)
 
 # 아카이브: 압축 해제 없이 내부 문서를 멤버별로 변환
 jdoc docs.zip                               # === 멤버 경로 === 구분으로 출력
@@ -257,6 +258,7 @@ CLI는 각 환경의 관례에 맞는 대응 필드·플래그를 제공한다.
 | `image_dir` | `""` | 이미지 저장 디렉토리. 빈 값이면 본문에 이미지 링크를 넣지 않음. 문자열 변환(`convert`)은 이미지를 추출하지 않고, 페이지별 변환(`convert_pages`)은 이미지를 메모리로만 돌려줌 | `--images DIR` |
 | `image_ref_prefix` | `""` | 마크다운 이미지 참조 경로 앞에 붙일 접두사 | — |
 | `min_image_size` | `50` | 문서에 포함된 이미지 중 N×N px 미만 제외 (`0` = 필터 없음). 이미지 파일 자체를 변환하는 경우에는 적용되지 않음 | `--min-image-size N` |
+| `metadata` | `false` | 요약정보(제목·주제·작성자·마지막 저장자·키워드·설명·회사·날짜 등)를 본문 앞 `---` 블록으로 출력. HWP·HWPX·DOC/XLS/PPT·OOXML·ODF·PDF | `--metadata` |
 | `format` | `markdown` | `markdown` 또는 `text` (예전 이름 `plaintext`, `--text`, `--plaintext`는 경고와 함께 계속 받음) | `--format F` |
 
 ### 아카이브 한도 (`ConvertOptions::archive`)

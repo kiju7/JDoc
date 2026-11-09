@@ -146,16 +146,18 @@ struct OleStream {
     Bytes data;
 };
 
-// Build a minimal CFB holding FileHeader, DocInfo and BodyText/Section0.
+// Build a minimal CFB holding FileHeader, DocInfo and BodyText/Section0,
+// plus `extra` streams at the root.
 // Every stream is padded past the 4096-byte mini-stream cutoff so the
 // regular FAT chain is used and no mini-FAT is needed.
 Bytes build_ole(const Bytes& file_header, const Bytes& doc_info,
-                const Bytes& section0) {
+                const Bytes& section0, const std::vector<OleStream>& extra = {}) {
     std::vector<OleStream> streams = {
         {"FileHeader", file_header},
         {"DocInfo", doc_info},
         {"BodyText/Section0", section0},
     };
+    streams.insert(streams.end(), extra.begin(), extra.end());
 
     // Pad each stream to a whole number of sectors, at least MINI_CUTOFF.
     for (auto& s : streams) {
@@ -167,7 +169,7 @@ Bytes build_ole(const Bytes& file_header, const Bytes& doc_info,
     // Sector layout: 0 = FAT, 1..2 = directory, then the stream chains.
     constexpr uint32_t FAT_SEC = 0;
     constexpr uint32_t DIR_SEC = 1;
-    constexpr uint32_t DIR_SECTORS = 2;  // 5 entries x 128 bytes = 640 > 512
+    constexpr uint32_t DIR_SECTORS = 2;  // up to 8 entries x 128 bytes
 
     uint32_t next_sec = DIR_SEC + DIR_SECTORS;
     std::vector<uint32_t> start_sec(streams.size());
@@ -208,6 +210,9 @@ Bytes build_ole(const Bytes& file_header, const Bytes& doc_info,
         {"BodyText",   1,  4, 0, 0},
         {"Section0",   2, -1, start_sec[2], uint32_t(streams[2].data.size())},
     };
+    for (size_t i = 3; i < streams.size(); i++)
+        ents.push_back({streams[i].name, 2, -1, start_sec[i],
+                        uint32_t(streams[i].data.size())});
 
     Bytes dir(DIR_SECTORS * SEC_SIZE, 0);
     for (size_t i = 0; i < ents.size(); i++) {
@@ -292,6 +297,60 @@ int count_occurrences(const std::string& haystack, const std::string& needle) {
 } // namespace
 
 // ── Tests ───────────────────────────────────────────────────
+
+// HwpSummaryInformation: a property set whose one section holds the codepage,
+// a UTF-16 title, a codepage (CP949) author and a FILETIME.
+static void test_summary_information() {
+    TEST(summary_information_as_front_matter)
+    auto push32 = [](Bytes& b, uint64_t v, int n = 4) {
+        for (int i = 0; i < n; i++) b.push_back(uint8_t(v >> (8 * i)));
+    };
+    auto prop = [&](uint16_t type, const Bytes& v, int count = -1) {
+        Bytes b;
+        push32(b, type);
+        if (count >= 0) push32(b, uint32_t(count));
+        b.insert(b.end(), v.begin(), v.end());
+        b.resize((b.size() + 3) & ~size_t(3), 0);
+        return b;
+    };
+    Bytes ft;
+    push32(ft, 133000000000000000ull, 8);
+    std::vector<std::pair<uint32_t, Bytes>> props = {
+        {1, prop(2, {0xB5, 0x03})},                                  // codepage 949
+        {2, prop(0x1F, {'Q', 0, '"', 0, 'A', 0, 0, 0}, 4)},          // Q"A
+        {4, prop(0x1E, {0xC8, 0xAB, 0xB1, 0xE6, 0xB5, 0xBF, 0}, 7)}, // 홍길동
+        {12, prop(0x40, ft)},
+    };
+    Bytes index, values;
+    for (auto& [id, v] : props) {
+        push32(index, id);
+        push32(index, 8 + props.size() * 8 + values.size());
+        values.insert(values.end(), v.begin(), v.end());
+    }
+    Bytes stream = {0xFE, 0xFF};
+    stream.resize(24, 0);                       // version, system, clsid
+    push32(stream, 1);                          // one section
+    stream.resize(44, 0);                       // its fmtid
+    push32(stream, 48);                         // and offset
+    push32(stream, 8 + index.size() + values.size());
+    push32(stream, props.size());
+    stream.insert(stream.end(), index.begin(), index.end());
+    stream.insert(stream.end(), values.begin(), values.end());
+
+    Bytes sec;
+    put_paragraph(sec, 0, u"본문");
+    Bytes ole = build_ole(make_file_header(), Bytes(64, 0), sec,
+                          {{"\x05HwpSummaryInformation", stream}});
+    jdoc::ConvertOptions opts;
+    std::string plain = jdoc::convert(ole.data(), ole.size(), "s.hwp", opts);
+    ASSERT(plain.find("title:") == std::string::npos);
+    opts.metadata = true;
+    std::string md = jdoc::convert(ole.data(), ole.size(), "s.hwp", opts);
+    ASSERT(md.rfind("---\ntitle: \"Q\\\"A\"\nauthor: \"홍길동\"\n"
+                    "created: \"2022-06-18T04:26:40Z\"\n---\n\n", 0) == 0);
+    ASSERT(md.find("본문") != std::string::npos);
+    TEST_END
+}
 
 // A gso control anchored in a body paragraph carries its caption in a
 // LIST_HEADER whose paragraphs are *siblings* of the LIST_HEADER record.
@@ -523,6 +582,7 @@ int main() {
     test_footnote_follows_referencing_paragraph();
     test_footnote_inside_table_cell();
     test_surrogate_pair_text();
+    test_summary_information();
 
     std::cerr << "\n=== Results: " << tests_passed << " passed, "
               << tests_failed << " failed ===\n";

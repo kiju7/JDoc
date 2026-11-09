@@ -432,6 +432,29 @@ static void test_drawings() {
     TEST_END
 }
 
+static void test_summary() {
+    std::cerr << "\nSummary block:\n";
+
+    TEST(summary_fields_as_front_matter)
+        auto f = simple_doc(false);
+        auto put_field = [&](int index, const std::string& utf8) {
+            Bytes w;
+            put_text(w, utf8);
+            memcpy(f.data() + 30 + 128 + index * 112, w.data(), w.size());
+        };
+        put_field(0, "보고서");       // title
+        put_field(2, "Kim");          // author
+        put_field(4, "alpha");        // keywords, two lines
+        put_field(5, "beta");
+        jdoc::ConvertOptions opts;
+        opts.metadata = true;
+        auto md = jdoc::convert(f.data(), f.size(), "test.hwp", opts);
+        ASSERT(md.rfind("---\ntitle: \"보고서\"\nauthor: \"Kim\"\n"
+                        "keywords: \"alpha, beta\"\n---\n\nHello HWP3", 0) == 0);
+        ASSERT(convert_mem(f).rfind("Hello HWP3", 0) == 0);
+    TEST_END
+}
+
 static void test_tables() {
     std::cerr << "\nTables:\n";
 
@@ -534,6 +557,7 @@ int main() {
     test_text_extraction();
     test_tables();
     test_drawings();
+    test_summary();
     test_robustness();
 
     std::cerr << "\n=== Results: " << tests_passed << " passed, "

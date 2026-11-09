@@ -96,6 +96,10 @@ struct ConvertOptions {
     unsigned min_image_size = 50;   // skip images smaller than NxN pixels (0 = no filter)
     OutputFormat format = OutputFormat::MARKDOWN;
     ArchiveLimits archive;
+    // Document properties (title, author, last saved by, company, dates...)
+    // as a front-matter block ahead of the body. Embedded objects never
+    // print theirs; each archive member prints its own.
+    bool metadata = false;
 };
 
 } // namespace jdoc

@@ -33,6 +33,8 @@ typedef struct {
      * offsets. Text format only: 1 = read multi-column pages column by
      * column (default 1); 0 = keep the page's physical lines (PDF). */
     int columns;
+    int metadata;                    /* 1 = document properties as a front-matter
+                                      * block ahead of the text (default 0) */
 } JDocOptions;
 
 /* Returns default options: images on, markdown, all pages, min_size=50. */

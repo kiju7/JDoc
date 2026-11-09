@@ -15,6 +15,7 @@
 #include "common/binary_utils.h"
 #include "common/embedded.h"
 #include "common/file_utils.h"
+#include "common/metadata.h"
 #include "common/string_utils.h"
 #include "legacy/ole_reader.h"
 
@@ -882,6 +883,29 @@ bool is_hwp3_signature(const uint8_t* data, size_t size) {
     static const char kPrefix[] = "HWP Document File V";
     return data && size >= sizeof(kPrefix) - 1 &&
            memcmp(data, kPrefix, sizeof(kPrefix) - 1) == 0;
+}
+
+// The summary block: title, subject, author, date, two keyword lines and
+// three comment lines, 56 characters each.
+void read_hwp3_properties(const uint8_t* data, size_t size, DocProps& props) {
+    static const DocProp kFields[] = {
+        PROP_TITLE, PROP_SUBJECT, PROP_AUTHOR, PROP_DATE, PROP_KEYWORDS,
+        PROP_KEYWORDS, PROP_DESCRIPTION, PROP_DESCRIPTION, PROP_DESCRIPTION,
+    };
+    constexpr size_t kFieldLen = kSummaryLen / 9;
+    if (!is_hwp3_signature(data, size) || size < kSignatureLen + kDocInfoLen + kSummaryLen)
+        return;
+    const uint8_t* field = data + kSignatureLen + kDocInfoLen;
+    for (DocProp prop : kFields) {
+        std::string v;
+        for (size_t at = 0; at < kFieldLen; at += 2) {
+            uint16_t ch = util::read_u16_le(field + at);
+            if (ch == 0) break;
+            append_hwp_char(v, ch);
+        }
+        add_property(props, prop, v);
+        field += kFieldLen;
+    }
 }
 
 Hwp3Parser::Hwp3Parser(const std::string& file_path) {

@@ -1,4 +1,5 @@
 #include "pdf_extract.h"
+#include "common/metadata.h"
 #include "common/string_utils.h"
 #include <algorithm>
 #include <cassert>
@@ -1765,5 +1766,51 @@ std::vector<PageChunk> result_to_chunks(ExtractResult& r,
     return chunks;
 }
 
+// "D:YYYYMMDDHHmmSS+HH'mm'" as ISO 8601; missing fields take their earliest
+// value. A string that is not a PDF date is kept as written.
+static std::string pdf_date_iso(const std::string& s) {
+    size_t i = s.compare(0, 2, "D:") == 0 ? 2 : 0;
+    std::string d;
+    while (i < s.size() && d.size() < 14 && isdigit(static_cast<unsigned char>(s[i])))
+        d.push_back(s[i++]);
+    if (d.size() < 4) return s;
+    for (size_t k = d.size(); k < 14; k++) d.push_back("00000101000000"[k]);
+    std::string out = d.substr(0, 4) + '-' + d.substr(4, 2) + '-' + d.substr(6, 2) +
+                      'T' + d.substr(8, 2) + ':' + d.substr(10, 2) + ':' + d.substr(12, 2);
+    if (i < s.size() && s[i] == 'Z') return out + 'Z';
+    if (i < s.size() && (s[i] == '+' || s[i] == '-')) {
+        std::string z;
+        for (size_t k = i + 1; k < s.size() && z.size() < 4; k++)
+            if (isdigit(static_cast<unsigned char>(s[k]))) z.push_back(s[k]);
+        if (z.size() >= 2) out += s[i] + z.substr(0, 2) + ':' + (z.size() == 4 ? z.substr(2) : "00");
+    }
+    return out;
+}
 
 }} // namespace jdoc::pdf_detail
+
+namespace jdoc {
+
+void read_pdf_properties(const uint8_t* data, size_t size, DocProps& props) {
+    using namespace pdf_detail;
+    PdfDoc doc(data, size);
+    if (!doc.parse()) return;
+    if (doc.trailer.has("Encrypt") && !doc.init_encryption("")) return;
+    PdfObj info = doc.resolve(doc.trailer.get("Info"));
+    if (!info.is_dict()) return;
+    static const struct { const char* key; DocProp prop; } kFields[] = {
+        {"Title", PROP_TITLE}, {"Subject", PROP_SUBJECT}, {"Author", PROP_AUTHOR},
+        {"Keywords", PROP_KEYWORDS}, {"Creator", PROP_APPLICATION},
+        {"Producer", PROP_APPLICATION}, {"CreationDate", PROP_CREATED},
+        {"ModDate", PROP_MODIFIED},
+    };
+    for (const auto& f : kFields) {
+        PdfObj v = doc.resolve(info.get(f.key));
+        if (!v.is_str()) continue;
+        std::string s = decode_pdf_text(v.str_val);
+        bool date = f.prop == PROP_CREATED || f.prop == PROP_MODIFIED;
+        add_property(props, f.prop, date ? pdf_date_iso(s) : s);
+    }
+}
+
+} // namespace jdoc

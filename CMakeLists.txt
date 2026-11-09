@@ -223,6 +223,7 @@ add_library(jdoc_lib STATIC
     src/common/emf_text.cpp
     src/common/wmf_text.cpp
     src/common/embedded.cpp
+    src/common/metadata.cpp
     src/zip_reader.cpp
     # archive containers + walker
     src/archive/input_stream.cpp

@@ -1,6 +1,7 @@
 // test_odf.cpp - Tests for ODF (odt/ods/odp) to Markdown conversion
 // License: MIT
 
+#include "jdoc/jdoc.h"
 #include "jdoc/office.h"
 #include <cstdint>
 #include <iostream>
@@ -213,6 +214,27 @@ void test_odf() {
         auto md = conv(make_odf("application/vnd.oasis.opendocument.text", body),
                        "unnamed.bin");
         ASSERT(md.find("from mimetype") != std::string::npos);
+    TEST_END
+
+    TEST(meta_xml_as_front_matter)
+        std::string meta =
+            "<?xml version=\"1.0\"?><office:document-meta "
+            "xmlns:office=\"urn:oasis:names:tc:opendocument:xmlns:office:1.0\" "
+            "xmlns:meta=\"urn:oasis:names:tc:opendocument:xmlns:meta:1.0\" "
+            "xmlns:dc=\"http://purl.org/dc/elements/1.1/\"><office:meta>"
+            "<dc:title>Plan\n2027</dc:title><meta:initial-creator>Lee</meta:initial-creator>"
+            "<dc:creator>Park</dc:creator><meta:keyword>a</meta:keyword>"
+            "<meta:keyword>b</meta:keyword><dc:date>2026-11-09T10:00:00</dc:date>"
+            "</office:meta></office:document-meta>";
+        std::string body = "<office:text><text:p>body</text:p></office:text>";
+        std::string pkg = make_odf("application/vnd.oasis.opendocument.text", body,
+                                   {{"meta.xml", meta}});
+        jdoc::ConvertOptions opts;
+        opts.metadata = true;
+        auto md = jdoc::convert(pkg.data(), pkg.size(), "m.odt", opts);
+        ASSERT(md.rfind("---\ntitle: \"Plan 2027\"\nauthor: \"Lee\"\n"
+                        "last_modified_by: \"Park\"\nkeywords: \"a, b\"\n"
+                        "modified: \"2026-11-09T10:00:00\"\n---\n\nbody", 0) == 0);
     TEST_END
 
     std::cerr << "\n=== Results: " << tests_passed << " passed, "

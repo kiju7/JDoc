@@ -31,6 +31,7 @@ static jdoc::ConvertOptions to_cpp_opts(const JDocOptions* opts) {
     if (!opts) return o;
     o.tables = (opts->tables != 0);
     o.columns = (opts->columns != 0);
+    o.metadata = (opts->metadata != 0);
     o.images = (opts->images != 0);
     if (opts->image_dir)
         o.image_dir = opts->image_dir;

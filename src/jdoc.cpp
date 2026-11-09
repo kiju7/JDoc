@@ -13,6 +13,8 @@
 #include "legacy/ole_reader.h"
 #include "common/string_utils.h"
 #include "common/file_utils.h"
+#include "common/mapped_file.h"
+#include "common/metadata.h"
 #include "common/image_utils.h"
 #include "common/png_encode.h"
 #include "common/emf_text.h"
@@ -608,6 +610,25 @@ std::string convert_from_memory(const uint8_t* data, size_t size,
     return convert_from_memory_as(fmt, data, size, name_hint, opts);
 }
 
+// The front-matter block of the document's properties, when asked for.
+static std::string properties_of(const uint8_t* data, size_t size,
+                                 const ConvertOptions& opts) {
+    return opts.metadata ? properties_block(document_properties(data, size)) : std::string();
+}
+
+static std::string properties_of(const std::string& path, const ConvertOptions& opts) {
+    if (!opts.metadata) return {};
+    MappedFile mf(path);
+    return mf.valid() ? properties_of(mf.data(), mf.size(), opts) : std::string();
+}
+
+// In place: a body built by appending usually has the room spare, so a large
+// output is not copied a second time.
+static std::string with_properties(const std::string& block, std::string body) {
+    if (!block.empty()) body.insert(0, block);
+    return body;
+}
+
 static std::string convert_mem_dispatch(FileFormat, const uint8_t*, size_t,
                                         const std::string&, const ConvertOptions&);
 static std::string convert_file_dispatch(FileFormat, const std::string&,
@@ -627,7 +648,8 @@ std::string convert_from_memory_as(FileFormat fmt,
         o.tables = true;
         return layout_tables(convert_from_memory_as(fmt, data, size, name_hint, o), opts);
     }
-    return without_image_refs(convert_mem_dispatch(fmt, data, size, name_hint, opts), opts);
+    return with_properties(properties_of(data, size, opts),
+        without_image_refs(convert_mem_dispatch(fmt, data, size, name_hint, opts), opts));
 }
 
 static std::string convert_mem_dispatch(FileFormat fmt,
@@ -662,7 +684,8 @@ std::string convert(const std::string& file_path, ConvertOptions opts) {
         o.tables = true;
         return layout_tables(convert(file_path, o), opts);
     }
-    return without_image_refs(convert_file_dispatch(fmt, file_path, opts), opts);
+    return with_properties(properties_of(file_path, opts),
+        without_image_refs(convert_file_dispatch(fmt, file_path, opts), opts));
 }
 
 static std::string convert_file_dispatch(FileFormat fmt, const std::string& file_path,
@@ -742,6 +765,8 @@ std::vector<PageChunk> convert_chunks(const std::string& file_path,
     const ChunkPass pass(fmt, opts);
     auto chunks = convert_chunks_impl(fmt, file_path, pass.run);
     for (auto& c : chunks) pass.apply(c, opts);
+    if (!chunks.empty())
+        chunks[0].text = with_properties(properties_of(file_path, opts), std::move(chunks[0].text));
     return chunks;
 }
 
@@ -786,8 +811,11 @@ void for_each_chunk(const std::string& file_path, const ConvertOptions& opts,
     validate_options(opts);
     auto fmt = detect_format(file_path);
     const ChunkPass pass(fmt, opts);
+    std::string props = properties_of(file_path, opts);
     for_each_chunk_impl(fmt, file_path, pass.run, [&](PageChunk&& c) {
         pass.apply(c, opts);
+        c.text = with_properties(props, std::move(c.text));
+        props.clear();
         return sink(std::move(c));
     });
 }
@@ -841,8 +869,11 @@ void for_each_chunk(const void* data, size_t size, const std::string& name_hint,
     const uint8_t* bytes = static_cast<const uint8_t*>(data);
     auto fmt = detect_format_mem(bytes, size, name_hint);
     const ChunkPass pass(fmt, opts);
+    std::string props = properties_of(bytes, size, opts);
     for_each_chunk_impl(fmt, bytes, size, name_hint, pass.run, [&](PageChunk&& c) {
         pass.apply(c, opts);
+        c.text = with_properties(props, std::move(c.text));
+        props.clear();
         return sink(std::move(c));
     });
 }

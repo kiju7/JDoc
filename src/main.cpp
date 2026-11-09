@@ -1,6 +1,6 @@
 // jdoc CLI - Universal document to Markdown converter
 // Usage: jdoc <input_file> [output.md] [--format markdown|text] [--no-tables]
-//            [--no-columns] [--pages 0,1,2] [--chunks] [--images DIR]
+//            [--no-columns] [--pages 0,1,2] [--chunks] [--images DIR] [--metadata]
 // Supports: PDF, DOCX, XLSX, PPTX, DOC, XLS, PPT, RTF, HWP, HWPX
 
 #include "jdoc/jdoc.h"
@@ -32,6 +32,8 @@ void print_usage(const char* prog) {
               << "  --images DIR    Save images to DIR and link them in the output\n"
               << "                  (without it no images are extracted or linked)\n"
               << "  --min-image-size N  Skip images smaller than NxN pixels (default: 50, 0=no filter)\n"
+              << "  --metadata      Print document properties (title, author, dates...)\n"
+              << "                  as a front-matter block before the text\n"
               << "\nArchive options:\n"
               << "  --max-depth N        Max nested-archive depth (default: 3, -1 = unlimited)\n"
               << "  --max-member-mb N    Per-member uncompressed cap in MiB (default: 512, -1 = unlimited)\n"
@@ -87,6 +89,8 @@ int main(int argc, char* argv[]) {
                 opts.columns = false;
             } else if (arg == "--no-tables") {
                 opts.tables = false;
+            } else if (arg == "--metadata") {
+                opts.metadata = true;
             } else if (arg == "--chunks") {
                 chunk_mode = true;
             } else if (arg == "--images") {
