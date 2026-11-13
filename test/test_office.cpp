@@ -397,6 +397,57 @@ void test_dwfx_not_office() {
         ASSERT(info.format == "ZIP");
         ASSERT(info.convertible);
     TEST_END
+
+    // A deck carrying a chart's workbook lists spreadsheetml (and a pasted
+    // Word object wordprocessingml) among its content types. Under a name that
+    // does not say pptx (Hancom Show saves .show) the main part must decide,
+    // or the slides are dropped and only the chart data comes out.
+    const std::string slide =
+        "<?xml version=\"1.0\"?>"
+        "<p:sld xmlns:p=\"http://schemas.openxmlformats.org/presentationml/2006/main\""
+        " xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\">"
+        "<p:cSld><p:spTree>" + text_shape("sp", "show slide body") +
+        "</p:spTree></p:cSld></p:sld>";
+    const std::string mixed_ct =
+        "<?xml version=\"1.0\"?><Types xmlns=\"http://schemas.openxmlformats.org/"
+        "package/2006/content-types\">"
+        "<Default Extension=\"docx\" ContentType=\"application/vnd.openxmlformats-"
+        "officedocument.wordprocessingml.document\"/>"
+        "<Default Extension=\"xlsx\" ContentType=\"application/vnd.openxmlformats-"
+        "officedocument.spreadsheetml.sheet\"/>"
+        "<Override PartName=\"/ppt/presentation.xml\" ContentType=\"application/"
+        "vnd.openxmlformats-officedocument.presentationml.presentation.main+xml\"/>"
+        "</Types>";
+
+    TEST(deck_with_embedded_workbook_detected_by_main_part)
+        auto zip = make_zip(
+            {{"[Content_Types].xml", mixed_ct},
+             {"_rels/.rels",
+              "<?xml version=\"1.0\"?><Relationships xmlns=\"http://schemas."
+              "openxmlformats.org/package/2006/relationships\"><Relationship "
+              "Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/"
+              "2006/relationships/officeDocument\" Target=\"ppt/presentation.xml\"/>"
+              "</Relationships>"},
+             {"ppt/presentation.xml", "<?xml version=\"1.0\"?><p:presentation/>"},
+             {"ppt/slides/slide1.xml", slide},
+             {"ppt/embeddings/Microsoft_Excel_Worksheet1.xlsx", std::string(64, 'x')}});
+        ASSERT(jdoc::detect_office_format_mem(
+                   reinterpret_cast<const uint8_t*>(zip.data()), zip.size(),
+                   "deck.show") == jdoc::DocFormat::PPTX);
+        auto md = jdoc::office_to_markdown_mem(
+            reinterpret_cast<const uint8_t*>(zip.data()), zip.size(), "deck.show");
+        ASSERT(md.find("show slide body") != std::string::npos);
+    TEST_END
+
+    TEST(deck_without_package_rels_detected_by_part_path)
+        auto zip = make_zip(
+            {{"[Content_Types].xml", mixed_ct},
+             {"ppt/presentation.xml", "<?xml version=\"1.0\"?><p:presentation/>"},
+             {"ppt/slides/slide1.xml", slide}});
+        ASSERT(jdoc::detect_office_format_mem(
+                   reinterpret_cast<const uint8_t*>(zip.data()), zip.size(),
+                   "oleObject1.bin") == jdoc::DocFormat::PPTX);
+    TEST_END
 }
 
 void test_pptx_shape_tree() {
