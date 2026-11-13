@@ -9,6 +9,7 @@
 #include "common/file_utils.h"
 #include "common/string_utils.h"
 #include "legacy/ole_reader.h"
+#include "common/image_magic.h"
 #include "ooxml/xlsb_parser.h"
 #include <iostream>
 #include <cassert>
@@ -1624,6 +1625,42 @@ void test_xls_sst_continue() {
     TEST_END
 }
 
+// ── DOC picture scan: JPEG bounds ───────────────────────────
+
+void test_doc_jpeg_bounds() {
+    std::cerr << "\nDOC JPEG bounds:\n";
+    auto seg = [](unsigned char m, const std::string& body) {
+        std::string s = "\xFF";
+        s += static_cast<char>(m);
+        size_t n = body.size() + 2;
+        s += static_cast<char>(n >> 8);
+        s += static_cast<char>(n & 0xFF);
+        return s + body;
+    };
+    const std::string thumb = "\xFF\xD8\xFF\xD9";  // a JPEG inside APP1
+    const std::string jpeg = std::string("\xFF\xD8", 2) +
+                             seg(0xE1, "Exif" + thumb) + seg(0xDB, std::string(4, '\x01')) +
+                             seg(0xDA, std::string(3, '\x02')) +
+                             std::string("\x11\xFF\x00\x22\xFF\xD3\x33", 7) +
+                             std::string("\xFF\xD9", 2);
+
+    TEST(jpeg_end_skips_thumbnail_eoi)
+        // The first FF D9 belongs to the EXIF thumbnail; cutting there left
+        // a photo that does not open.
+        std::string buf = jpeg + "trailing bytes";
+        ASSERT(jdoc::util::jpeg_length(buf.data(), buf.size()) == jpeg.size());
+    TEST_END
+
+    TEST(jpeg_end_at_end_of_stream)
+        ASSERT(jdoc::util::jpeg_length(jpeg.data(), jpeg.size()) == jpeg.size());
+    TEST_END
+
+    TEST(random_ff_d8_ff_is_not_a_jpeg)
+        std::string junk("\xFF\xD8\xFF\xAD\x2F\x47\xFF\xC2\xB4\x97\xE3\x73\xFF\xD9", 14);
+        ASSERT(jdoc::util::jpeg_length(junk.data(), junk.size()) == 0);
+    TEST_END
+}
+
 // ── XLSB sparse-cell storage ────────────────────────────────
 
 static void put_xlsb_varint(std::string& out, uint32_t value) {
@@ -2110,6 +2147,7 @@ int main() {
     test_xlsx_streaming();
     test_xlsx_cell_values();
     test_xls_sst_continue();
+    test_doc_jpeg_bounds();
     test_xlsb_sparse_cells();
     test_html_charset();
     test_html_images();

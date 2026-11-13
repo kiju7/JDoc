@@ -102,4 +102,45 @@ inline const char* image_magic_ext(const void* data, size_t n) {
     return image_ext(image_magic(data, n));
 }
 
+// The length of a JPEG that starts at data (FF D8), found by walking its
+// segments; 0 when the bytes are not a JPEG. Taking the first FF D9 cut a
+// photo short at the end of the EXIF thumbnail inside its APP1 segment, and
+// accepting any FF D8 FF saved random bytes of compressed data as a .jpg.
+inline size_t jpeg_length(const void* bytes, size_t len) {
+    const auto* data = static_cast<const unsigned char*>(bytes);
+    auto u8 = [&](size_t i) { return static_cast<uint8_t>(data[i]); };
+    auto known_marker = [](uint8_t m) {
+        return (m >= 0xC0 && m <= 0xCF) || m == 0xDA || m == 0xDB || m == 0xDD ||
+               (m >= 0xE0 && m <= 0xEF) || m == 0xFE || m == 0xD9;
+    };
+    size_t i = 2;
+    while (i + 2 <= len) {
+        if (u8(i) != 0xFF) return 0;
+        uint8_t m = u8(i + 1);
+        if (m == 0xFF) { ++i; continue; }          // fill byte
+        if (!known_marker(m)) return 0;
+        if (m == 0xD9) return i + 2;              // EOI
+        if (i + 4 > len) return 0;
+        size_t seg = (size_t(u8(i + 2)) << 8) | u8(i + 3);
+        if (seg < 2 || i + 2 + seg > len) return 0;
+        i += 2 + seg;
+        if (m != 0xDA) continue;
+        // Entropy-coded data after SOS: FF 00 is a stuffed byte, FF D0-D7 a
+        // restart marker; any other marker ends the scan (EOI, or the next
+        // segment of a progressive JPEG).
+        while (i + 1 < len) {
+            if (u8(i) == 0xFF) {
+                uint8_t n = u8(i + 1);
+                if (n == 0x00 || (n >= 0xD0 && n <= 0xD7) || n == 0xFF) {
+                    i += (n == 0xFF) ? 1 : 2;
+                    continue;
+                }
+                break;
+            }
+            ++i;
+        }
+    }
+    return 0;
+}
+
 }} // namespace jdoc::util
