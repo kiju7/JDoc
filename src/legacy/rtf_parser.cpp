@@ -20,6 +20,9 @@ static const char* kSkipDestinations[] = {
     "fonttbl", "colortbl", "stylesheet", "info", "header", "footer",
     "footnote", "annotation", "xmlnstbl", "listtable", "listoverridetable",
     "revtbl", "rsidtbl", "generator", "datafield", "fldinst",
+    // The metafile copy of a picture kept for readers that do not know
+    // \shppict; the same picture again.
+    "nonshppict",
     nullptr
 };
 
@@ -96,6 +99,10 @@ void RtfParser::parse(std::string& out_text, std::vector<PictImage>& out_images)
     // Current pict image being assembled.
     PictImage current_pict;
     bool collecting_pict_hex = false;
+    // Group depth of the \pict group. Its sub-groups ({\*\picprop ...},
+    // {\*\blipuid ...}) close before the picture does; closing one used to
+    // end the picture, and the rest of its hex data was printed as text.
+    size_t pict_depth = 0;
 
     // Flag: next group is a destination (set by \*).
     bool next_is_destination = false;
@@ -106,6 +113,44 @@ void RtfParser::parse(std::string& out_text, std::vector<PictImage>& out_images)
     // Pending lead byte for DBCS codepages (CP949, CP932).
     uint8_t dbcs_lead = 0;
     bool dbcs_pending = false;
+    // Where the byte pairing with a pending lead byte has to start: right
+    // after the lead's \' escape. A lead byte not followed at once by its
+    // trail is an orphan and is dropped, rather than paired with whatever
+    // text came next (which printed a wrong syllable or U+FFFD).
+    size_t dbcs_trail_pos = 0;
+
+    // Bold and italic markers follow the text, not the groups: Word wraps
+    // every run in its own {\b ...} group, and emitting a marker at each
+    // group edge gave "**a****b**". A marker opens when visible text in that
+    // style is written and closes when the style ends or the paragraph does.
+    // A closing marker goes before trailing spaces ("**a** b", not
+    // "**a **b", which Markdown does not read as emphasis).
+    auto close_marker = [&](const char* m) {
+        size_t end = out_text.size();
+        while (end > 0 && out_text[end - 1] == ' ') --end;
+        out_text.insert(end, m);
+    };
+    auto close_fmt = [&]() {
+        if (was_italic) { close_marker("*"); was_italic = false; }
+        if (was_bold) { close_marker("**"); was_bold = false; }
+    };
+    auto sync_fmt = [&]() {
+        if (was_italic && (!cur.italic || cur.bold != was_bold)) {
+            close_marker("*");
+            was_italic = false;
+        }
+        if (was_bold && !cur.bold) {
+            close_marker("**");
+            was_bold = false;
+        } else if (!was_bold && cur.bold) {
+            out_text += "**";
+            was_bold = true;
+        }
+        if (cur.italic && !was_italic) {
+            out_text += "*";
+            was_italic = true;
+        }
+    };
 
     while (pos < len) {
         char ch = data[pos];
@@ -126,22 +171,8 @@ void RtfParser::parse(std::string& out_text, std::vector<PictImage>& out_images)
         if (ch == '}') {
             // Pop state.
             // Close any open formatting spans.
-            if (!cur.skip && !cur.in_pict) {
-                if (was_bold && !cur.bold) {
-                    // Already closed.
-                } else if (cur.bold) {
-                    out_text += "**";
-                    was_bold = false;
-                }
-                if (was_italic && !cur.italic) {
-                    // Already closed.
-                } else if (cur.italic) {
-                    out_text += "*";
-                    was_italic = false;
-                }
-            }
-
-            if (cur.in_pict && collecting_pict_hex) {
+            if (cur.in_pict && collecting_pict_hex &&
+                state_stack.size() == pict_depth) {
                 // Finalize the pict image.
                 collecting_pict_hex = false;
                 if (!current_pict.hex_data.empty() || !current_pict.bin_data.empty()) {
@@ -167,8 +198,7 @@ void RtfParser::parse(std::string& out_text, std::vector<PictImage>& out_images)
             // \<CR> or \<LF> = paragraph break (RTF spec equivalent to \par)
             if (ch == '\r' || ch == '\n') {
                 if (!cur.skip && !cur.in_pict) {
-                    if (was_bold) { out_text += "**"; was_bold = false; }
-                    if (was_italic) { out_text += "*"; was_italic = false; }
+                    close_fmt();
                     out_text += "\n\n";
                 }
                 pos++;
@@ -180,6 +210,7 @@ void RtfParser::parse(std::string& out_text, std::vector<PictImage>& out_images)
             // Special two-character escapes.
             if (ch == '\\' || ch == '{' || ch == '}') {
                 if (!cur.skip && !cur.in_pict) {
+                    sync_fmt();
                     out_text.push_back(ch);
                 }
                 pos++;
@@ -188,6 +219,7 @@ void RtfParser::parse(std::string& out_text, std::vector<PictImage>& out_images)
 
             // \' hex escape.
             if (ch == '\'') {
+                if (dbcs_pending && pos - 1 != dbcs_trail_pos) dbcs_pending = false;
                 pos++;
                 if (pos + 2 <= len) {
                     char h1 = data[pos], h2 = data[pos + 1];
@@ -199,6 +231,7 @@ void RtfParser::parse(std::string& out_text, std::vector<PictImage>& out_images)
                     };
                     uint8_t byte = static_cast<uint8_t>((hex_val(h1) << 4) | hex_val(h2));
                     if (!cur.skip && !cur.in_pict) {
+                        sync_fmt();
                         if (doc_codepage == 949 || doc_codepage == 1361) {
                             // CP949/EUC-KR: DBCS lead byte 0x81-0xFE
                             if (dbcs_pending) {
@@ -207,6 +240,7 @@ void RtfParser::parse(std::string& out_text, std::vector<PictImage>& out_images)
                             } else if (util::is_cp949_lead(byte)) {
                                 dbcs_lead = byte;
                                 dbcs_pending = true;
+                                dbcs_trail_pos = pos + 2;
                             } else {
                                 util::append_cp1252(out_text, byte);
                             }
@@ -218,6 +252,7 @@ void RtfParser::parse(std::string& out_text, std::vector<PictImage>& out_images)
                             } else if ((byte >= 0x81 && byte <= 0x9F) || (byte >= 0xE0 && byte <= 0xFC)) {
                                 dbcs_lead = byte;
                                 dbcs_pending = true;
+                                dbcs_trail_pos = pos + 2;
                             } else {
                                 util::append_cp1252(out_text, byte);
                             }
@@ -283,40 +318,30 @@ void RtfParser::parse(std::string& out_text, std::vector<PictImage>& out_images)
                     pos++;
                 }
 
+                // \* marks only the control word right after it. Taken here,
+                // whatever branch handles the word: a \*\picprop inside a
+                // picture used to leave the mark set, and the next unrelated
+                // word (a \sectd in the body) then hid the rest of the
+                // document as a skipped destination.
+                const bool is_destination = next_is_destination;
+                next_is_destination = false;
+
                 // Handle control words.
                 if (word == "par" || word == "line") {
                     if (!cur.skip && !cur.in_pict) {
                         // Close formatting before paragraph break.
-                        if (was_bold) { out_text += "**"; was_bold = false; }
-                        if (was_italic) { out_text += "*"; was_italic = false; }
+                        close_fmt();
                         out_text += (word == "par") ? "\n\n" : "\n";
                     }
                 } else if (word == "tab") {
                     if (!cur.skip && !cur.in_pict) out_text.push_back('\t');
                 } else if (word == "b") {
-                    bool new_bold = !has_param || param != 0;
-                    if (!cur.skip && !cur.in_pict) {
-                        if (new_bold && !cur.bold) {
-                            out_text += "**";
-                            was_bold = true;
-                        } else if (!new_bold && cur.bold && was_bold) {
-                            out_text += "**";
-                            was_bold = false;
-                        }
-                    }
-                    cur.bold = new_bold;
+                    cur.bold = !has_param || param != 0;
                 } else if (word == "i") {
-                    bool new_italic = !has_param || param != 0;
-                    if (!cur.skip && !cur.in_pict) {
-                        if (new_italic && !cur.italic) {
-                            out_text += "*";
-                            was_italic = true;
-                        } else if (!new_italic && cur.italic && was_italic) {
-                            out_text += "*";
-                            was_italic = false;
-                        }
-                    }
-                    cur.italic = new_italic;
+                    cur.italic = !has_param || param != 0;
+                } else if (word == "plain") {
+                    cur.bold = false;
+                    cur.italic = false;
                 } else if (word == "ansicpg") {
                     if (has_param) { cur.codepage = param; doc_codepage = param; }
                 } else if (word == "intbl") {
@@ -325,27 +350,24 @@ void RtfParser::parse(std::string& out_text, std::vector<PictImage>& out_images)
                     cur.in_table = true;
                 } else if (word == "cell") {
                     if (!cur.skip && !cur.in_pict) {
-                        if (was_bold) { out_text += "**"; was_bold = false; }
-                        if (was_italic) { out_text += "*"; was_italic = false; }
+                        close_fmt();
                         out_text += "\x1F"; // cell separator (same as DOC)
                     }
                 } else if (word == "row") {
                     if (!cur.skip && !cur.in_pict) {
-                        if (was_bold) { out_text += "**"; was_bold = false; }
-                        if (was_italic) { out_text += "*"; was_italic = false; }
+                        close_fmt();
                         out_text += "\n";
                     }
                     cur.in_table = false;
                 } else if (word == "pard") {
                     // Reset paragraph formatting.
-                    if (was_bold) { out_text += "**"; was_bold = false; }
-                    if (was_italic) { out_text += "*"; was_italic = false; }
                     cur.bold = false;
                     cur.italic = false;
                     cur.in_table = false;
                 } else if (word == "u") {
                     // Unicode character.
                     if (has_param && !cur.skip && !cur.in_pict) {
+                        sync_fmt();
                         int16_t uval = static_cast<int16_t>(param);
                         uint32_t cp = (uval < 0) ? static_cast<uint32_t>(uval + 65536) : static_cast<uint32_t>(uval);
                         util::append_utf8(out_text, cp);
@@ -368,6 +390,12 @@ void RtfParser::parse(std::string& out_text, std::vector<PictImage>& out_images)
                                 }
                                 if (pos < len && data[pos] == ' ') pos++;
                             }
+                        } else if (data[pos] == '\r' || data[pos] == '\n') {
+                            // Line breaks in the file are not text and do
+                            // not count; counting one let the real fallback
+                            // byte ("\'5f" = '_') through.
+                            pos++;
+                            --s;
                         } else if (data[pos] != '{' && data[pos] != '}') {
                             pos++;
                         }
@@ -377,6 +405,7 @@ void RtfParser::parse(std::string& out_text, std::vector<PictImage>& out_images)
                 } else if (word == "pict") {
                     cur.in_pict = true;
                     collecting_pict_hex = true;
+                    pict_depth = state_stack.size();
                     current_pict = PictImage{};
                 } else if (cur.in_pict) {
                     // Pict-related keywords.
@@ -395,9 +424,8 @@ void RtfParser::parse(std::string& out_text, std::vector<PictImage>& out_images)
                             pos += bin_count;
                         }
                     }
-                } else if (next_is_destination || is_skip_destination(word)) {
+                } else if (is_destination || is_skip_destination(word)) {
                     cur.skip = true;
-                    next_is_destination = false;
                 }
 
                 continue;
@@ -409,18 +437,29 @@ void RtfParser::parse(std::string& out_text, std::vector<PictImage>& out_images)
         }
 
         // Regular character.
-        if (cur.in_pict && collecting_pict_hex) {
-            // Collect hex data for the pict image.
-            if (std::isxdigit(static_cast<unsigned char>(ch))) {
+        if (cur.in_pict) {
+            // Hex data of the picture itself; a sub-group's text (a
+            // \blipuid, a property value) is not part of it.
+            if (collecting_pict_hex && state_stack.size() == pict_depth &&
+                std::isxdigit(static_cast<unsigned char>(ch))) {
                 current_pict.hex_data.push_back(ch);
             }
-            // Ignore whitespace and other chars in hex data.
         } else if (!cur.skip) {
             if (ch == '\r' || ch == '\n') {
                 // In standard RTF, file-level CR/LF are ignored.
                 // But in macOS RTF without \par, consecutive newlines
                 // at text boundaries serve as paragraph breaks.
+            } else if (dbcs_pending && pos == dbcs_trail_pos) {
+                // A DBCS trail byte in the printable range is written as
+                // itself ("\'b0A"), not as another \' escape.
+                if (doc_codepage == 932)
+                    util::append_cp932(out_text, dbcs_lead, static_cast<uint8_t>(ch));
+                else
+                    util::append_cp949(out_text, dbcs_lead, static_cast<uint8_t>(ch));
+                dbcs_pending = false;
             } else {
+                dbcs_pending = false;
+                if (ch != ' ') sync_fmt();
                 out_text.push_back(ch);
             }
         }
@@ -429,8 +468,7 @@ void RtfParser::parse(std::string& out_text, std::vector<PictImage>& out_images)
     }
 
     // Close any remaining formatting.
-    if (was_bold) out_text += "**";
-    if (was_italic) out_text += "*";
+    close_fmt();
 }
 
 // ---------- public API -------------------------------------------------------
