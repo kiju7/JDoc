@@ -132,6 +132,53 @@ void test_rtf_parser() {
     TEST_END
 
     std::remove(rtf_path.c_str());
+
+    auto rtf_md = [](const std::string& body) {
+        std::string doc = "{\\rtf1\\ansi\\ansicpg949 " + body + "}";
+        jdoc::ConvertOptions opts;
+        opts.images = false;
+        return jdoc::office_to_markdown_mem(
+            reinterpret_cast<const uint8_t*>(doc.data()), doc.size(), "t.rtf", opts);
+    };
+
+    TEST(rtf_picture_subgroups_do_not_end_the_picture)
+        // Word writes {\*\picprop ...} and {\*\blipuid ...} inside \pict.
+        // Closing one used to end the picture: the rest of its hex data was
+        // printed as text, and the \* left pending hid the body after it.
+        auto md = rtf_md(
+            "before\\par {\\*\\shppict{\\pict{\\*\\picprop{\\sp{\\sn a}{\\sv 1}}}"
+            "\\pngblip{\\*\\blipuid 0123456789abcdef}89504e470d0a1a0a0000}}"
+            "{\\nonshppict{\\pict\\wmetafile8 0100090000}}"
+            "\\sectd after\\par");
+        ASSERT(md.find("before") != std::string::npos);
+        ASSERT(md.find("after") != std::string::npos);
+        ASSERT(md.find("89504e47") == std::string::npos);
+        ASSERT(md.find("0123456789") == std::string::npos);
+    TEST_END
+
+    TEST(rtf_bold_runs_in_separate_groups_join)
+        // Word gives every run its own {\b ...} group.
+        auto md = rtf_md("{\\b Bold}{\\b  text} plain\\par");
+        ASSERT(md.find("**Bold text**") != std::string::npos);
+        ASSERT(md.find("****") == std::string::npos);
+    TEST_END
+
+    TEST(rtf_unicode_fallback_after_line_break_skipped)
+        // A line break in the file between \uN and its fallback byte is not
+        // text; counting it let the fallback ('_') through.
+        auto md = rtf_md("{\\uc1\\u51452\r\n\\'5f\\u48124\\'5f}\\par");
+        ASSERT(md.find("\xEC\xA3\xBC\xEB\xAF\xBC") != std::string::npos);  // 주민
+        ASSERT(md.find('_') == std::string::npos);
+    TEST_END
+
+    TEST(rtf_dbcs_trail_written_as_itself)
+        // CP949 trail bytes in the ASCII range follow the lead's escape as
+        // plain characters: "\'b0A" is one syllable. A lead byte with no
+        // trail right after it is dropped, not paired with later text.
+        auto md = rtf_md("\\'b0A\\'b0{\\b0 }[x]\\par");
+        ASSERT(md.find("[x]") != std::string::npos);
+        ASSERT(md.find("\xEF\xBF\xBD") == std::string::npos);  // U+FFFD
+    TEST_END
 }
 
 // ── PPTX shape tree ─────────────────────────────────────────
