@@ -44,7 +44,9 @@ private:
     std::vector<ImageData> extract_images(unsigned min_image_size = 0);
 
     // Format a slide as markdown.
-    static std::string slide_to_markdown(const Slide& slide);
+    // page_marker: lead with "--- Page N ---". A chunk leaves it out, since
+    // whoever joins chunks (plain-text output) adds its own.
+    static std::string slide_to_markdown(const Slide& slide, bool page_marker = true);
 
 };
 

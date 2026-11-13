@@ -1787,6 +1787,32 @@ void test_xls_sst_continue() {
     TEST_END
 }
 
+// ── PPT notes and page markers ──────────────────────────────
+
+void test_ppt_notes_and_pages() {
+    std::cerr << "\nPPT notes and page markers:\n";
+    const char* path = "test/fixtures/ppt/notes_two_slides.ppt";
+
+    TEST(slide_number_field_is_not_a_note)
+        // Every notes page carries the slide-number field, stored as '*'.
+        // It printed "> **Notes:** *" under every slide.
+        auto md = jdoc::office_to_markdown(path);
+        ASSERT(md.find("> **Notes:** speaker note two") != std::string::npos);
+        ASSERT(md.find("**Notes:** *") == std::string::npos);
+        ASSERT(md.find("\n> *\n") == std::string::npos);
+    TEST_END
+
+    TEST(plain_text_marks_each_page_once)
+        // The slide chunks carried their own marker and the plain-text join
+        // added another: "--- Page 2 ---" twice.
+        jdoc::ConvertOptions opts;
+        opts.format = jdoc::OutputFormat::PLAINTEXT;
+        auto txt = jdoc::office_to_markdown(path, opts);
+        ASSERT(count_occurrences(txt, "--- Page 2 ---") == 1);
+        ASSERT(txt.find("Slide title 2") != std::string::npos);
+    TEST_END
+}
+
 // ── XLSB sparse-cell storage ────────────────────────────────
 
 static void put_xlsb_varint(std::string& out, uint32_t value) {
@@ -2273,6 +2299,7 @@ int main() {
     test_xlsx_streaming();
     test_xlsx_cell_values();
     test_xls_sst_continue();
+    test_ppt_notes_and_pages();
     test_xlsb_sparse_cells();
     test_html_charset();
     test_html_images();
