@@ -4,6 +4,7 @@
 #include "jdoc/jdoc.h"
 #include "jdoc/office.h"
 #include <cstdint>
+#include <filesystem>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -235,6 +236,36 @@ void test_odf() {
         ASSERT(md.rfind("---\ntitle: \"Plan 2027\"\nauthor: \"Lee\"\n"
                         "last_modified_by: \"Park\"\nkeywords: \"a, b\"\n"
                         "modified: \"2026-11-09T10:00:00\"\n---\n\nbody", 0) == 0);
+    TEST_END
+
+    TEST(picture_outside_pictures_folder_extracted)
+        // LibreOffice stores pictures under Pictures/, other writers under a
+        // folder of their own (media/). Both are linked by xlink:href.
+        std::string png = "\x89PNG\r\n\x1a\n" + std::string(64, '\0');
+        std::string body =
+            "<office:text><text:p><draw:frame><draw:image xlink:href=\"media/image1.png\"/>"
+            "</draw:frame><draw:frame><draw:image xlink:href=\"./Pictures/p.png\"/>"
+            "</draw:frame></text:p></office:text>";
+        std::string pkg = make_odf("application/vnd.oasis.opendocument.text", body,
+                                   {{"media/image1.png", png}, {"Pictures/p.png", png},
+                                    {"Thumbnails/thumbnail.png", png}});
+        auto dir = std::filesystem::temp_directory_path() / "jdoc_odf_media_test";
+        std::filesystem::remove_all(dir);
+        jdoc::ConvertOptions opts;
+        opts.images = true;
+        opts.min_image_size = 0;
+        opts.image_dir = dir.string();
+        auto md = jdoc::office_to_markdown_mem(
+            reinterpret_cast<const uint8_t*>(pkg.data()), pkg.size(), "d.odt", opts);
+        size_t n = 0;
+        for (size_t p = md.find("![page1_img"); p != std::string::npos;
+             p = md.find("![page1_img", p + 1))
+            n++;
+        ASSERT(n == 2);
+        size_t files = 0;
+        for (auto& e : std::filesystem::directory_iterator(dir)) { (void)e; files++; }
+        ASSERT(files == 2);  // the thumbnail stays out
+        std::filesystem::remove_all(dir);
     TEST_END
 
     std::cerr << "\n=== Results: " << tests_passed << " passed, "

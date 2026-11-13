@@ -27,7 +27,7 @@ private:
     ZipReader& zip_;
     DocFormat kind_;
     std::string prefix_;
-    std::map<std::string, std::string> image_name_map_;  // Pictures/x.png -> ref name
+    std::map<std::string, std::string> image_name_map_;  // part path (Pictures/x.png) -> ref name
     pugi::xml_node skip_;     // already rendered (a slide's title frame)
     bool in_list_ = false;    // paragraphs are list items
     bool flat_ = false;       // inside a table cell: tables read as text
@@ -53,7 +53,7 @@ private:
                             int depth);
     std::string header_footer_text(const ConvertOptions& opts);
     std::string image_ref(const pugi::xml_node& image, const ConvertOptions& opts) const;
-    void extract_images(const ConvertOptions& opts);
+    void extract_images(const pugi::xml_node& root, const ConvertOptions& opts);
 };
 
 } // namespace jdoc
