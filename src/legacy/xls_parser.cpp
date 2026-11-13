@@ -494,6 +494,14 @@ static void split_oversized_drawing_group(std::vector<char>& wb) {
             if ((vi & 0x0F) != 0x0F || ft != 0xF000) continue;
             size_t end = c + 8 + util::read_u32_le(wb.data() + c + 4);
             if (end <= pos + 4 + size || end + 4 > wb.size()) return 0;
+            // Excel continues a large group in further MSODRAWINGGROUP or
+            // CONTINUE records; only a group with no such follow-up is one
+            // Hancom record that overran its length.
+            size_t after = pos + 4 + size;
+            if (after + 4 <= wb.size()) {
+                uint16_t nt = util::read_u16_le(wb.data() + after);
+                if (nt == RT_MSODRAWINGGROUP || nt == RT_CONTINUE) return 0;
+            }
             // A record must follow where the container ends.
             if (end + 4 + util::read_u16_le(wb.data() + end + 2) > wb.size()) return 0;
             start = c;
