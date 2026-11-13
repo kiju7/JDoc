@@ -37,6 +37,7 @@ static constexpr uint16_t RT_FORMAT     = 0x041E;
 static constexpr uint16_t RT_XF         = 0x00E0;
 static constexpr uint16_t RT_FILEPASS   = 0x002F;
 static constexpr uint16_t RT_FONT      = 0x0031;
+static constexpr uint16_t RT_MSODRAWINGGROUP = 0x00EB;
 static constexpr uint16_t RT_MSODRAWING = 0x00EC;
 static constexpr uint16_t RT_HEADER     = 0x0014;
 static constexpr uint16_t RT_FOOTER     = 0x0015;
@@ -890,7 +891,10 @@ std::vector<ImageData> XlsParser::extract_images(unsigned min_image_size) {
     }
     if (wb.empty()) return images;
 
-    // Collect all MSODRAWING + CONTINUE data.
+    // Collect the drawing records with their CONTINUEs. The pictures
+    // themselves live in the workbook-wide MSODRAWINGGROUP (its BStore holds
+    // one FBSE per picture, the BLIP inline after it); a sheet's MSODRAWING
+    // only points at them. Reading the sheet records alone found nothing.
     std::vector<char> drawing_data;
     size_t pos = 0;
 
@@ -900,7 +904,7 @@ std::vector<ImageData> XlsParser::extract_images(unsigned min_image_size) {
         pos += 4;
         if (pos + rec_size > wb.size()) break;
 
-        if (rec_type == RT_MSODRAWING) {
+        if (rec_type == RT_MSODRAWINGGROUP || rec_type == RT_MSODRAWING) {
             drawing_data.insert(drawing_data.end(), wb.data() + pos, wb.data() + pos + rec_size);
             size_t look = pos + rec_size;
             while (look + 4 <= wb.size()) {
@@ -931,6 +935,22 @@ std::vector<ImageData> XlsParser::extract_images(unsigned min_image_size) {
 
         if (ver == 0x0F) {
             pos += 8;
+            continue;
+        }
+
+        // FBSE: a 36-byte header and an optional name, then the BLIP it
+        // describes. Step onto that BLIP; the loop reads it next.
+        if (rec_type == 0xF007) {
+            size_t fbse_end = pos + 8 + size_t(rec_len);
+            if (rec_len >= 36 && fbse_end <= drawing_data.size()) {
+                uint8_t cb_name = static_cast<uint8_t>(drawing_data[pos + 8 + 33]);
+                size_t blip = pos + 8 + 36 + cb_name;
+                if (blip + 8 <= fbse_end) {
+                    pos = blip;
+                    continue;
+                }
+            }
+            pos = fbse_end;
             continue;
         }
 

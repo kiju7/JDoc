@@ -1622,6 +1622,23 @@ void test_xls_sst_continue() {
         ASSERT(md.find("unique_string_number_0446@example.com") != std::string::npos);
         ASSERT(md.find("unique_string_number_0999@example.com") != std::string::npos);
     TEST_END
+
+    // Excel and LibreOffice keep every picture of a workbook in the global
+    // MSODRAWINGGROUP record (a BStore of FBSE entries, each with its BLIP
+    // inline); the sheet's MSODRAWING only points at them. Reading the sheet
+    // records alone extracted no picture from any .xls.
+    TEST(picture_in_drawing_group_extracted)
+        std::string dir = temp_image_dir("xls_drawing_group");
+        jdoc::ConvertOptions opts;
+        opts.images = true;
+        opts.image_dir = dir;
+        auto md = jdoc::office_to_markdown(
+            "test/fixtures/xls/drawing_group_picture.xls", opts);
+        ASSERT(md.find("picture sheet") != std::string::npos);
+        ASSERT(md.find("![page1_img0.png]") != std::string::npos);
+        assert_targets_exist(md, dir);
+        std::filesystem::remove_all(dir);
+    TEST_END
 }
 
 // ── XLSB sparse-cell storage ────────────────────────────────
