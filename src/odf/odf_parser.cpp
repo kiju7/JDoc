@@ -228,22 +228,56 @@ std::string OdfParser::format_table(const pugi::xml_node& table,
     return out;
 }
 
-void OdfParser::extract_images(const ConvertOptions& opts) {
+// A package path from an xlink:href: "./" and the sub-document prefix
+// dropped, so "Pictures/a.png" and "./Pictures/a.png" name the same part.
+static std::string odf_part_path(std::string href) {
+    while (href.rfind("./", 0) == 0) href.erase(0, 2);
+    return href;
+}
+
+void OdfParser::extract_images(const pugi::xml_node& root, const ConvertOptions& opts) {
     if (!opts.images) return;
     int img_idx = 0;
-    for (auto* entry : zip_.entries_with_prefix(prefix_ + "Pictures/")) {
-        std::string ext = util::get_extension(entry->name);
+    auto store = [&](const ZipReader::Entry& entry, const std::string& key) {
+        std::string ext = util::get_extension(entry.name);
         ImageData img;
         img.page_number = 1;
         img.name = "page1_img" + std::to_string(img_idx);
         img.format = util::image_format_from_ext(ext);
-        img.data = zip_.read_entry(*entry);
+        img.data = zip_.read_entry(entry);
 
         // ext is what the package named the part; store_image keeps it.
         std::string filename = util::store_image(img, opts, ext);
-        if (filename.empty()) continue;
-        image_name_map_[util::get_filename(entry->name)] = filename;
+        if (filename.empty()) return;
+        image_name_map_[key] = filename;
         img_idx++;
+    };
+    for (auto* entry : zip_.entries_with_prefix(prefix_ + "Pictures/"))
+        store(*entry, entry->name.substr(prefix_.size()));
+
+    // LibreOffice keeps pictures under Pictures/, but other writers pick
+    // their own folder (media/image1.png); those used to be dropped. Follow
+    // every draw:image the body links to. Sub-documents ("Object 1/") and
+    // their replacement pictures belong to the embedded object, not here.
+    struct Walker : pugi::xml_tree_walker {
+        std::vector<std::string> hrefs;
+        bool for_each(pugi::xml_node& n) override {
+            if (n.type() == pugi::node_element && is(n, "image")) {
+                const char* h = xml_attr(n, "href");
+                if (h[0]) hrefs.push_back(odf_part_path(h));
+            }
+            return true;
+        }
+    } walker;
+    pugi::xml_node body = root;  // a handle; traverse() is non-const
+    body.traverse(walker);
+    for (const auto& path : walker.hrefs) {
+        if (path.empty() || image_name_map_.count(path)) continue;
+        if (path.find("://") != std::string::npos) continue;
+        if (path.rfind("Object", 0) == 0) continue;  // Object N/, ObjectReplacements/
+        const ZipReader::Entry* entry = zip_.find_entry(prefix_ + path);
+        if (!entry) continue;
+        store(*entry, path);
     }
 }
 
@@ -252,9 +286,9 @@ std::string OdfParser::image_ref(const pugi::xml_node& image,
     if (!opts.images) return "";
     const char* href = xml_attr(image, "href");  // xlink:href
     if (!href[0]) return "";
-    std::string path = href;
-    if (path.rfind("http://", 0) == 0 || path.rfind("https://", 0) == 0) return "";
-    auto it = image_name_map_.find(util::get_filename(path));
+    std::string path = odf_part_path(href);
+    if (path.find("://") != std::string::npos) return "";
+    auto it = image_name_map_.find(path);
     if (it == image_name_map_.end()) return "";
     return "![" + it->second + "](" + opts.image_ref_prefix + it->second + ")";
 }
@@ -450,7 +484,7 @@ std::vector<PageChunk> OdfParser::to_chunks(const ConvertOptions& opts) {
     std::vector<char> buf;
     if (!load_part("content.xml", doc, buf)) return {};
 
-    extract_images(opts);  // saves files + populates image_name_map_
+    extract_images(doc.document_element(), opts);  // saves files + populates image_name_map_
 
     pugi::xml_node body = xml_child(doc.document_element(), "body");
     if (!body) return {};
