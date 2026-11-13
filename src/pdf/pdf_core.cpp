@@ -1,4 +1,5 @@
 #include "pdf_core.h"
+#include "pdf_base14.h"
 #include "jbig2.h"
 #include "pdf_limits.h"
 #include "common/string_utils.h"
@@ -7,6 +8,7 @@
 #include <fstream>
 #include <zlib.h>
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <cmath>
 #include <cstdlib>
@@ -17,6 +19,7 @@
 #include <numeric>
 #include <sstream>
 #include <stdexcept>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -151,47 +154,7 @@ PdfObj PdfLexer::parse_object(int depth) {
 
 
 std::vector<uint8_t> decode_flate(const uint8_t* src, size_t src_len) {
-    std::vector<uint8_t> out;
-    if (src_len == 0) return out;
-
-    // Fast path: libdeflate decodes a well-formed FlateDecode stream whole.
-    auto whole = inflate_zlib(src, src_len, src_len * 3);
-    if (!whole.empty()) return whole;
-
-    // Fallback: many real PDFs have truncated/malformed streams (missing the
-    // adler32 trailer, wrong /Length). zlib's streaming inflate recovers the
-    // PARTIAL output that precedes the damage, where libdeflate returns nothing.
-    out.reserve(src_len * 3);
-
-    z_stream zs = {};
-    if (inflateInit(&zs) != Z_OK) return {};
-    zs.next_in = const_cast<Bytef*>(src);
-    zs.avail_in = static_cast<uInt>(src_len);
-
-    uint8_t buf[8192];
-    int ret;
-    do {
-        zs.next_out = buf;
-        zs.avail_out = sizeof(buf);
-        uInt prev_in = zs.avail_in;
-        ret = inflate(&zs, Z_NO_FLUSH);
-        size_t have = sizeof(buf) - zs.avail_out;
-        out.insert(out.end(), buf, buf + have);
-        if (ret == Z_STREAM_END) break;
-        if (ret == Z_STREAM_ERROR || ret == Z_DATA_ERROR || ret == Z_MEM_ERROR
-            || ret == Z_NEED_DICT) {
-            inflateEnd(&zs);
-            return out; // return partial
-        }
-        // Z_BUF_ERROR or Z_OK with no progress (e.g. truncated stream missing
-        // adler32 trailer) — bail out instead of looping forever.
-        if (have == 0 && zs.avail_in == prev_in) {
-            inflateEnd(&zs);
-            return out;
-        }
-    } while (true);
-    inflateEnd(&zs);
-    return out;
+    return inflate_zlib_lenient(src, src_len);
 }
 
 bool flate_encoded_size(const uint8_t* src, size_t src_len,
@@ -310,7 +273,10 @@ std::vector<uint8_t> decode_lzw(const uint8_t* src, size_t src_len, int early_ch
         }
         prev = code;
 
-        int sz = (int)table.size() + (early_change ? 0 : 1);
+        // The code widens once the next entry would need the extra bit:
+        // with EarlyChange 1 (the default) one entry early, at 511 for 10
+        // bits; with 0, at 512.
+        int sz = (int)table.size() + (early_change ? 1 : 0);
         if (sz >= (1 << bits) && bits < 12) bits++;
     }
     return out;
@@ -1000,11 +966,82 @@ uint32_t glyph_name_to_unicode(const std::string& name) {
         {"hungarumlaut", 0x2DD}, {"cedilla", 0xB8}, {"acute", 0xB4},
         {"dieresis", 0xA8}, {"macron", 0xAF}, {"breve", 0x2D8},
     };
+    // The names TeX's Computer Modern and AMS fonts use for math symbols and
+    // Greek. Their glyphs sit at control codes and letter codes in the
+    // program's own encoding, so without the name a minus sign is lost and
+    // a dagger reads as 'y'.
+    static const std::unordered_map<std::string, uint32_t> math_table = {
+        {"asteriskmath", 0x2217}, {"periodcentered", 0x00B7}, {"similar", 0x223C},
+        {"bardbl", 0x2016}, {"minusplus", 0x2213}, {"diamondmath", 0x22C4},
+        {"circleplus", 0x2295}, {"circleminus", 0x2296}, {"circlemultiply", 0x2297},
+        {"circledivide", 0x2298}, {"circledot", 0x2299}, {"circlecopyrt", 0x00A9},
+        {"openbullet", 0x25E6}, {"equivasymptotic", 0x224D}, {"equivalence", 0x2261},
+        {"reflexsubset", 0x2286}, {"reflexsuperset", 0x2287},
+        {"precedesequal", 0x2AAF}, {"followsequal", 0x2AB0},
+        {"propersubset", 0x2282}, {"propersuperset", 0x2283},
+        {"lessmuch", 0x226A}, {"greatermuch", 0x226B}, {"precedes", 0x227A},
+        {"follows", 0x227B}, {"arrowleft", 0x2190}, {"arrowright", 0x2192},
+        {"arrowup", 0x2191}, {"arrowdown", 0x2193}, {"arrowboth", 0x2194},
+        {"arrownortheast", 0x2197}, {"arrowsoutheast", 0x2198},
+        {"arrownorthwest", 0x2196}, {"arrowsouthwest", 0x2199},
+        {"similarequal", 0x2243}, {"arrowdblleft", 0x21D0}, {"arrowdblright", 0x21D2},
+        {"arrowdblup", 0x21D1}, {"arrowdbldown", 0x21D3}, {"arrowdblboth", 0x21D4},
+        {"proportional", 0x221D}, {"prime", 0x2032}, {"element", 0x2208},
+        {"owner", 0x220B}, {"triangle", 0x25B3}, {"triangleinv", 0x25BD},
+        {"negationslash", 0x0338}, {"mapsto", 0x21A6}, {"universal", 0x2200},
+        {"existential", 0x2203}, {"logicalnot", 0x00AC}, {"emptyset", 0x2205},
+        {"Rfractur", 0x211C}, {"Ifractur", 0x2111}, {"latticetop", 0x22A4},
+        {"perpendicular", 0x22A5}, {"aleph", 0x2135}, {"union", 0x222A},
+        {"intersection", 0x2229}, {"unionmulti", 0x228E}, {"logicaland", 0x2227},
+        {"logicalor", 0x2228}, {"turnstileleft", 0x22A2}, {"turnstileright", 0x22A3},
+        {"floorleft", 0x230A}, {"floorright", 0x230B}, {"ceilingleft", 0x2308},
+        {"ceilingright", 0x2309}, {"angbracketleft", 0x27E8}, {"angbracketright", 0x27E9},
+        {"arrowbothv", 0x2195}, {"arrowdblbothv", 0x21D5}, {"wreathproduct", 0x2240},
+        {"coproduct", 0x2210}, {"nabla", 0x2207}, {"unionsq", 0x2294},
+        {"intersectionsq", 0x2293}, {"subsetsqequal", 0x2291}, {"supersetsqequal", 0x2292},
+        {"club", 0x2663}, {"diamond", 0x25C7}, {"heart", 0x2661}, {"spade", 0x2660},
+        {"partialdiff", 0x2202}, {"flat", 0x266D}, {"natural", 0x266E}, {"sharp", 0x266F},
+        {"weierstrass", 0x2118}, {"vector", 0x20D7}, {"tie", 0x2040}, {"lscript", 0x2113},
+        {"star", 0x22C6}, {"triangleright", 0x25B7}, {"triangleleft", 0x25C1},
+        {"dotlessi", 0x0131}, {"dotlessj", 0x0237}, {"suppress", 0},
+        {"Gamma", 0x0393}, {"Delta", 0x0394}, {"Theta", 0x0398}, {"Lambda", 0x039B},
+        {"Xi", 0x039E}, {"Pi", 0x03A0}, {"Sigma", 0x03A3}, {"Upsilon", 0x03A5},
+        {"Phi", 0x03A6}, {"Psi", 0x03A8}, {"Omega", 0x03A9},
+        {"alpha", 0x03B1}, {"beta", 0x03B2}, {"gamma", 0x03B3}, {"delta", 0x03B4},
+        {"epsilon", 0x03B5}, {"zeta", 0x03B6}, {"eta", 0x03B7}, {"theta", 0x03B8},
+        {"iota", 0x03B9}, {"kappa", 0x03BA}, {"lambda", 0x03BB}, {"nu", 0x03BD},
+        {"xi", 0x03BE}, {"omicron", 0x03BF}, {"pi", 0x03C0}, {"rho", 0x03C1},
+        {"sigma", 0x03C3}, {"tau", 0x03C4}, {"upsilon", 0x03C5}, {"phi", 0x03C6},
+        {"chi", 0x03C7}, {"psi", 0x03C8}, {"omega", 0x03C9},
+        {"epsilon1", 0x03F5}, {"theta1", 0x03D1}, {"pi1", 0x03D6}, {"rho1", 0x03F1},
+        {"sigma1", 0x03C2}, {"phi1", 0x03D5},
+        {"quotedblbase", 0x201E}, {"quotesinglbase", 0x201A}, {"perthousand", 0x2030},
+        {"fraction", 0x2044}, {"florin", 0x0192}, {"guilsinglleft", 0x2039},
+        {"guilsinglright", 0x203A}, {"periodcentered", 0x00B7},
+    };
     // Single letter names: A-Z, a-z
     if (name.size() == 1 && ((name[0] >= 'A' && name[0] <= 'Z') || (name[0] >= 'a' && name[0] <= 'z')))
         return static_cast<uint32_t>(name[0]);
     auto it = table.find(name);
-    return (it != table.end()) ? it->second : 0;
+    if (it != table.end()) return it->second;
+    auto mt = math_table.find(name);
+    if (mt != math_table.end()) return mt->second;
+    // "uni20AC" / "u1F600": the code point spelled in the name (AGL §6).
+    auto hex_at = [&](size_t off, size_t len) -> uint32_t {
+        if (name.size() < off + len) return 0;
+        uint32_t v = 0;
+        for (size_t i = off; i < off + len; i++) {
+            char c = name[i];
+            int d = (c >= '0' && c <= '9') ? c - '0'
+                  : (c >= 'A' && c <= 'F') ? c - 'A' + 10 : -1;
+            if (d < 0) return 0;
+            v = v * 16 + static_cast<uint32_t>(d);
+        }
+        return v;
+    };
+    if (name.compare(0, 3, "uni") == 0 && name.size() >= 7) return hex_at(3, 4);
+    if (name[0] == 'u' && name.size() >= 5 && name.size() <= 7) return hex_at(1, name.size() - 1);
+    return 0;
 }
 
 // WinAnsiEncoding (PDF spec, Appendix D)
@@ -1039,6 +1076,68 @@ static const uint32_t kMacRoman[256] = {
     0xF8FF,0xD2,0xDA,0xDB,0xD9,0x131,0x2C6,0x2DC,0xAF,0x2D8,0x2D9,0x2DA,0xB8,0x2DD,0x2DB,0x2C7,
 };
 
+
+// HancomEQN, the equation font of Hancom Office (HWP): its ToUnicode maps
+// most glyphs into the Private Use Area, so the letters of every equation
+// are dropped as unportable. The PUA values are the font's own fixed codes,
+// not a per-document numbering: across thirteen documents from different
+// producers (journals, theses, reports, subsets renumbered or not) each
+// code drew the same glyph. Read from the glyph outlines, the codes run in
+// alphabet order: upright A-Z from E000, digits 1-9 and 0 from E034, Greek
+// capitals from E085 and small letters from E09D, double-struck capitals
+// from E0CB, italic a-z from E0E5, between them ASCII punctuation, the
+// operators and the pieces of tall brackets. Codes inside a run take the
+// run's order (several seen in every run); a code no outline confirmed
+// outside the runs stays unmapped.
+static uint32_t hancom_eqn_unicode(uint32_t pua) {
+    if (pua >= 0xE000 && pua <= 0xE019) return 'A' + (pua - 0xE000);
+    if (pua >= 0xE034 && pua <= 0xE03C) return '1' + (pua - 0xE034);
+    if (pua == 0xE03D) return '0';
+    if (pua >= 0xE085 && pua <= 0xE09C) {
+        static const uint16_t caps[24] = {
+            0x391, 0x392, 0x393, 0x394, 0x395, 0x396, 0x397, 0x398, 0x399, 0x39A, 0x39B, 0x39C,
+            0x39D, 0x39E, 0x39F, 0x3A0, 0x3A1, 0x3A3, 0x3A4, 0x3A5, 0x3A6, 0x3A7, 0x3A8, 0x3A9};
+        return caps[pua - 0xE085];
+    }
+    if (pua >= 0xE09D && pua <= 0xE0B4) {
+        static const uint16_t small[24] = {
+            0x3B1, 0x3B2, 0x3B3, 0x3B4, 0x3F5, 0x3B6, 0x3B7, 0x3B8, 0x3B9, 0x3BA, 0x3BB, 0x3BC,
+            0x3BD, 0x3BE, 0x3BF, 0x3C0, 0x3C1, 0x3C3, 0x3C4, 0x3C5, 0x3C6, 0x3C7, 0x3C8, 0x3C9};
+        return small[pua - 0xE09D];
+    }
+    if (pua >= 0xE0CB && pua <= 0xE0E4) {
+        // Mathematical double-struck capitals, with the letterlike symbols
+        // that stand in for the holes of that block.
+        const uint32_t i = pua - 0xE0CB;
+        switch ('A' + i) {
+            case 'C': return 0x2102; case 'H': return 0x210D; case 'N': return 0x2115;
+            case 'P': return 0x2119; case 'Q': return 0x211A; case 'R': return 0x211D;
+            case 'Z': return 0x2124;
+            default: return 0x1D538 + i;
+        }
+    }
+    if (pua >= 0xE0E5 && pua <= 0xE0FE) return 'a' + (pua - 0xE0E5);
+    switch (pua) {
+        case 0xE03E: return '!';    case 0xE03F: return '@';    case 0xE043: return '*';
+        case 0xE044: return '(';    case 0xE045: return ')';    case 0xE046: return 0x2212;
+        case 0xE047: return '=';    case 0xE048: return '+';    case 0xE049: return '[';
+        case 0xE04A: return ']';    case 0xE04B: return '{';    case 0xE04C: return '}';
+        case 0xE04D: return '|';    case 0xE052: return ',';    case 0xE053: return '.';
+        case 0xE054: return '/';    case 0xE055: return '<';    case 0xE056: return '>';
+        case 0xE05B: return 0x222B; case 0xE05C: return 0x221A; case 0xE063: return 0x2C6;
+        case 0xE066: return 0x2DC;  case 0xE067: return 0x2211; case 0xE06B: return 0x222A;
+        case 0xE06D: return 0x2212; case 0xE06E: return 0x2192;
+        // Pieces of tall braces, parentheses and brackets.
+        case 0xE078: return 0x23A7; case 0xE079: return 0x23A8; case 0xE07A: return 0x23A9;
+        case 0xE07B: return 0x23AA; case 0xE07C: return 0x239B; case 0xE07D: return 0x239C;
+        case 0xE07E: return 0x239D; case 0xE07F: return 0x239E; case 0xE080: return 0x239F;
+        case 0xE081: return 0x23A0; case 0xE100: return 0x23A1; case 0xE101: return 0x23A2;
+        case 0xE102: return 0x23A4; case 0xE103: return 0x23A3; case 0xE104: return 0x23A6;
+        case 0xE105: return 0x23A5;
+        case 0xE0C2: return 0x3C6;  case 0xE10E: return 0x3B5;
+        default: return 0;
+    }
+}
 
 void parse_tounicode_cmap(PdfDoc& doc, const PdfObj& tu_obj, PdfFont& font) {
     auto resolved = doc.resolve(tu_obj);
@@ -1098,6 +1197,38 @@ void parse_tounicode_cmap(PdfDoc& doc, const PdfObj& tu_obj, PdfFont& font) {
         return 0x10000 + ((high - 0xD800) << 10) + (low - 0xDC00);
     };
 
+    // A destination may be several UTF-16 units: an unencoded ligature glyph
+    // maps to its letters (<00660069> = "fi"). Decode the whole sequence so
+    // the letters past the first are not lost.
+    auto parse_unicode_seq = [&](const std::string& hex) -> std::vector<uint32_t> {
+        std::vector<uint32_t> out;
+        if (hex.size() < 4) {
+            out.push_back(parse_hex(hex));
+            return out;
+        }
+        size_t i = 0;
+        while (i + 4 <= hex.size()) {
+            uint32_t high = parse_hex(hex.substr(i, 4));
+            i += 4;
+            if (high < 0xD800 || high > 0xDFFF) {
+                out.push_back(high);
+                continue;
+            }
+            if (high > 0xDBFF || i + 4 > hex.size()) {
+                out.push_back(0xFFFD);
+                continue;
+            }
+            uint32_t low = parse_hex(hex.substr(i, 4));
+            if (low < 0xDC00 || low > 0xDFFF) {
+                out.push_back(0xFFFD);
+                continue;
+            }
+            i += 4;
+            out.push_back(0x10000 + ((high - 0xD800) << 10) + (low - 0xDC00));
+        }
+        return out;
+    };
+
     auto extract_hex = [](const std::string& s, size_t start, size_t end) -> std::string {
         std::string h;
         for (size_t i = start; i < end; i++) {
@@ -1131,7 +1262,10 @@ void parse_tounicode_cmap(PdfDoc& doc, const PdfObj& tu_obj, PdfFont& font) {
             std::string dst_hex = extract_hex(cmap, s2 + 1, e2);
 
             uint32_t src = parse_hex(src_hex);
-            font.to_unicode[src] = parse_unicode(dst_hex);
+            auto seq = parse_unicode_seq(dst_hex);
+            font.to_unicode[src] = seq.empty() ? 0xFFFD : seq[0];
+            if (seq.size() > 1)
+                font.to_unicode_multi[src] = std::move(seq);
             cp = e2 + 1;
         }
         p = ebc + 9;
@@ -1177,7 +1311,10 @@ void parse_tounicode_cmap(PdfDoc& doc, const PdfObj& tu_obj, PdfFont& font) {
                     auto ae = cmap.find('>', as);
                     if (ae >= arr_end) break;
                     std::string dh = extract_hex(cmap, as + 1, ae);
-                    font.to_unicode[code] = parse_unicode(dh);
+                    auto seq = parse_unicode_seq(dh);
+                    font.to_unicode[code] = seq.empty() ? 0xFFFD : seq[0];
+                    if (seq.size() > 1)
+                        font.to_unicode_multi[code] = std::move(seq);
                     code++;
                     ap = ae + 1;
                 }
@@ -1198,6 +1335,105 @@ void parse_tounicode_cmap(PdfDoc& doc, const PdfObj& tu_obj, PdfFont& font) {
     }
 }
 
+// StandardEncoding (PDF 32000 Annex D): the base encoding of a Type1 program
+// that declares "/Encoding StandardEncoding def". Differs from WinAnsi in the
+// quotes (0x27 is quoteright, 0x60 quoteleft) and everywhere above 0x7F.
+static const uint32_t* standard_encoding() {
+    static const std::array<uint32_t, 256> t = [] {
+        std::array<uint32_t, 256> a{};
+        for (uint32_t i = 0x20; i < 0x7F; i++) a[i] = i;
+        a[0x27] = 0x2019; a[0x60] = 0x2018;
+        static const struct { int code; uint32_t u; } hi[] = {
+            {0xA1, 0xA1}, {0xA2, 0xA2}, {0xA3, 0xA3}, {0xA4, 0x2044}, {0xA5, 0xA5},
+            {0xA6, 0x192}, {0xA7, 0xA7}, {0xA8, 0xA4}, {0xA9, 0x27}, {0xAA, 0x201C},
+            {0xAB, 0xAB}, {0xAC, 0x2039}, {0xAD, 0x203A}, {0xAE, 0xFB01}, {0xAF, 0xFB02},
+            {0xB1, 0x2013}, {0xB2, 0x2020}, {0xB3, 0x2021}, {0xB4, 0xB7}, {0xB6, 0xB6},
+            {0xB7, 0x2022}, {0xB8, 0x201A}, {0xB9, 0x201E}, {0xBA, 0x201D}, {0xBB, 0xBB},
+            {0xBC, 0x2026}, {0xBD, 0x2030}, {0xBF, 0xBF}, {0xC1, 0x60}, {0xC2, 0xB4},
+            {0xC3, 0x2C6}, {0xC4, 0x2DC}, {0xC5, 0xAF}, {0xC6, 0x2D8}, {0xC7, 0x2D9},
+            {0xC8, 0xA8}, {0xCA, 0x2DA}, {0xCB, 0xB8}, {0xCD, 0x2DD}, {0xCE, 0x2DB},
+            {0xCF, 0x2C7}, {0xD0, 0x2014}, {0xE1, 0xC6}, {0xE3, 0xAA}, {0xE8, 0x141},
+            {0xE9, 0xD8}, {0xEA, 0x152}, {0xEB, 0xBA}, {0xF1, 0xE6}, {0xF5, 0x131},
+            {0xF8, 0x142}, {0xF9, 0xF8}, {0xFA, 0x153}, {0xFB, 0xDF},
+        };
+        for (auto& e : hi) a[e.code] = e.u;
+        return a;
+    }();
+    return t.data();
+}
+
+// The encoding built into an embedded Type1 program. Its cleartext part
+// (everything before "eexec") declares either "/Encoding StandardEncoding
+// def" or a 256-entry array filled by "dup <code> /<glyph> put" lines. TeX
+// embeds Computer Modern this way with no /Encoding in the PDF, and its math
+// symbols sit at control codes (minus at 0, asteriskmath at 3) or on letter
+// codes (dagger at 'y'), so the WinAnsi default reads them as nothing or as
+// the wrong letter.
+static void parse_type1_builtin_encoding(const std::vector<uint8_t>& data,
+                                         PdfFont& font) {
+    std::string_view sv(reinterpret_cast<const char*>(data.data()), data.size());
+    size_t end = sv.find("eexec");
+    if (end != std::string_view::npos) sv = sv.substr(0, end);
+    size_t p = sv.find("/Encoding");
+    if (p == std::string_view::npos) return;
+    p += 9;
+    while (p < sv.size() && (sv[p] == ' ' || sv[p] == '\t' || sv[p] == '\r' || sv[p] == '\n')) p++;
+    if (sv.compare(p, 16, "StandardEncoding") == 0) {
+        font.encoding_table = standard_encoding();
+        return;
+    }
+    // The array form ends at "readonly def" (or a bare "def" when the
+    // program omits readonly); nothing past that belongs to the encoding.
+    size_t stop = sv.find("readonly def", p);
+    if (stop == std::string_view::npos) stop = sv.find(" def", p);
+    if (stop == std::string_view::npos) stop = sv.size();
+    size_t q = p;
+    while ((q = sv.find("dup ", q)) != std::string_view::npos && q < stop) {
+        q += 4;
+        int code = 0;
+        bool digits = false;
+        while (q < stop && sv[q] >= '0' && sv[q] <= '9') {
+            code = code * 10 + (sv[q] - '0');
+            q++;
+            digits = true;
+        }
+        if (!digits) continue;
+        while (q < stop && sv[q] == ' ') q++;
+        if (q >= stop || sv[q] != '/') continue;
+        q++;
+        size_t name_start = q;
+        while (q < stop && sv[q] != ' ' && sv[q] != '\t' && sv[q] != '\r' &&
+               sv[q] != '\n' && sv[q] != '/')
+            q++;
+        if (code >= 0 && code < 256 && q > name_start)
+            font.builtin_names[code] = std::string(sv.substr(name_start, q - name_start));
+    }
+}
+
+// Embedded program of a FontDescriptor, for glyph rendering.
+static void record_font_program(PdfDoc& doc, const PdfObj& desc, PdfFont& font) {
+    if (!desc.is_dict()) return;
+    font.symbolic = (desc.get("Flags").as_int() & 4) != 0;
+    static const char* keys[] = {"FontFile2", "FontFile3", "FontFile"};
+    for (const char* key : keys) {
+        const PdfObj& v = desc.get(key);
+        if (!v.is_ref()) continue;
+        uint8_t kind = 0;
+        if (key[8] == '2') kind = 2;
+        else if (key[8] == '3') {
+            auto st = doc.resolve(v);
+            if (!st.is_stream()) continue;
+            auto& sub = st.get("Subtype");
+            if (sub.is_name() && sub.str_val == "OpenType") kind = 4;
+            else kind = 3;
+        } else kind = 1;
+        font.program_ref = v.ref_num;
+        font.program_gen = v.ref_gen;
+        font.program_kind = kind;
+        return;
+    }
+}
+
 PdfFont load_font(PdfDoc& doc, const PdfObj& font_ref) {
     PdfFont font;
     auto fobj = doc.resolve(font_ref);
@@ -1211,10 +1447,15 @@ PdfFont load_font(PdfDoc& doc, const PdfObj& font_ref) {
     {
         std::string lower;
         for (char c : font.name) lower += std::tolower(static_cast<unsigned char>(c));
+        // Both spellings of a medium weight: the abbreviated "-Medi" of the
+        // URW Times bold that TeX embeds (NimbusRomNo9L-Medi), and the full
+        // word without a separator that Korean heading faces use
+        // (KoPubWorldDotumMedium).
         font.is_bold = lower.find("bold") != std::string::npos ||
                        lower.find("heavy") != std::string::npos ||
                        lower.find("black") != std::string::npos ||
-                       lower.find("-medi") != std::string::npos;
+                       lower.find("-medi") != std::string::npos ||
+                       lower.find("medium") != std::string::npos;
         font.is_italic = lower.find("italic") != std::string::npos ||
                          lower.find("oblique") != std::string::npos;
         font.is_dingbat = lower.find("wingdings") != std::string::npos ||
@@ -1230,6 +1471,7 @@ PdfFont load_font(PdfDoc& doc, const PdfObj& font_ref) {
         if (flags & (1 << 6))  font.is_italic = true;  // bit 7 (Italic)
         double mw = desc.get("MissingWidth").as_num();
         if (mw > 0) font.missing_width = mw;
+        record_font_program(doc, desc, font);
     }
 
     // Font type
@@ -1245,6 +1487,7 @@ PdfFont load_font(PdfDoc& doc, const PdfObj& font_ref) {
             font.widths[static_cast<uint32_t>(first_char + i)] = w;
         }
     }
+
 
     if (font_type == "Type3") {
         font.is_type3 = true;
@@ -1275,6 +1518,13 @@ PdfFont load_font(PdfDoc& doc, const PdfObj& font_ref) {
         if (descendants.is_arr() && !descendants.arr.empty()) {
             auto cid_font = doc.resolve(descendants.arr[0]);
             if (cid_font.is_dict()) {
+                auto sys_info = doc.resolve(cid_font.get("CIDSystemInfo"));
+                if (sys_info.is_dict()) {
+                    auto reg = doc.resolve(sys_info.get("Registry"));
+                    auto ord = doc.resolve(sys_info.get("Ordering"));
+                    if (reg.is_str() && reg.str_val == "Adobe" && ord.is_str())
+                        font.cid_collection = adobe_cid_collection(ord.str_val);
+                }
                 double dw = doc.resolve(cid_font.get("DW")).as_num();
                 if (dw > 0) font.default_width = dw;
 
@@ -1312,7 +1562,11 @@ PdfFont load_font(PdfDoc& doc, const PdfObj& font_ref) {
                 if (cid_desc.is_dict()) {
                     double mw = cid_desc.get("MissingWidth").as_num();
                     if (mw > 0) font.missing_width = mw;
+                    record_font_program(doc, cid_desc, font);
                 }
+                font.cid_font = true;
+                const PdfObj& c2g = cid_font.get("CIDToGIDMap");
+                if (c2g.is_ref()) font.cid_to_gid_ref = c2g.ref_num;
             }
         }
     }
@@ -1320,6 +1574,13 @@ PdfFont load_font(PdfDoc& doc, const PdfObj& font_ref) {
     // ToUnicode CMap (may be an indirect reference)
     auto tu = doc.resolve(fobj.get("ToUnicode"));
     if (!tu.is_none()) parse_tounicode_cmap(doc, tu, font);
+    if (font.name.find("HancomEQN") != std::string::npos) {
+        for (auto& [code, u] : font.to_unicode)
+            if (uint32_t m = hancom_eqn_unicode(u)) u = m;
+        for (auto& [code, seq] : font.to_unicode_multi)
+            for (auto& u : seq)
+                if (uint32_t m = hancom_eqn_unicode(u)) u = m;
+    }
 
     // Simple fonts (everything but Type0 composite fonts) index glyphs with
     // single-byte codes, whatever the ToUnicode CMap's codespacerange claims.
@@ -1331,13 +1592,15 @@ PdfFont load_font(PdfDoc& doc, const PdfObj& font_ref) {
     // Encoding (may be an indirect reference to an encoding dictionary)
     auto enc_obj = doc.resolve(fobj.get("Encoding"));
     if (enc_obj.is_name()) {
-        if (enc_obj.str_val == "WinAnsiEncoding") font.encoding_table = kWinAnsi;
-        else if (enc_obj.str_val == "MacRomanEncoding") font.encoding_table = kMacRoman;
+        if (enc_obj.str_val == "WinAnsiEncoding") { font.encoding_table = kWinAnsi; font.named_base_encoding = 1; }
+        else if (enc_obj.str_val == "MacRomanEncoding") { font.encoding_table = kMacRoman; font.named_base_encoding = 2; }
+        else if (enc_obj.str_val == "StandardEncoding") { font.encoding_table = standard_encoding(); font.named_base_encoding = 3; }
     } else if (enc_obj.is_dict()) {
         auto& base_enc = enc_obj.get("BaseEncoding");
         if (base_enc.is_name()) {
-            if (base_enc.str_val == "WinAnsiEncoding") font.encoding_table = kWinAnsi;
-            else if (base_enc.str_val == "MacRomanEncoding") font.encoding_table = kMacRoman;
+            if (base_enc.str_val == "WinAnsiEncoding") { font.encoding_table = kWinAnsi; font.named_base_encoding = 1; }
+            else if (base_enc.str_val == "MacRomanEncoding") { font.encoding_table = kMacRoman; font.named_base_encoding = 2; }
+            else if (base_enc.str_val == "StandardEncoding") { font.encoding_table = standard_encoding(); font.named_base_encoding = 3; }
         }
         // Differences array
         auto& diffs = enc_obj.get("Differences");
@@ -1350,9 +1613,81 @@ PdfFont load_font(PdfDoc& doc, const PdfObj& font_ref) {
         }
     }
 
+    // No named base encoding: a simple font reads through its program's own
+    // encoding (PDF 32000 9.6.6.1), beneath any /Differences. Only a Type1
+    // program (/FontFile) is readable here; CFF and TrueType keep the default.
+    if (!font.is_type0 && !font.is_type3 && !font.encoding_table && desc.is_dict()) {
+        auto ff = doc.resolve(desc.get("FontFile"));
+        if (ff.is_stream()) {
+            auto program = doc.decode_stream(ff);
+            if (!program.empty()) parse_type1_builtin_encoding(program, font);
+        }
+    }
+
+    // A simple font that names a standard 14 face. The PDF may leave out
+    // its /Widths and font program (PDF 32000-1 9.6.2.2), relying on the
+    // reader's built-in metrics and the face's built-in encoding.
+    const Base14Font* base14 = nullptr;
+    bool embedded = false;
+    if (!font.is_type0 && !font.is_type3) {
+        base14 = find_base14_font(font.name);
+        if (desc.is_dict())
+            embedded = !desc.get("FontFile").is_none() || !desc.get("FontFile2").is_none() ||
+                       !desc.get("FontFile3").is_none();
+    }
+    const bool explicit_encoding = font.encoding_table != nullptr;
+
+    // With no base encoding named, a non-embedded standard face reads through
+    // its own built-in encoding (9.6.6.1, 9.6.6.2): StandardEncoding for a
+    // Type1 Latin face, the font's own table for Symbol and ZapfDingbats.
+    // A TrueType alias (non-embedded "Arial") keeps the WinAnsi reading that
+    // producers of such fonts assume.
+    const uint32_t* builtin_encoding = nullptr;
+    if (base14 && !embedded) {
+        if (base14->symbolic) builtin_encoding = base14_builtin_encoding(*base14);
+        else if (font_type == "Type1" || font_type == "MMType1")
+            builtin_encoding = standard_encoding();
+    }
+
     // Default encoding if nothing set
     if (!font.encoding_table && font.to_unicode.empty() && !font.is_identity) {
-        font.encoding_table = kWinAnsi;
+        font.encoding_table = builtin_encoding ? builtin_encoding : kWinAnsi;
+    }
+
+    // Built-in widths, only where the PDF gives none: a /Widths array always
+    // wins. Each code's glyph is found the way the text is decoded, by name
+    // through /Differences or the program's encoding, otherwise through the
+    // base encoding's character.
+    if (base14 && (!widths_arr.is_arr() || widths_arr.arr.empty())) {
+        const uint32_t* base_table = explicit_encoding ? font.encoding_table
+                                   : builtin_encoding ? builtin_encoding
+                                   : font.encoding_table ? font.encoding_table : kWinAnsi;
+        for (uint32_t code = 0; code < 256; code++) {
+            int w = -1;
+            const std::string* gname = nullptr;
+            auto d = font.differences.find(static_cast<int>(code));
+            if (d != font.differences.end()) gname = &d->second;
+            else {
+                auto b = font.builtin_names.find(static_cast<int>(code));
+                if (b != font.builtin_names.end()) gname = &b->second;
+            }
+            if (gname) {
+                w = base14_width_by_name(*base14, *gname);
+                if (w < 0) {
+                    uint32_t u = glyph_name_to_unicode(*gname);
+                    if (u) w = base14_width_by_unicode(*base14, u);
+                }
+            } else if (base14->symbolic && base_table == builtin_encoding) {
+                w = base14_width_by_code(*base14, code);
+            } else if (base_table[code]) {
+                w = base14_width_by_unicode(*base14, base_table[code]);
+                // A symbolic face addressed through a Latin encoding (Symbol
+                // with /WinAnsiEncoding) has no glyph for the Latin letter;
+                // the code then selects the glyph of the built-in encoding.
+                if (w < 0 && base14->symbolic) w = base14_width_by_code(*base14, code);
+            }
+            if (w >= 0) font.widths[code] = w;
+        }
     }
 
     // A Type3 font with no ToUnicode whose glyph names carry no meaning

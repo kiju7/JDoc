@@ -85,6 +85,70 @@ inline bool is_cp932_lead(uint8_t ch) {
 // pos past the sequence. Returns 0xFFFD on invalid/overlong sequences.
 uint32_t decode_utf8(const char* data, size_t len, size_t& pos);
 
+// ── Display width ──────────────────────────────────────────
+// Columns a codepoint occupies in a monospace view, the way terminals and
+// editors lay it out: East Asian wide/full-width forms (Hangul, CJK, kana,
+// full-width ASCII) take 2, combining marks and zero-width format characters
+// take 0, everything else 1. Markdown tables pad their columns with this,
+// and plain-text output aligns table columns with it, so a Korean cell is
+// not counted as half its visual width. The table is built in rather than
+// taken from the C library (wcwidth), whose answer depends on the platform
+// and the process locale.
+inline int display_width(uint32_t cp) {
+    if (cp < 0x300) return cp < 0x20 ? 0 : 1;
+    if ((cp >= 0x0300 && cp <= 0x036F) ||    // combining diacritics
+        (cp >= 0x0483 && cp <= 0x0489) ||    // Cyrillic combining marks
+        (cp >= 0x0591 && cp <= 0x05BD) ||    // Hebrew points and accents
+        (cp >= 0x0610 && cp <= 0x061A) ||    // Arabic marks
+        (cp >= 0x064B && cp <= 0x065F) ||    // Arabic vowel signs
+        (cp >= 0x1160 && cp <= 0x11FF) ||    // Hangul Jamo vowels, finals
+        (cp >= 0x1AB0 && cp <= 0x1AFF) ||    // combining diacritics ext.
+        (cp >= 0x1DC0 && cp <= 0x1DFF) ||    // combining diacritics suppl.
+        (cp >= 0x200B && cp <= 0x200F) ||    // zero-width space/joiners, marks
+        (cp >= 0x2060 && cp <= 0x2064) ||    // word joiner, invisible ops
+        (cp >= 0x20D0 && cp <= 0x20FF) ||    // combining marks for symbols
+        (cp >= 0x302A && cp <= 0x302F) ||    // ideographic/Hangul tone marks
+        (cp >= 0x3099 && cp <= 0x309A) ||    // combining kana voicing marks
+        (cp >= 0xD7B0 && cp <= 0xD7FF) ||    // Hangul Jamo extended-B
+        (cp >= 0xFE00 && cp <= 0xFE0F) ||    // variation selectors
+        (cp >= 0xFE20 && cp <= 0xFE2F) ||    // combining half marks
+        cp == 0xFEFF ||                      // BOM / zero-width no-break space
+        (cp >= 0xE0100 && cp <= 0xE01EF))    // variation selectors suppl.
+        return 0;
+    if ((cp >= 0x1100 && cp <= 0x115F) ||    // Hangul Jamo leading consonants
+        (cp >= 0x2E80 && cp <= 0x303E) ||    // CJK radicals, punctuation
+        (cp >= 0x3041 && cp <= 0x33FF) ||    // kana, compat jamo, CJK compat
+        (cp >= 0x3400 && cp <= 0x4DBF) ||    // CJK extension A
+        (cp >= 0x4E00 && cp <= 0x9FFF) ||    // CJK unified ideographs
+        (cp >= 0xA000 && cp <= 0xA4CF) ||    // Yi
+        (cp >= 0xA960 && cp <= 0xA97F) ||    // Hangul Jamo extended-A
+        (cp >= 0xAC00 && cp <= 0xD7A3) ||    // Hangul syllables
+        (cp >= 0xF900 && cp <= 0xFAFF) ||    // CJK compatibility ideographs
+        (cp >= 0xFE10 && cp <= 0xFE19) ||    // vertical forms
+        (cp >= 0xFE30 && cp <= 0xFE6F) ||    // CJK compat forms, small forms
+        (cp >= 0xFF00 && cp <= 0xFF60) ||    // full-width forms
+        (cp >= 0xFFE0 && cp <= 0xFFE6) ||    // full-width signs
+        (cp >= 0x1F300 && cp <= 0x1F64F) ||  // pictographs, emoticons
+        (cp >= 0x1F900 && cp <= 0x1F9FF) ||  // supplemental pictographs
+        (cp >= 0x20000 && cp <= 0x3FFFD))    // CJK extensions B and beyond
+        return 2;
+    return 1;
+}
+
+// Display width of a UTF-8 string, summed over its codepoints.
+inline size_t display_width(const std::string& s) {
+    size_t w = 0;
+    for (size_t pos = 0; pos < s.size(); ) {
+        if (static_cast<unsigned char>(s[pos]) < 0x80) {
+            w += s[pos] >= 0x20 ? 1 : 0;
+            pos++;
+            continue;
+        }
+        w += static_cast<size_t>(display_width(decode_utf8(s.data(), s.size(), pos)));
+    }
+    return w;
+}
+
 // True if the whole buffer is well-formed UTF-8. The pointer overload avoids
 // copying into a std::string just to validate.
 bool is_valid_utf8(const char* data, size_t len);
@@ -107,17 +171,33 @@ inline std::string legacy_name_to_utf8(std::string&& name) {
     return is_valid_utf8(name) ? std::move(name) : cp949_string_to_utf8(name);
 }
 
-// Normalize plain-text bytes to UTF-8: already-valid UTF-8 (including pure
-// ASCII) is kept verbatim, anything else is decoded as CP949 — the encoding
-// legacy Korean .txt files and archive members use. Shared by the .txt reader
-// (path and in-memory) so plain text always leaves the library as UTF-8.
+// UTF-16 text by its byte-order mark (FF FE little-endian, FE FF big-endian)
+// decoded to UTF-8, the mark dropped; false when there is no mark. Notepad's
+// "Unicode" encoding is this, and it used to come out as U+FFFD and NULs.
+bool utf16_bom_to_utf8(const std::string& s, std::string& out);
+
+// Normalize plain-text bytes to UTF-8: UTF-16 with a byte-order mark is
+// decoded, a UTF-8 mark dropped, already-valid UTF-8 (including pure ASCII)
+// kept verbatim, anything else decoded as CP949 — the encoding legacy Korean
+// .txt files and archive members use. Shared by the .txt reader (path and
+// in-memory) so plain text always leaves the library as UTF-8.
 inline std::string plain_text_to_utf8(const std::string& s) {
+    std::string u16;
+    if (utf16_bom_to_utf8(s, u16)) return u16;
+    if (s.size() >= 3 && s.compare(0, 3, "\xEF\xBB\xBF") == 0) {
+        std::string rest = s.substr(3);
+        return is_valid_utf8(rest) ? rest : cp949_string_to_utf8(rest);
+    }
     return is_valid_utf8(s) ? s : cp949_string_to_utf8(s);
 }
 // rvalue overload: the .txt readers pass the whole-file buffer as a temporary
 // (ss.str() / std::string(data, size)); move it through the valid-UTF-8 fast
 // path instead of copying the entire document.
 inline std::string plain_text_to_utf8(std::string&& s) {
+    if (s.size() >= 2 &&
+        ((s[0] == '\xFF' && s[1] == '\xFE') || (s[0] == '\xFE' && s[1] == '\xFF')))
+        return plain_text_to_utf8(static_cast<const std::string&>(s));
+    if (s.size() >= 3 && s.compare(0, 3, "\xEF\xBB\xBF") == 0) s.erase(0, 3);
     return is_valid_utf8(s) ? std::move(s) : cp949_string_to_utf8(s);
 }
 

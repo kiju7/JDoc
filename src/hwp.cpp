@@ -7,6 +7,7 @@
 #include "jdoc/hwp_types.h"
 #include "legacy/hwp3_parser.h"
 #include "legacy/ole_reader.h"
+#include "common/embedded.h"
 #include "common/emf_text.h"
 #include "common/file_utils.h"
 #include "common/image_utils.h"
@@ -656,10 +657,28 @@ private:
         } else if (ctrl_str == "gso ") {
             std::string dummy;
             read_gso(cur, ctrl_level, para, false, dummy);
-        } else if (ctrl_str == "head" || ctrl_str == "foot") {
+        } else if (ctrl_str == "head" || ctrl_str == "foot" || ctrl_str == "secd") {
             // Page furniture: hoisted to the top of the section rather than
-            // emitted at the anchor paragraph, which sits mid-prose.
+            // emitted at the anchor paragraph, which sits mid-prose. A
+            // section definition holds its master pages (바탕쪽) as lists.
             read_list_control_text(cur, ctrl_level, section_header_texts_);
+        } else if (ctrl_str == "tdut") {
+            // 덧말: the base text and the text set over or under it, two
+            // length-prefixed UTF-16 strings after the control id.
+            std::string text;
+            size_t off = 4;
+            for (int k = 0; k < 2 && r.data && off + 2 <= r.size; k++) {
+                size_t len = util::read_u16_le(r.data + off);
+                off += 2;
+                if (off + len * 2 > r.size) break;
+                std::string part = util::utf16le_to_utf8(r.data + off, len * 2);
+                off += len * 2;
+                if (part.empty()) continue;
+                if (!text.empty()) text += ' ';
+                text += part;
+            }
+            if (!text.empty()) para.shape_texts.push_back(std::move(text));
+            skip_control(cur, ctrl_level);
         } else if (ctrl_str == "fn  " || ctrl_str == "en  ") {
             // Notes stay with the paragraph that references them
             read_list_control_text(cur, ctrl_level, para.note_texts);
@@ -971,6 +990,30 @@ private:
         }
     }
 
+    // An OLE object's own text (a spreadsheet or document pasted in), placed
+    // like a text box's. Its BinData stream is a document, not an image.
+    void emit_ole(int bin_id, bool in_cell, std::string& cell_text, HWPParagraph& para) {
+        auto* entry = find_image_entry(bin_id);
+        if (!entry) return;
+        auto bytes = load_bin_data(entry->name);
+        // In the body the document keeps the output's format (markdown keeps
+        // its tables); in a table cell it is flattened to plain lines.
+        ConvertOptions o = opts_;
+        if (in_cell) o.format = OutputFormat::PLAINTEXT;
+        std::string text;
+        for (char c : embedded_document_text(bytes.data(), bytes.size(), entry->name, o)) {
+            if (c != '\n') text += c;
+            else if (!in_cell || (!text.empty() && text.back() != '\x02')) text += '\x02';
+        }
+        if (text.empty()) return;
+        if (in_cell) {
+            if (!cell_text.empty()) cell_text += '\x02';
+            cell_text += text;
+        } else {
+            para.shape_texts.push_back(std::move(text));
+        }
+    }
+
     // Read GSO (graphic shape object): SHAPE_COMPONENT + picture/OLE/container
     void read_gso(RecordCursor& cur, uint16_t ctrl_level, HWPParagraph& para,
                   bool in_cell, std::string& cell_text) {
@@ -1000,7 +1043,7 @@ private:
                     if (rec.data && rec.size >= 14)
                         bin_id = util::read_u16_le(rec.data + 12);
                     if (bin_id == 0) bin_id = sequential_bin_id_;
-                    emit_image(bin_id, in_cell, cell_text, para);
+                    emit_ole(bin_id, in_cell, cell_text, para);
                 }
             } else if (r.tag == hwp::SHAPE_COMPONENT) {
                 auto rec = cur.next();
@@ -1009,7 +1052,11 @@ private:
                     memcpy(sc_name, rec.data, 4);
                     bool is_pic = (std::string(sc_name) == "cip$" ||
                                    std::string(sc_name) == "$pic");
-                    if (is_pic) {
+                    bool is_ole = (std::string(sc_name) == "elo$" ||
+                                   std::string(sc_name) == "$ole");
+                    if (is_ole) {
+                        sc_pending = true; // Wait for the OLE record
+                    } else if (is_pic) {
                         // Try fillInfo extraction from SHAPE_COMPONENT data
                         int fill_bid = extract_shape_component_image(rec.data, rec.size);
                         if (fill_bid > 0) {
@@ -1127,8 +1174,15 @@ private:
                 break;
 
             case hwp::HWPCharType::ControlChar:
+                // Line breaks, and the characters HWP stores as controls: a
+                // hyphen (24), a non-breaking space (30), a fixed-width space
+                // (31). Dropping those ran the words they join together.
                 if (code == 13 || code == 10) {
                     para.text.push_back(u'\n');
+                } else if (code == 24) {
+                    para.text.push_back(u'-');
+                } else if (code == 30 || code == 31) {
+                    para.text.push_back(u' ');
                 } else {
                     para.text.push_back(0);  // placeholder
                 }

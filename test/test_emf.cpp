@@ -62,13 +62,21 @@ static std::vector<uint8_t> emf_eof() {
 
 // An EMR_EXTTEXTOUTW/A record placing `str_bytes` at record offset 76.
 // type = 0x54 (W) or 0x53 (A); x/y = reference point; chars = char count.
+// advance > 0 adds the offDx array: that advance for every character.
 static std::vector<uint8_t> exttextout(uint32_t type, int32_t x, int32_t y,
                                        uint32_t chars,
-                                       const std::vector<uint8_t>& str_bytes) {
+                                       const std::vector<uint8_t>& str_bytes,
+                                       int32_t advance = 0) {
     const size_t str_off = 76;
     size_t total = str_off + str_bytes.size();
     total = (total + 3) & ~size_t(3);            // 4-byte align
+    size_t dx_off = total;
+    if (advance > 0) total += size_t(chars) * 4;
     std::vector<uint8_t> r(total, 0);
+    if (advance > 0) {
+        put_u32(r, 72, (uint32_t)dx_off);         // EMRTEXT.offDx
+        for (uint32_t i = 0; i < chars; ++i) put_u32(r, dx_off + i * 4, (uint32_t)advance);
+    }
     put_u32(r, 0, type);
     put_u32(r, 4, (uint32_t)total);
     put_u32(r, 36, (uint32_t)x);                 // EMRTEXT.reference.x
@@ -140,7 +148,20 @@ void test_reading_order() {
         append(emf, exttextout(0x54, 10,  100, 1, b));   // x=10 → first
         append(emf, emf_eof());
         auto out = jdoc::emf_extract_text(emf.data(), emf.size());
+        // One line. Without advances nothing shows a gap, so the runs join
+        // (a formula or a word set one glyph per record must not split).
         ASSERT(out == "12");
+    TEST_END
+
+    TEST("runs whose advances meet join; overlapping ones stay apart")
+        std::vector<uint8_t> emf = emf_header();
+        append(emf, exttextout(0x54, 10, 100, 2, utf16le({'a','b'}), 8));  // ends at 26
+        append(emf, exttextout(0x54, 26, 100, 2, utf16le({'c','d'}), 8));  // ends at 42
+        append(emf, exttextout(0x54, 30, 200, 4, utf16le({'1','2','3','4'}), 8));
+        append(emf, exttextout(0x54, 40, 200, 2, utf16le({'5','6'}), 8));  // over the cell
+        append(emf, emf_eof());
+        auto out = jdoc::emf_extract_text(emf.data(), emf.size());
+        ASSERT(out == "abcd\n1234 56");
     TEST_END
 }
 

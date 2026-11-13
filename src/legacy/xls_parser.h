@@ -44,10 +44,19 @@ private:
     struct Sheet {
         std::string name;
         std::vector<Cell> cells;
+        // Text printed on the sheet outside its cells: the page header and
+        // footer, text boxes and notes (TXO).
+        std::vector<std::string> texts;
     };
 
     // Shared String Table.
     std::vector<std::string> sst_;
+    // Hancom Cell flags every string 8-bit and writes it as UTF-16; seen
+    // first in a BOUNDSHEET name, it then applies to every string.
+    bool hancom_wide_ = false;
+    // The Workbook (or Book) stream, rewritten into Excel's dialect where
+    // Hancom Cell writes its own (sets hancom_wide_).
+    std::vector<char> read_workbook_stream();
 
     // Parsed sheets.
     std::vector<Sheet> sheets_;
@@ -88,6 +97,7 @@ private:
 
     // Build a markdown table from sheet cells.
     static std::string sheet_to_markdown(const Sheet& sheet, int sheet_num);
+    static std::string sheet_table(const Sheet& sheet);
 
     // Extract images from MSODRAWING records.
     std::vector<ImageData> extract_images(unsigned min_image_size = 0);

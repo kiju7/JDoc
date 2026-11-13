@@ -1,6 +1,7 @@
 #pragma once
 // pdf_content.h — internal: content-stream parse vocabulary and line layout.
 #include "pdf_core.h"
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstring>
@@ -54,7 +55,7 @@ struct GfxState {
     double text_rise = 0;
     double text_leading = 0;
     int render_mode = 0;   // Tr: 2/6 = fill+stroke (faux bold in HWP exports)
-    PdfFont* font = nullptr;
+    const PdfFont* font = nullptr;
 
     // Graphics state for paths
     double stroke_r = 0, stroke_g = 0, stroke_b = 0;
@@ -117,6 +118,25 @@ struct PdfFillRect {
     float r, g, b;
 };
 
+// One painted subpath, summarised: its box and what kind of mark it is.
+// Kept in every graphics mode, so the page's drawings are known to the
+// table detectors whether or not figures are rendered. A path painting
+// several subpaths at once (a bar chart's bars, a table's shaded cells)
+// yields one of these per subpath, so each bar and each cell is measured
+// on its own. Rules, boxes and cell shading are axis-aligned (ortho) and
+// a rule is a hairline; a chart's lines, curves and markers are not, and
+// its bars are fills with no text inside. Light (pastel) marks are
+// backgrounds, not ink.
+struct DrawnShape {
+    float x0, y0, x1, y1;  // page-space box, stroke width included
+    bool curve;            // holds a Bezier segment
+    bool ortho;            // no curve and no diagonal segment
+    bool rule;             // a hairline: one dimension a stroke wide
+    bool dark;             // stroked or filled in a colour darker than 0.7
+    bool colored;          // filled in a saturated colour (chroma 0.25 or more)
+    bool filled;
+};
+
 struct ImagePlacement {
     int xobj_ref = -1;
     std::string xobj_name;
@@ -145,10 +165,25 @@ struct RenderPath {
     int seq = 0; // draw order shared with ImagePlacement
 };
 
+// One shown glyph, kept for the compositor to draw from the embedded font
+// program (only when render paths are collected).
+struct GlyphDraw {
+    uint32_t code = 0;
+    int font = -1;          // index into ContentParseResult::glyph_fonts
+    double m[6];            // text space (1 unit = 1 em) -> page space
+    float fill_r = 0, fill_g = 0, fill_b = 0, alpha = 1;
+    float clip[4] = {-1e30f, -1e30f, 1e30f, 1e30f};
+    int seq = 0;            // draw order shared with RenderPath/ImagePlacement
+};
+
 struct ContentParseResult {
     std::vector<TextChar> chars;
+    std::vector<GlyphDraw> glyphs;
+    std::vector<std::shared_ptr<const PdfFont>> glyph_fonts;
     std::vector<PdfLineSegment> segments;
     std::vector<PdfFillRect> fill_rects; // sizable pure-fill rects (cell shading)
+    std::vector<DrawnShape> shapes;      // every painted author path, summarised
+    std::vector<std::array<float, 4>> image_boxes; // every image placement's page box
     std::vector<ImagePlacement> images;
     std::vector<RenderPath> paths; // for vector rendering
     int draw_ops = 0; // total paths+images recorded (seq offset for nested forms)
@@ -173,6 +208,23 @@ struct TextLine {
     // this a vertical caption whose page-space midpoint lands on a body
     // line's baseline reads as part of that line.
     int16_t rot = 0;
+    // Gap, in points, before the line's second word (0 when it has one
+    // word). A section number sits a word space or a tab from its title; a
+    // page number or an axis tick shares a baseline with text ems away.
+    double first_gap = 0;
+    // Column of a column band (find_column_bands) the line was cut from, or
+    // -1: band index * 2, plus 1 for the band's right column. A band's lines
+    // are already in reading order, left column first; the page-wide column
+    // reordering leaves them where they are.
+    int band = -1;
+    // The band is two staggered flows (kStaggerMinRows), not running text:
+    // its region is kept from the table and layout-block detectors.
+    bool staggered = false;
+    // Byte ranges [first, second) of `text` set in a bold face, for inline
+    // emphasis in the Markdown body. `is_bold` above stays the line-level
+    // flag the heading logic reads; these only change how a body line that
+    // is partly bold is written ("**Residual Dropout** We apply ...").
+    std::vector<std::pair<uint32_t, uint32_t>> bold_spans;
 };
 
 // ── Reading order for rotated runs ──────────────────────
@@ -228,6 +280,50 @@ inline void text_along_span(int16_t rot, double left, double right,
     hi = std::max(std::max(v0, v1), std::max(v2, v3));
 }
 
+// A glyph of a rotated run, moved into its run's own upright frame (the page
+// turned by -rot): its baseline runs along +x and earlier lines sit at larger
+// y, so line grouping, word gaps and grid placement written for upright text
+// measure the run along its own advance. The result is marked upright (rot 0)
+// and has the box an upright glyph would have: origin to advance end along
+// x, ascender (0.8 em) over descender (0.2 em) along y.
+// The page-space box is an axis-aligned rectangle around a rectangle turned
+// by the run's angle, W = w|cos| + h|sin| wide and H = w|sin| + h|cos| high,
+// with h the em height (font_size). The advance w is recovered from whichever
+// of the two is better conditioned. Re-boxing the page box instead is exact
+// only on quarter turns: at 45° every glyph's box swells by its height and
+// neighbours overlap, so the words of a slanted axis label glue and a
+// doubled letter reads as an overprint.
+// Line building (chars_to_lines), the plain-text grid and the markdown
+// layout fallback all go through this, so they agree on a rotated run.
+inline TextChar to_writing_frame(const TextChar& ch) {
+    double c, s;
+    writing_axes(ch.rot, c, s);
+    TextChar t = ch;
+    t.x = ch.x * c + ch.y * s;
+    t.y = -ch.x * s + ch.y * c;
+    const double ac = std::fabs(c), as = std::fabs(s);
+    const double W = ch.right - ch.left, H = ch.top - ch.bot;
+    const double h = ch.font_size > 0 ? ch.font_size : 0;
+    double w = ac >= as ? (W - h * as) / ac : (H - h * ac) / as;
+    if (!(w > 0)) w = 0;
+    t.left = t.x;
+    t.right = t.x + w;
+    t.top = t.y + 0.8 * h;
+    t.bot = t.y - 0.2 * h;
+    t.rot = 0;
+    return t;
+}
+
+// Inverse of to_writing_frame for a point: frame (fx, fy) of a run written
+// at `rot` back to page space.
+inline void from_writing_frame(int16_t rot, double fx, double fy,
+                               double& px, double& py) {
+    double c, s;
+    writing_axes(rot, c, s);
+    px = fx * c - fy * s;
+    py = fx * s + fy * c;
+}
+
 struct PageCharCache {
     struct CharInfo {
         double x, y;
@@ -235,6 +331,7 @@ struct PageCharCache {
         double font_size;
         unsigned int unicode;
         int16_t rot;   // writing direction, as TextChar::rot
+        bool is_bold;  // a cell set entirely in a bold face is emitted bold
     };
     std::vector<CharInfo> chars;
     std::vector<size_t> y_sorted;
@@ -243,7 +340,8 @@ struct PageCharCache {
         chars.reserve(text_chars.size());
         for (auto& tc : text_chars) {
             if (tc.unicode == 0 || tc.unicode == '\r' || tc.unicode == '\n' || tc.unicode == 0xFFFD) continue;
-            chars.push_back({tc.x, tc.y, tc.left, tc.right, tc.top, tc.bot, tc.font_size, tc.unicode, tc.rot});
+            chars.push_back({tc.x, tc.y, tc.left, tc.right, tc.top, tc.bot, tc.font_size, tc.unicode, tc.rot,
+                             tc.is_bold});
         }
         y_sorted.resize(chars.size());
         for (size_t i = 0; i < chars.size(); i++) y_sorted[i] = i;
@@ -251,7 +349,10 @@ struct PageCharCache {
             [this](size_t a, size_t b) { return chars[a].y < chars[b].y; });
     }
 
-    std::string get_text_in_rect(double left, double top, double right, double bottom) const {
+    // all_bold, when given, reports whether every glyph in the rect is bold
+    // (false for an empty rect) so a ruled cell can keep its emphasis.
+    std::string get_text_in_rect(double left, double top, double right, double bottom,
+                                 bool* all_bold = nullptr) const {
         double rect_top = std::max(top, bottom);
         double rect_bot = std::min(top, bottom);
         double y_lo = rect_bot + 0.5, y_hi = rect_top - 0.5;
@@ -295,6 +396,7 @@ struct PageCharCache {
         double prev_fs = 12.0;
         int16_t prev_rot = 0;
         bool first = true;
+        int glyphs = 0, bold_glyphs = 0;
         for (size_t idx : matches) {
             auto& ch = chars[idx];
             double fs = ch.font_size > 1.0 ? ch.font_size : 12.0;
@@ -341,7 +443,12 @@ struct PageCharCache {
             prev_fs = fs;
             prev_rot = ch.rot;
             first = false;
+            if (ch.unicode != ' ' && ch.unicode != 0xA0) {
+                glyphs++;
+                if (ch.is_bold) bold_glyphs++;
+            }
         }
+        if (all_bold) *all_bold = glyphs > 0 && bold_glyphs == glyphs;
         size_t s = text.find_first_not_of(" ");
         size_t e = text.find_last_not_of(" ");
         if (s != std::string::npos) return text.substr(s, e - s + 1);
@@ -366,7 +473,8 @@ struct PageCharCache {
 // deterministic, so two workers racing on a miss both compute the same value
 // and the duplicate insert is harmless.
 struct FontCache {
-    std::unordered_map<int, PdfFont> map;
+    // Fonts are read-only once loaded: pages share them instead of copying.
+    std::unordered_map<int, std::shared_ptr<const PdfFont>> map;
     std::mutex mu;
 };
 
@@ -398,7 +506,87 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
                                          const double* initial_ctm = nullptr,
                                          int depth = 0,
                                          const GfxState* inherit_gs = nullptr);
+// Word spaces the producer wrote. A space glyph drawn in the content stream
+// between two upright glyphs of one baseline, the second further right and
+// the spaces between them, separates the two even where the gap measures
+// less than a word space (unless the second glyph starts within
+// kWrittenSpaceMinEm of the space itself — a space kerned out entirely is a
+// break opportunity, not a space): justified or kerned
+// text can close it below a word space ("2 Excludes",
+// the E kerned back over the space), and a space set in another font or
+// rise lies off the baseline and is lost to line grouping (a 6.6-pt space
+// 3 pt above 11-pt "Maria Hazel"). For each glyph index: the index of the
+// glyph such spaces separate it from, or -1. Callers apply it only when that
+// glyph is the one they placed just before, so it never adds a space
+// between glyphs the stream did not set side by side.
+std::vector<int> explicit_word_spaces(const std::vector<TextChar>& chars);
+// Smallest gap, in ems, at which such a written space still counts.
+constexpr double kWrittenSpaceMinEm = 0.02;
+
+// Drops glyphs drawn again over themselves: the same character at nearly
+// the same origin (within 0.12 em along the line and 0.2 em across it), in
+// the same direction and size. Producers fake bold by striking a run twice with a small offset
+// and draw outlined or shadowed headlines as a stack of copies; the copies
+// add ink, not text. The first glyph of each stack stays, in stream order.
+void drop_overprinted_chars(std::vector<TextChar>& chars);
+
+// Moves exponents, footnote marks and citation numbers set off the baseline
+// onto the baseline of the word they touch (definition explains when).
+void settle_raised_marks(std::vector<TextChar>& chars);
+
+// Append one glyph's text; ligature presentation forms are spelt out.
+void append_glyph_text(std::string& out, uint32_t cp);
+// Whether a code point is a spacing accent (U+02DC small tilde, ...).
+bool is_spacing_accent(uint32_t cp);
+// Precomposed letter for a base letter and a spacing accent, or 0.
+uint32_t compose_spacing_accent(uint32_t base, uint32_t accent);
+
+// `ruled` holds the boxes of ruled tables found before the text is read
+// (detect_tables needs no column boundary): their glyphs count as the
+// table's full width when the page's column boundary is found. A page
+// holding little but a ruled table would otherwise read the table's columns
+// as its own.
 std::vector<TextLine> chars_to_lines(const std::vector<TextChar>& chars,
-                                     double* out_col_boundary = nullptr);
+                                     double* out_col_boundary = nullptr,
+                                     const std::vector<std::array<double, 4>>* ruled = nullptr);
+// Plain-text page body as a character grid built from glyph coordinates
+// (pdftotext -layout style); see pdf_layout.cpp. col_boundary is the page's
+// column boundary from chars_to_lines (0 = single column).
+std::string layout_page_text(const std::vector<TextChar>& chars,
+                             double col_boundary = 0);
+
+// A region the markdown path shows as a layout block (a fenced grid of the
+// region's lines) because it is laid out as a table but no table detector
+// claimed it. See find_layout_fallbacks in pdf_layout.cpp.
+struct LayoutFallback {
+    double x0 = 0, y0 = 0, x1 = 0, y1 = 0;  // page-space box of its glyphs
+    int16_t rot = 0;   // writing direction of the text lines it replaces
+    std::string text;  // grid lines, newline-terminated, no fence
+};
+using PageBox = std::array<double, 4>;  // x0, y0, x1, y1 in page space
+
+// Regions of the page that are drawings (pdf_figures.cpp): clusters of the
+// page's marks that hold what tables never draw, a curve or a diagonal
+// line, bars (dark fills with no text in them, taller than a line) or a
+// raster, grown by a margin for the labels set beside the drawing. The text
+// inside them is a figure's labels and axis ticks, never table cells.
+std::vector<PageBox> drawing_regions(const ContentParseResult& pr,
+                                     const std::vector<TextChar>& chars,
+                                     double page_w, double page_h);
+
+// A ruled grid the ruled detector rejected for holding too few rows with two
+// filled cells (detect_tables' sparse_grids output).
+struct SparseGrid {
+    PageBox box;
+    std::vector<double> levels;                // row rule y's, ascending
+    std::vector<std::array<double, 3>> rules;  // inner v-rules: x, y0, y1
+};
+
+// table_boxes: detected tables (their glyphs are never re-used).
+std::vector<LayoutFallback> find_layout_fallbacks(
+    const std::vector<TextChar>& chars, double col_boundary,
+    const std::vector<PageBox>& table_boxes,
+    const std::vector<SparseGrid>& sparse_grids,
+    const std::vector<PdfLineSegment>* rules = nullptr);
 
 }} // namespace jdoc::pdf_detail

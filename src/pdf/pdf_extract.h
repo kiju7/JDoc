@@ -1,29 +1,149 @@
 #pragma once
+#include <cstdlib>
 // pdf_extract.h — internal: aggregate result types and per-cluster entry points.
 #include "pdf_content.h"
 
 namespace jdoc { namespace pdf_detail {
+
+// JDOC_TABLE_DEBUG traces table detection to stderr. Read once: the checks
+// sit in per-row loops, and getenv walks the whole environment each call.
+inline bool table_debug() {
+    static const bool on = std::getenv("JDOC_TABLE_DEBUG") != nullptr;
+    return on;
+}
+
 
 struct TableData {
     std::vector<std::vector<std::string>> rows;
     std::string title;  // full-width title row extracted from top of table
     double x0, y0, x1, y1;
     int page = 0;
+    // Full drawn cells with verified wrapped text, safe from prose-size rejection.
+    bool wrapped_closed_grid = false;
     // What the detection keyed on. Ruled/shading tables are drawn geometry
     // (their paths must not be mistaken for a vector figure); text tables
     // are alignment-only and own no paths.
     enum Kind { RULED, SHADING, TEXT } kind = RULED;
+    // Header labels that straddle several columns ("BLEU" over EN-DE|EN-FR):
+    // per column of rows[0], how many columns the label starting there
+    // covers (0 = an ordinary cell). Consumed by merge_header_rows.
+    std::vector<int> header_spans;
+    // Per cell, whether every glyph is in a bold face; parallel to rows.
+    // Kept out of the cell text so the shape heuristics (a marker row of
+    // "1 | 2*", a numeric column) still see the bare text; format_table
+    // applies it, and ignores a mask that has fallen out of step with rows.
+    std::vector<std::vector<uint8_t>> cell_bold;
+    // build_table cleared the rows because fewer than the required rows had
+    // two filled cells (a ruled box around wrapped text, a label column
+    // beside long cells). Read only by detect_tables' sparse_grids output.
+    bool too_sparse = false;
+    // build_table took a single boxed row of drawn cells (two rule levels).
+    bool single_box = false;
+    // Longest cell text (bytes) among cells the author did not rule off:
+    // there a whole paragraph in a cell means page prose swallowed by a
+    // ruled group. A cell is ruled off when its row is a drawn interval
+    // (rules across the grid above and below) and a column rule runs beside
+    // it. Set by build_table.
+    size_t open_cell_max = 0;
+    // Grid column edges, left to right, when the columns are the drawn grid
+    // (build_table, lead_grid_row); empty otherwise. Two pieces of a table
+    // split over a page break share them (join_split_tables).
+    std::vector<double> col_xs;
+    // The rows continue the previous page's table and are printed there;
+    // the table stays on its own page only so its lines are not printed
+    // again as prose.
+    bool continued = false;
 };
+
+// Fold physical header rows into one: a second row whose first cell is
+// blank (a units row: "(Acc)") or that fills the columns the first row left
+// empty completes the header rather than opening the data.
+void merge_header_rows(TableData& table);
+
+// Ruled-table assembly helpers are exposed in the internal header so geometry
+// regressions can be tested without manufacturing a complete PDF document.
+std::vector<double> find_column_boundaries(
+    const std::vector<PdfLineSegment>& v_lines,
+    const std::vector<PdfLineSegment>& h_lines,
+    double table_left, double table_right,
+    double table_bot, double table_top,
+    const std::vector<double>& row_ys);
+// drawn_rules: the lines are strokes on the page (false when synthesized
+// from cell shading, which is weaker evidence for a small grid).
+TableData build_table(const std::vector<double>& row_ys,
+                      const std::vector<PdfLineSegment>& h_lines,
+                      const std::vector<PdfLineSegment>& v_lines,
+                      const PageCharCache& cache,
+                      bool drawn_rules = true);
+
+// Heading-classification helpers (pdf_markdown.cpp), exposed the same way
+// so the section-number and standalone-emphasis rules can be tested directly.
+struct SectionNumber {
+    int depth = 0;        // numeric segments; 0 = no section number
+    size_t text_pos = 0;  // first byte of the title text
+    bool closed = false;  // '.' closed the number
+};
+SectionNumber parse_section_number(const std::string& text);
+size_t glued_mark_offset(const std::string& text);
+bool line_all_caps(const std::string& text);
+bool line_letter_spaced(const std::string& text);
 
 struct FontStats {
     double body_size = 12.0;
+    // Document-wide frequency of (rounded size, weight) line styles. The
+    // standalone-heading rule uses it: a bold line only signals a heading
+    // when the document uses that bold style sparingly.
+    std::map<int, int> style_counts;
+    int style_total = 0;
 
-    void compute(const std::vector<std::vector<TextLine>>& all_lines) {
-        std::map<int, int> counts;
-        for (auto& pl : all_lines)
-            for (auto& l : pl)
-                if (l.font_size > 1.0)
-                    counts[static_cast<int>(l.font_size * 10)]++;
+    static int style_key(double fs, bool bold) {
+        return static_cast<int>(fs * 10) * 2 + (bold ? 1 : 0);
+    }
+    double style_share(double fs, bool bold) const {
+        if (style_total == 0) return 0.0;
+        auto it = style_counts.find(style_key(fs, bold));
+        return it == style_counts.end()
+                   ? 0.0
+                   : static_cast<double>(it->second) / style_total;
+    }
+
+    void compute(const std::vector<std::vector<TextLine>>& all_lines,
+                 const std::vector<std::vector<TableData>>& all_tables = {}) {
+        // Table interiors skew the mode toward cell type (dense parameter
+        // grids, chart labels): the body size is the most common size of
+        // the text OUTSIDE tables. When everything sits in tables, fall
+        // back to counting every line.
+        std::map<int, int> counts, counts_all;
+        for (size_t p = 0; p < all_lines.size(); p++) {
+            const std::vector<TableData>* tabs =
+                p < all_tables.size() ? &all_tables[p] : nullptr;
+            for (auto& l : all_lines[p]) {
+                if (l.font_size <= 1.0) continue;
+                style_counts[style_key(l.font_size, l.is_bold)]++;
+                style_total++;
+                int key = static_cast<int>(l.font_size * 10);
+                counts_all[key]++;
+                bool in_table = false;
+                if (tabs) {
+                    double mid_x = (l.x_left + l.x_right) / 2.0;
+                    for (auto& t : *tabs) {
+                        if (l.y_center >= std::min(t.y0, t.y1) - 2.0 &&
+                            l.y_center <= std::max(t.y0, t.y1) + 2.0 &&
+                            mid_x >= std::min(t.x0, t.x1) - 2.0 &&
+                            mid_x <= std::max(t.x0, t.x1) + 2.0) {
+                            in_table = true;
+                            break;
+                        }
+                    }
+                }
+                if (!in_table) counts[key]++;
+            }
+        }
+        int kept = 0;
+        for (auto& [k, c] : counts) kept += c;
+        // A table-dominated page leaves too few free lines to vote (a page
+        // that is one big table plus its caption): fall back to all lines.
+        if (kept < 8) counts = std::move(counts_all);
 
         int max_c = 0, max_k = 120;
         for (auto& [k, c] : counts)
@@ -97,7 +217,14 @@ struct ExtractResult {
     std::vector<std::vector<double>> all_image_x;  // per-page image X positions
     std::vector<double> col_boundaries;  // per-page column boundary (0 if single-column)
     std::vector<std::vector<TableData>> all_tables;
+    std::vector<TableData> lead_grids;  // per page: lead_grid_row
+    // Per-page layout blocks for tabular regions no detector claimed
+    // (markdown with tables on only; find_layout_fallbacks).
+    std::vector<std::vector<LayoutFallback>> all_fallbacks;
     std::vector<std::vector<AnnotEntry>> all_annots;
+    // Per-page layout-preserving body text, filled only for plain-text
+    // output (layout_page_text); the markdown path never reads it.
+    std::vector<std::string> layout_text;
     std::vector<double> page_widths;
     std::vector<double> page_heights;
     std::vector<PageRenderDiag> page_diags;
@@ -108,9 +235,13 @@ struct ExtractResult {
 };
 
 // Cross-translation-unit declarations.
+// sparse_grids, when given, receives every ruled grid rejected only for
+// holding too few multi-cell rows that has full-width row rules and a
+// vertical rule inside; the markdown path may show those as layout blocks.
 std::vector<TableData> detect_tables(const std::vector<PdfLineSegment>& lines,
                                      const PageCharCache& cache,
-                                     double page_width, double page_height);
+                                     double page_width, double page_height,
+                                     std::vector<SparseGrid>* sparse_grids = nullptr);
 std::vector<TableData> detect_shading_tables(
     const std::vector<PdfFillRect>& fill_rects,
     const PageCharCache& cache,
@@ -119,8 +250,18 @@ std::vector<TableData> detect_shading_tables(
 std::vector<TableData> detect_text_tables(const PageCharCache& cache,
                                           const std::vector<TableData>& existing_tables,
                                           double page_width, double page_height,
-                                          double col_boundary = 0.0);
+                                          double col_boundary = 0.0,
+                                           const std::vector<std::array<double, 4>>& figures = {},
+                                           const std::vector<PdfLineSegment>* rules = nullptr,
+                                           const std::vector<std::array<double, 4>>* excluded = nullptr);
 std::string format_table(const TableData& table);
+// The top row of a page when it is a closed box of drawn rules (rules over
+// and under it at one width, a column rule at each end and at least one
+// inside), with its cells' text; rows empty when there is none. A table
+// split over a page break leaves such a lone row on the next page, too
+// short for detect_tables to accept as a table of its own.
+TableData lead_grid_row(const std::vector<PdfLineSegment>& segments,
+                        const PageCharCache& cache, double page_width);
 std::vector<ExtractedImage> extract_page_images(PdfDoc& doc, const PdfObj& resources,
                                                 const ContentParseResult& parse_result,
                                                 int page_num,
@@ -129,6 +270,16 @@ std::vector<ExtractedImage> extract_page_images(PdfDoc& doc, const PdfObj& resou
                                                 PageRenderDiag* diag = nullptr,
                                                 const std::vector<size_t>* only = nullptr,
                                                 int name_base = 0);
+// Render the whole visible page. `view` is the page's visible area (its
+// CropBox) [x0,y0,x1,y1] in viewing coordinates; the canvas covers exactly
+// that area, so trim margins outside the CropBox never pad the output.
+ImageData render_page_composite(PdfDoc& doc, const PdfObj& resources,
+                                const ContentParseResult& parse_result,
+                                int page_num, const double view[4],
+                                const std::string& output_dir,
+                                int img_idx = 0,
+                                PageRenderDiag* diag = nullptr);
+// Same, over the area [0,0,page_w,page_h].
 ImageData render_page_composite(PdfDoc& doc, const PdfObj& resources,
                                 const ContentParseResult& parse_result,
                                 int page_num, double page_w, double page_h,

@@ -162,7 +162,546 @@ static void page_view_ctm(int rotate, double w, double h,
     mat_multiply(out, T, R);
 }
 
+// A figure or table caption line ("Figure 3", "Fig. 2", "그림 1", "Table 4"):
+// the caption word followed by a number within the next few characters.
+static bool is_caption_line(const std::string& t) {
+    size_t i = 0;
+    while (i < t.size() && (t[i] == ' ' || t[i] == '<' || t[i] == '[' || t[i] == '(')) i++;
+    auto starts = [&](const char* w) { return t.compare(i, strlen(w), w) == 0; };
+    if (!(starts("Figure") || starts("Fig.") || starts("FIGURE") || starts("Table") ||
+          starts("TABLE") || starts("\xea\xb7\xb8\xeb\xa6\xbc") ||   // 그림
+          starts("\xed\x91\x9c")))                                  // 표
+        return false;
+    for (size_t k = i; k < std::min(t.size(), i + 16); k++)
+        if (t[k] >= '0' && t[k] <= '9') return true;
+    return false;
+}
+
+// Body text of a page: one flag per line. A body line spans a good part of
+// the text column it sits in, carries real character mass (glyphs set
+// close, not a row of axis ticks spread across a chart) and belongs to a
+// paragraph — another such line of its size sits a line space above or
+// below it, overlapping it — set in the page's running-text size (notes and
+// sources under a chart, in a smaller size, belong to the chart). A
+// figure's own label rows can be as wide and as full (token rows of a
+// diagram) but stand alone, several line heights apart. The short last line
+// of a paragraph is body too: it sits a line space under (or over) a body
+// line.
+//
+// On a two-column page a line within one column is measured against that
+// column, not the page: each column's lines are under half the page wide.
+// Mass counts characters, not UTF-8 bytes.
+static std::vector<char> body_line_flags(const std::vector<TextLine>& lines,
+                                         double page_w, double col_boundary) {
+    const size_t n = lines.size();
+    auto side = [&](const TextLine& ln) {
+        if (col_boundary <= 0) return 0;
+        if (ln.x_right <= col_boundary + 5) return 1;
+        if (ln.x_left >= col_boundary - 5) return 2;
+        return 0;
+    };
+    // The running-text size: the size most of the page's characters are set in.
+    std::vector<std::pair<double, size_t>> sizes;
+    size_t total = 0;
+    for (auto& ln : lines) {
+        sizes.push_back({ln.font_size, ln.text.size()});
+        total += ln.text.size();
+    }
+    std::sort(sizes.begin(), sizes.end());
+    double body_fs = 0;
+    for (size_t k = 0, acc = 0; k < sizes.size(); k++) {
+        acc += sizes[k].second;
+        if (acc * 2 >= total) { body_fs = sizes[k].first; break; }
+    }
+    std::vector<char> wide(n, 0), body(n, 0);
+    for (size_t i = 0; i < n; i++) {
+        const auto& ln = lines[i];
+        if (ln.font_size < 0.85 * body_fs) continue;
+        double lw = ln.x_right - ln.x_left;
+        int sd = side(ln);
+        double measure = sd == 1 ? col_boundary : sd == 2 ? page_w - col_boundary : page_w;
+        if (lw <= 0.4 * measure) continue;
+        size_t chars = 0;
+        for (unsigned char c : ln.text)
+            if ((c & 0xC0) != 0x80 && c != ' ') chars++;
+        double fs = std::max(ln.font_size, 4.0);
+        wide[i] = chars >= 15 && lw <= 1.3 * fs * chars;
+    }
+    // Lines i and j are neighbours in one paragraph: same column, same size,
+    // overlapping, baselines at most two font sizes apart.
+    auto neighbours = [&](size_t i, size_t j) {
+        const auto& a = lines[i]; const auto& b = lines[j];
+        if (a.rot != b.rot || side(a) != side(b)) return false;
+        double fa = std::max(a.font_size, 4.0), fb = std::max(b.font_size, 4.0);
+        if (std::abs(fa - fb) > 0.15 * std::max(fa, fb)) return false;
+        double dy = std::abs(a.y_center - b.y_center);
+        if (dy < 0.5 * fa || dy > 2.0 * fa) return false;
+        double ov = std::min(a.x_right, b.x_right) - std::max(a.x_left, b.x_left);
+        return ov >= 0.5 * std::min(a.x_right - a.x_left, b.x_right - b.x_left);
+    };
+    for (size_t i = 0; i < n; i++) {
+        if (!wide[i]) continue;
+        for (size_t j = 0; j < n && !body[i]; j++)
+            if (j != i && wide[j] && neighbours(i, j)) body[i] = 1;
+    }
+    // A line wider than 0.4 of the page with 30 bytes of text is body as
+    // before, paragraph or not (a table row beside a logo).
+    for (size_t i = 0; i < n; i++)
+        if (lines[i].x_right - lines[i].x_left > 0.4 * page_w && lines[i].text.size() >= 30)
+            body[i] = 1;
+    std::vector<char> out = body;
+    for (size_t i = 0; i < n; i++) {
+        if (body[i] || lines[i].text.empty()) continue;
+        for (size_t j = 0; j < n; j++)
+            if (body[j] && neighbours(i, j) &&
+                std::abs(lines[i].x_left - lines[j].x_left) <= 2.0 * std::max(lines[j].font_size, 4.0)) {
+                out[i] = 1;
+                break;
+            }
+    }
+    return out;
+}
+
+// Runs of upright text on one baseline, split where the gap between two
+// glyphs exceeds 1.5 font sizes. A line can join headings that only share a
+// baseline (two charts' titles set side by side read as one line); a run
+// keeps them apart.
+struct TextRun { double x0, x1, y, fs; };
+static std::vector<TextRun> text_runs(const std::vector<TextChar>& chars) {
+    std::vector<const TextChar*> cs;
+    for (auto& c : chars)
+        if (c.rot == 0 && c.unicode != ' ' && c.font_size > 1.0) cs.push_back(&c);
+    std::sort(cs.begin(), cs.end(), [](const TextChar* a, const TextChar* b) {
+        if (std::abs(a->y - b->y) > 0.3 * std::max(a->font_size, b->font_size))
+            return a->y > b->y;
+        return a->left < b->left;
+    });
+    std::vector<TextRun> runs;
+    for (auto* c : cs) {
+        if (!runs.empty()) {
+            auto& r = runs.back();
+            if (std::abs(c->y - r.y) <= 0.3 * std::max(c->font_size, r.fs) &&
+                c->left - r.x1 <= 1.5 * std::max(c->font_size, r.fs) && c->left >= r.x0) {
+                r.x1 = std::max(r.x1, c->right);
+                r.fs = std::max(r.fs, c->font_size);
+                continue;
+            }
+        }
+        runs.push_back({c->left, c->right, c->y, c->font_size});
+    }
+    return runs;
+}
+
+// A title of a picture's own: a run of text over the picture's top (above
+// it, or inside its top band) that stays within the picture's width and does
+// not reach over to the neighbour beside it. Page space is y-up here: the
+// top edge is y1 and a run's glyphs stand above its baseline y.
+static bool has_own_title(const std::vector<TextRun>& runs,
+                          double x0, double y0, double x1, double y1,
+                          double nx0, double nx1) {
+    const double h = y1 - y0;
+    for (auto& r : runs) {
+        double fs = std::max(r.fs, 4.0);
+        if (r.x1 - r.x0 < 3.0 * fs) continue;                    // a mark, not a title
+        if (r.x0 < x0 - 2 || r.x1 > x1 + 2) continue;            // within this picture
+        if (r.x1 > nx0 && r.x0 < nx1) continue;                  // reaches the neighbour
+        double ry0 = r.y - 0.3 * fs, ry1 = r.y + fs;
+        if (ry0 > y1 + 2.5 * fs || ry1 < y1 - 0.15 * h) continue;  // over the top
+        return true;
+    }
+    return false;
+}
+
+// Two placements or regions side by side, each with a title of its own,
+// are two pictures however close they sit. Two pictures set side by side
+// each carry one (two charts' headings, panels A and B, a row of cards); the
+// two halves of one raster cut down the middle carry none of their own,
+// their title spanning the seam if they have one.
+static bool separate_titled_pictures(const std::vector<TextRun>& runs,
+                                     double ax0, double ay0, double ax1, double ay1,
+                                     double bx0, double by0, double bx1, double by1) {
+    double yov = std::min(ay1, by1) - std::max(ay0, by0);
+    if (yov < 0.5 * std::min(ay1 - ay0, by1 - by0)) return false;  // not side by side
+    return has_own_title(runs, ax0, ay0, ax1, ay1, bx0, bx1) &&
+           has_own_title(runs, bx0, by0, bx1, by1, ax0, ax1);
+}
+
+// Composite regions of the fragment clusters on a page with body text: each
+// cluster box grown over the vector paths it touches, neighbouring panels of
+// one figure merged, and the figure's own labels taken in. Boxes are clamped
+// to the page. body flags the body lines among lines (body_line_flags).
+static std::vector<std::array<double, 4>> fragment_regions(
+        const std::vector<std::array<double, 4>>& cluster_boxes,
+        const std::vector<RenderPath>& paths,
+        const std::vector<TextLine>& lines, const std::vector<char>& body,
+        const std::vector<TextRun>& runs, double page_w, double page_h) {
+    std::vector<std::array<double, 4>> regions;
+    std::vector<std::array<double, 4>> path_boxes;
+    std::vector<char> path_backdrop;   // filled, not stroked: a panel or shading
+    for (auto& rp : paths) {
+        if (rp.synthetic) continue;
+        double bx0 = 1e300, by0 = 1e300, bx1 = -1e300, by1 = -1e300;
+        for (auto& pt : rp.points) {
+            if (pt.type == PathPoint::CLOSE) continue;
+            bx0 = std::min(bx0, pt.x); bx1 = std::max(bx1, pt.x);
+            by0 = std::min(by0, pt.y); by1 = std::max(by1, pt.y);
+        }
+        if (bx0 > bx1 || by0 > by1) continue;
+        // A frame or background panel around half the page would grow
+        // every region to the page.
+        if ((bx1 - bx0) * (by1 - by0) > 0.25 * page_w * page_h) continue;
+        path_boxes.push_back({bx0, by0, bx1, by1});
+        path_backdrop.push_back(rp.do_fill && !rp.do_stroke);
+    }
+    // A filled panel fitted around the pictures it holds (the tinted card
+    // behind a chart, with the chart's legend as a second cluster inside it)
+    // is ground: compare it with the union of every cluster inside it.
+    std::vector<char> path_ground(path_boxes.size(), 0);
+    for (size_t pi = 0; pi < path_boxes.size(); pi++) {
+        if (!path_backdrop[pi]) continue;
+        const auto& b = path_boxes[pi];
+        double u0 = 1e300, u1 = 1e300, u2 = -1e300, u3 = -1e300;
+        for (auto& c : cluster_boxes)
+            if (b[0] <= c[0] + 1 && b[1] <= c[1] + 1 && b[2] >= c[2] - 1 && b[3] >= c[3] - 1) {
+                u0 = std::min(u0, c[0]); u1 = std::min(u1, c[1]);
+                u2 = std::max(u2, c[2]); u3 = std::max(u3, c[3]);
+            }
+        if (u0 > u2) continue;
+        path_ground[pi] = (b[2] - b[0]) * (b[3] - b[1]) <= 1.6 * (u2 - u0) * (u3 - u1);
+    }
+    // The clusters one ground panel holds are one picture (a chart cut into
+    // bands, its legend strips below): they become one cluster, the union of
+    // their own boxes, without the panel's margins.
+    std::vector<std::array<double, 4>> clusters_in = cluster_boxes;
+    for (size_t pi = 0; pi < path_boxes.size(); pi++) {
+        if (!path_ground[pi]) continue;
+        const auto& b = path_boxes[pi];
+        std::array<double, 4> u = {1e300, 1e300, -1e300, -1e300};
+        std::vector<std::array<double, 4>> rest;
+        for (auto& c : clusters_in) {
+            if (b[0] <= c[0] + 1 && b[1] <= c[1] + 1 && b[2] >= c[2] - 1 && b[3] >= c[3] - 1) {
+                u = {std::min(u[0], c[0]), std::min(u[1], c[1]),
+                     std::max(u[2], c[2]), std::max(u[3], c[3])};
+            } else {
+                rest.push_back(c);
+            }
+        }
+        if (u[0] > u[2]) continue;
+        rest.push_back(u);
+        clusters_in.swap(rest);
+    }
+    // Hairlines: one dimension a stroke wide, the other much longer.
+    std::vector<char> path_rule(path_boxes.size(), 0);
+    for (size_t pi = 0; pi < path_boxes.size(); pi++) {
+        const auto& b = path_boxes[pi];
+        double w = b[2] - b[0], h = b[3] - b[1];
+        path_rule[pi] = (h <= 2.0 && w >= 10.0 * std::max(h, 1.0)) ||
+                        (w <= 2.0 && h >= 10.0 * std::max(w, 1.0));
+    }
+    // Whether box b spans the full width (a horizontal rule) or height (a
+    // vertical one) of a cluster other than own, overlapping it.
+    auto spans_other = [&](const std::array<double, 4>& b,
+                           const std::array<double, 4>& own) {
+        bool horiz = b[2] - b[0] >= b[3] - b[1];
+        for (auto& o : clusters_in) {
+            if (&o == &own) continue;
+            if (horiz) {
+                if (b[0] <= o[0] + 1 && b[2] >= o[2] - 1 &&
+                    b[1] <= o[3] + 2 && b[3] >= o[1] - 2) return true;
+            } else {
+                if (b[1] <= o[1] + 1 && b[3] >= o[3] - 1 &&
+                    b[0] <= o[2] + 2 && b[2] >= o[0] - 2) return true;
+            }
+        }
+        return false;
+    };
+    for (auto& c : clusters_in) {
+        double rg[4] = {c[0], c[1], c[2], c[3]};
+        // Grow over touching paths until the region is stable: a drawing
+        // chains box to arrow to box well past two hops.
+        for (int pass = 0; pass < 10; pass++) {
+            double g[4] = {rg[0], rg[1], rg[2], rg[3]};
+            for (size_t pi = 0; pi < path_boxes.size(); pi++) {
+                const auto& b = path_boxes[pi];
+                if (b[2] < rg[0] - 2 || b[0] > rg[2] + 2 ||
+                    b[3] < rg[1] - 2 || b[1] > rg[3] + 2) continue;
+                // Ground (see path_ground) would add its margins and pull the
+                // chart's title in after them. A box in a diagram that holds
+                // a small raster among its other parts is far larger than
+                // that raster and still grows the region, as do stroked axes
+                // and frames.
+                if (path_ground[pi] && b[0] <= c[0] + 1 && b[1] <= c[1] + 1 &&
+                    b[2] >= c[2] - 1 && b[3] >= c[3] - 1) continue;
+                // A rule run right across another picture (the line under a
+                // row of charts, a divider between panels) belongs to the
+                // layout, not to this picture: following it would grow the
+                // region over its neighbours. A connector that only reaches
+                // another picture's edge (an arrow in a diagram) is followed.
+                if (path_rule[pi] && spans_other(b, c)) continue;
+                double n0 = std::min(g[0], b[0]), n1 = std::min(g[1], b[1]);
+                double n2 = std::max(g[2], b[2]), n3 = std::max(g[3], b[3]);
+                if ((n2 - n0) * (n3 - n1) > 0.6 * page_w * page_h) continue;
+                g[0] = n0; g[1] = n1; g[2] = n2; g[3] = n3;
+            }
+            bool same = g[0] == rg[0] && g[1] == rg[1] && g[2] == rg[2] && g[3] == rg[3];
+            std::copy(g, g + 4, rg);
+            if (same) break;
+        }
+        regions.push_back({std::max(rg[0], 0.0), std::max(rg[1], 0.0),
+                           std::min(rg[2], page_w), std::min(rg[3], page_h)});
+    }
+    // Each fragment cluster is one original picture cut into strips or
+    // tiles; two clusters are two pictures (separate charts, the panels a
+    // producer stored as separate images) and keep their own images. They
+    // merge only when the drawing grown around them overlaps: arrows and
+    // frames that join raster pieces into one diagram. Nearness alone does
+    // not join them. The union still may not take in body text or a caption,
+    // which mark two figures.
+    auto body_lines_in = [&](const std::array<double, 4>& r) {
+        int n = 0;
+        for (auto& ln : lines) {
+            if (ln.y_center < r[1] || ln.y_center > r[3]) continue;
+            if (ln.x_left < r[0] - 1 || ln.x_right > r[2] + 1) continue;
+            if (is_caption_line(ln.text)) return 99;
+            if (body[&ln - lines.data()]) n++;
+        }
+        return n;
+    };
+    for (bool merged = true; merged;) {
+        merged = false;
+        for (size_t i = 0; i < regions.size() && !merged; i++)
+            for (size_t j = i + 1; j < regions.size() && !merged; j++) {
+                auto& A = regions[i]; auto& B = regions[j];
+                double gx = std::max(A[0], B[0]) - std::min(A[2], B[2]);
+                double gy = std::max(A[1], B[1]) - std::min(A[3], B[3]);
+                if (gx >= 0 || gy >= 0) continue;   // touching or apart: two pictures
+                if (separate_titled_pictures(runs, A[0], A[1], A[2], A[3],
+                                             B[0], B[1], B[2], B[3])) continue;
+                std::array<double, 4> U = {std::min(A[0], B[0]), std::min(A[1], B[1]),
+                                           std::max(A[2], B[2]), std::max(A[3], B[3])};
+                if (body_lines_in(U) >= 2) continue;
+                A = U;
+                regions.erase(regions.begin() + j);
+                merged = true;
+            }
+    }
+    // A figure's labels outside its drawn area (a "Class Label" over the
+    // arrows, axis titles, panel subcaptions) are text the region would cut
+    // off now that glyphs are drawn: grow each region over short lines that
+    // sit within 1.5 line heights of it. Captions and body text are not
+    // taken in.
+    for (auto& R : regions) {
+        for (int pass = 0; pass < 3; pass++) {
+            bool grew = false;
+            for (auto& ln : lines) {
+                if (ln.text.empty() || is_caption_line(ln.text)) continue;
+                double lw = ln.x_right - ln.x_left;
+                if (body[&ln - lines.data()]) continue;
+                double fs = std::max(ln.font_size, 4.0);
+                // An upright line's y_center is its baseline: the glyphs span
+                // the em box above it (the compositor's descender to
+                // ascender), so a label straddling the region's top edge is
+                // taken whole. A rotated line's y_center is its box middle.
+                double ly0 = ln.rot == 0 ? ln.y_center - 0.3 * fs : ln.y_center - 0.6 * fs;
+                double ly1 = ln.rot == 0 ? ln.y_center + fs : ln.y_center + 0.6 * fs;
+                if (ly0 >= R[1] && ly1 <= R[3] && ln.x_left >= R[0] && ln.x_right <= R[2]) continue;
+                double ov = std::min(ln.x_right, R[2]) - std::max(ln.x_left, R[0]);
+                if (ov < 0.5 * std::max(lw, 1.0)) continue;
+                double gap = std::max(ly0 - R[3], R[1] - ly1);
+                if (gap > 1.5 * fs) continue;
+                // Above the picture sit its title and subtitle, below it the
+                // caption, notes and source: long lines of their own. The
+                // drawing's labels there are short (a unit "(%)", an axis
+                // title, "(a)"), so a line wider than a quarter of the region
+                // is not taken in over the top or bottom edge.
+                bool over_edge = ly0 >= R[3] - 0.5 * fs || ly1 <= R[1] + 0.5 * fs;
+                if (over_edge && lw > 0.25 * (R[2] - R[0])) continue;
+                // A line reaching into another picture is not this one's
+                // label: two panels' notes set on one baseline read as one
+                // line, and taking it would grow the region over the next.
+                bool into_other = false;
+                for (auto& O : regions) {
+                    if (&O == &R) continue;
+                    if (ln.x_right > O[0] + 1 && ln.x_left < O[2] - 1 &&
+                        ly1 > O[1] && ly0 < O[3]) { into_other = true; break; }
+                }
+                if (into_other) continue;
+                R[0] = std::min(R[0], ln.x_left); R[2] = std::max(R[2], ln.x_right);
+                R[1] = std::min(R[1], ly0);       R[3] = std::max(R[3], ly1);
+                grew = true;
+            }
+            if (!grew) break;
+        }
+        R[0] = std::max(R[0], 0.0); R[1] = std::max(R[1], 0.0);
+        R[2] = std::min(R[2], page_w); R[3] = std::min(R[3], page_h);
+    }
+    return regions;
+}
+
+// True when a render produced an image (in memory or saved to disk).
+static bool has_image(const ImageData& img) {
+    return !img.data.empty() || !img.pixels.empty() || !img.saved_path.empty();
+}
+
 // Extract from an in-memory buffer; pdf_path is used for error messages only.
+// Rows ruled off one from the next: four or more horizontal rules across
+// half the page at least, stacked at most six lines apart with the same span (a
+// table drawn with rules between its rows and none between its columns, a
+// dialogue's turns boxed by rules). No ruled-table detector takes them, so
+// they are boxed here for the column boundary: as with a ruled table, the
+// glyphs between the rules vote as the stack's full width, and a table of
+// two columns of words set alone on a page is not read as two text columns.
+static std::vector<PageBox> rule_stack_boxes(const std::vector<PdfLineSegment>& segs,
+                                             const std::vector<TextChar>& chars,
+                                             double page_w) {
+    std::vector<PageBox> out;
+    std::vector<double> fs;
+    for (const auto& c : chars)
+        if (c.font_size > 1.0 && c.unicode != ' ') fs.push_back(c.font_size);
+    if (fs.size() < 20) return out;
+    std::nth_element(fs.begin(), fs.begin() + fs.size() / 2, fs.end());
+    const double line = fs[fs.size() / 2];
+    struct Rule { double y, x0, x1; };
+    std::vector<Rule> rules;
+    for (const auto& s : segs) {
+        if (!s.is_horizontal()) continue;
+        double x0 = std::min(s.x0, s.x1), x1 = std::max(s.x0, s.x1);
+        if (x1 - x0 < 0.5 * page_w) continue;
+        rules.push_back({(s.y0 + s.y1) / 2.0, x0, x1});
+    }
+    std::sort(rules.begin(), rules.end(),
+              [](const Rule& a, const Rule& b) { return a.y < b.y; });
+    size_t i = 0;
+    while (i < rules.size()) {
+        size_t j = i;
+        PageBox box{rules[i].x0, rules[i].y, rules[i].x1, rules[i].y};
+        while (j + 1 < rules.size()) {
+            const Rule& a = rules[j];
+            const Rule& b = rules[j + 1];
+            double span = std::max(a.x1 - a.x0, b.x1 - b.x0);
+            if (b.y - a.y > 6.0 * line ||
+                std::min(a.x1, b.x1) - std::max(a.x0, b.x0) < 0.8 * span)
+                break;
+            j++;
+            box[0] = std::min(box[0], b.x0);
+            box[2] = std::max(box[2], b.x1);
+            box[3] = b.y;
+        }
+        // A table has text in nearly every band between its rules; a
+        // chart's gridlines run through its plot with none.
+        size_t bands = 0, with_text = 0;
+        for (size_t k = i; j - i + 1 >= 4 && k < j; k++) {
+            double lo = std::min(rules[k].y, rules[k + 1].y), hi = std::max(rules[k].y, rules[k + 1].y);
+            bands++;
+            for (const auto& c : chars) {
+                if (c.unicode == ' ' || c.right <= c.left) continue;
+                double cx = (c.left + c.right) / 2, cy = (c.top + c.bot) / 2;
+                if (cy > lo && cy < hi && cx >= box[0] && cx <= box[2]) { with_text++; break; }
+            }
+        }
+        if (j - i + 1 >= 4 && with_text * 4 >= bands * 3) out.push_back(box);
+        i = j + 1;
+    }
+    return out;
+}
+
+// A ruled table broken by a page break continues at the top of the next
+// page with the same drawn columns. The pieces join when the table is the
+// last thing on its page and its continuation the first on the next (a
+// running head or foot of a line or two aside), and every column edge
+// matches. The continuation is the next page's first ruled table, or its
+// lead row (lead_grid_row) when only one row carried over, which no
+// detector accepts as a table by itself; a text table read out of that
+// row's cells gives way to it. A header row repeated at the top of the
+// continuation is dropped. The continuation stays on its page marked
+// `continued`, so its lines are still recognised as table text there.
+static void join_split_tables(ExtractResult& r, const std::vector<int>& pages) {
+    constexpr int kMarginLines = 2;
+    auto box = [](const TableData& t) {
+        return std::array<double, 4>{std::min(t.x0, t.x1), std::min(t.y0, t.y1),
+                                     std::max(t.x0, t.x1), std::max(t.y0, t.y1)};
+    };
+    auto same_columns = [](const TableData& a, const TableData& b) {
+        if (a.col_xs.size() < 3 || a.col_xs.size() != b.col_xs.size()) return false;
+        for (size_t i = 0; i < a.col_xs.size(); i++)
+            if (std::abs(a.col_xs[i] - b.col_xs[i]) > 3.0) return false;
+        return true;
+    };
+    // A continuation joined on the page before, and the table printing it:
+    // a table over three pages joins its third piece to the first.
+    const TableData* carried = nullptr;
+    TableData* owner = nullptr;
+    for (size_t k = 1; k < pages.size(); k++) {
+        const int p = pages[k], q = pages[k - 1];
+        const TableData* prev_carried = carried;
+        TableData* prev_owner = owner;
+        carried = nullptr;
+        owner = nullptr;
+        if (q != p - 1) continue;
+        // The previous page's lowest table, with no more than a footer below.
+        TableData* last = nullptr;
+        for (auto& t : r.all_tables[q])
+            if (!last || box(t)[1] < box(*last)[1]) last = &t;
+        if (!last || last->kind != TableData::RULED || last->rows.empty()) continue;
+        int below = 0;
+        for (const auto& l : r.all_lines[q]) below += l.y_center < box(*last)[1] - 2.0;
+        if (below > kMarginLines) continue;
+        // This page's highest ruled table, or its lead row above it.
+        TableData* first = nullptr;
+        for (auto& t : r.all_tables[p])
+            if (t.kind == TableData::RULED && !t.rows.empty() &&
+                (!first || box(t)[3] > box(*first)[3]))
+                first = &t;
+        TableData& lead = r.lead_grids[p];
+        bool use_lead = !lead.rows.empty() && (!first || box(lead)[3] > box(*first)[3] + 2.0);
+        TableData* cont = use_lead ? &lead : first;
+        if (!cont || !same_columns(*last, *cont)) continue;
+        TableData* into = last->continued && last == prev_carried ? prev_owner : last;
+        if (last->continued && !into) continue;
+        const auto cb = box(*cont);
+        int above = 0;
+        for (const auto& l : r.all_lines[p]) above += l.y_center > cb[3] + 2.0;
+        if (above > kMarginLines) continue;
+        for (const auto& t : r.all_tables[p])
+            if (&t != cont && t.kind != TableData::TEXT && box(t)[3] > cb[3] + 2.0) above = -1;
+        if (above < 0) continue;
+
+        size_t from = 0;
+        if (cont->rows[0] == into->rows[0] && cont->rows.size() > 1) from = 1;
+        for (size_t i = from; i < cont->rows.size(); i++) {
+            into->rows.push_back(cont->rows[i]);
+            if (into->cell_bold.size() + 1 == into->rows.size())
+                into->cell_bold.push_back(i < cont->cell_bold.size() ? cont->cell_bold[i]
+                                                                     : std::vector<uint8_t>{});
+        }
+        into->cell_bold.resize(std::min(into->cell_bold.size(), into->rows.size()));
+        owner = into;
+        if (use_lead) {
+            // Text tables and layout blocks read out of the row's cells.
+            auto overlaps = [&](const std::array<double, 4>& b) {
+                return std::min(b[2], cb[2]) > std::max(b[0], cb[0]) &&
+                       std::min(b[3], cb[3]) > std::max(b[1], cb[1]);
+            };
+            auto& tables = r.all_tables[p];
+            tables.erase(std::remove_if(tables.begin(), tables.end(), [&](const TableData& t) {
+                return t.kind == TableData::TEXT && overlaps(box(t));
+            }), tables.end());
+            auto& fbs = r.all_fallbacks[p];
+            fbs.erase(std::remove_if(fbs.begin(), fbs.end(), [&](const LayoutFallback& f) {
+                return overlaps({std::min(f.x0, f.x1), std::min(f.y0, f.y1),
+                                 std::max(f.x0, f.x1), std::max(f.y0, f.y1)});
+            }), fbs.end());
+            lead.continued = true;
+            tables.push_back(std::move(lead));
+            lead = TableData{};
+            carried = &tables.back();
+        } else {
+            cont->continued = true;
+            carried = cont;
+        }
+    }
+}
+
 static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
                                         const std::string& pdf_path,
                                         const ConvertOptions& opts,
@@ -239,7 +778,10 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
     result.all_image_x.resize(tp);
     result.col_boundaries.resize(tp, 0);
     result.all_tables.resize(tp);
+    result.lead_grids.resize(tp);
     result.all_annots.resize(tp);
+    if (opts.format == OutputFormat::PLAINTEXT) result.layout_text.resize(tp);
+    else result.all_fallbacks.resize(tp);
     result.page_diags.resize(tp);
     result.page_widths.resize(tp, 0);
     result.page_heights.resize(tp, 0);
@@ -369,21 +911,49 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
             page_view_ctm(page_rotate, page_w, page_h, mb_llx, mb_lly, base_ctm);
             initial_ctm = base_ctm;
         }
+        // The visible area (CropBox) in viewing coordinates: the page-space
+        // box through the same base CTM the content is parsed with. A
+        // whole-page composite covers exactly this area; trim margins
+        // outside it would pad the image with blank paper no viewer shows.
+        double view_box[4] = {crop_x0, crop_y0, crop_x1, crop_y1};
+        if (initial_ctm) {
+            double vx[2] = {1e300, -1e300}, vy[2] = {1e300, -1e300};
+            for (double cx : {crop_x0 + mb_llx, crop_x1 + mb_llx})
+                for (double cy : {crop_y0 + mb_lly, crop_y1 + mb_lly}) {
+                    double tx = base_ctm[0] * cx + base_ctm[2] * cy + base_ctm[4];
+                    double ty = base_ctm[1] * cx + base_ctm[3] * cy + base_ctm[5];
+                    vx[0] = std::min(vx[0], tx); vx[1] = std::max(vx[1], tx);
+                    vy[0] = std::min(vy[0], ty); vy[1] = std::max(vy[1], ty);
+                }
+            view_box[0] = vx[0]; view_box[1] = vy[0];
+            view_box[2] = vx[1]; view_box[3] = vy[1];
+        }
         if (page_rotate == 90 || page_rotate == 270)
             std::swap(page_w, page_h);
         result.page_widths[p] = page_w;
         result.page_heights[p] = page_h;
 
-        // Quick check: skip pages with no fonts and no extractable images
+        // Quick check: skip pages with no fonts and no extractable images.
+        // A page-level /Font dictionary is not the only place text can come
+        // from: imposition and print pipelines wrap every page in a Form
+        // XObject that carries its own /Resources, so a page whose /Font is
+        // empty may still draw text through /XObject. Only skip when neither
+        // exists (a bare, empty page).
         bool has_fonts = false;
+        bool has_xobjects = false;
         {
             auto& font_res = resources.get("Font");
             if (!font_res.is_none()) {
                 auto fd = doc.resolve(font_res);
                 has_fonts = fd.is_dict() && !fd.dict.empty();
             }
+            auto& xobj_res = resources.get("XObject");
+            if (!xobj_res.is_none()) {
+                auto xd = doc.resolve(xobj_res);
+                has_xobjects = xd.is_dict() && !xd.dict.empty();
+            }
         }
-        if (!has_fonts && !opts.images) return;
+        if (!has_fonts && !has_xobjects && !opts.images) return;
 
         // Parse content stream
         auto content_data = get_page_content(doc, page_obj);
@@ -391,7 +961,9 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
 
         // Extract text lines
         bool plaintext = (opts.format == OutputFormat::PLAINTEXT);
-        bool need_tables = opts.tables && !plaintext;
+        // Tables off still finds them in markdown: their regions become
+        // layout blocks (below), not prose with the columns glued together.
+        bool need_tables = !plaintext;
         bool need_graphics = need_tables || opts.images;
 
         ContentParseOptions parse_options;
@@ -407,34 +979,114 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
             doc, content_data, resources, page_h, &font_cache, parse_options,
             initial_ctm);
 
-        result.all_lines[p] = chars_to_lines(parse_result.chars, &result.col_boundaries[p]);
+        drop_overprinted_chars(parse_result.chars);
+        // Ruled tables first: they need no column boundary, and the page's
+        // column boundary is then found without their glyphs.
+        PageCharCache cache;
+        std::vector<SparseGrid> sparse_grids;
+        std::vector<TableData> ruled_tables;
+        std::vector<PageBox> ruled_boxes;
+        std::vector<PageBox> figures;  // drawings: their text is no table's
+        if (need_tables) {
+            cache.build(parse_result.chars);
+            figures = drawing_regions(parse_result, parse_result.chars, page_w, page_h);
+            ruled_tables = detect_tables(parse_result.segments, cache,
+                page_w, page_h, &sparse_grids);
+            for (auto& t : ruled_tables)
+                ruled_boxes.push_back({std::min(t.x0, t.x1), std::min(t.y0, t.y1),
+                                       std::max(t.x0, t.x1), std::max(t.y0, t.y1)});
+            for (auto& b : rule_stack_boxes(parse_result.segments, parse_result.chars, page_w))
+                ruled_boxes.push_back(b);
+        }
+        // Prose lines read raised marks on their word's baseline
+        // (settle_raised_marks). The table detectors keep the glyphs where
+        // they were drawn: they are tuned on those positions.
+        std::vector<TextChar> line_chars = parse_result.chars;
+        settle_raised_marks(line_chars);
+        result.all_lines[p] = chars_to_lines(line_chars, &result.col_boundaries[p],
+                                             &ruled_boxes);
+        // Columns off (ConvertOptions::columns, plain text only) keeps the
+        // page's physical lines across the gutter.
+        if (plaintext)
+            result.layout_text[p] = layout_page_text(
+                parse_result.chars, opts.columns ? result.col_boundaries[p] : 0.0);
 
         // Extract annotations (text notes, links)
         result.all_annots[p] = extract_annotations(doc, page_obj, page_h, initial_ctm);
 
-        if (need_tables) {
-            PageCharCache cache;
-            cache.build(parse_result.chars);
+        // Staggered column bands (find_column_bands) are two flows of
+        // lines, read column by column; no table or layout block may claim
+        // their glyphs across the gutter.
+        std::vector<PageBox> stagger_boxes;
+        for (const auto& l : result.all_lines[p]) {
+            if (!l.staggered) continue;
+            size_t k = static_cast<size_t>(l.band / 2);
+            if (k >= stagger_boxes.size())
+                stagger_boxes.resize(k + 1, PageBox{1e18, 1e18, -1e18, -1e18});
+            auto& b = stagger_boxes[k];
+            b[0] = std::min(b[0], l.x_left);
+            b[1] = std::min(b[1], l.y_center - 0.5 * l.font_size);
+            b[2] = std::max(b[2], l.x_right);
+            b[3] = std::max(b[3], l.y_center + l.font_size);
+        }
+        if (std::getenv("JDOC_BAND_DEBUG"))
+            for (const auto& l : result.all_lines[p])
+                if (l.staggered)
+                    fprintf(stderr, "[stagger] page %d band %d x %.0f-%.0f y %.1f %s\n", p + 1,
+                            l.band, l.x_left, l.x_right, l.y_center, l.text.c_str());
+        stagger_boxes.erase(std::remove_if(stagger_boxes.begin(), stagger_boxes.end(),
+                                           [](const PageBox& b) { return b[0] > b[2]; }),
+                            stagger_boxes.end());
 
-            result.all_tables[p] = detect_tables(parse_result.segments, cache,
-                page_w, page_h);
+        if (need_tables) {
+            result.all_tables[p] = std::move(ruled_tables);
             auto shade_tables = detect_shading_tables(parse_result.fill_rects,
                 cache, result.all_tables[p], page_w, page_h);
             for (auto& st : shade_tables)
                 result.all_tables[p].push_back(std::move(st));
             auto text_tables = detect_text_tables(cache, result.all_tables[p],
-                page_w, page_h, result.col_boundaries[p]);
+                page_w, page_h, result.col_boundaries[p], figures, &parse_result.segments,
+                &stagger_boxes);
             for (auto& tt : text_tables)
                 result.all_tables[p].push_back(std::move(tt));
+            for (auto& t : result.all_tables[p])
+                merge_header_rows(t);
+            result.lead_grids[p] = lead_grid_row(parse_result.segments, cache, page_w);
+
+            // Tabular regions no detector accepted keep their layout as a
+            // fenced block in the markdown (find_layout_fallbacks).
+            std::vector<PageBox> table_boxes;
+            for (auto& t : result.all_tables[p])
+                table_boxes.push_back({std::min(t.x0, t.x1), std::min(t.y0, t.y1),
+                                       std::max(t.x0, t.x1), std::max(t.y0, t.y1)});
+            // A drawing's labels keep no layout block either.
+            table_boxes.insert(table_boxes.end(), figures.begin(), figures.end());
+            table_boxes.insert(table_boxes.end(), stagger_boxes.begin(), stagger_boxes.end());
+            result.all_fallbacks[p] = find_layout_fallbacks(
+                parse_result.chars, result.col_boundaries[p], table_boxes,
+                sparse_grids, &parse_result.segments);
+            // JDOC_TABLE_DEBUG: dump every table as detected, to stderr.
+            if (table_debug()) {
+                for (auto& t : result.all_tables[p]) {
+                    fprintf(stderr, "[table] page %d kind %d x %.1f..%.1f y %.1f..%.1f rows %zu\n",
+                            p + 1, (int)t.kind, t.x0, t.x1, t.y0, t.y1, t.rows.size());
+                    for (auto& row : t.rows) {
+                        std::string line;
+                        for (auto& c : row) line += "|" + c;
+                        fprintf(stderr, "    %s|\n", line.c_str());
+                    }
+                }
+            }
         }
 
         // Image extraction
         if (opts.images) {
             auto render_composite = [&]() {
-                const size_t memory_cost = composite_memory_cost(page_w, page_h);
+                const size_t memory_cost = composite_memory_cost(
+                    view_box[2] - view_box[0], view_box[3] - view_box[1]);
                 CompositeMemoryLease lease(composite_memory, memory_cost);
                 return render_page_composite(
-                    doc, resources, parse_result, p, page_w, page_h, image_dir,
+                    doc, resources, parse_result, p, view_box, image_dir,
                     0, &result.page_diags[p]);
             };
 
@@ -464,6 +1116,9 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
                 int obj_num;            // resolved ref; -1 for name/inline
                 bool masked;            // stencil/1-bit or /SMask//Mask-backed
                 int px_w, px_h;         // source raster size, /Width x /Height
+                // Pixels per point along x and y for an upright placement
+                // (no rotation or skew), 0 otherwise.
+                double dens_x, dens_y;
             };
             std::vector<PlacementInfo> infos;
             auto xobjects = doc.resolve(resources.get("XObject"));
@@ -514,13 +1169,19 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
                               xobj.get("BitsPerComponent").as_int() == 1 ||
                               !xobj.get("SMask").is_none() ||
                               !xobj.get("Mask").is_none();
+                const int pw = xobj.get("Width").as_int();
+                const int ph = xobj.get("Height").as_int();
+                const bool upright = m[1] == 0 && m[2] == 0 &&
+                                     m[0] != 0 && m[3] != 0;
                 infos.push_back({i, bx0, by0, bx1, by1, ip.xobj_ref, masked,
-                                 xobj.get("Width").as_int(),
-                                 xobj.get("Height").as_int()});
+                                 pw, ph,
+                                 upright ? pw / std::abs(m[0]) : 0.0,
+                                 upright ? ph / std::abs(m[3]) : 0.0});
             }
 
             const size_t n_inf = infos.size();
             DisjointSet image_sets(n_inf);
+            const std::vector<TextRun> page_runs = text_runs(parse_result.chars);
 
             // Print-driver strips abut within sub-point rounding; distinct
             // assets sit tens of points apart in real layouts.
@@ -550,7 +1211,26 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
                             if (xov >= 0.5 * std::min(wa, wb))
                                 eps_y = std::max(eps, 0.02 * page_h);
                         }
-                        if (gx <= eps && gy <= eps_y) {
+                        // Two pieces of one raster cut along a seam keep its
+                        // pixel density across the seam: halves cut side by
+                        // side share pixels per point vertically, bands cut
+                        // one above the other share them horizontally. Two
+                        // pictures that merely abut (two charts set edge to
+                        // edge) were scaled on their own and rarely agree.
+                        auto density_differs = [](double a, double b) {
+                            return a > 0 && b > 0 &&
+                                   std::abs(a - b) > 0.02 * std::max(a, b);
+                        };
+                        bool abut_x = gx > -eps && gy < 0;   // side by side
+                        bool abut_y = gy > -eps && gx < 0;   // one above the other
+                        if ((abut_x && density_differs(infos[a].dens_y, infos[b].dens_y)) ||
+                            (abut_y && density_differs(infos[a].dens_x, infos[b].dens_x)))
+                            continue;
+                        if (gx <= eps && gy <= eps_y &&
+                            !separate_titled_pictures(
+                                page_runs, infos[a].x0, infos[a].y0,
+                                infos[a].x1, infos[a].y1, infos[b].x0, infos[b].y0,
+                                infos[b].x1, infos[b].y1)) {
                             image_sets.unite(a, b);
                         }
                     }
@@ -640,13 +1320,47 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
             }
             bool fragment_page = fragment_count >= 2;
 
+            // On a page with body text, each fragment cluster composites into
+            // its own region (the cluster grown over the vector paths it
+            // touches: axes, legends, frames) and the rest of the page keeps
+            // its usual handling below. A whole-page composite there
+            // returned the page, not the figure, and carried none of the
+            // page text. Pages without text (scans, vector-text pages) still
+            // composite whole.
+            // Text-line classes the single-raster overlay test below shares
+            // with fragment_regions: a numbered caption, and body text (a
+            // wide line carrying real character mass).
+            auto caption_line = [](const std::string& t) { return is_caption_line(t); };
+            const std::vector<char> body_flags = body_line_flags(
+                result.all_lines[p], page_w, result.col_boundaries[p]);
+            auto body_line = [&](const TextLine& ln) {
+                return body_flags[&ln - result.all_lines[p].data()] != 0;
+            };
+            bool split_regions = fragment_page && !no_text && !vector_text_page;
+            std::vector<std::array<double, 4>> regions;
+            if (split_regions) {
+                std::vector<std::array<double, 4>> cluster_boxes;
+                for (auto& c : clusters)
+                    if (qualifies(c)) cluster_boxes.push_back({c.x0, c.y0, c.x1, c.y1});
+                regions = fragment_regions(cluster_boxes, parse_result.paths,
+                                           result.all_lines[p], body_flags,
+                                           page_runs, page_w, page_h);
+            }
+            double region_area = 0;
+            for (auto& R : regions) region_area += (R[2] - R[0]) * (R[3] - R[1]);
+            // Regions that cover the page (a cover, a scan with a text
+            // line) are the page itself: composite it whole. A full-page
+            // infographic or a page of charts still leaves margins, a page
+            // number, a running head: it keeps its regions.
+            bool region_fragments = split_regions && !regions.empty() &&
+                                    region_area <= 0.9 * page_w * page_h;
             bool composited = false;
-            if (vector_text_page || fragment_page) {
+            if (vector_text_page || (fragment_page && !region_fragments)) {
                 // The composite draws every placement, standalone images
                 // included; exporting those separately would store the same
                 // content twice, so a composited page emits exactly one file.
                 auto rendered = render_composite();
-                if (!rendered.data.empty() || !rendered.pixels.empty() || !rendered.saved_path.empty()) {
+                if (has_image(rendered)) {
                     result.all_images[p].push_back(std::move(rendered));
                     result.all_image_y[p].push_back(page_h);
                     result.all_image_x[p].push_back(0);
@@ -661,6 +1375,58 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
                 int img_idx = 0;
                 std::vector<char> handled(parse_result.images.size(), 0);
                 std::vector<std::array<double, 4>> done_regions;
+
+                if (region_fragments) {
+                    bool region_failed = false;
+                    for (auto& R : regions) {
+                        double rg[4] = {R[0], R[1], R[2], R[3]};
+                        std::vector<size_t> members;
+                        for (auto& info : infos)
+                            if (!handled[info.idx] && info.x1 > rg[0] && info.x0 < rg[2] &&
+                                info.y1 > rg[1] && info.y0 < rg[3])
+                                members.push_back(info.idx);
+                        if (members.empty()) continue;
+                        std::sort(members.begin(), members.end());
+                        ImageData rendered;
+                        {
+                            CompositeMemoryLease lease(
+                                composite_memory,
+                                composite_memory_cost(rg[2] - rg[0], rg[3] - rg[1]));
+                            rendered = render_region_composite(
+                                doc, resources, parse_result, members, p, rg,
+                                image_dir, img_idx, &result.page_diags[p]);
+                        }
+                        if (!has_image(rendered)) {
+                            // A region that paints nothing (seen with GDI strip
+                            // maps) must not lose the figure: fall back to the
+                            // whole-page composite this page had before.
+                            region_failed = true;
+                            break;
+                        }
+                        for (size_t mi : members) handled[mi] = 1;
+                        result.all_images[p].push_back(std::move(rendered));
+                        result.all_image_y[p].push_back(rg[3]);
+                        result.all_image_x[p].push_back(rg[0]);
+                        done_regions.push_back({rg[0], rg[1], rg[2], rg[3]});
+                        img_idx++;
+                    }
+                    if (region_failed) {
+                        auto rendered = render_composite();
+                        if (has_image(rendered)) {
+                            result.all_images[p].clear();
+                            result.all_image_y[p].clear();
+                            result.all_image_x[p].clear();
+                            result.all_images[p].push_back(std::move(rendered));
+                            result.all_image_y[p].push_back(page_h);
+                            result.all_image_x[p].push_back(0);
+                            composited = true;
+                            // The composite holds every placement and path:
+                            // nothing below may export them a second time.
+                            std::fill(handled.begin(), handled.end(), 1);
+                            done_regions.push_back({0.0, 0.0, page_w, page_h});
+                        }
+                    }
+                }
 
                 // ── Vector figures ──────────────────────────────
                 // A schematic or chart drawn as paths (often with a few small
@@ -1038,10 +1804,7 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
                                 rgn, image_dir, img_idx,
                                 &result.page_diags[p]);
                         }
-                        if (rendered.data.empty() &&
-                            rendered.pixels.empty() &&
-                            rendered.saved_path.empty())
-                            continue;
+                        if (!has_image(rendered)) continue;
                         for (size_t mi : members) handled[mi] = 1;
                         result.all_images[p].push_back(std::move(rendered));
                         result.all_image_y[p].push_back(rgn[3]);
@@ -1143,11 +1906,16 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
                     }
                     remaining.swap(kept);
                 }
-                if (!remaining.empty()) {
+                // Original rasters go out as their own bytes; the batch is
+                // flushed whenever a composite has to take the next name, so
+                // file names keep content-stream order.
+                auto export_raw = [&](const std::vector<size_t>& list) {
+                    if (list.empty()) return;
                     auto extracted = extract_page_images(
                         doc, resources, parse_result, p, image_dir,
                         opts.min_image_size, &result.page_diags[p],
-                        &remaining, img_idx);
+                        &list, img_idx);
+                    img_idx += static_cast<int>(extracted.size());
                     for (auto& ei : extracted) {
                         if (fig_debug) {
                             double ix0 = std::min(ei.ctm[4],
@@ -1174,6 +1942,225 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
                         result.all_image_x[p].push_back(ei.ctm[4]); // X position
                         result.all_images[p].push_back(std::move(ei.img));
                     }
+                };
+
+                // ── Text drawn over a standalone raster ─────────────
+                // A chart or photo saved as one raster often gets its title,
+                // values and axis labels as real text objects painted on top
+                // of it. The raster's own bytes lack them, so such a
+                // placement composites (raster, then the glyphs over it, in
+                // content-stream order) into its own region, exactly as a
+                // fragmented figure does. Only glyphs that are drawn — an
+                // embedded font program, not Tr 3/7 — after the raster and
+                // within its visible box count; text under it is hidden and
+                // invisible OCR layers paint nothing. The raster stays
+                // original when it is the page's background (it fills the
+                // page, so its "labels" are the page itself) or when body
+                // text runs over it: running text across a picture or a
+                // caption on it is page text on a backdrop, not a label.
+                std::vector<char> overlaid(parse_result.images.size(), 0);
+                if (!remaining.empty() && !parse_result.glyphs.empty()) {
+                    std::vector<const PlacementInfo*> by_idx(
+                        parse_result.images.size(), nullptr);
+                    for (auto& info : infos) by_idx[info.idx] = &info;
+                    for (size_t idx : remaining) {
+                        const PlacementInfo* pi = by_idx[idx];
+                        if (!pi) continue;
+                        // Too small to export at all: leave it to the
+                        // extractor's own skip.
+                        if (opts.min_image_size > 0 &&
+                            (pi->px_w < static_cast<int>(opts.min_image_size) ||
+                             pi->px_h < static_cast<int>(opts.min_image_size)))
+                            continue;
+                        const double B[4] = {std::max(pi->x0, 0.0), std::max(pi->y0, 0.0),
+                                             std::min(pi->x1, page_w), std::min(pi->y1, page_h)};
+                        const double bw = B[2] - B[0], bh = B[3] - B[1];
+                        if (bw < 1.0 || bh < 1.0) continue;
+                        if (bw * bh >= 0.9 * page_w * page_h) continue;
+                        const int seq = parse_result.images[idx].seq;
+                        bool over = false;
+                        for (auto& g : parse_result.glyphs) {
+                            if (g.seq < seq) continue;
+                            // Centre of the em box (descender to ascender).
+                            double cx = g.m[0] * 0.5 + g.m[2] * 0.35 + g.m[4];
+                            double cy = g.m[1] * 0.5 + g.m[3] * 0.35 + g.m[5];
+                            if (cx < B[0] || cx > B[2] || cy < B[1] || cy > B[3]) continue;
+                            if (cx < g.clip[0] || cx > g.clip[2] ||
+                                cy < g.clip[1] || cy > g.clip[3]) continue;
+                            over = true;
+                            break;
+                        }
+                        if (!over) continue;
+                        bool backdrop = false;
+                        int held_body = 0;
+                        for (auto& ln : result.all_lines[p]) {
+                            if (ln.text.empty()) continue;
+                            if (ln.y_center < B[1] || ln.y_center > B[3]) continue;
+                            double lw = ln.x_right - ln.x_left;
+                            double inside = std::min(ln.x_right, B[2]) -
+                                            std::max(ln.x_left, B[0]);
+                            if (inside <= 0) continue;
+                            if (caption_line(ln.text)) { backdrop = true; break; }
+                            // Page body text crossing the picture's edge.
+                            if (body_line(ln) && inside < 0.7 * lw) { backdrop = true; break; }
+                            // Body text the picture holds: the vector-figure
+                            // test, wide for the box and with real mass.
+                            if (lw > std::max(0.5 * bw, 60.0) && ln.text.size() >= 30 &&
+                                inside >= 0.7 * lw)
+                                held_body++;
+                        }
+                        if (backdrop || held_body >= 2) {
+                            if (fig_debug)
+                                fprintf(stderr, "[figdbg] p=%d raster overlay"
+                                        " kept:backdrop (%.1f,%.1f)-(%.1f,%.1f)\n",
+                                        p + 1, B[0], B[1], B[2], B[3]);
+                            continue;
+                        }
+                        overlaid[idx] = 1;
+                    }
+                }
+
+                // Words of drawn glyphs: runs of glyphs shown one after
+                // another whose em boxes (descender to ascender, one em
+                // wide: the compositor's own glyph box) touch or nearly
+                // touch. A word space keeps a label in one word; the gap
+                // between two labels on one baseline splits them.
+                struct GlyphWord { double x0, y0, x1, y1; int seq; };
+                std::vector<GlyphWord> glyph_words;
+                if (std::find(overlaid.begin(), overlaid.end(), 1) != overlaid.end()) {
+                    int last_seq = -2;
+                    for (auto& g : parse_result.glyphs) {
+                        double gx0 = 1e300, gy0 = 1e300, gx1 = -1e300, gy1 = -1e300;
+                        for (double ux : {0.0, 1.0})
+                            for (double uy : {-0.3, 1.0}) {
+                                double px = g.m[0] * ux + g.m[2] * uy + g.m[4];
+                                double py = g.m[1] * ux + g.m[3] * uy + g.m[5];
+                                gx0 = std::min(gx0, px); gx1 = std::max(gx1, px);
+                                gy0 = std::min(gy0, py); gy1 = std::max(gy1, py);
+                            }
+                        if (!std::isfinite(gx0) || !std::isfinite(gy0) ||
+                            !std::isfinite(gx1) || !std::isfinite(gy1))
+                            continue;
+                        double em = std::sqrt(std::abs(g.m[0] * g.m[3] - g.m[1] * g.m[2]));
+                        bool join = false;
+                        if (!glyph_words.empty() && g.seq == last_seq + 1) {
+                            auto& w = glyph_words.back();
+                            double gx = std::max(w.x0, gx0) - std::min(w.x1, gx1);
+                            double gy = std::max(w.y0, gy0) - std::min(w.y1, gy1);
+                            join = gx <= 0.3 * em && gy <= 0.3 * em;
+                        }
+                        if (join) {
+                            auto& w = glyph_words.back();
+                            w.x0 = std::min(w.x0, gx0); w.y0 = std::min(w.y0, gy0);
+                            w.x1 = std::max(w.x1, gx1); w.y1 = std::max(w.y1, gy1);
+                        } else {
+                            glyph_words.push_back({gx0, gy0, gx1, gy1, g.seq});
+                        }
+                        last_seq = g.seq;
+                    }
+                }
+
+                {
+                    // A source drawn again later is a duplicate the extractor
+                    // skips within one call; across flushed batches (and
+                    // after a composite took it) that is done here.
+                    std::unordered_set<int> seen_refs;
+                    std::unordered_set<std::string> seen_names;
+                    auto seen = [&](size_t idx) {
+                        const auto& ip = parse_result.images[idx];
+                        if (ip.inline_img) return false;
+                        if (ip.xobj_ref >= 0) return seen_refs.count(ip.xobj_ref) > 0;
+                        return !ip.xobj_name.empty() && seen_names.count(ip.xobj_name) > 0;
+                    };
+                    auto mark_seen = [&](size_t idx) {
+                        const auto& ip = parse_result.images[idx];
+                        if (ip.inline_img) return;
+                        if (ip.xobj_ref >= 0) seen_refs.insert(ip.xobj_ref);
+                        else if (!ip.xobj_name.empty()) seen_names.insert(ip.xobj_name);
+                    };
+                    auto flush = [&](std::vector<size_t>& batch) {
+                        export_raw(batch);
+                        for (size_t i : batch) mark_seen(i);
+                        batch.clear();
+                    };
+                    std::vector<size_t> batch;
+                    for (size_t idx : remaining) {
+                        if (handled[idx]) continue;
+                        if (!overlaid[idx]) {
+                            if (!seen(idx)) batch.push_back(idx);
+                            continue;
+                        }
+                        const PlacementInfo* pi = nullptr;
+                        for (auto& info : infos)
+                            if (info.idx == idx) { pi = &info; break; }
+                        // The region is the picture plus the words drawn
+                        // on it, whole: a title straddling its edge is not
+                        // cut. Words, not lines: labels of panels standing
+                        // side by side merge into one page-wide line, and
+                        // growing over that line would take in half of the
+                        // next panel.
+                        double rg[4] = {std::max(pi->x0, 0.0), std::max(pi->y0, 0.0),
+                                        std::min(pi->x1, page_w), std::min(pi->y1, page_h)};
+                        {
+                            const double B[4] = {rg[0], rg[1], rg[2], rg[3]};
+                            const int seq = parse_result.images[idx].seq;
+                            for (auto& w : glyph_words) {
+                                if (w.seq < seq) continue;
+                                if (w.x1 <= B[0] || w.x0 >= B[2] || w.y1 <= B[1] || w.y0 >= B[3])
+                                    continue;
+                                rg[0] = std::min(rg[0], w.x0); rg[1] = std::min(rg[1], w.y0);
+                                rg[2] = std::max(rg[2], w.x1); rg[3] = std::max(rg[3], w.y1);
+                            }
+                            rg[0] = std::max(rg[0], 0.0); rg[1] = std::max(rg[1], 0.0);
+                            rg[2] = std::min(rg[2], page_w); rg[3] = std::min(rg[3], page_h);
+                        }
+                        if (fig_debug)
+                            fprintf(stderr, "[figdbg] p=%d raster overlay composite"
+                                    " (%.1f,%.1f)-(%.1f,%.1f) -> (%.1f,%.1f)-(%.1f,%.1f)\n",
+                                    p + 1, pi->x0, pi->y0, pi->x1, pi->y1,
+                                    rg[0], rg[1], rg[2], rg[3]);
+                        // Rasters stamped over this one (a logo, a marker)
+                        // draw with it.
+                        std::vector<size_t> members{idx};
+                        for (auto& info : infos)
+                            if (info.idx != idx && !handled[info.idx] && !overlaid[info.idx] &&
+                                parse_result.images[info.idx].seq > parse_result.images[idx].seq &&
+                                std::find(batch.begin(), batch.end(), info.idx) == batch.end() &&
+                                info.x0 >= rg[0] && info.x1 <= rg[2] &&
+                                info.y0 >= rg[1] && info.y1 <= rg[3])
+                                members.push_back(info.idx);
+                        std::sort(members.begin(), members.end());
+                        flush(batch);
+                        const PageRenderDiag before = result.page_diags[p];
+                        ImageData rendered;
+                        {
+                            CompositeMemoryLease lease(
+                                composite_memory,
+                                composite_memory_cost(rg[2] - rg[0], rg[3] - rg[1]));
+                            rendered = render_region_composite(
+                                doc, resources, parse_result, members, p, rg,
+                                image_dir, img_idx, &result.page_diags[p]);
+                        }
+                        // A raster the compositor could not decode would come
+                        // back as bare text: keep the original instead.
+                        bool empty = rendered.data.empty() && rendered.pixels.empty() &&
+                                     rendered.saved_path.empty();
+                        if (empty || result.page_diags[p].images_failed > before.images_failed) {
+                            result.page_diags[p] = before;
+                            if (!rendered.saved_path.empty())
+                                std::remove(rendered.saved_path.c_str());
+                            if (!seen(idx)) batch.push_back(idx);
+                            continue;
+                        }
+                        mark_seen(idx);
+                        for (size_t mi : members) handled[mi] = 1;
+                        result.all_images[p].push_back(std::move(rendered));
+                        result.all_image_y[p].push_back(rg[3]);
+                        result.all_image_x[p].push_back(rg[0]);
+                        done_regions.push_back({rg[0], rg[1], rg[2], rg[3]});
+                        img_idx++;
+                    }
+                    flush(batch);
                 }
 
                 // Fallback: render page for scanned/vector-only pages.
@@ -1186,7 +2173,7 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
                         !parse_result.paths.empty()) {
                         result.page_diags[p] = {};
                         auto rendered = render_composite();
-                        if (!rendered.data.empty() || !rendered.pixels.empty() || !rendered.saved_path.empty()) {
+                        if (has_image(rendered)) {
                             result.all_images[p].push_back(std::move(rendered));
                             result.all_image_y[p].push_back(page_h);
                             result.all_image_x[p].push_back(0);
@@ -1205,6 +2192,34 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
                     discard_image_payload(img);
                 }
             }
+        }
+
+        // Tables off: each table region is a layout block of its glyphs,
+        // laid out on a grid of its own, in place of the markdown table. The
+        // tables stayed until now for the image pass, which keeps a table's
+        // rules out of the figures.
+        if (need_tables && !opts.tables) {
+            for (const auto& t : result.all_tables[p]) {
+                LayoutFallback fb;
+                fb.x0 = std::min(t.x0, t.x1);
+                fb.x1 = std::max(t.x0, t.x1);
+                fb.y0 = std::min(t.y0, t.y1);
+                fb.y1 = std::max(t.y0, t.y1);
+                std::vector<TextChar> inside;
+                for (const auto& ch : parse_result.chars) {
+                    double cx = (ch.left + ch.right) / 2, cy = (ch.top + ch.bot) / 2;
+                    if (ch.rot == 0 && cx >= fb.x0 - 1 && cx <= fb.x1 + 1 &&
+                        cy >= fb.y0 - 1 && cy <= fb.y1 + 1)
+                        inside.push_back(ch);
+                }
+                if (inside.empty()) continue;
+                fb.text = layout_page_text(inside, 0.0);
+                while (!fb.text.empty() && fb.text.back() == '\n') fb.text.pop_back();
+                fb.text += '\n';
+                result.all_fallbacks[p].push_back(std::move(fb));
+            }
+            result.all_tables[p].clear();
+            result.lead_grids[p] = TableData{};
         }
 
         // Set after the image pipeline: the per-attempt diag resets above must
@@ -1257,6 +2272,8 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
         if (first_error) std::rethrow_exception(first_error);
     }
 
+    join_split_tables(result, page_indices);
+
     collect_attachments(doc, root, result.attachments);
 
     // Extract bookmarks
@@ -1279,7 +2296,7 @@ static ExtractResult extract_pdf_buffer(const uint8_t* data, size_t size,
         }
     }
 
-    result.stats.compute(result.all_lines);
+    result.stats.compute(result.all_lines, result.all_tables);
     return result;
 }
 

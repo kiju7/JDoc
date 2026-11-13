@@ -16,6 +16,7 @@
 #include "html/html_parser.h"
 #include "mail/msg_parser.h"
 #include "odf/odf_parser.h"
+#include "convert_internal.h"
 
 #include <fstream>
 #include <cstring>
@@ -72,7 +73,82 @@ static DocFormat classify_odf_zip(const ZipReader& zip) {
     if (s.find("opendocument.text")         != std::string::npos) return DocFormat::ODT;
     if (s.find("opendocument.spreadsheet")   != std::string::npos) return DocFormat::ODS;
     if (s.find("opendocument.presentation")  != std::string::npos) return DocFormat::ODP;
+    // A chart, drawing or formula package (most often an embedded object):
+    // the ODF reader walks whatever body it has.
+    if (s.find("application/vnd.oasis.opendocument.") != std::string::npos)
+        return DocFormat::ODT;
     return DocFormat::UNKNOWN;
+}
+
+// The kind of an OOXML package, read from its main part. [Content_Types].xml
+// lists every content type the package holds, so a presentation that carries a
+// chart's workbook (or a sheet with a pasted Word object) registers
+// spreadsheetml or wordprocessingml as well; a substring scan then picked the
+// first family that happened to appear and a .show deck came out as its chart
+// data alone. The package relationship names the one main part, and its
+// content type (or failing that its well-known path) settles the kind.
+static DocFormat classify_ooxml_zip(const ZipReader& zip) {
+    auto ct_bytes = zip.read_entry("[Content_Types].xml");
+    if (ct_bytes.empty()) return DocFormat::UNKNOWN;
+    const std::string ct(ct_bytes.begin(), ct_bytes.end());
+
+    auto from_type = [](const std::string& t) {
+        if (t.find("wordprocessingml") != std::string::npos ||
+            t.find("ms-word") != std::string::npos)
+            return DocFormat::DOCX;
+        if (t.find("spreadsheetml") != std::string::npos ||
+            t.find("ms-excel") != std::string::npos)
+            return t.find("binary") != std::string::npos ? DocFormat::XLSB
+                                                         : DocFormat::XLSX;
+        if (t.find("presentationml") != std::string::npos ||
+            t.find("ms-powerpoint") != std::string::npos)
+            return DocFormat::PPTX;
+        return DocFormat::UNKNOWN;
+    };
+    auto attr = [](const std::string& s, size_t from, size_t to, const char* name) {
+        std::string key = std::string(" ") + name + "=\"";
+        size_t a = s.find(key, from);
+        if (a == std::string::npos || a >= to) return std::string();
+        a += key.size();
+        size_t b = s.find('"', a);
+        return b == std::string::npos || b > to ? std::string() : s.substr(a, b - a);
+    };
+
+    // 1. The main part the package relationship points at.
+    std::string main_part;
+    auto rels_bytes = zip.read_entry("_rels/.rels");
+    const std::string rels(rels_bytes.begin(), rels_bytes.end());
+    for (size_t p = rels.find("<Relationship"); p != std::string::npos;
+         p = rels.find("<Relationship", p + 1)) {
+        size_t e = rels.find('>', p);
+        if (e == std::string::npos) break;
+        std::string type = attr(rels, p, e, "Type");
+        if (type.size() >= 15 &&
+            type.compare(type.size() - 15, 15, "/officeDocument") == 0) {
+            main_part = attr(rels, p, e, "Target");
+            break;
+        }
+    }
+    if (!main_part.empty()) {
+        if (main_part[0] != '/') main_part = "/" + main_part;
+        for (size_t p = ct.find("<Override"); p != std::string::npos;
+             p = ct.find("<Override", p + 1)) {
+            size_t e = ct.find('>', p);
+            if (e == std::string::npos) break;
+            if (attr(ct, p, e, "PartName") == main_part) {
+                DocFormat f = from_type(attr(ct, p, e, "ContentType"));
+                if (f != DocFormat::UNKNOWN) return f;
+                break;
+            }
+        }
+    }
+    // 2. The conventional main-part paths.
+    if (zip.has_entry("ppt/presentation.xml")) return DocFormat::PPTX;
+    if (zip.has_entry("word/document.xml")) return DocFormat::DOCX;
+    if (zip.has_entry("xl/workbook.bin")) return DocFormat::XLSB;
+    if (zip.has_entry("xl/workbook.xml")) return DocFormat::XLSX;
+    // 3. Last resort: whichever family the type list mentions.
+    return from_type(ct);
 }
 
 DocFormat detect_office_format(const std::string& file_path) {
@@ -102,21 +178,8 @@ DocFormat detect_office_format(const std::string& file_path) {
         // Fallback: inspect [Content_Types].xml, then the ODF mimetype member.
         ZipReader zip(file_path);
         if (zip.is_open()) {
-            auto ct = zip.read_entry("[Content_Types].xml");
-            if (!ct.empty()) {
-                std::string content(ct.begin(), ct.end());
-                if (content.find("wordprocessingml") != std::string::npos)
-                    return DocFormat::DOCX;
-                if (content.find("spreadsheetml") != std::string::npos) {
-                    // Check if XLSB by looking for .bin worksheets
-                    if (content.find("binaryFormat") != std::string::npos ||
-                        zip.has_entry("xl/workbook.bin"))
-                        return DocFormat::XLSB;
-                    return DocFormat::XLSX;
-                }
-                if (content.find("presentationml") != std::string::npos)
-                    return DocFormat::PPTX;
-            }
+            DocFormat ooxml = classify_ooxml_zip(zip);
+            if (ooxml != DocFormat::UNKNOWN) return ooxml;
             DocFormat odf = classify_odf_zip(zip);
             if (odf != DocFormat::UNKNOWN) return odf;
         }
@@ -212,20 +275,8 @@ DocFormat detect_office_format_mem(const uint8_t* data, size_t size,
 
         ZipReader zip(data, size);
         if (zip.is_open()) {
-            auto ct = zip.read_entry("[Content_Types].xml");
-            if (!ct.empty()) {
-                std::string content(ct.begin(), ct.end());
-                if (content.find("wordprocessingml") != std::string::npos)
-                    return DocFormat::DOCX;
-                if (content.find("spreadsheetml") != std::string::npos) {
-                    if (content.find("binaryFormat") != std::string::npos ||
-                        zip.has_entry("xl/workbook.bin"))
-                        return DocFormat::XLSB;
-                    return DocFormat::XLSX;
-                }
-                if (content.find("presentationml") != std::string::npos)
-                    return DocFormat::PPTX;
-            }
+            DocFormat ooxml = classify_ooxml_zip(zip);
+            if (ooxml != DocFormat::UNKNOWN) return ooxml;
             DocFormat odf = classify_odf_zip(zip);
             if (odf != DocFormat::UNKNOWN) return odf;
         }
@@ -323,6 +374,10 @@ struct DocInput {
     const uint8_t* data = nullptr;
     size_t size = 0;
 
+    // Or a storage of another OLE file (an object embedded in a .doc/.xls).
+    const OleReader* host = nullptr;
+    std::string storage;
+
     std::string display() const { return path ? *path : "<memory>"; }
 
     std::unique_ptr<ZipReader> open_zip() const {
@@ -330,6 +385,11 @@ struct DocInput {
                     : std::make_unique<ZipReader>(data, size);
     }
     std::unique_ptr<OleReader> open_ole() const {
+        if (host) {
+            auto sub = host->open_storage(storage);
+            if (!sub) throw std::runtime_error("Missing OLE storage: " + storage);
+            return sub;
+        }
         return path ? std::make_unique<OleReader>(*path)
                     : std::make_unique<OleReader>(data, size);
     }
@@ -466,6 +526,21 @@ std::string office_to_markdown(const std::string& file_path, ConvertOptions opts
     DocInput in;
     in.path = &file_path;
     return to_markdown_impl(detect_office_format(file_path), in, opts);
+}
+
+std::string office_storage_to_markdown(const OleReader& host, const std::string& storage,
+                                      const ConvertOptions& opts) {
+    auto sub = host.open_storage(storage);
+    if (!sub) return "";
+    DocFormat fmt = sub->has_stream("WordDocument") ? DocFormat::DOC
+                  : sub->has_stream("Workbook") || sub->has_stream("Book") ? DocFormat::XLS
+                  : sub->has_stream("PowerPoint Document") ? DocFormat::PPT
+                  : DocFormat::UNKNOWN;
+    if (fmt == DocFormat::UNKNOWN) return "";
+    DocInput in;
+    in.host = &host;
+    in.storage = storage;
+    return to_markdown_impl(fmt, in, opts);
 }
 
 std::vector<PageChunk> office_to_markdown_chunks(const std::string& file_path,

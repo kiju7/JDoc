@@ -1,0 +1,51 @@
+%PDF-1.4
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [3 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 5 0 R /F2 6 0 R >> >> /Contents 4 0 R >>
+endobj
+4 0 obj
+<< /Length 859 >>
+stream
+BT 0.45 g /F1 9.0 Tf 52.00 802.00 Td (Journal of Urban Climate  Vol. 8  No. 2  2026) Tj ET 0 g
+BT 0.45 g /F1 9.0 Tf 532.99 802.00 Td (45) Tj ET 0 g
+0.5 w 52.00 794.00 m 543.00 794.00 l S
+BT /F2 18.0 Tf 164.45 746.00 Td (Summer Temperatures by Park) Tj ET
+BT /F1 11.0 Tf 52.00 712.00 Td (Table 1 lists the mean afternoon reading in each park.) Tj ET
+BT /F2 11.0 Tf 165.58 682.00 Td (Park) Tj ET
+BT /F2 11.0 Tf 370.13 682.00 Td (Mean temperature) Tj ET
+BT /F1 11.0 Tf 159.77 664.00 Td (Central) Tj ET
+BT /F1 11.0 Tf 385.40 664.00 Td (31.2 degrees) Tj ET
+BT /F1 11.0 Tf 134.71 646.00 Td (Riverside Garden) Tj ET
+BT /F1 11.0 Tf 406.80 646.00 Td (33.6) Tj ET
+BT /F1 11.0 Tf 154.89 628.00 Td (North Hill) Tj ET
+BT /F1 11.0 Tf 375.30 628.00 Td (32.4 in the shade) Tj ET
+BT /F1 11.0 Tf 153.35 610.00 Td (Corner lot) Tj ET
+BT /F1 11.0 Tf 406.80 610.00 Td (34.0) Tj ET
+
+endstream
+endobj
+5 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>
+endobj
+6 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold /Encoding /WinAnsiEncoding >>
+endobj
+xref
+0 7
+0000000000 65535 f 
+0000000009 00000 n 
+0000000058 00000 n 
+0000000115 00000 n 
+0000000251 00000 n 
+0000001161 00000 n 
+0000001258 00000 n 
+trailer
+<< /Size 7 /Root 1 0 R >>
+startxref
+1360
+%%EOF

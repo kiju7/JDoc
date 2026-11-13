@@ -1,0 +1,56 @@
+%PDF-1.4
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [3 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 600 800] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>
+endobj
+4 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>
+endobj
+5 0 obj
+<< /Length 987 >>
+stream
+0 G 0.5 w
+50 450 m 500 450 l S
+50 650 m 500 650 l S
+50 680 m 500 680 l S
+50 450 m 50 680 l S
+275 450 m 275 680 l S
+500 450 m 500 680 l S
+BT /F1 10 Tf 60 660 Td (Materials) Tj ET
+BT /F1 10 Tf 285 660 Td (Equipment) Tj ET
+BT /F1 10 Tf 60 630 Td (Material item 0) Tj ET
+BT /F1 10 Tf 285 630 Td (Equipment item 0) Tj ET
+BT /F1 10 Tf 60 610 Td (Material item 1) Tj ET
+BT /F1 10 Tf 285 610 Td (Equipment item 1) Tj ET
+BT /F1 10 Tf 60 590 Td (Material item 2) Tj ET
+BT /F1 10 Tf 285 590 Td (Equipment item 2) Tj ET
+BT /F1 10 Tf 60 570 Td (Material item 3) Tj ET
+BT /F1 10 Tf 285 570 Td (Equipment item 3) Tj ET
+BT /F1 10 Tf 60 550 Td (Material item 4) Tj ET
+BT /F1 10 Tf 285 550 Td (Equipment item 4) Tj ET
+BT /F1 10 Tf 60 530 Td (Material item 5) Tj ET
+BT /F1 10 Tf 285 530 Td (Equipment item 5) Tj ET
+BT /F1 10 Tf 60 510 Td (Material item 6) Tj ET
+BT /F1 10 Tf 285 510 Td (Equipment item 6) Tj ET
+BT /F1 10 Tf 60 490 Td (Material item 7) Tj ET
+BT /F1 10 Tf 285 490 Td (Equipment item 7) Tj ET
+endstream
+endobj
+xref
+0 6
+0000000000 65535 f 
+0000000009 00000 n 
+0000000058 00000 n 
+0000000115 00000 n 
+0000000241 00000 n 
+0000000311 00000 n 
+trailer
+<< /Size 6 /Root 1 0 R >>
+startxref
+1349
+%%EOF

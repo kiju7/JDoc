@@ -1,0 +1,55 @@
+%PDF-1.4
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [3 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 5 0 R /F2 6 0 R >> >> /Contents 4 0 R >>
+endobj
+4 0 obj
+<< /Length 925 >>
+stream
+BT /F1 10.0 Tf 72.00 742.00 Td (The transducers below were observed over the whole corpus.) Tj ET
+BT /F2 10.0 Tf 205.54 712.00 Td (Transducer) Tj ET
+BT /F2 10.0 Tf 289.43 712.00 Td (Frequency) Tj ET
+BT /F1 10.0 Tf 237.76 699.00 Td (0000) Tj ET
+BT /F1 10.0 Tf 334.44 699.00 Td (1) Tj ET
+BT /F1 10.0 Tf 226.64 686.00 Td (000100) Tj ET
+BT /F1 10.0 Tf 334.44 686.00 Td (8) Tj ET
+BT /F1 10.0 Tf 204.40 673.00 Td (0001010110) Tj ET
+BT /F1 10.0 Tf 334.44 673.00 Td (1) Tj ET
+BT /F1 10.0 Tf 215.52 660.00 Td (00010110) Tj ET
+BT /F1 10.0 Tf 334.44 660.00 Td (4) Tj ET
+BT /F1 10.0 Tf 204.40 647.00 Td (0001011100) Tj ET
+BT /F1 10.0 Tf 334.44 647.00 Td (1) Tj ET
+BT /F1 10.0 Tf 226.64 634.00 Td (000110) Tj ET
+BT /F1 10.0 Tf 334.44 634.00 Td (8) Tj ET
+BT /F1 10.0 Tf 215.52 621.00 Td (00011100) Tj ET
+BT /F1 10.0 Tf 334.44 621.00 Td (4) Tj ET
+BT /F1 10.0 Tf 215.52 608.00 Td (01000110) Tj ET
+BT /F1 10.0 Tf 323.32 608.00 Td (480) Tj ET
+
+endstream
+endobj
+5 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>
+endobj
+6 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold /Encoding /WinAnsiEncoding >>
+endobj
+xref
+0 7
+0000000000 65535 f 
+0000000009 00000 n 
+0000000058 00000 n 
+0000000115 00000 n 
+0000000251 00000 n 
+0000001227 00000 n 
+0000001324 00000 n 
+trailer
+<< /Size 7 /Root 1 0 R >>
+startxref
+1426
+%%EOF

@@ -119,7 +119,8 @@ static std::string extract_textbody_text(const pugi::xml_node& txBody);
 std::string PptxParser::extract_chart_text(const std::string& chart_path) {
     std::vector<char> data;
     pugi::xml_document doc;
-    if (!xml_load_part(zip_, chart_path, doc, data)) return "";
+    if (!xml_load_part(zip_, chart_path, doc, data,
+                           pugi::parse_default | pugi::parse_ws_pcdata)) return "";
 
     std::string result;
 
@@ -161,7 +162,8 @@ std::string PptxParser::extract_diagram_text(
     const std::string& diagram_data_path) {
     std::vector<char> data;
     pugi::xml_document doc;
-    if (!xml_load_part(zip_, diagram_data_path, doc, data)) return "";
+    if (!xml_load_part(zip_, diagram_data_path, doc, data,
+                           pugi::parse_default | pugi::parse_ws_pcdata)) return "";
 
     std::string result;
     std::vector<pugi::xml_node> pt_nodes;
@@ -202,7 +204,8 @@ std::string PptxParser::extract_diagram_text(
 std::string PptxParser::extract_notes_text(const std::string& notes_path) {
     std::vector<char> data;
     pugi::xml_document doc;
-    if (!xml_load_part(zip_, notes_path, doc, data)) return "";
+    if (!xml_load_part(zip_, notes_path, doc, data,
+                           pugi::parse_default | pugi::parse_ws_pcdata)) return "";
 
     auto cSld = xml_child(doc.first_child(), "cSld");
     if (!cSld) return "";
@@ -794,7 +797,7 @@ std::string PptxParser::to_markdown(const ConvertOptions& opts) {
         if (!body.empty() && body.back() != '\n') body += "\n";
         body += extra;
     }
-    body += format_embedded_parts(zip_);
+    body += format_embedded_parts(zip_, opts);
     return body;
 }
 
@@ -901,7 +904,7 @@ std::vector<PageChunk> PptxParser::to_chunks(const ConvertOptions& opts) {
         chunks.push_back(std::move(c));
         return true;
     });
-    append_embedded_parts(zip_, chunks);
+    append_embedded_parts(zip_, opts, chunks);
     return chunks;
 }
 

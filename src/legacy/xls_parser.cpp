@@ -1,6 +1,7 @@
 // .xls (BIFF8) parser implementation.
 
 #include "xls_parser.h"
+#include "common/embedded.h"
 #include "common/emf_text.h"
 #include "common/file_utils.h"
 #include "common/image_utils.h"
@@ -36,7 +37,65 @@ static constexpr uint16_t RT_FORMAT     = 0x041E;
 static constexpr uint16_t RT_XF         = 0x00E0;
 static constexpr uint16_t RT_FILEPASS   = 0x002F;
 static constexpr uint16_t RT_FONT      = 0x0031;
+static constexpr uint16_t RT_MSODRAWINGGROUP = 0x00EB;
 static constexpr uint16_t RT_MSODRAWING = 0x00EC;
+static constexpr uint16_t RT_HEADER     = 0x0014;
+static constexpr uint16_t RT_FOOTER     = 0x0015;
+static constexpr uint16_t RT_TXO        = 0x01B6;
+
+// An XLUnicodeString (cch, flags, characters) — 8-bit or UTF-16LE.
+static std::string xl_unicode_string(const char* d, size_t n, bool force_wide = false) {
+    if (n < 3) return "";
+    size_t cch = util::read_u16_le(d);
+    bool wide = force_wide || (static_cast<uint8_t>(d[2]) & 0x01) != 0;
+    size_t bytes = std::min(wide ? cch * 2 : cch, n - 3);
+    if (wide) return util::utf16le_to_utf8(d + 3, bytes & ~size_t(1));
+    std::string out;
+    for (size_t i = 0; i < bytes; ++i) util::append_cp1252(out, static_cast<uint8_t>(d[3 + i]));
+    return out;
+}
+
+// The header/footer string with its &-codes (&L &C &R sections, &"font",
+// sizes, fields like &P) reduced to the printed text.
+static std::string header_footer_text(const std::string& code) {
+    std::string out;
+    for (size_t i = 0; i < code.size(); ++i) {
+        char c = code[i];
+        if (c != '&' || i + 1 >= code.size()) { out += c; continue; }
+        char k = code[++i];
+        if (k == '&') out += '&';
+        else if (k == 'L' || k == 'C' || k == 'R') { if (!out.empty()) out += ' '; }
+        else if (k == '"') { size_t e = code.find('"', i + 1); i = e == std::string::npos ? code.size() : e; }
+        else if (k >= '0' && k <= '9') { while (i + 1 < code.size() && code[i + 1] >= '0' && code[i + 1] <= '9') ++i; }
+        else if (k == 'K') i = std::min(code.size() - 1, i + 6);
+    }
+    return util::trim(out);
+}
+
+// The text of a TXO record (a text box, a note): cchText characters carried
+// by the CONTINUE records that follow it, each opening with its own
+// 8-bit/UTF-16 flag byte.
+static std::string txo_text(const std::vector<char>& wb, size_t txo_pos, size_t txo_size,
+                            bool force_wide = false) {
+    if (txo_size < 12) return "";
+    size_t left = util::read_u16_le(wb.data() + txo_pos + 10);
+    std::string out;
+    size_t pos = txo_pos + txo_size;
+    while (left > 0 && pos + 4 <= wb.size() &&
+           util::read_u16_le(wb.data() + pos) == RT_CONTINUE) {
+        size_t size = util::read_u16_le(wb.data() + pos + 2);
+        const char* d = wb.data() + pos + 4;
+        pos += 4 + size;
+        if (pos > wb.size() || size < 1) break;
+        bool wide = force_wide || (static_cast<uint8_t>(d[0]) & 0x01) != 0;
+        size_t n = std::min(left, (size - 1) / (wide ? 2 : 1));
+        if (wide) out += util::utf16le_to_utf8(d + 1, n * 2);
+        else for (size_t i = 0; i < n; ++i) util::append_cp1252(out, static_cast<uint8_t>(d[1 + i]));
+        left -= n;
+    }
+    for (auto& ch : out) if (ch == '\r' || ch == '\n') ch = ' ';
+    return util::trim(out);
+}
 
 // ---------- XlsParser --------------------------------------------------------
 
@@ -265,8 +324,9 @@ namespace {
 // is enough to hit it).
 class SstCursor {
 public:
-    explicit SstCursor(std::vector<std::pair<const char*, size_t>> segs)
-        : segs_(std::move(segs)) {}
+    explicit SstCursor(std::vector<std::pair<const char*, size_t>> segs,
+                       bool force_wide = false)
+        : segs_(std::move(segs)), force_wide_(force_wide) {}
 
     bool at_end() {
         norm();
@@ -280,7 +340,7 @@ public:
         uint16_t cch = 0;
         uint8_t flags = 0;
         if (!u16(cch) || !u8(flags)) { failed_ = true; return out; }
-        bool high  = (flags & 0x01) != 0;
+        bool high  = force_wide_ || (flags & 0x01) != 0;
         bool ext   = (flags & 0x04) != 0;
         bool rich  = (flags & 0x08) != 0;
 
@@ -297,7 +357,7 @@ public:
                 // option-flags byte; only bit 0 (fHighByte) applies here.
                 uint8_t g = static_cast<uint8_t>(segs_[si_].first[off_]);
                 off_++;
-                high = (g & 0x01) != 0;
+                high = force_wide_ || (g & 0x01) != 0;
                 entered_mid_chars_ = false;
                 continue;  // re-normalize (the flags byte may end the record)
             }
@@ -324,11 +384,19 @@ public:
                 entered_mid_chars_ = true;
         }
 
+        // Hancom Cell marks a string with formatting runs by bit 0 (Excel's
+        // fHighByte, which it never needs: its text is always UTF-16) and
+        // stores the run count and runs after the characters.
+        if (force_wide_ && (flags & 0x01) && !rich && !u16(run_count)) {
+            failed_ = true;
+            return out;
+        }
         skip(size_t(run_count) * 4 + ext_size);
         return out;
     }
 
 private:
+    bool force_wide_ = false;  // Hancom Cell: UTF-16 under an 8-bit flag
     std::vector<std::pair<const char*, size_t>> segs_;
     size_t si_ = 0, off_ = 0;
     bool entered_mid_chars_ = false;
@@ -395,22 +463,194 @@ void XlsParser::parse_sst(const char* data, size_t len,
     sst_.reserve(static_cast<size_t>(
         std::min<uint64_t>(unique_count, total / 3 + 1)));
 
-    SstCursor cur(std::move(segs));
+    SstCursor cur(std::move(segs), hancom_wide_);
     for (uint32_t i = 0; i < unique_count && !cur.at_end(); ++i) {
         sst_.push_back(cur.read_string());
         if (cur.failed()) break;
     }
 }
 
-// ---------- Workbook parsing -------------------------------------------------
+// ---------- Workbook stream ---------------------------------------------------
 
-void XlsParser::parse_workbook() {
+// Hancom Cell writes the workbook's MSODRAWINGGROUP as one record however
+// large its pictures are, with a length field that does not hold the size
+// (a 3.6 MB drawing group under a 60 KB length). Every record after it was
+// then read from the middle of picture data, no sheet was found and the
+// output was empty. The OfficeArt container inside states the real size;
+// rewrite such a record as Excel would, an MSODRAWINGGROUP of at most 8224
+// bytes followed by CONTINUE records, so every pass reads a normal stream.
+static void split_oversized_drawing_group(std::vector<char>& wb) {
+    constexpr size_t kMaxRec = 8224;
+    // The real end of an MSODRAWINGGROUP whose container overruns its
+    // record, or 0 when the record is an ordinary one.
+    auto container_end = [&](size_t pos, size_t size, size_t& start) -> size_t {
+        // The container sits at the start of the body, or after two bytes
+        // Hancom puts before it.
+        for (size_t skip : {size_t(0), size_t(2)}) {
+            size_t c = pos + 4 + skip;
+            if (c + 8 > wb.size()) return 0;
+            uint16_t vi = util::read_u16_le(wb.data() + c);
+            uint16_t ft = util::read_u16_le(wb.data() + c + 2);
+            if ((vi & 0x0F) != 0x0F || ft != 0xF000) continue;
+            size_t end = c + 8 + util::read_u32_le(wb.data() + c + 4);
+            if (end <= pos + 4 + size || end + 4 > wb.size()) return 0;
+            // Excel continues a large group in further MSODRAWINGGROUP or
+            // CONTINUE records; only a group with no such follow-up is one
+            // Hancom record that overran its length.
+            size_t after = pos + 4 + size;
+            if (after + 4 <= wb.size()) {
+                uint16_t nt = util::read_u16_le(wb.data() + after);
+                if (nt == RT_MSODRAWINGGROUP || nt == RT_CONTINUE) return 0;
+            }
+            // A record must follow where the container ends.
+            if (end + 4 + util::read_u16_le(wb.data() + end + 2) > wb.size()) return 0;
+            start = c;
+            return end;
+        }
+        return 0;
+    };
+
+    size_t pos = 0;
+    while (pos + 4 <= wb.size()) {
+        uint16_t type = util::read_u16_le(wb.data() + pos);
+        size_t size = util::read_u16_le(wb.data() + pos + 2);
+        size_t start = 0, end = 0;
+        if (type != RT_MSODRAWINGGROUP || !(end = container_end(pos, size, start))) {
+            pos += 4 + size;
+            continue;
+        }
+        std::vector<char> out(wb.begin(), wb.begin() + pos);
+        for (size_t from = start; from < end;) {
+            size_t n = std::min(kMaxRec, end - from);
+            uint16_t t = from == start ? RT_MSODRAWINGGROUP : RT_CONTINUE;
+            const char hdr[4] = {char(t & 0xFF), char(t >> 8), char(n & 0xFF), char(n >> 8)};
+            out.insert(out.end(), hdr, hdr + 4);
+            out.insert(out.end(), wb.begin() + from, wb.begin() + from + n);
+            from += n;
+        }
+        pos = out.size();
+        out.insert(out.end(), wb.begin() + end, wb.end());
+        wb.swap(out);
+    }
+}
+
+// True when a BOUNDSHEET name is flagged 8-bit but its record holds exactly
+// twice its characters with every high byte zero: UTF-16 under an 8-bit
+// flag, which only Hancom Cell writes.
+static bool hancom_sheet_name(const char* rec, size_t size) {
+    if (size < 8) return false;
+    size_t cch = static_cast<uint8_t>(rec[6]);
+    if ((static_cast<uint8_t>(rec[7]) & 0x01) || cch == 0 || size != 8 + cch * 2)
+        return false;
+    for (size_t i = 0; i < cch; ++i)
+        if (rec[8 + 2 * i + 1] != 0) return false;
+    return true;
+}
+
+// Hancom Cell's BIFF8 differs from Excel's in the records below; rewrite
+// them as Excel would so the parser reads one dialect.
+// - Cell records carry the row as 32 bits (Excel: 16), two bytes more than
+//   the record should hold, so every cell came out in the wrong place with
+//   the wrong value. The high word is dropped.
+// - A TXO (text box, note) holds its text inline after the 10-byte header,
+//   where Excel puts it in CONTINUE records. It is moved into a CONTINUE.
+static void normalize_hancom_biff(std::vector<char>& wb) {
+    // True when a cell record has Hancom's shape: a 32-bit row (high word
+    // zero) and a size that fits that layout, not Excel's. Variable-size
+    // records are checked against their own length fields.
+    auto wide_row = [](uint16_t t, const char* b, size_t n) -> bool {
+        if (n < 8 || b[2] != 0 || b[3] != 0) return false;
+        auto u16 = [&](size_t o) { return size_t(util::read_u16_le(b + o)); };
+        switch (t) {
+            case 0x0201: return n == 8;                        // BLANK
+            case 0x0205: return n == 10;                       // BOOLERR
+            case 0x00FD: return n == 12;                       // LABELSST
+            case 0x027E: return n == 12;                       // RK
+            case 0x0203: return n == 16;                       // NUMBER
+            case 0x0208: return n == 18;                       // ROW
+            case 0x00BD:                                       // MULRK
+                return n >= 14 && (n - 8) % 6 == 0 &&
+                       u16(n - 2) >= u16(4) && u16(n - 2) - u16(4) + 1 == (n - 8) / 6;
+            case 0x00BE:                                       // MULBLANK
+                return n >= 10 && n % 2 == 0 &&
+                       u16(n - 2) >= u16(4) && u16(n - 2) - u16(4) + 1 == (n - 8) / 2;
+            case 0x0006:                                       // FORMULA
+                return n >= 24 && n == 24 + u16(22);
+            case 0x0204:                                       // LABEL (UTF-16)
+                return n >= 11 && n == 11 + u16(8) * 2;
+            default: return false;
+        }
+    };
+    std::vector<char> out;
+    out.reserve(wb.size());
+    size_t pos = 0;
+    auto put_rec = [&](uint16_t t, const char* body, size_t n) {
+        const char hdr[4] = {char(t & 0xFF), char(t >> 8), char(n & 0xFF), char(n >> 8)};
+        out.insert(out.end(), hdr, hdr + 4);
+        out.insert(out.end(), body, body + n);
+    };
+    while (pos + 4 <= wb.size()) {
+        uint16_t t = util::read_u16_le(wb.data() + pos);
+        size_t n = util::read_u16_le(wb.data() + pos + 2);
+        if (pos + 4 + n > wb.size()) break;
+        const char* b = wb.data() + pos + 4;
+        pos += 4 + n;
+        if (wide_row(t, b, n)) {
+            std::string body(b, b + 2);
+            body.append(b + 4, b + n);
+            put_rec(t, body.data(), body.size());
+            continue;
+        }
+        bool inline_txo = t == RT_TXO && n > 18 &&
+                          !(pos + 2 <= wb.size() &&
+                            util::read_u16_le(wb.data() + pos) == RT_CONTINUE);
+        if (inline_txo) {
+            // 10 bytes of TXO fields, cchText, then flag + characters.
+            size_t cch = util::read_u16_le(b + 10);
+            size_t text_bytes = std::min(cch * 2, n - 13);
+            std::string txo(b, b + 18 < b + n ? b + 18 : b + n);
+            txo.resize(18, '\0');
+            txo[12] = txo[13] = 0;  // cbRuns: no formatting runs follow
+            put_rec(t, txo.data(), txo.size());
+            std::string cont(1, '\x01');  // UTF-16
+            cont.append(b + 13, b + 13 + text_bytes);
+            put_rec(RT_CONTINUE, cont.data(), cont.size());
+            continue;
+        }
+        put_rec(t, b, n);
+    }
+    out.insert(out.end(), wb.begin() + std::min(pos, wb.size()), wb.end());
+    wb.swap(out);
+}
+
+std::vector<char> XlsParser::read_workbook_stream() {
     std::vector<char> wb;
     if (ole_.has_stream("Workbook")) {
         wb = ole_.read_stream("Workbook");
     } else if (ole_.has_stream("Book")) {
         wb = ole_.read_stream("Book");
     }
+    split_oversized_drawing_group(wb);
+    // A Hancom workbook names itself through its sheet names (written before
+    // any cell), so look there before reading anything else.
+    for (size_t pos = 0; pos + 4 <= wb.size();) {
+        uint16_t t = util::read_u16_le(wb.data() + pos);
+        size_t n = util::read_u16_le(wb.data() + pos + 2);
+        if (pos + 4 + n > wb.size() || t == RT_EOF) break;
+        if (t == RT_BOUNDSHEET && hancom_sheet_name(wb.data() + pos + 4, n)) {
+            hancom_wide_ = true;
+            break;
+        }
+        pos += 4 + n;
+    }
+    if (hancom_wide_) normalize_hancom_biff(wb);
+    return wb;
+}
+
+// ---------- Workbook parsing -------------------------------------------------
+
+void XlsParser::parse_workbook() {
+    std::vector<char> wb = read_workbook_stream();
     if (wb.empty()) return;
 
     // First pass: collect BoundSheet names, SST, FORMAT, XF records.
@@ -446,7 +686,20 @@ void XlsParser::parse_workbook() {
                 uint8_t name_len = static_cast<uint8_t>(rec_data[6]);
                 uint8_t name_flags = static_cast<uint8_t>(rec_data[7]);
                 std::string sname;
-                if (name_flags & 0x01) {
+                // Hancom Cell flags the name as 8-bit but writes it as UTF-16:
+                // the record then holds exactly twice the characters, every
+                // high byte zero ("t\0e\0x\0t\0"). Read as 8-bit it came out
+                // as "t\0e\0", NULs and all.
+                bool wide = (name_flags & 0x01) != 0;
+                if (!wide && name_len > 0 && rec_size == 8 + size_t(name_len) * 2) {
+                    wide = true;
+                    for (size_t i = 0; i < name_len; ++i)
+                        if (rec_data[8 + 2 * i + 1] != 0) { wide = false; break; }
+                    // The same writer flags every string 8-bit and writes it
+                    // as UTF-16: shared strings, labels, formats, text boxes.
+                    if (wide) hancom_wide_ = true;
+                }
+                if (wide) {
                     size_t byte_len = std::min(size_t(name_len) * 2, size_t(rec_size - 8));
                     sname = util::utf16le_to_utf8(rec_data + 8, byte_len);
                 } else {
@@ -464,7 +717,7 @@ void XlsParser::parse_workbook() {
                 // Format string is an XLUnicodeString starting at offset 2
                 uint16_t cch = util::read_u16_le(rec_data + 2);
                 uint8_t flags = static_cast<uint8_t>(rec_data[4]);
-                bool high_byte = (flags & 0x01) != 0;
+                bool high_byte = hancom_wide_ || (flags & 0x01) != 0;
 
                 size_t str_start = 5;
                 size_t bytes_needed = high_byte ? (size_t(cch) * 2) : size_t(cch);
@@ -533,6 +786,7 @@ void XlsParser::parse_workbook() {
     // Pass 2: sheet cell data (LABELSST, LABEL, NUMBER, RK, MULRK, FORMULA).
     pos = 0;
     bof_count = 0;
+    int bof_depth = 0, sheet_index = -1;
     int current_sheet = -1;
     bool expect_string = false;  // true after FORMULA with string result
     uint16_t formula_row = 0, formula_col = 0;
@@ -545,11 +799,13 @@ void XlsParser::parse_workbook() {
         if (pos + rec_size > wb.size()) break;
         const char* rec_data = wb.data() + pos;
 
+        // Substreams nest: a chart embedded in a worksheet opens its own
+        // BOF..EOF inside the sheet's, and is not a sheet of the workbook.
         if (rec_type == RT_BOF) {
-            ++bof_count;
-            if (bof_count > 1) {
-                current_sheet = bof_count - 2;
-            }
+            if (++bof_depth == 1 && ++bof_count > 1) sheet_index = bof_count - 2;
+            current_sheet = bof_depth == 1 ? sheet_index : -1;
+        } else if (rec_type == RT_EOF && bof_depth > 0) {
+            if (--bof_depth == 1) current_sheet = sheet_index;
         }
 
         // STRING record follows FORMULA when result is a string.
@@ -558,7 +814,7 @@ void XlsParser::parse_workbook() {
             if (formula_sheet >= 0 && formula_sheet < static_cast<int>(sheets_.size())) {
                 uint16_t cch = util::read_u16_le(rec_data);
                 uint8_t flags = static_cast<uint8_t>(rec_data[2]);
-                bool high_byte = (flags & 0x01) != 0;
+                bool high_byte = hancom_wide_ || (flags & 0x01) != 0;
                 size_t str_start = 3;
                 size_t bytes_needed = high_byte ? (size_t(cch) * 2) : size_t(cch);
                 std::string val;
@@ -595,7 +851,13 @@ void XlsParser::parse_workbook() {
         if (current_sheet >= 0 && current_sheet < static_cast<int>(sheets_.size())) {
             Sheet& sheet = sheets_[current_sheet];
 
-            if (rec_type == RT_LABELSST && rec_size >= 10) {
+            if ((rec_type == RT_HEADER || rec_type == RT_FOOTER) && rec_size >= 3) {
+                std::string t = header_footer_text(xl_unicode_string(rec_data, rec_size, hancom_wide_));
+                if (!t.empty()) sheet.texts.push_back(std::move(t));
+            } else if (rec_type == RT_TXO) {
+                std::string t = txo_text(wb, pos, rec_size, hancom_wide_);
+                if (!t.empty()) sheet.texts.push_back(std::move(t));
+            } else if (rec_type == RT_LABELSST && rec_size >= 10) {
                 uint16_t row = util::read_u16_le(rec_data);
                 uint16_t col = util::read_u16_le(rec_data + 2);
                 uint16_t xf_idx = util::read_u16_le(rec_data + 4);
@@ -634,7 +896,7 @@ void XlsParser::parse_workbook() {
                 // XF index at offset 4 (2 bytes) — skip
                 uint16_t cch = util::read_u16_le(rec_data + 6);
                 uint8_t flags = static_cast<uint8_t>(rec_data[8]);
-                bool high_byte = (flags & 0x01) != 0;
+                bool high_byte = hancom_wide_ || (flags & 0x01) != 0;
                 size_t str_start = 9;
                 size_t bytes_needed = high_byte ? (size_t(cch) * 2) : size_t(cch);
                 std::string val;
@@ -730,6 +992,16 @@ void XlsParser::parse_workbook() {
 // ---------- sheet to markdown ------------------------------------------------
 
 std::string XlsParser::sheet_to_markdown(const Sheet& sheet, int sheet_num) {
+    std::string md = sheet_table(sheet);
+    for (const auto& t : sheet.texts) md += t + "\n\n";
+    if (md.empty()) return "";
+    std::string display_name = sheet.name.empty()
+        ? ("Sheet " + std::to_string(sheet_num))
+        : sheet.name;
+    return "## " + display_name + "\n\n" + md;
+}
+
+std::string XlsParser::sheet_table(const Sheet& sheet) {
     if (sheet.cells.empty()) return "";
 
     // Determine grid dimensions.
@@ -767,10 +1039,6 @@ std::string XlsParser::sheet_to_markdown(const Sheet& sheet, int sheet_num) {
 
     // Render markdown table.
     std::ostringstream out;
-    std::string display_name = sheet.name.empty()
-        ? ("Sheet " + std::to_string(sheet_num))
-        : sheet.name;
-    out << "## " << display_name << "\n\n";
 
     for (int r = 0; r < used_rows; ++r) {
         out << "|";
@@ -810,15 +1078,13 @@ std::string XlsParser::sheet_to_markdown(const Sheet& sheet, int sheet_num) {
 std::vector<ImageData> XlsParser::extract_images(unsigned min_image_size) {
     std::vector<ImageData> images;
 
-    std::vector<char> wb;
-    if (ole_.has_stream("Workbook")) {
-        wb = ole_.read_stream("Workbook");
-    } else if (ole_.has_stream("Book")) {
-        wb = ole_.read_stream("Book");
-    }
+    std::vector<char> wb = read_workbook_stream();
     if (wb.empty()) return images;
 
-    // Collect all MSODRAWING + CONTINUE data.
+    // Collect the drawing records with their CONTINUEs. The pictures
+    // themselves live in the workbook-wide MSODRAWINGGROUP (its BStore holds
+    // one FBSE per picture, the BLIP inline after it); a sheet's MSODRAWING
+    // only points at them. Reading the sheet records alone found nothing.
     std::vector<char> drawing_data;
     size_t pos = 0;
 
@@ -828,7 +1094,7 @@ std::vector<ImageData> XlsParser::extract_images(unsigned min_image_size) {
         pos += 4;
         if (pos + rec_size > wb.size()) break;
 
-        if (rec_type == RT_MSODRAWING) {
+        if (rec_type == RT_MSODRAWINGGROUP || rec_type == RT_MSODRAWING) {
             drawing_data.insert(drawing_data.end(), wb.data() + pos, wb.data() + pos + rec_size);
             size_t look = pos + rec_size;
             while (look + 4 <= wb.size()) {
@@ -859,6 +1125,22 @@ std::vector<ImageData> XlsParser::extract_images(unsigned min_image_size) {
 
         if (ver == 0x0F) {
             pos += 8;
+            continue;
+        }
+
+        // FBSE: a 36-byte header and an optional name, then the BLIP it
+        // describes. Step onto that BLIP; the loop reads it next.
+        if (rec_type == 0xF007) {
+            size_t fbse_end = pos + 8 + size_t(rec_len);
+            if (rec_len >= 36 && fbse_end <= drawing_data.size()) {
+                uint8_t cb_name = static_cast<uint8_t>(drawing_data[pos + 8 + 33]);
+                size_t blip = pos + 8 + 36 + cb_name;
+                if (blip + 8 <= fbse_end) {
+                    pos = blip;
+                    continue;
+                }
+            }
+            pos = fbse_end;
             continue;
         }
 
@@ -945,19 +1227,20 @@ std::string XlsParser::to_markdown(const ConvertOptions& opts) {
         // An Escher BLIP record declares a type rather than a filename, so
         // store_image settles the extension from the format. An image that
         // could not be written is not referenced.
+        // Without image extraction nothing is linked, as in every other
+        // parser, but a metafile's text is still part of the document.
         for (auto& img : images) {
-            const std::string filename = util::store_image(img, opts);
-            if (filename.empty()) continue;
-            if (opts.images)
+            if (opts.images) {
+                const std::string filename = util::store_image(img, opts);
+                if (filename.empty()) continue;
                 md += "![" + filename + "](" + opts.image_ref_prefix + filename + ")\n\n";
-            else
-                md += "![" + filename + "](" + filename + ")\n\n";
+            }
             if (!img.embedded_text.empty())
                 md += img.embedded_text + "\n\n";
         }
     }
 
-    return md;
+    return md + ole_storage_attachments(ole_, opts);
 }
 
 std::vector<PageChunk> XlsParser::to_chunks(const ConvertOptions& opts) {
@@ -1039,6 +1322,8 @@ std::vector<PageChunk> XlsParser::to_chunks(const ConvertOptions& opts) {
         chunks.push_back(std::move(chunk));
     }
 
+    std::string att = ole_storage_attachments(ole_, opts);
+    if (!att.empty() && !chunks.empty()) chunks.back().text += att;
     return chunks;
 }
 

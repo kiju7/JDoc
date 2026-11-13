@@ -3,14 +3,14 @@
 //
 // Word, Excel and PowerPoint keep an inserted object — a spreadsheet behind a
 // chart, a CAD drawing dropped into a report — as its own package part under
-// <word|xl|ppt>/embeddings/. jdoc does not open those payloads, and dropping
-// them without a word left callers indexing the document with no idea the file
-// was there. This lists them, the way the PDF layer lists /EmbeddedFiles.
+// <word|xl|ppt>/embeddings/. Each is listed by name, the way the PDF layer
+// lists /EmbeddedFiles, followed by its text when it is a document jdoc reads.
 // License: MIT
 
 #include "zip_reader.h"
 #include "jdoc/types.h"
 #include "common/file_utils.h"
+#include "common/embedded.h"
 
 #include <cstring>
 #include <string>
@@ -38,7 +38,8 @@ inline bool is_embedding_part(const std::string& name, std::string& leaf) {
 
 // Markdown for a package's embedded object parts, or "" when it has none.
 // Includes the trailing blank line so callers can append it unconditionally.
-inline std::string format_embedded_parts(const ZipReader& zip) {
+inline std::string format_embedded_parts(const ZipReader& zip,
+                                         const ConvertOptions& opts) {
     std::string list;
     for (const auto& e : zip.entries()) {
         std::string leaf;
@@ -49,6 +50,10 @@ inline std::string format_embedded_parts(const ZipReader& zip) {
         if (e.uncompressed_size > 0)
             list += " (" + util::human_bytes(e.uncompressed_size) + ")";
         list += "\n";
+        auto bytes = zip.read_entry(e);
+        std::string text = embedded_document_text(
+            reinterpret_cast<const uint8_t*>(bytes.data()), bytes.size(), leaf, opts);
+        if (!text.empty()) list += "\n" + text + "\n\n";
     }
     if (list.empty()) return "";
     return "\n## Attachments\n\n" + list + "\n";
@@ -57,9 +62,9 @@ inline std::string format_embedded_parts(const ZipReader& zip) {
 // Mirror the listing into the last chunk, so the chunk APIs and the
 // whole-document API agree about what the package contains. This is what the
 // header/footer and master-layout trailers already do.
-inline void append_embedded_parts(const ZipReader& zip,
+inline void append_embedded_parts(const ZipReader& zip, const ConvertOptions& opts,
                                   std::vector<PageChunk>& chunks) {
-    std::string block = format_embedded_parts(zip);
+    std::string block = format_embedded_parts(zip, opts);
     if (block.empty()) return;
     if (chunks.empty()) {
         PageChunk c;

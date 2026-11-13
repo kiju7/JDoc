@@ -1,8 +1,10 @@
 #include "pdf_extract.h"
+#include "common/file_utils.h"
 #include "common/string_utils.h"
 #include <algorithm>
 #include <cassert>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <functional>
@@ -287,7 +289,11 @@ std::vector<double> find_column_boundaries(
         col_xs = std::move(merged);
     }
 
-    while (col_xs.size() > 9) {
+    // Accepted boundaries already have repeated rule evidence.  Keep wide
+    // grids intact (survey/result tables commonly exceed eight columns) and
+    // retain only a generous safety cap for pathological vector drawings.
+    constexpr size_t kMaxStrongGridColumns = 64;
+    while (col_xs.size() > kMaxStrongGridColumns + 1) {
         double min_gap = 1e9;
         size_t min_idx = 1;
         for (size_t i = 1; i < col_xs.size() - 1; i++) {
@@ -299,22 +305,43 @@ std::vector<double> find_column_boundaries(
     return col_xs;
 }
 
+// cell_bold rides along with rows: every site that reshapes rows moves the
+// mask the same way (no-ops when the table carries no mask).
+static void mask_erase_row(TableData& t, size_t r) {
+    if (r < t.cell_bold.size()) t.cell_bold.erase(t.cell_bold.begin() + r);
+}
+static void mask_erase_col(TableData& t, size_t c) {
+    for (auto& m : t.cell_bold)
+        if (c < m.size()) m.erase(m.begin() + c);
+}
+static void mask_pop_col(TableData& t) {
+    for (auto& m : t.cell_bold)
+        if (!m.empty()) m.pop_back();
+}
+
 void trim_table(TableData& table) {
     auto row_empty = [](const std::vector<std::string>& row) {
         for (auto& c : row) if (!c.empty()) return false;
         return true;
     };
-    while (!table.rows.empty() && row_empty(table.rows.back()))
+    while (!table.rows.empty() && row_empty(table.rows.back())) {
         table.rows.pop_back();
-    while (!table.rows.empty() && row_empty(table.rows.front()))
+        mask_erase_row(table, table.rows.size());
+    }
+    while (!table.rows.empty() && row_empty(table.rows.front())) {
         table.rows.erase(table.rows.begin());
+        mask_erase_row(table, 0);
+    }
 
     while (!table.rows.empty() && !table.rows[0].empty()) {
         int last = (int)table.rows[0].size() - 1;
         bool empty = true;
         for (auto& row : table.rows)
             if (last < (int)row.size() && !row[last].empty()) { empty = false; break; }
-        if (empty) { for (auto& row : table.rows) if (!row.empty()) row.pop_back(); }
+        if (empty) {
+            for (auto& row : table.rows) if (!row.empty()) row.pop_back();
+            mask_pop_col(table);
+        }
         else break;
     }
 }
@@ -324,11 +351,13 @@ std::vector<double> infer_columns_from_text(const PageCharCache& cache,
                                              double left, double right,
                                              const std::vector<double>& row_ys);
 
-TableData build_table(const std::vector<double>& row_ys,
+TableData build_table(const std::vector<double>& input_row_ys,
                        const std::vector<PdfLineSegment>& h_lines,
                        const std::vector<PdfLineSegment>& v_lines,
-                       const PageCharCache& cache) {
+                       const PageCharCache& cache,
+                       bool drawn_rules) {
     TableData table;
+    auto row_ys = input_row_ys;
     double table_top = row_ys.back();
     double table_bot = row_ys.front();
 
@@ -378,6 +407,69 @@ TableData build_table(const std::vector<double>& row_ys,
     auto col_xs = find_column_boundaries(v_lines, h_lines, table_left, table_right,
                                           table_bot, table_top, row_ys);
 
+    auto closed_grid = [&](const std::vector<double>& columns) {
+        if (!drawn_rules || row_ys.size() < 3 || columns.size() < 2) return false;
+        auto covered = [](std::vector<std::pair<double,double>> spans, double lo) {
+            std::sort(spans.begin(), spans.end());
+            double total = 0, end = lo;
+            for (const auto& span : spans) {
+                total += std::max(0.0, span.second - std::max(end, span.first));
+                end = std::max(end, span.second);
+            }
+            return total;
+        };
+        for (double y : row_ys) {
+            std::vector<std::pair<double,double>> spans;
+            for (const auto& line : h_lines) {
+                if (std::abs((line.y0 + line.y1) * 0.5 - y) > 3) continue;
+                double lo = std::max(columns.front(), double(std::min(line.x0,line.x1)));
+                double hi = std::min(columns.back(), double(std::max(line.x0,line.x1)));
+                if (hi > lo) spans.push_back({lo,hi});
+            }
+            if (covered(spans,columns.front()) < (columns.back()-columns.front())*.8) return false;
+        }
+        for (double x : columns) {
+            for (size_t r = 0; r+1 < row_ys.size(); ++r) {
+                double lo = row_ys[r], hi = row_ys[r+1];
+                std::vector<std::pair<double,double>> spans;
+                for (const auto& line : v_lines) {
+                    if (std::abs((line.x0+line.x1)*.5-x)>3) continue;
+                    double a=std::max(lo,double(std::min(line.y0,line.y1)));
+                    double b=std::min(hi,double(std::max(line.y0,line.y1)));
+                    if (b>a) spans.push_back({a,b});
+                }
+                if (covered(spans,lo)<(hi-lo)*.8) return false;
+            }
+        }
+        return true;
+    };
+    // Segmented rectangle borders also contribute vertical endpoints inside
+    // each cell. In a verified one-column grid only its horizontal divisions
+    // are row boundaries; retain the original levels if outer closure fails.
+    if (drawn_rules && col_xs.size() == 2) {
+        std::vector<double> drawn_levels;
+        for (double y : row_ys) {
+            bool ruled = false;
+            for (const auto& line : h_lines)
+                if (std::abs((line.y0+line.y1)*.5-y)<3 &&
+                    std::min(line.x0,line.x1)<=table_left+2 &&
+                    std::max(line.x0,line.x1)>=table_right-2) ruled = true;
+            if (ruled) drawn_levels.push_back(y);
+        }
+        if (drawn_levels.size() >= 4) {
+            auto original = row_ys;
+            row_ys = std::move(drawn_levels);
+            if (!closed_grid(col_xs)) row_ys = std::move(original);
+        }
+    }
+    bool drawn_single_column = row_ys.size() >= 4 && col_xs.size() == 2 && closed_grid(col_xs);
+    if (table_debug()) {
+        fprintf(stderr, "[ruled-columns] drawn %d single %d x %.1f..%.1f cols %zu levels",
+                drawn_rules, drawn_single_column, table_left, table_right, col_xs.size());
+        for (double y : row_ys) fprintf(stderr, " %.1f", y);
+        fprintf(stderr, "\n");
+    }
+
     int internal_vline_count = 0;
     for (auto& vl : v_lines) {
         double vx = (vl.x0 + vl.x1) / 2.0;
@@ -390,16 +482,226 @@ TableData build_table(const std::vector<double>& row_ys,
     }
 
     if (col_xs.size() < 3 && internal_vline_count == 0) {
-        col_xs = infer_columns_from_text(cache, table_left, table_right, row_ys);
+        auto inferred = infer_columns_from_text(cache, table_left, table_right, row_ys);
+        if (!drawn_single_column || inferred.size() >= 3) {
+            col_xs = std::move(inferred);
+            drawn_single_column = false;
+        }
     }
 
-    if (col_xs.size() < 3) {
+    // A drawn grid may omit single rules (a subdivided header cell whose
+    // data columns are separated by whitespace only).  When text alignment
+    // independently reproduces most drawn boundaries, its extra boundaries
+    // inside unusually wide columns are trusted as the omitted rules.  The
+    // added boundaries carry no v-lines, so they are exempted from the
+    // v-line colspan logic below.
+    std::vector<double> text_boundaries;
+    if (col_xs.size() >= 4 && internal_vline_count > 0) {
+        auto inferred = infer_columns_from_text(cache, table_left,
+                                                table_right, row_ys);
+        std::vector<double> widths;
+        for (size_t i = 1; i < col_xs.size(); i++)
+            widths.push_back(col_xs[i] - col_xs[i - 1]);
+        std::nth_element(widths.begin(), widths.begin() + widths.size() / 2,
+                         widths.end());
+        double median_w = widths[widths.size() / 2];
+        // Right-aligned values shift a whitespace gap's center away from
+        // the drawn rule, so alignment is judged at column scale.
+        double align_tol = std::max(12.0, median_w * 0.4);
+        size_t internal_n = col_xs.size() - 2;
+        int aligned = 0;
+        for (size_t i = 1; i + 1 < col_xs.size(); i++)
+            for (double tx : inferred)
+                if (std::abs(tx - col_xs[i]) < align_tol) { aligned++; break; }
+        if (internal_n > 0 && aligned * 10 >= (int)internal_n * 7) {
+            for (size_t j = 1; j + 1 < inferred.size(); j++) {
+                double tx = inferred[j];
+                // The offset twin of a drawn rule is not a new boundary.
+                bool near_drawn = false;
+                for (double cx : col_xs)
+                    if (std::abs(cx - tx) < align_tol) { near_drawn = true; break; }
+                if (near_drawn) continue;
+                auto it = std::upper_bound(col_xs.begin(), col_xs.end(), tx);
+                if (it == col_xs.begin() || it == col_xs.end()) continue;
+                double lo = *(it - 1), hi = *it;
+                if (hi - lo < median_w * 1.5) continue;    // not a wide column
+                if (tx - lo < 15.0 || hi - tx < 15.0) continue;
+                // An omitted rule separates text on both of its sides;
+                // whitespace with no text at all on one side is the padding
+                // of a wide left- or right-aligned column, not a column.
+                int left_rows = 0, right_rows = 0;
+                for (size_t r = 0; r + 1 < row_ys.size(); r++) {
+                    double rb = std::min(row_ys[r], row_ys[r + 1]);
+                    double rt = std::max(row_ys[r], row_ys[r + 1]);
+                    bool has_l = false, has_r = false;
+                    for (auto& ch : cache.chars) {
+                        if (ch.unicode == ' ' || ch.unicode == 0xA0 ||
+                            ch.unicode == '\t') continue;
+                        if (ch.y <= rb || ch.y >= rt) continue;
+                        if (ch.x > lo && ch.x < tx) has_l = true;
+                        else if (ch.x > tx && ch.x < hi) has_r = true;
+                    }
+                    left_rows += has_l;
+                    right_rows += has_r;
+                }
+                if (left_rows == 0 || right_rows == 0) continue;
+                // An omitted rule has whitespace under it. Lines whose run of
+                // glyphs passes over tx with no more than a word space say tx
+                // is inside one cell's text; when several lines do and no
+                // line leaves a gap at tx, nothing in the column is split
+                // there and tx is not between two cells. (A wide header over
+                // two columns crosses while the body lines leave the gap.)
+                bool crossed = false;
+                {
+                    struct LineAt { double y, fs, l_right, r_left; bool over; };
+                    std::vector<LineAt> lines;
+                    for (auto& ch : cache.chars) {
+                        if (ch.unicode == ' ' || ch.unicode == 0xA0 ||
+                            ch.unicode == '\t') continue;
+                        if (ch.y <= row_ys.front() || ch.y >= row_ys.back()) continue;
+                        if (ch.right < lo || ch.left > hi) continue;
+                        double fs = std::max(ch.font_size, 4.0);
+                        LineAt* ln = nullptr;
+                        for (auto& l : lines)
+                            if (std::abs(l.y - ch.y) < std::max(l.fs, fs) * 0.3) { ln = &l; break; }
+                        if (!ln) { lines.push_back({ch.y, fs, -1e9, 1e9, false}); ln = &lines.back(); }
+                        if (ch.left < tx - 0.5 && ch.right > tx + 0.5) ln->over = true;
+                        else if (ch.right <= tx + 0.5) ln->l_right = std::max(ln->l_right, (double)ch.right);
+                        else ln->r_left = std::min(ln->r_left, (double)ch.left);
+                    }
+                    int over = 0, gapped = 0;
+                    for (const auto& l : lines) {
+                        if (l.over) { ++over; continue; }
+                        if (l.l_right < -1e8 || l.r_left > 1e8) continue;
+                        if (l.r_left - l.l_right < l.fs * 0.6) ++over; else ++gapped;
+                    }
+                    crossed = over >= 2 && gapped == 0;
+                }
+                if (crossed) continue;
+                text_boundaries.push_back(tx);
+            }
+            if (!text_boundaries.empty()) {
+                col_xs.insert(col_xs.end(), text_boundaries.begin(),
+                              text_boundaries.end());
+                std::sort(col_xs.begin(), col_xs.end());
+            }
+        }
+    }
+
+    if (col_xs.size() < 3 && !drawn_single_column) {
         table.rows.clear();
         return table;
     }
 
+    // Per-level h-rule coverage (fraction of the grid width that carries a
+    // rule) feeds the edge tolerance below and both closed-grid tests
+    // further down.  Use the drawn row levels here, not text-derived row
+    // splits: a ruled section may contain several wrapped logical rows
+    // between two horizontal borders while remaining a closed grid.
+    const double grid_width = table_right - table_left;
+    std::vector<double> level_coverage;
+    for (double ry : row_ys) {
+        std::vector<std::pair<double,double>> intervals;
+        for (auto& hl : h_lines) {
+            double hy = (hl.y0 + hl.y1) / 2.0;
+            if (std::abs(hy - ry) > 4.0) continue;
+            double lo = std::max(table_left,
+                                 std::min((double)hl.x0, (double)hl.x1));
+            double hi = std::min(table_right,
+                                 std::max((double)hl.x0, (double)hl.x1));
+            if (hi > lo) intervals.push_back({lo, hi});
+        }
+        std::sort(intervals.begin(), intervals.end());
+        double coverage = 0;
+        if (!intervals.empty()) {
+            double lo = intervals[0].first, hi = intervals[0].second;
+            for (size_t i = 1; i < intervals.size(); i++) {
+                if (intervals[i].first <= hi + 2.0)
+                    hi = std::max(hi, intervals[i].second);
+                else {
+                    coverage += hi - lo;
+                    lo = intervals[i].first;
+                    hi = intervals[i].second;
+                }
+            }
+            coverage += hi - lo;
+        }
+        level_coverage.push_back(grid_width > 0 ? coverage / grid_width : 0.0);
+    }
+
+    // Sparse text is expected in recording forms. Preserve empty cells only
+    // with full drawn row divisions and outer borders, never with inferred
+    // columns or a single framed prose box.
+    bool structural_form = closed_grid(col_xs) && text_boundaries.empty();
+    if (structural_form) {
+        int populated_rows = 0, paired_rows = 0, keys = 0;
+        for (size_t r = 0; r+1 < row_ys.size(); ++r) {
+            int filled = 0;
+            for (size_t c = 0; c+1 < col_xs.size(); ++c)
+                if (!cache.get_text_in_rect(col_xs[c], row_ys[r+1],
+                                            col_xs[c+1], row_ys[r]).empty()) ++filled;
+            populated_rows += filled > 0;
+            paired_rows += filled >= 2;
+            keys += !cache.get_text_in_rect(col_xs[0], row_ys[r+1],
+                                            col_xs[1], row_ys[r]).empty();
+        }
+        structural_form = populated_rows >= 3 && paired_rows < 3 &&
+                          keys * 5 >= int(row_ys.size()-1) * 4;
+        if (structural_form && col_xs.size() == 2) {
+            int multi_column_rows = 0;
+            for (size_t r=0;r+1<row_ys.size();++r) {
+                std::vector<const PageCharCache::CharInfo*> glyphs;
+                for (const auto& ch : cache.chars)
+                    if (ch.y > row_ys[r] && ch.y < row_ys[r+1] &&
+                        ch.left >= col_xs.front() && ch.right <= col_xs.back() &&
+                        ch.unicode != ' ' && ch.unicode != '\t' && ch.unicode != 0xA0)
+                        glyphs.push_back(&ch);
+                std::sort(glyphs.begin(),glyphs.end(),
+                    [](const auto* a,const auto* b){return a->left<b->left;});
+                int gaps = 0;
+                for (size_t i=1;i<glyphs.size();++i)
+                    if (std::abs(glyphs[i]->y-glyphs[i-1]->y)<3 &&
+                        glyphs[i]->left-glyphs[i-1]->right >
+                        std::max(glyphs[i]->font_size,glyphs[i-1]->font_size)*1.5) ++gaps;
+                if (gaps>=2) ++multi_column_rows;
+            }
+            if (multi_column_rows >= 3) structural_form = false;
+        }
+    }
+
+    // A header and one fully boxed data row can contain lists. Continuous
+    // outer and inner borders distinguish it from a booktabs data section.
+    bool boxed_two_row = row_ys.size() == 3 && col_xs.size() >= 3 &&
+                         text_boundaries.empty() && closed_grid(col_xs);
+    for (size_t c=1; boxed_two_row && c+1<col_xs.size();++c)
+        for (const auto& ch : cache.chars)
+            if (ch.y > row_ys.front() && ch.y < row_ys.back() &&
+                ch.unicode != ' ' && ch.left+ch.font_size*.2 < col_xs[c] &&
+                ch.right-ch.font_size*.2 > col_xs[c]) boxed_two_row = false;
+    // Fully boxed means unbroken: an inner divider with a gap lets a line
+    // span two cells, which is row structure inside the box, not a list.
+    for (size_t c = 1; boxed_two_row && c + 1 < col_xs.size(); ++c)
+        for (size_t r = 0; boxed_two_row && r + 1 < row_ys.size(); ++r) {
+            double lo = row_ys[r], hi = row_ys[r + 1], end = lo, covered = 0;
+            std::vector<std::pair<double, double>> spans;
+            for (const auto& line : v_lines) {
+                if (std::abs((line.x0 + line.x1) * 0.5 - col_xs[c]) > 3) continue;
+                double y0 = std::max(lo, double(std::min(line.y0, line.y1)));
+                double y1 = std::min(hi, double(std::max(line.y0, line.y1)));
+                if (y1 > y0) spans.push_back({y0, y1});
+            }
+            std::sort(spans.begin(), spans.end());
+            for (const auto& span : spans) {
+                covered += std::max(0.0, span.second - std::max(end, span.first));
+                end = std::max(end, span.second);
+            }
+            if (covered < (hi - lo) - 3.0) boxed_two_row = false;
+        }
+    if (boxed_two_row) table.wrapped_closed_grid = true;
     std::vector<double> actual_ys;
+    std::vector<double> split_centers;
     bool merge_wrap_rows = false;
+    bool rows_are_drawn = true;   // rows are the drawn rule intervals
     {
         double tl = col_xs.front(), tr = col_xs.back();
         double row_h = (row_ys.size() >= 2) ? (row_ys[1] - row_ys[0]) : 18.0;
@@ -446,10 +748,16 @@ TableData build_table(const std::vector<double>& row_ys,
         double tb = row_ys.front(), tt = row_ys.back();
         // Only centers inside the grid count: a page heading sharing the
         // table's x-band would otherwise inject a phantom row boundary and
-        // break the monotonic row order.
+        // break the monotonic row order. A fully drawn outer rule closes
+        // its edge — a caption or unit note hugging the border stays out —
+        // while an open edge keeps the half-row margin for rule-less rows.
+        double top_tol = (!level_coverage.empty() &&
+                          level_coverage.back() >= 0.7) ? 2.0 : row_h * 0.5;
+        double bot_tol = (!level_coverage.empty() &&
+                          level_coverage.front() >= 0.7) ? 2.0 : row_h * 0.5;
         std::vector<double> grid_centers;
         for (double tc : table_row_centers)
-            if (tc >= tb - row_h * 0.5 && tc <= tt + row_h * 0.5)
+            if (tc >= tb - bot_tol && tc <= tt + top_tol)
                 grid_centers.push_back(tc);
         int rows_in_grid = (int)grid_centers.size();
 
@@ -463,10 +771,94 @@ TableData build_table(const std::vector<double>& row_ys,
         bool use_text_rows = ((rows_in_grid < n_rows_expected * 0.9) &&
                               (rows_in_grid >= n_rows_expected * 0.8)) ||
                              under_segmented;
-        merge_wrap_rows = under_segmented;
+        // Several physical text lines do not imply several logical rows
+        // inside a closed grid. A single-line stub beside wrapped prose in
+        // multiple cells is positive evidence for the drawn row bands. In
+        // contrast, sparse ruled groups of short values still need the text
+        // split above, even when their group label appears only once.
+        bool wrapped_grid = under_segmented && drawn_rules && n_cols_found >= 3 &&
+                            text_boundaries.empty();
+        for (double coverage : level_coverage)
+            if (coverage < 0.8) wrapped_grid = false;
+        for (size_t r = 0; wrapped_grid && r + 1 < row_ys.size(); ++r) {
+            double bottom = row_ys[r], top = row_ys[r + 1];
+            for (int c = 1; wrapped_grid && c < n_cols_found; ++c) {
+                std::vector<std::pair<double, double>> spans;
+                for (const auto& line : v_lines) {
+                    if (std::abs((line.x0 + line.x1) * 0.5 - col_xs[c]) > 4.0) continue;
+                    double lo = std::max(bottom, double(std::min(line.y0, line.y1)));
+                    double hi = std::min(top, double(std::max(line.y0, line.y1)));
+                    if (hi > lo) spans.push_back({lo, hi});
+                }
+                std::sort(spans.begin(), spans.end());
+                double coverage = 0, end = bottom;
+                for (const auto& span : spans) {
+                    coverage += std::max(0.0, span.second - std::max(end, span.first));
+                    end = std::max(end, span.second);
+                }
+                if (coverage < (top - bottom) * 0.8) wrapped_grid = false;
+            }
+            int physical_rows = 0;
+            for (double y : grid_centers) if (y > bottom && y < top) ++physical_rows;
+            if (!wrapped_grid || physical_rows <= 1) continue;
+            int prose_cells = 0;
+            for (int c = 0; c < n_cols_found; ++c) {
+                std::vector<const PageCharCache::CharInfo*> glyphs;
+                double fs = 4.0;
+                for (const auto& ch : cache.chars) {
+                    if (ch.unicode == ' ' || ch.unicode == '\t' || ch.unicode == 0xA0) continue;
+                    double x = (ch.left + ch.right) * 0.5;
+                    if (x <= col_xs[c] || x >= col_xs[c + 1] || ch.y <= bottom || ch.y >= top) continue;
+                    glyphs.push_back(&ch);
+                    fs = std::max(fs, ch.font_size);
+                }
+                std::sort(glyphs.begin(), glyphs.end(),
+                    [](const auto* a, const auto* b) { return a->y < b->y; });
+                struct Line { double y, lo, hi; };
+                std::vector<Line> lines;
+                size_t letters = 0;
+                for (const auto* ch : glyphs) {
+                    auto u = ch->unicode;
+                    letters += (u >= 'A' && u <= 'Z') || (u >= 'a' && u <= 'z') ||
+                               (u >= 0x2E80 && u <= 0xD7AF);
+                    if (lines.empty() || ch->y - lines.back().y > std::max(2.0, fs * 0.4))
+                        lines.push_back({ch->y, ch->left, ch->right});
+                    else {
+                        lines.back().lo = std::min(lines.back().lo, ch->left);
+                        lines.back().hi = std::max(lines.back().hi, ch->right);
+                    }
+                }
+                if (c == 0) {
+                    if (lines.size() != 1) wrapped_grid = false;
+                    continue;
+                }
+                int wide_lines = 0;
+                bool continuous_leading = true;
+                for (size_t k = 0; k < lines.size(); ++k) {
+                    const auto& line = lines[k];
+                    if (line.hi - line.lo >= (col_xs[c + 1] - col_xs[c]) * 0.5) ++wide_lines;
+                    // Blank space between independent text records is a
+                    // row cue, even when the records themselves are long.
+                    if (k && line.y - lines[k - 1].y > fs * 1.8) continuous_leading = false;
+                }
+                if (lines.size() >= 3 && wide_lines >= 2 && continuous_leading &&
+                    letters * 2 >= glyphs.size()) ++prose_cells;
+            }
+            if (prose_cells < 2) wrapped_grid = false;
+        }
+        table.wrapped_closed_grid = wrapped_grid || boxed_two_row;
+        if (wrapped_grid) use_text_rows = false;
+        merge_wrap_rows = under_segmented && use_text_rows;
 
+
+        if (structural_form || boxed_two_row) {
+            use_text_rows = false;
+            merge_wrap_rows = false;
+        }
         if (use_text_rows && !grid_centers.empty()) {
+            rows_are_drawn = false;
             std::sort(grid_centers.begin(), grid_centers.end());
+            split_centers = grid_centers;
             double half = std::min(row_h / 2.0, 10.0);
             // Clamp to h-line grid boundaries — don't extend beyond the table
             double grid_top = row_ys.back() + half;
@@ -480,6 +872,13 @@ TableData build_table(const std::vector<double>& row_ys,
         }
     }
 
+    if (table_debug()) {
+        fprintf(stderr, "[ruled-build] x %.1f..%.1f y %.1f..%.1f wrapped %d cols", table_left, table_right, table_bot, table_top, table.wrapped_closed_grid);
+        for (double x : col_xs) fprintf(stderr, " %.1f", x);
+        fprintf(stderr, " rows");
+        for (double y : actual_ys) fprintf(stderr, " %.1f", y);
+        fprintf(stderr, "\n");
+    }
     int n_rows = (int)actual_ys.size() - 1;
     int n_cols = (int)col_xs.size() - 1;
 
@@ -489,10 +888,12 @@ TableData build_table(const std::vector<double>& row_ys,
     table.y1 = actual_ys.back();
 
     int last_col_idx = n_cols - 1;
-    auto sub_boundaries = detect_response_boundaries(cache,
-        col_xs[last_col_idx], col_xs[last_col_idx + 1], actual_ys);
+    auto sub_boundaries = (structural_form || boxed_two_row) ? std::vector<double>{} :
+        detect_response_boundaries(cache,
+            col_xs[last_col_idx], col_xs[last_col_idx + 1], actual_ys);
     int n_sub = sub_boundaries.empty() ? 0 : (int)sub_boundaries.size() - 1;
     int total_cols = (n_sub > 1) ? (n_cols - 1 + n_sub) : n_cols;
+    if (n_sub <= 1) table.col_xs = col_xs;
 
     // Detect merged cells: check v-line presence at each internal boundary per row
     // has_vline[r][b] = true if a v-line exists near col_xs[b] spanning row r
@@ -518,6 +919,35 @@ TableData build_table(const std::vector<double>& row_ys,
             has_vline[r][b] = found;
         }
     }
+    // Boundaries taken from text alignment have no rule to find: they
+    // separate columns by definition, in every row.
+    for (double tx : text_boundaries)
+        for (int b = 1; b < n_cols; b++)
+            if (std::abs(col_xs[b] - tx) < 1.0)
+                for (int r = 0; r < n_rows; r++)
+                    has_vline[r][b] = true;
+
+    // A dense closed grid is stronger table evidence than small glyph/rule
+    // overlaps.  Some producers place long labels almost flush with borders,
+    // which makes the crossing heuristic below reject otherwise complete
+    // rectangular tables.  Require both horizontal and vertical coverage so
+    // diagram boxes do not receive the exemption.
+    bool dense_closed_grid = structural_form || boxed_two_row || (n_rows >= 3 && n_cols >= 2);
+    if (dense_closed_grid) {
+        int ruled_levels = 0;
+        for (double c : level_coverage)
+            if (c >= 0.8) ruled_levels++;
+        int min_ruled_levels = std::max(3, static_cast<int>(
+            std::ceil(row_ys.size() * 0.8)));
+        dense_closed_grid = ruled_levels >= min_ruled_levels;
+        for (int b = 1; dense_closed_grid && b < n_cols; b++) {
+            int covered_rows = 0;
+            for (int r = 0; r < n_rows; r++)
+                if (has_vline[r][b]) covered_rows++;
+            if (covered_rows * 5 < n_rows * 4)
+                dense_closed_grid = false;
+        }
+    }
 
     // Check v-line grid density: a real table has v-lines in most row/boundary positions.
     // Stray v-lines from body text have sparse coverage.
@@ -531,14 +961,29 @@ TableData build_table(const std::vector<double>& row_ys,
     if (vline_total > 0 && vline_present < vline_total && vline_present >= vline_total * 0.4)
         has_merged_cells = true;
 
+    // Merged-cell spans are keyed on missing v-lines, but a grid whose
+    // columns came from text alignment has no v-lines anywhere — every span
+    // would swallow the whole row. Such grids keep one cell per column.
+    const bool spans_from_vlines = internal_vline_count > 0;
+
+    // Keep physical boundary evidence alongside text-derived rows. After a
+    // continuation is removed, the next row still needs its original rule
+    // evidence, not an index into the now-shorter text matrix.
+    std::vector<std::vector<bool>> rule_above(
+        n_rows, std::vector<bool>(total_cols, false));
+    // Cells that are one grid column wide, for the row-span pass below.
+    std::vector<std::vector<char>> single(n_rows, std::vector<char>(total_cols, 0));
     table.rows.resize(n_rows);
+    table.cell_bold.assign(n_rows, {});
     for (int r = 0; r < n_rows; r++) {
         table.rows[r].resize(total_cols);
+        table.cell_bold[r].assign(total_cols, 0);
         int c = 0;
         while (c < n_cols) {
             // Determine span: extend while no v-line at next boundary
             int span = 1;
-            while (c + span < n_cols && !has_vline[r][c + span])
+            while (spans_from_vlines && c + span < n_cols &&
+                   !has_vline[r][c + span])
                 span++;
 
             double left   = col_xs[c];
@@ -546,27 +991,166 @@ TableData build_table(const std::vector<double>& row_ys,
             double bottom = actual_ys[r];
             double top    = actual_ys[r + 1];
 
+            auto separated_above = [&](double left, double right) {
+                if (!merge_wrap_rows || r + 1 >= n_rows) return false;
+                // Reading order is reversed below. A rule between this line
+                // and the line above it prohibits continuation in this cell.
+                // Use the actual text centers: the rule need not coincide
+                // with the midpoint chosen for text extraction.
+                struct Stroke { double y, left, right; };
+                std::vector<Stroke> strokes;
+                for (const auto& line : h_lines) {
+                    double y = (line.y0 + line.y1) * 0.5;
+                    if (y <= split_centers[r] || y >= split_centers[r + 1])
+                        continue;
+                    double lo = std::max(left, double(std::min(line.x0, line.x1)));
+                    double hi = std::min(right, double(std::max(line.x0, line.x1)));
+                    if (hi > lo) strokes.push_back({y, lo, hi});
+                }
+                std::sort(strokes.begin(), strokes.end(),
+                    [](const Stroke& a, const Stroke& b) { return a.y < b.y; });
+                // Only strokes on one rule level can close the cell. Use
+                // the same 4-point level tolerance as the grid coverage
+                // test, anchored to the first stroke to avoid chaining
+                // several staggered levels into one apparent border.
+                for (size_t start = 0; start < strokes.size(); ) {
+                    size_t next = start;
+                    std::vector<std::pair<double, double>> intervals;
+                    while (next < strokes.size() &&
+                           strokes[next].y - strokes[start].y <= 4.0) {
+                        intervals.push_back({strokes[next].left, strokes[next].right});
+                        ++next;
+                    }
+                    std::sort(intervals.begin(), intervals.end());
+                    double coverage = 0, end = left;
+                    for (const auto& interval : intervals) {
+                        coverage += std::max(0.0, interval.second -
+                                                  std::max(end, interval.first));
+                        end = std::max(end, interval.second);
+                    }
+                    if (coverage >= (right - left) * 0.8) return true;
+                    start = next;
+                }
+                return false;
+            };
+
+            // A cell set entirely in a bold face keeps the emphasis (mask
+            // only; the text stays bare for the shape heuristics below).
+            auto fill_cell = [&](int col, double l, double t, double rt, double b) {
+                rule_above[r][col] = separated_above(l, rt);
+                bool bold = false;
+                table.rows[r][col] = cache.get_text_in_rect(l, t, rt, b, &bold);
+                table.cell_bold[r][col] = bold && !table.rows[r][col].empty();
+            };
             if (c + span - 1 == last_col_idx && n_sub > 1 && span == 1) {
                 if (is_scale_row(cache, left, right, bottom, top, sub_boundaries)) {
                     for (int sc = 0; sc < n_sub; sc++) {
-                        table.rows[r][n_cols - 1 + sc] = cache.get_text_in_rect(
+                        fill_cell(n_cols - 1 + sc,
                             sub_boundaries[sc], top, sub_boundaries[sc+1], bottom);
                     }
                 } else {
-                    table.rows[r][c] = cache.get_text_in_rect(left, top, right, bottom);
+                    fill_cell(c, left, top, right, bottom);
                 }
             } else {
-                table.rows[r][c] = cache.get_text_in_rect(left, top, right, bottom);
+                fill_cell(c, left, top, right, bottom);
             }
+            // A cell the author ruled off: its row is a drawn interval
+            // (rules across the grid above and below) and a column rule
+            // runs beside it.
+            bool ruled_side = (c > 0 && has_vline[r][c]) ||
+                              (c + span < n_cols && has_vline[r][c + span]);
+            bool drawn_row = rows_are_drawn &&
+                             level_coverage[r] >= 0.8 &&
+                             level_coverage[r + 1] >= 0.8;
+            if (!(ruled_side && drawn_row))
+                table.open_cell_max = std::max(table.open_cell_max,
+                                               table.rows[r][c].size());
+            if (span == 1 && n_sub <= 1) single[r][c] = 1;
             c += span;
         }
     }
 
+    // Row spans: a drawn level that rules the other columns but stops short
+    // of one leaves that column's cell open across it ("Decoding" beside
+    // the two decoding parameters). The cell's text sits wherever the
+    // producer centred it, often in a middle row; it belongs to the span's
+    // first row, the others left empty. Rows from text alignment, and
+    // levels that rule no column at all (an open body between a header
+    // and a bottom rule), are not spans. Nor is the top row's lower level:
+    // a header rule is often drawn cell by cell, and a cell's piece too
+    // short to count as a rule must not join the header to the body.
+    if (rows_are_drawn && n_rows >= 3 && n_sub <= 1) {
+        auto covered = [&](double y, double lo, double hi) {
+            std::vector<std::pair<double, double>> iv;
+            for (const auto& hl : h_lines) {
+                if (std::abs((hl.y0 + hl.y1) / 2.0 - y) > 4.0) continue;
+                double a = std::max(lo, double(std::min(hl.x0, hl.x1)));
+                double b = std::min(hi, double(std::max(hl.x0, hl.x1)));
+                if (b > a) iv.push_back({a, b});
+            }
+            std::sort(iv.begin(), iv.end());
+            double cov = 0, end = lo;
+            for (const auto& [a, b] : iv) {
+                cov += std::max(0.0, b - std::max(end, a));
+                end = std::max(end, b);
+            }
+            return cov >= (hi - lo) * 0.5;
+        };
+        // Level k parts rows k-1 and k (bottom first): ruled per column.
+        std::vector<std::vector<char>> ruled(n_rows, std::vector<char>(n_cols, 0));
+        std::vector<char> any_ruled(n_rows, 0);
+        for (int k = 1; k < n_rows; k++)
+            for (int c = 0; c < n_cols; c++) {
+                ruled[k][c] = covered(actual_ys[k], col_xs[c], col_xs[c + 1]);
+                any_ruled[k] |= ruled[k][c];
+            }
+        for (int c = 0; c < n_cols; c++) {
+            for (int a = 0; a < n_rows; ) {
+                int b = a;
+                while (b + 1 < n_rows - 1 && any_ruled[b + 1] && !ruled[b + 1][c] &&
+                       single[b][c] && single[b + 1][c])
+                    b++;
+                // One cell's text, in one row of the run: rows that each
+                // hold a value are rows of their own whatever the rules.
+                // Every row of the span is a row of the table beside it (a
+                // spacer row is not), and its first row is not a header
+                // the label would be pulled into (all bold where the
+                // label's row is not).
+                int filled = 0, at = -1;
+                for (int r = a; r <= b; r++)
+                    if (!table.rows[r][c].empty()) { filled++; at = r; }
+                auto others = [&](int r, bool bold_only) {
+                    int n = 0, bold = 0;
+                    for (int k = 0; k < n_cols; k++)
+                        if (k != c && !table.rows[r][k].empty()) {
+                            n++;
+                            bold += table.cell_bold[r][k] != 0;
+                        }
+                    return bold_only ? n > 0 && bold == n : n > 0;
+                };
+                bool rows_ok = true;
+                for (int r = a; r <= b; r++) rows_ok = rows_ok && others(r, false);
+                if (rows_ok && at >= 0 && others(b, true) && !others(at, true)) rows_ok = false;
+                if (b > a && filled == 1 && at != b && rows_ok) {
+                    // Rows a..b, bottom first: the top row is b.
+                    table.rows[b][c] = std::move(table.rows[at][c]);
+                    table.rows[at][c].clear();
+                    table.cell_bold[b][c] = table.cell_bold[at][c];
+                    table.cell_bold[at][c] = 0;
+                }
+                a = b + 1;
+            }
+        }
+    }
+
     std::reverse(table.rows.begin(), table.rows.end());
+    std::reverse(table.cell_bold.begin(), table.cell_bold.end());
+    std::reverse(rule_above.begin(), rule_above.end());
 
     // Text-row splitting of an under-segmented grid separates the wrap
     // lines of multi-line cells into their own rows; a row with a single
-    // filled cell under a filled cell is such a fragment.
+    // filled cell under a filled cell may be such a fragment, but never
+    // across a horizontal rule that closes that cell.
     if (merge_wrap_rows) {
         for (size_t r = 1; r < table.rows.size(); ) {
             auto& row = table.rows[r];
@@ -574,7 +1158,8 @@ TableData build_table(const std::vector<double>& row_ys,
             for (int c = 0; c < (int)row.size(); c++)
                 if (!row[c].empty()) { filled++; fc = c; }
             auto& prev = table.rows[r - 1];
-            if (filled == 1 && fc < (int)prev.size() && !prev[fc].empty()) {
+            if (filled == 1 && fc < (int)prev.size() && !prev[fc].empty() &&
+                !rule_above[r][fc]) {
                 bool digit_wrap = prev[fc].size() >= 2 &&
                                   prev[fc].back() == '-' &&
                                   prev[fc][prev[fc].size() - 2] >= '0' &&
@@ -583,13 +1168,55 @@ TableData build_table(const std::vector<double>& row_ys,
                 if (!digit_wrap) prev[fc] += " ";
                 prev[fc] += row[fc];
                 table.rows.erase(table.rows.begin() + r);
+                rule_above.erase(rule_above.begin() + r);
+                mask_erase_row(table, r);
             } else {
                 r++;
             }
         }
     }
 
-    trim_table(table);
+    // Text-split rows are no drawn cells; every cell counts (and wrap
+    // merging above may have grown them).
+    if (!rows_are_drawn)
+        for (auto& row : table.rows)
+            for (auto& cell : row)
+                table.open_cell_max = std::max(table.open_cell_max, cell.size());
+
+    if (!structural_form) trim_table(table);
+
+    // Key/description tables can contain whole paragraphs. Accept their
+    // length only when every logical band is drawn and the divider covers
+    // the band, with a populated short key beside each description.
+    if (drawn_rules && n_cols == 2 && actual_ys == row_ys &&
+        table.rows.size() >= 3 && text_boundaries.empty()) {
+        bool verified = !level_coverage.empty();
+        for (double coverage : level_coverage)
+            if (coverage < 0.8) verified = false;
+        for (int r = 0; verified && r < n_rows; ++r) {
+            double lo = actual_ys[r], hi = actual_ys[r + 1];
+            std::vector<std::pair<double, double>> spans;
+            for (const auto& line : v_lines) {
+                if (std::abs((line.x0 + line.x1) * 0.5 - col_xs[1]) > 4) continue;
+                double a = std::max(lo, double(std::min(line.y0, line.y1)));
+                double b = std::min(hi, double(std::max(line.y0, line.y1)));
+                if (b > a) spans.push_back({a, b});
+            }
+            std::sort(spans.begin(), spans.end());
+            double covered = 0, end = lo;
+            for (const auto& span : spans) {
+                covered += std::max(0.0, span.second - std::max(end, span.first));
+                end = std::max(end, span.second);
+            }
+            if (covered < (hi - lo) * 0.8) verified = false;
+        }
+        int paired_keys = 0;
+        for (const auto& row : table.rows)
+            if (row.size() == 2 && !row[0].empty() && row[0].size() <= 100 &&
+                !row[1].empty()) ++paired_keys;
+        if (verified && paired_keys * 5 >= int(table.rows.size()) * 4)
+            table.wrapped_closed_grid = true;
+    }
 
     // Extract title rows: rows at top where only one cell has content,
     // the table has 3+ columns, and the text is long (form titles inside table borders).
@@ -606,6 +1233,7 @@ TableData build_table(const std::vector<double>& row_ys,
             if (!table.title.empty()) table.title += " ";
             table.title += row[0];
             table.rows.erase(table.rows.begin());
+            mask_erase_row(table, 0);
         }
     }
 
@@ -615,7 +1243,124 @@ TableData build_table(const std::vector<double>& row_ys,
         for (auto& cell : row) if (!cell.empty()) filled_cols++;
         if (filled_cols >= 2) meaningful_rows++;
     }
-    if (meaningful_rows < 3) table.rows.clear();
+    // A fully boxed small grid (header plus one data row, common for compact
+    // result tables, or a two-column key/value box) is real even with only
+    // two content rows. The evidence is the drawn structure: rules at every
+    // level and column rules beside most cells, and then either several
+    // column rules (a ruled grid of three or more columns) or, for a single
+    // column rule, that rule running through every row with every content
+    // row filling both its cells. A pair of stacked diagram boxes, or a
+    // label box beside a paragraph, has no such consistent occupancy. The
+    // single-rule case needs drawn strokes: a two-band patch of shading is
+    // as often a highlighted column inside a larger table.
+    bool small_closed_grid = false;
+    if ((int)row_ys.size() >= 3 && !table.rows.empty()) {
+        bool all_ruled = !level_coverage.empty();
+        for (double c : level_coverage)
+            if (c < 0.7) all_ruled = false;
+        bool ruled_cells = all_ruled && vline_total > 0 &&
+                           vline_present * 3 >= vline_total * 2;
+        bool evidence = n_cols >= 3;
+        if (ruled_cells && !evidence && drawn_rules &&
+            vline_present == vline_total) {
+            evidence = true;
+            for (auto& row : table.rows) {
+                int f = 0;
+                for (auto& cell : row) if (!cell.empty()) f++;
+                if (f > 0 && f < (int)row.size()) { evidence = false; break; }
+            }
+        }
+        small_closed_grid = ruled_cells && evidence;
+    }
+    // A single boxed row of two or more cells (a form's total line, a
+    // reference number box): rules above and below across its width, a
+    // rule down both edges and between every pair of cells, and text in
+    // every cell. A one-cell box (a notice) is not a table.
+    bool single_box = false;
+    if ((int)row_ys.size() == 2 && drawn_rules && n_cols >= 2 && n_rows == 1 &&
+        table.rows.size() == 1 && text_boundaries.empty() &&
+        level_coverage.size() == 2 && level_coverage[0] >= 0.9 &&
+        level_coverage[1] >= 0.9 && vline_total > 0 && vline_present == vline_total) {
+        single_box = true;
+        for (auto& cell : table.rows[0]) if (cell.empty()) single_box = false;
+        // A band of a larger table (a shaded row of a striped table) has
+        // rows of the same columns right above or below it: a line within
+        // one row height that sets text in two of the box's columns.
+        if (single_box) {
+            // Look only as far as the nearest rule across the box's columns:
+            // text past it belongs to another ruled table.
+            double rh = row_ys[1] - row_ys[0];
+            double up = row_ys[1] + rh, down = row_ys[0] - rh;
+            for (const auto& hl : h_lines) {
+                double hy = (hl.y0 + hl.y1) * 0.5;
+                double lo = std::min(hl.x0, hl.x1), hi = std::max(hl.x0, hl.x1);
+                if (hi <= col_xs.front() + 2 || lo >= col_xs.back() - 2) continue;
+                if (hy > row_ys[1] + 1.0 && hy < up) up = hy;
+                if (hy < row_ys[0] - 1.0 && hy > down) down = hy;
+            }
+            std::vector<std::pair<double, std::vector<bool>>> lines;
+            for (auto& ch : cache.chars) {
+                if (ch.unicode == ' ' || ch.unicode == 0xA0 || ch.unicode == '\t') continue;
+                bool near = (ch.y > row_ys[1] && ch.y < up) ||
+                            (ch.y < row_ys[0] && ch.y > down);
+                if (!near || ch.x < col_xs.front() || ch.x > col_xs.back()) continue;
+                int c = 0;
+                while (c + 1 < (int)col_xs.size() && ch.x > col_xs[c + 1]) ++c;
+                std::vector<bool>* hit = nullptr;
+                for (auto& l : lines)
+                    if (std::abs(l.first - ch.y) < 3.0) { hit = &l.second; break; }
+                if (!hit) { lines.push_back({ch.y, std::vector<bool>(n_cols, false)}); hit = &lines.back().second; }
+                if (c < n_cols) (*hit)[c] = true;
+            }
+            for (auto& l : lines) {
+                int cols_hit = 0;
+                for (bool b : l.second) cols_hit += b;
+                if (cols_hit >= 2) single_box = false;
+            }
+        }
+        // A section number boxed beside its title ("II | Education") is a
+        // numbered heading, not a row of data.
+        if (single_box && n_cols == 2) {
+            const std::string& first = table.rows[0][0];
+            size_t i = 0, chars = 0;
+            bool numeral = !first.empty();
+            while (i < first.size() && numeral) {
+                unsigned char c = first[i];
+                uint32_t cp; int len;
+                if (c < 0x80) { cp = c; len = 1; }
+                else if ((c >> 5) == 6) { cp = c & 0x1F; len = 2; }
+                else if ((c >> 4) == 14) { cp = c & 0x0F; len = 3; }
+                else { cp = c & 0x07; len = 4; }
+                for (int k = 1; k < len && i + k < first.size(); k++)
+                    cp = (cp << 6) | (first[i + k] & 0x3F);
+                i += len;
+                if (cp == ' ' || cp == '*') continue;   // markdown bold marks
+                ++chars;
+                bool ok = (cp >= '0' && cp <= '9') || cp == 'I' || cp == 'V' || cp == 'X' ||
+                          cp == '.' || cp == ')' || (cp >= 0x2160 && cp <= 0x217F) ||
+                          (cp >= 0x2460 && cp <= 0x24FF);
+                if (!ok) numeral = false;
+            }
+            if (numeral && chars <= 4) single_box = false;
+        }
+        double lo = row_ys[0], hi = row_ys[1];
+        for (double ex : {col_xs.front(), col_xs.back()}) {
+            double covered = 0;
+            for (auto& vl : v_lines) {
+                if (std::abs((vl.x0 + vl.x1) * 0.5 - ex) > 3.0) continue;
+                double a = std::max(lo, (double)std::min(vl.y0, vl.y1));
+                double b = std::min(hi, (double)std::max(vl.y0, vl.y1));
+                covered = std::max(covered, b - a);
+            }
+            if (covered < (hi - lo) * 0.8) single_box = false;
+        }
+    }
+    table.single_box = single_box;
+    if (!structural_form && !single_box &&
+        meaningful_rows < ((small_closed_grid || boxed_two_row) ? 2 : 3)) {
+        table.rows.clear();
+        table.too_sparse = true;
+    }
 
     // Text running THROUGH a drawn v-line marks a drawing, not a table: a
     // table author never lays text across a rule, while diagram boxes (ERD
@@ -652,7 +1397,7 @@ TableData build_table(const std::vector<double>& row_ys,
                     crossed++;
             }
         }
-        if (crossed >= 2 && crossed * 10 >= near_n * 3) {
+        if (!dense_closed_grid && crossed >= 2 && crossed * 10 >= near_n * 3) {
             table.rows.clear();
             return table;
         }
@@ -704,8 +1449,11 @@ TableData build_table(const std::vector<double>& row_ys,
 
     // Reject tables where text continues across column boundaries
     // (body text split by vertical lines — not real tabular data)
-    // SKIP when merged cells detected: v-line grid confirms real table structure.
-    if (!table.rows.empty() && !has_merged_cells) {
+    // SKIP when merged cells detected: v-line grid confirms real table
+    // structure. Grids without any v-line cannot have split body text this
+    // way — their columns came from whitespace alignment instead.
+    if (!table.rows.empty() && !has_merged_cells && !dense_closed_grid &&
+        spans_from_vlines) {
         int n_cols_t = (int)table.rows[0].size();
         // Detect word continuation: Latin alphanumeric at both boundaries.
         // CJK characters are self-contained units (not word fragments),
@@ -723,7 +1471,85 @@ TableData build_table(const std::vector<double>& row_ys,
                 if (is_content((unsigned char)row[0].back()) && is_content((unsigned char)row[1][0]))
                     cont_rows++;
             }
-            if (checked >= 3 && cont_rows >= checked * 0.15)
+            // In a two-column grid of words, text runs on across the rule only where
+            // the glyphs either side of it sit a word space apart or closer.
+            // Cells keep their padding between them, however their words
+            // begin and end ("heroin | anxiety, euphoria"). A grid of three
+            // columns is left to this test alone: its rules are often the
+            // coarse outline of a table whose columns the text alignment
+            // detector finds in full.
+            // Only for a grid of words on both sides (a term beside its
+            // description): a chart frame's two cells hold axis figures.
+            int worded = 0;
+            for (auto& row : table.rows) {
+                if ((int)row.size() < 2) continue;
+                int letters[2] = {0, 0};
+                for (int c = 0; c < 2; c++)
+                    for (unsigned char ch : row[c])
+                        if ((ch | 0x20) - 'a' < 26u || ch >= 0x80) letters[c]++;
+                if (letters[0] >= 2 && letters[1] >= 2) worded++;
+            }
+            const bool word_grid = n_cols_t == 2 && worded * 2 >= checked;
+            // A grid of three columns is measured the same way: a word that
+            // ends one cell and a word that starts the next ("Retrieval |
+            // Top-k") are not a word running on unless they nearly touch.
+            // Unless its cells hold columns of their own (values set apart
+            // on one baseline, "31   38" under a group header): then the
+            // rules are only the table's outline, and the text alignment
+            // detector finds its columns in full. A gap of most of an em
+            // is wider than any word space.
+            int inner_gaps = 0;
+            if (n_cols_t == 3)
+                for (int r = 0; r < n_rows; r++)
+                    for (int c = 0; c < n_cols; c++) {
+                        double lo = col_xs[c], hi = col_xs[c + 1];
+                        double row_bot = std::min(actual_ys[r], actual_ys[r + 1]);
+                        double row_top = std::max(actual_ys[r], actual_ys[r + 1]);
+                        std::vector<const PageCharCache::CharInfo*> g;
+                        for (auto& ch : cache.chars)
+                            if (ch.unicode != ' ' && ch.unicode != 0xA0 && ch.unicode != '\t' &&
+                                ch.x > lo && ch.x < hi && ch.y > row_bot && ch.y < row_top)
+                                g.push_back(&ch);
+                        std::sort(g.begin(), g.end(), [](auto* x, auto* y) {
+                            return std::abs(x->y - y->y) > 2.0 ? x->y > y->y : x->left < y->left;
+                        });
+                        bool gap = false;
+                        for (size_t i = 1; i < g.size() && !gap; i++) {
+                            if (std::abs(g[i]->y - g[i - 1]->y) > 2.0) continue;
+                            double fs = std::max(4.0, double(g[i]->font_size));
+                            gap = g[i]->left - g[i - 1]->right > 0.7 * fs;
+                        }
+                        inner_gaps += gap;
+                    }
+            const bool measure = word_grid || (n_cols_t == 3 && inner_gaps < 2);
+            int tight_rows = measure ? 0 : checked;
+            for (int r = 0; measure && r < n_rows; r++) {
+                double row_bot = std::min(actual_ys[r], actual_ys[r + 1]);
+                double row_top = std::max(actual_ys[r], actual_ys[r + 1]);
+                bool tight = false;
+                for (int b = 1; b < n_cols && !tight; b++) {
+                    double cx = col_xs[b];
+                    const PageCharCache::CharInfo* prev = nullptr;
+                    const PageCharCache::CharInfo* next = nullptr;
+                    for (auto& ch : cache.chars) {
+                        if (ch.unicode == ' ' || ch.unicode == 0xA0 ||
+                            ch.unicode == '\t') continue;
+                        if (ch.y < row_bot + 1 || ch.y > row_top - 1) continue;
+                        if ((ch.left + ch.right) / 2.0 < cx) {
+                            if (!prev || ch.right > prev->right) prev = &ch;
+                        } else {
+                            if (!next || ch.left < next->left) next = &ch;
+                        }
+                    }
+                    if (!prev || !next) continue;
+                    double fs = std::max(prev->font_size, next->font_size);
+                    if (fs < 4) fs = 10;
+                    tight = next->left - prev->right <= fs * 0.6;
+                }
+                tight_rows += tight;
+            }
+            if (checked >= 3 && cont_rows >= checked * 0.15 &&
+                tight_rows * 20 >= checked * 3)
                 table.rows.clear();
             if (!table.rows.empty() && n_cols_t == 2) {
                 int long_first = 0;
@@ -769,7 +1595,8 @@ TableData build_table(const std::vector<double>& row_ys,
 
     // Reject tables where most content concentrates in one column
     // while others are mostly empty — body text split by stray vertical lines.
-    if (!table.rows.empty() && (int)table.rows.size() >= 3) {
+    if (!table.rows.empty() && !dense_closed_grid &&
+        (int)table.rows.size() >= 3) {
         int n_cols_t = (int)table.rows[0].size();
         int nr = (int)table.rows.size();
         // Find the column with most content
@@ -917,14 +1744,28 @@ std::vector<double> infer_columns_from_text(const PageCharCache& cache,
     std::vector<double> boundaries;
     boundaries.push_back(left);
     bool in_gap = false;
-    double gap_start = 0;
+    int gap_b0 = 0;
     for (int b = 0; b < n_bins; b++) {
-        double bx = left + b * bin_w + bin_w / 2.0;
         if (gap_counts[b] >= threshold) {
-            if (!in_gap) { gap_start = bx; in_gap = true; }
+            if (!in_gap) { gap_b0 = b; in_gap = true; }
         } else {
             if (in_gap) {
-                double gap_center = (gap_start + bx) / 2.0;
+                // Inside a gap run, the boundary goes to the stretch blank in
+                // the most rows: a right-aligned header wider than its numbers
+                // reaches into the run, and the run's plain center would cut
+                // the header's first letters off into the left column.
+                int best = 0;
+                for (int k = gap_b0; k < b; k++) best = std::max(best, gap_counts[k]);
+                int s0 = -1, s1 = -1, k = gap_b0;
+                while (k < b) {
+                    if (gap_counts[k] != best) { k++; continue; }
+                    int e = k;
+                    while (e + 1 < b && gap_counts[e + 1] == best) e++;
+                    if (s0 < 0 || e - k > s1 - s0) { s0 = k; s1 = e; }
+                    k = e + 1;
+                }
+                // (same center as before when the whole run is equally blank)
+                double gap_center = left + (s0 + s1 + 2) * bin_w / 2.0;
                 if (gap_center > left + 15 && gap_center < right - 15)
                     boundaries.push_back(gap_center);
                 in_gap = false;
@@ -955,31 +1796,171 @@ std::vector<double> infer_columns_from_text(const PageCharCache& cache,
     return boundaries;
 }
 
-std::vector<TableData> detect_tables(const std::vector<PdfLineSegment>& lines,
-                                      const PageCharCache& cache,
-                                      double page_width, double page_height) {
-    if (lines.size() < 4) return {};
-
-    std::vector<PdfLineSegment> h_lines, v_lines;
-    for (auto& l : lines) {
-        if (l.is_horizontal()) {
-            double y = (l.y0 + l.y1) / 2.0;
-            if (y < 0 || y > page_height) continue;
-            double lx = std::min((double)l.x0, (double)l.x1);
-            double rx = std::max((double)l.x0, (double)l.x1);
-            if (lx < -10 || rx > page_width + 10) continue;
-            if (rx - lx < 50.0) continue;
-            h_lines.push_back(l);
-        } else if (l.is_vertical()) {
-            double x = (l.x0 + l.x1) / 2.0;
-            if (x < 0 || x > page_width) continue;
-            double ly = std::min((double)l.y0, (double)l.y1);
-            double ry = std::max((double)l.y0, (double)l.y1);
-            if (ly < -10 || ry > page_height + 10) continue;
-            v_lines.push_back(l);
+// True when the codepoints (one text line, x-sorted, spaces removed) start
+// like a table/figure caption: "Table 3", "TABLE 2.6", "Fig. 5", "표 4.2",
+// "그림 3", optionally wrapped in <>, 〈〉, () or []. A caption between two rule
+// levels marks the boundary between stacked tables, never a data row.
+static bool is_caption_start(const std::vector<uint32_t>& cps) {
+    size_t i = 0;
+    if (i < cps.size() && (cps[i] == '<' || cps[i] == '[' || cps[i] == '(' ||
+                           cps[i] == 0x3008 || cps[i] == 0xFF1C || cps[i] == 0xFF08))
+        i++;
+    auto lower = [](uint32_t c) -> uint32_t {
+        return (c >= 'A' && c <= 'Z') ? c + 32 : c;
+    };
+    auto match = [&](const char* w) {
+        size_t j = i, k = 0;
+        while (w[k] && j < cps.size() && lower(cps[j]) == (uint32_t)w[k]) {
+            j++; k++;
         }
+        if (w[k]) return false;
+        i = j;
+        return true;
+    };
+    bool head = match("tables") || match("table") ||
+                match("figures") || match("figure") || match("fig");
+    if (!head && i < cps.size() && cps[i] == 0xD45C) { i++; head = true; }
+    if (!head && i + 1 < cps.size() &&
+        cps[i] == 0xADF8 && cps[i + 1] == 0xB9BC) { i += 2; head = true; }
+    if (!head) return false;
+    // The caption number follows immediately, past at most light
+    // punctuation ("Fig. 5", "표: 3"). Roman numerals cover IEEE style;
+    // a letter here means an ordinary word ("Tablet") — not a caption.
+    for (int steps = 0; i < cps.size() && steps < 4; i++, steps++) {
+        uint32_t c = cps[i];
+        if (c >= '0' && c <= '9') return true;
+        if (c == 'I' || c == 'V' || c == 'X') return true;
+        if (c != '.' && c != ':') return false;
     }
+    return false;
+}
 
+// One y-level group can hold two side-by-side independent tables (the left
+// and right columns of a two-column page): grouping keys on the bounding
+// x-span per level, so a level holding "left segment + right segment" looks
+// like one wide rule. When every rule of the group stays clear of a tall
+// vertical band that no v-line or text crosses either, that band is a page
+// gutter, not a wide cell: split the group's lines there and build each
+// side as its own table.
+struct TableLineSet {
+    std::vector<double> levels;
+    std::vector<PdfLineSegment> h_lines, v_lines;
+};
+
+static std::vector<TableLineSet> split_group_at_gutter(
+        const std::vector<double>& group,
+        const std::vector<PdfLineSegment>& h_lines,
+        const std::vector<PdfLineSegment>& v_lines,
+        const PageCharCache& cache) {
+    std::vector<TableLineSet> whole;
+    whole.push_back({group, h_lines, v_lines});
+
+    std::vector<std::pair<double, double>> iv;
+    for (auto& hl : h_lines) {
+        double hy = (hl.y0 + hl.y1) / 2.0;
+        for (auto& ry : group)
+            if (std::abs(hy - ry) < 4.0) {
+                iv.push_back({std::min((double)hl.x0, (double)hl.x1),
+                              std::max((double)hl.x0, (double)hl.x1)});
+                break;
+            }
+    }
+    if (iv.size() < 2) return whole;
+    std::sort(iv.begin(), iv.end());
+    // Dashed rules and per-cell borders arrive as fragments: join across
+    // small stroke gaps so only genuine voids remain.
+    constexpr double kStrokeJoinTol = 12.0;
+    std::vector<std::pair<double, double>> runs{iv[0]};
+    for (size_t i = 1; i < iv.size(); i++) {
+        if (iv[i].first <= runs.back().second + kStrokeJoinTol)
+            runs.back().second = std::max(runs.back().second, iv[i].second);
+        else
+            runs.push_back(iv[i]);
+    }
+    if (runs.size() < 2) return whole;
+
+    double y_lo = group.front() - 2.0, y_hi = group.back() + 2.0;
+    constexpr double kMinGutterWidth = 18.0;
+    std::vector<double> cuts;
+    for (size_t g = 1; g < runs.size(); g++) {
+        double gap_l = runs[g - 1].second, gap_r = runs[g].first;
+        if (gap_r - gap_l < kMinGutterWidth) continue;
+        bool blocked = false;
+        for (auto& vl : v_lines) {
+            double vx = (vl.x0 + vl.x1) / 2.0;
+            if (vx <= gap_l + 2.0 || vx >= gap_r - 2.0) continue;
+            double vy_lo = std::min((double)vl.y0, (double)vl.y1);
+            double vy_hi = std::max((double)vl.y0, (double)vl.y1);
+            if (std::min(vy_hi, y_hi) - std::max(vy_lo, y_lo) > 2.0) {
+                blocked = true;
+                break;
+            }
+        }
+        for (auto& ch : cache.chars) {
+            if (blocked) break;
+            if (ch.unicode == ' ' || ch.unicode == 0xA0 ||
+                ch.unicode == '\t')
+                continue;
+            if (ch.y <= y_lo || ch.y >= y_hi) continue;
+            if (ch.x > gap_l + 1.0 && ch.x < gap_r - 1.0) blocked = true;
+        }
+        if (!blocked) cuts.push_back((gap_l + gap_r) / 2.0);
+    }
+    if (cuts.empty()) return whole;
+
+    cuts.insert(cuts.begin(), -1e9);
+    cuts.push_back(1e9);
+    std::vector<TableLineSet> parts;
+    for (size_t s = 1; s < cuts.size(); s++) {
+        TableLineSet part;
+        double w_lo = cuts[s - 1], w_hi = cuts[s];
+        for (auto& hl : h_lines) {
+            double mx = (hl.x0 + hl.x1) / 2.0;
+            if (mx > w_lo && mx < w_hi) part.h_lines.push_back(hl);
+        }
+        for (auto& vl : v_lines) {
+            double vx = (vl.x0 + vl.x1) / 2.0;
+            if (vx > w_lo && vx < w_hi) part.v_lines.push_back(vl);
+        }
+        // Keep only the levels this side actually rules: the other side's
+        // row boundaries would otherwise split rows that have no rule here.
+        for (double ry : group) {
+            bool present = false;
+            for (auto& hl : part.h_lines) {
+                double hy = (hl.y0 + hl.y1) / 2.0;
+                if (std::abs(hy - ry) < 4.0) { present = true; break; }
+            }
+            for (auto& vl : part.v_lines) {
+                if (present) break;
+                double vy_lo = std::min((double)vl.y0, (double)vl.y1);
+                double vy_hi = std::max((double)vl.y0, (double)vl.y1);
+                if (vy_hi - vy_lo < 6.0) continue;
+                if (std::abs(vy_lo - ry) < 3.5 || std::abs(vy_hi - ry) < 3.5)
+                    present = true;
+            }
+            if (present) part.levels.push_back(ry);
+        }
+        if (part.levels.size() >= 3) parts.push_back(std::move(part));
+    }
+    // Even a single surviving side beats the welded whole; the dropped
+    // side's text stays in the prose flow.
+    if (parts.empty()) return whole;
+    return parts;
+}
+
+// Rule grouping over one zone's lines: row levels from h-rules (and v-rule
+// ends), groups of levels joined by v-rules or shared spans, then one table
+// per group (or per side of a gutter inside a group). keep_part, when set,
+// vetoes groups before they are built; kept_ranges receives the y-range of
+// every table built.
+static void detect_ruled_in_zone(
+        const std::vector<PdfLineSegment>& h_lines,
+        const std::vector<PdfLineSegment>& v_lines,
+        const PageCharCache& cache,
+        std::vector<SparseGrid>* sparse_grids,
+        const std::function<bool(const TableLineSet&)>& keep_part,
+        std::vector<TableData>& out,
+        std::vector<std::pair<double, double>>* kept_ranges) {
     std::vector<double> h_ys;
     for (auto& hl : h_lines) h_ys.push_back((hl.y0 + hl.y1) / 2.0);
     auto row_ys = cluster_values(h_ys, 3.0);
@@ -1018,7 +1999,7 @@ std::vector<TableData> detect_tables(const std::vector<PdfLineSegment>& lines,
         }
         std::sort(row_ys.begin(), row_ys.end());
     }
-    if (row_ys.size() < 3) return {};
+    if (row_ys.size() < 3) return;
 
     int n_levels = (int)row_ys.size();
 
@@ -1041,15 +2022,29 @@ std::vector<TableData> detect_tables(const std::vector<PdfLineSegment>& lines,
         double x_lo = std::max(lo_l, hi_l), x_hi = std::min(lo_r, hi_r);
         if (x_hi <= x_lo) { x_lo = std::min(lo_l, hi_l); x_hi = std::max(lo_r, hi_r); }
         if (x_hi <= x_lo) return allow_empty && gap < 60.0;
+        struct GapChar { double x, y; uint32_t cp; };
+        std::vector<GapChar> gap_chars;
         std::vector<double> ys;
         for (auto& ch : cache.chars) {
             if (ch.unicode == ' ' || ch.unicode == 0xA0 || ch.unicode == '\t') continue;
             if (ch.x < x_lo + 1 || ch.x > x_hi - 1) continue;
             if (ch.y <= y_lo + 2 || ch.y >= y_hi - 2) continue;
+            gap_chars.push_back({ch.x, ch.y, ch.unicode});
             ys.push_back(ch.y);
         }
         if (ys.empty()) return allow_empty && gap < 60.0;
         auto centers = cluster_values(ys, 3.0);
+        // A caption line anywhere in the gap separates stacked tables.
+        for (double cy : centers) {
+            std::vector<GapChar> line;
+            for (auto& gc : gap_chars)
+                if (std::abs(gc.y - cy) < 3.0) line.push_back(gc);
+            std::sort(line.begin(), line.end(),
+                      [](const GapChar& a, const GapChar& b) { return a.x < b.x; });
+            std::vector<uint32_t> cps;
+            for (auto& gc : line) cps.push_back(gc.cp);
+            if (is_caption_start(cps)) return false;
+        }
         double pitch = 14.0;
         if (centers.size() >= 2) {
             std::vector<double> diffs;
@@ -1095,6 +2090,61 @@ std::vector<TableData> detect_tables(const std::vector<PdfLineSegment>& lines,
         x_overlap[i] = h_lines_share_full_span(h_lines, row_ys[i], row_ys[i+1], 3.0);
     }
 
+    // A closed frame that stops is a table's end. An interval whose both
+    // neighbours are boxed in by v-rules at the rules' left AND right ends,
+    // while no v-rule crosses the interval itself, lies between two framed
+    // grids: a merged-cell row of one form keeps its outer border running
+    // through it. Such an interval is never bridged on span or text alone.
+    std::vector<bool> framed(n_levels - 1, false);
+    for (int i = 0; i < n_levels - 1; i++) {
+        double y_lo = row_ys[i], y_hi = row_ys[i + 1];
+        double lo = 1e9, hi = -1e9;
+        for (auto& hl : h_lines) {
+            double hy = (hl.y0 + hl.y1) / 2.0;
+            if (std::abs(hy - y_lo) >= 4.0 && std::abs(hy - y_hi) >= 4.0) continue;
+            lo = std::min(lo, (double)std::min(hl.x0, hl.x1));
+            hi = std::max(hi, (double)std::max(hl.x0, hl.x1));
+        }
+        if (hi <= lo) continue;
+        bool at_lo = false, at_hi = false;
+        for (auto& vl : v_lines) {
+            double vx = (vl.x0 + vl.x1) / 2.0;
+            double vy_lo = std::min((double)vl.y0, (double)vl.y1);
+            double vy_hi = std::max((double)vl.y0, (double)vl.y1);
+            double overlap = std::min(vy_hi, y_hi) - std::max(vy_lo, y_lo);
+            if (overlap < (y_hi - y_lo) * 0.5) continue;
+            if (std::abs(vx - lo) < 6.0) at_lo = true;
+            if (std::abs(vx - hi) < 6.0) at_hi = true;
+        }
+        framed[i] = at_lo && at_hi;
+    }
+    auto frame_break = [&](int i) {
+        return !connected[i] && i > 0 && i + 1 < n_levels - 1 &&
+               framed[i - 1] && framed[i + 1];
+    };
+    // Vertical rules that run through the rows above and below but stop at
+    // an interval holding no text leave white space between two ruled
+    // tables, not a row: a blank row of one grid keeps its rules running.
+    auto blank_between_grids = [&](int i) {
+        if (connected[i] || i == 0 || i + 1 >= n_levels - 1 ||
+            !connected[i - 1] || !connected[i + 1]) return false;
+        double y_lo = row_ys[i], y_hi = row_ys[i + 1];
+        double lo = 1e9, hi = -1e9;
+        for (auto& hl : h_lines) {
+            double hy = (hl.y0 + hl.y1) / 2.0;
+            if (std::abs(hy - y_lo) >= 4.0 && std::abs(hy - y_hi) >= 4.0) continue;
+            lo = std::min(lo, (double)std::min(hl.x0, hl.x1));
+            hi = std::max(hi, (double)std::max(hl.x0, hl.x1));
+        }
+        if (hi <= lo) return false;
+        for (auto& ch : cache.chars) {
+            if (ch.unicode == ' ' || ch.unicode == 0xA0 || ch.unicode == '\t') continue;
+            if (ch.x < lo || ch.x > hi) continue;
+            if (ch.y > y_lo + 2 && ch.y < y_hi - 2) return false;
+        }
+        return true;
+    };
+
     std::vector<std::vector<double>> table_groups;
     std::vector<double> current_group;
     int group_vline_connections = 0;
@@ -1106,12 +2156,14 @@ std::vector<TableData> detect_tables(const std::vector<PdfLineSegment>& lines,
         // holds nothing but that row's own text (merged-cell rows in forms).
         // Without the text check, stacked tables whose rules share the same
         // x-span get bridged across whole blocks of unrelated content.
-        bool h_span_ok = x_overlap[i] && close_enough &&
+        bool h_span_ok = x_overlap[i] && close_enough && !frame_break(i) &&
+                         !blank_between_grids(i) &&
                          bridge_gap_ok(row_ys[i], row_ys[i + 1], true);
         if (connected[i] || h_span_ok) {
             current_group.push_back(row_ys[i + 1]);
             if (connected[i]) group_vline_connections++;
-        } else if (close_enough && group_vline_connections > 0) {
+        } else if (close_enough && group_vline_connections > 0 &&
+                   !frame_break(i) && !blank_between_grids(i)) {
             // No v-line and no x-overlap, but we're already in a connected group.
             // Check if the next row's h-lines share x-range with the group's h-lines.
             double g_left = 1e9, g_right = 0;
@@ -1143,7 +2195,7 @@ std::vector<TableData> detect_tables(const std::vector<PdfLineSegment>& lines,
                 bridge_gap_ok(row_ys[i], row_ys[i + 1], true)) {
                 current_group.push_back(row_ys[i + 1]);
             } else {
-                if (current_group.size() >= 3 &&
+                if ((current_group.size() >= 3 || current_group.size() == 2) &&
                     (group_vline_connections > 0 || current_group.size() >= 7))
                     table_groups.push_back(current_group);
                 current_group.clear();
@@ -1151,7 +2203,7 @@ std::vector<TableData> detect_tables(const std::vector<PdfLineSegment>& lines,
                 current_group.push_back(row_ys[i + 1]);
             }
         } else {
-            if (current_group.size() >= 3 &&
+            if ((current_group.size() >= 3 || current_group.size() == 2) &&
                 (group_vline_connections > 0 || current_group.size() >= 7))
                 table_groups.push_back(current_group);
             current_group.clear();
@@ -1159,7 +2211,7 @@ std::vector<TableData> detect_tables(const std::vector<PdfLineSegment>& lines,
             current_group.push_back(row_ys[i + 1]);
         }
     }
-    if (current_group.size() >= 3 &&
+    if ((current_group.size() >= 3 || current_group.size() == 2) &&
         (group_vline_connections > 0 || current_group.size() >= 7))
         table_groups.push_back(current_group);
 
@@ -1194,7 +2246,23 @@ std::vector<TableData> detect_tables(const std::vector<PdfLineSegment>& lines,
             double y_gap = table_groups[g].front() - merged.back().back();
             // Merging split form pieces requires a swallowed text row in the
             // gap; an empty gap between two groups is inter-table spacing.
+            // The interval between the groups (when it is one interval)
+            // must not be the gap between two closed frames.
+            bool frames_apart = false;
+            for (int i = 0; i + 1 < n_levels; i++)
+                if (std::abs(row_ys[i] - merged.back().back()) < 0.01 &&
+                    std::abs(row_ys[i + 1] - table_groups[g].front()) < 0.01)
+                    frames_apart = frame_break(i);
+            // White space between two ruled grids anywhere in the gap (a
+            // one-row table sitting between the groups has its own) keeps
+            // the groups apart.
+            for (int i = 0; i + 1 < n_levels && !frames_apart; i++)
+                if (row_ys[i] >= merged.back().back() - 0.01 &&
+                    row_ys[i + 1] <= table_groups[g].front() + 0.01 &&
+                    blank_between_grids(i))
+                    frames_apart = true;
             if (extent > 50 && overlap >= extent * 0.7 && y_gap < 100 &&
+                !frames_apart &&
                 bridge_gap_ok(merged.back().back(), table_groups[g].front(),
                               false)) {
                 for (auto& y : table_groups[g])
@@ -1206,7 +2274,7 @@ std::vector<TableData> detect_tables(const std::vector<PdfLineSegment>& lines,
         table_groups = std::move(merged);
     }
 
-    if (table_groups.empty()) return {};
+    if (table_groups.empty()) return;
 
     // Split groups where v-line column structure changes significantly
     std::vector<std::vector<double>> final_groups;
@@ -1263,21 +2331,454 @@ std::vector<TableData> detect_tables(const std::vector<PdfLineSegment>& lines,
         if (last.size() >= 3) final_groups.push_back(last);
     }
 
-    std::vector<TableData> result;
     for (auto& group : final_groups) {
-        TableData t = build_table(group, h_lines, v_lines, cache);
-        if (t.rows.empty()) continue;
-        // Reject grids that swallowed page prose (stacked separate tables
-        // bridged across body text): no real cell holds a whole paragraph.
-        // Rejecting lets the band's lines flow back as normal text.
-        size_t max_cell = 0;
-        for (auto& row : t.rows)
-            for (auto& c : row)
-                if (c.size() > max_cell) max_cell = c.size();
-        if (max_cell > 300) continue;
-        result.push_back(std::move(t));
+        for (auto& part : split_group_at_gutter(group, h_lines, v_lines,
+                                                cache)) {
+            if (keep_part && !keep_part(part)) continue;
+            TableData t = build_table(part.levels, part.h_lines,
+                                      part.v_lines, cache);
+            // A group of two rule levels is kept only as a boxed row of
+            // drawn cells; such a band holds nothing else of a table.
+            if (part.levels.size() == 2 && !t.single_box) continue;
+            if (table_debug()) {
+                fprintf(stderr, "[rule-group]");
+                for (double y : part.levels) fprintf(stderr, " %.1f", y);
+                fprintf(stderr, " -> rows %zu%s\n", t.rows.size(),
+                        t.too_sparse ? " (sparse)" : "");
+            }
+            if (t.rows.empty()) {
+                // A grid of full-width row rules with a vertical rule inside
+                // it is laid out in columns even when too few of its rows
+                // fill two cells (a label column beside wrapped text):
+                // report it so the markdown path can keep its layout
+                // instead of gluing it.
+                if (sparse_grids && t.too_sparse) {
+                    double gx0 = 1e9, gx1 = -1e9;
+                    double gy0 = part.levels.front(), gy1 = part.levels.back();
+                    for (auto& hl : part.h_lines) {
+                        double hy = (hl.y0 + hl.y1) / 2.0;
+                        if (hy < gy0 - 4.0 || hy > gy1 + 4.0) continue;
+                        gx0 = std::min(gx0, (double)std::min(hl.x0, hl.x1));
+                        gx1 = std::max(gx1, (double)std::max(hl.x0, hl.x1));
+                    }
+                    // Every level a drawn rule across the grid: levels
+                    // synthesized from v-line ends (chart axes) or rules
+                    // over part of the width (a title box inside a page
+                    // frame) are not a table's row rules.
+                    bool full_rules = gx1 > gx0;
+                    for (double lv : part.levels) {
+                        double lo = 1e9, hi = -1e9;
+                        for (auto& hl : part.h_lines) {
+                            if (std::abs((hl.y0 + hl.y1) / 2.0 - lv) >= 4.0) continue;
+                            lo = std::min(lo, (double)std::min(hl.x0, hl.x1));
+                            hi = std::max(hi, (double)std::max(hl.x0, hl.x1));
+                        }
+                        if (hi - lo < 0.8 * (gx1 - gx0)) full_rules = false;
+                    }
+                    SparseGrid sg;
+                    sg.box = {gx0, gy0, gx1, gy1};
+                    sg.levels = part.levels;
+                    for (auto& vl : part.v_lines) {
+                        double vx = (vl.x0 + vl.x1) / 2.0;
+                        double vlo = std::min(vl.y0, vl.y1);
+                        double vhi = std::max(vl.y0, vl.y1);
+                        if (vx > gx0 + 5.0 && vx < gx1 - 5.0 &&
+                            std::min(vhi, gy1) - std::max(vlo, gy0) >= 10.0)
+                            sg.rules.push_back({vx, vlo, vhi});
+                    }
+                    if (full_rules && !sg.rules.empty())
+                        sparse_grids->push_back(std::move(sg));
+                }
+                continue;
+            }
+            // Reject grids that swallowed page prose (stacked separate
+            // tables bridged across body text): no real cell holds a whole
+            // paragraph. Rejecting lets the band's lines flow back as text.
+            // Bridging only joins levels no column rule connects, so a long
+            // cell set off by a drawn column rule is the author's own cell.
+            if (t.open_cell_max > 300 && !t.wrapped_closed_grid) continue;
+            if (kept_ranges)
+                kept_ranges->push_back({part.levels.front(), part.levels.back()});
+            out.push_back(std::move(t));
+        }
     }
 
+}
+
+// Rules of side-by-side structures (the tables of two page columns, a table
+// beside a framed figure) must be grouped apart: grouping keys on page-wide
+// y-levels, so rules of different columns at nearly the same height weld
+// into one level whose x-extent spans both columns, and a frame's vertical
+// rule in one column "connects" levels of a table in the other. A rule
+// gutter is a vertical strip at least kMinGutter wide that every h-rule
+// either avoids or crosses entirely, with two or more rules on each side
+// whose heights overlap (the sides stand next to each other). Inside the
+// strip only rules of the crossing (page-wide) structures may appear, and
+// no text may sit in its middle where both sides stand.
+struct RuleGutter { double a = 0, b = 0; };
+
+static bool find_rule_gutter(const std::vector<PdfLineSegment>& h_lines,
+                             const std::vector<PdfLineSegment>& v_lines,
+                             const PageCharCache& cache, RuleGutter& out) {
+    constexpr double kMinGutter = 18.0;
+    constexpr double kEdgeTol = 0.5;
+    // Vector-heavy pages (charts, drawings) carry thousands of rules; the
+    // candidate scan is quadratic, and such pages are not table layouts.
+    if (h_lines.size() < 4 || h_lines.size() > 1500) return false;
+    struct Iv { double lo, hi, y; };
+    std::vector<Iv> iv;
+    iv.reserve(h_lines.size());
+    for (auto& hl : h_lines)
+        iv.push_back({std::min((double)hl.x0, (double)hl.x1),
+                      std::max((double)hl.x0, (double)hl.x1),
+                      (hl.y0 + hl.y1) / 2.0});
+    std::vector<double> rights, lefts;
+    for (auto& i : iv) { rights.push_back(i.hi); lefts.push_back(i.lo); }
+    rights = cluster_values(rights, kEdgeTol);
+    std::sort(lefts.begin(), lefts.end());
+
+    bool found = false;
+    int best_min = 0;
+    double best_w = 0;
+    for (double a : rights) {
+        auto it = std::lower_bound(lefts.begin(), lefts.end(), a + kMinGutter);
+        if (it == lefts.end()) continue;
+        double b = *it;
+        int n_left = 0, n_right = 0;
+        double l_lo = 1e18, l_hi = -1e18, r_lo = 1e18, r_hi = -1e18;
+        std::vector<const Iv*> crossing;
+        bool clean = true;
+        for (auto& i : iv) {
+            if (i.hi <= a + kEdgeTol) {
+                n_left++; l_lo = std::min(l_lo, i.y); l_hi = std::max(l_hi, i.y);
+            } else if (i.lo >= b - kEdgeTol) {
+                n_right++; r_lo = std::min(r_lo, i.y); r_hi = std::max(r_hi, i.y);
+            } else if (i.lo <= a + kEdgeTol && i.hi >= b - kEdgeTol) {
+                crossing.push_back(&i);
+            } else {
+                clean = false;   // a rule ends inside the strip
+                break;
+            }
+        }
+        if (!clean || n_left < 2 || n_right < 2) continue;
+        double ov_lo = std::max(l_lo, r_lo), ov_hi = std::min(l_hi, r_hi);
+        if (ov_hi <= ov_lo) continue;    // stacked, not side by side
+        // A v-rule inside the strip belongs to a crossing structure (a
+        // page-wide grid's column rule) or the strip is no gutter.
+        for (auto& vl : v_lines) {
+            if (!clean) break;
+            double vx = (vl.x0 + vl.x1) / 2.0;
+            if (vx <= a + kEdgeTol || vx >= b - kEdgeTol) continue;
+            double vlo = std::min((double)vl.y0, (double)vl.y1);
+            double vhi = std::max((double)vl.y0, (double)vl.y1);
+            bool attached = false;
+            for (auto* c : crossing)
+                if (c->y >= vlo - 4.0 && c->y <= vhi + 4.0) { attached = true; break; }
+            if (!attached) clean = false;
+        }
+        if (!clean) continue;
+        // Text in the middle of the strip, at heights where both sides
+        // stand, is content running across it (a wide cell, prose).
+        double w = b - a;
+        double m_lo = a + w * 0.25, m_hi = b - w * 0.25;
+        for (auto& ch : cache.chars) {
+            if (ch.unicode == ' ' || ch.unicode == 0xA0 || ch.unicode == '\t') continue;
+            if (ch.y <= ov_lo || ch.y >= ov_hi) continue;
+            if (ch.x > m_lo && ch.x < m_hi) { clean = false; break; }
+        }
+        if (!clean) continue;
+        int m = std::min(n_left, n_right);
+        if (!found || m > best_min || (m == best_min && w > best_w)) {
+            found = true;
+            best_min = m;
+            best_w = w;
+            out = {a, b};
+        }
+    }
+    return found;
+}
+
+// Rules split at a rule gutter are grouped per side. Rules crossing the
+// gutter (a page-wide table) are grouped together with everything, as
+// before, and keep only groups standing on two or more crossing levels; the
+// side groups inside such a group's height are part of it and dropped.
+static void detect_ruled_zoned(const std::vector<PdfLineSegment>& h_lines,
+                               const std::vector<PdfLineSegment>& v_lines,
+                               const PageCharCache& cache,
+                               std::vector<SparseGrid>* sparse_grids,
+                               std::vector<TableData>& out, int depth) {
+    RuleGutter g;
+    if (depth >= 3 || !find_rule_gutter(h_lines, v_lines, cache, g)) {
+        detect_ruled_in_zone(h_lines, v_lines, cache, sparse_grids, nullptr,
+                             out, nullptr);
+        return;
+    }
+    if (table_debug())
+        fprintf(stderr, "[rule-gutter] depth %d x %.1f..%.1f\n", depth, g.a, g.b);
+    constexpr double kEdgeTol = 0.5;
+    std::vector<PdfLineSegment> hl, hr, hc, vl, vr;
+    for (auto& l : h_lines) {
+        double lo = std::min(l.x0, l.x1), hi = std::max(l.x0, l.x1);
+        if (hi <= g.a + kEdgeTol) hl.push_back(l);
+        else if (lo >= g.b - kEdgeTol) hr.push_back(l);
+        else hc.push_back(l);
+    }
+    for (auto& l : v_lines) {
+        double x = (l.x0 + l.x1) / 2.0;
+        if (x <= g.a + kEdgeTol) vl.push_back(l);
+        else if (x >= g.b - kEdgeTol) vr.push_back(l);
+    }
+
+    std::vector<std::pair<double, double>> wide_ranges;
+    if (!hc.empty()) {
+        auto crossing_levels = [&](const TableLineSet& part) {
+            int n = 0;
+            for (double ry : part.levels)
+                for (auto& c : hc)
+                    if (std::abs((c.y0 + c.y1) / 2.0 - ry) < 4.0) { n++; break; }
+            return n >= 2;
+        };
+        detect_ruled_in_zone(h_lines, v_lines, cache, sparse_grids,
+                             crossing_levels, out, &wide_ranges);
+    }
+    auto inside_wide = [&](double y0, double y1) {
+        double lo = std::min(y0, y1), hi = std::max(y0, y1);
+        for (auto& r : wide_ranges)
+            if (std::min(hi, r.second) - std::max(lo, r.first) > 2.0) return true;
+        return false;
+    };
+    for (int side = 0; side < 2; side++) {
+        std::vector<TableData> part_out;
+        std::vector<SparseGrid> part_sparse;
+        detect_ruled_zoned(side == 0 ? hl : hr, side == 0 ? vl : vr, cache,
+                           sparse_grids ? &part_sparse : nullptr, part_out,
+                           depth + 1);
+        for (auto& t : part_out)
+            if (!inside_wide(t.y0, t.y1)) out.push_back(std::move(t));
+        if (sparse_grids)
+            for (auto& sg : part_sparse)
+                if (!inside_wide(sg.box[1], sg.box[3]))
+                    sparse_grids->push_back(std::move(sg));
+    }
+}
+
+std::vector<TableData> detect_tables(const std::vector<PdfLineSegment>& lines,
+                                      const PageCharCache& cache,
+                                      double page_width, double page_height,
+                                      std::vector<SparseGrid>* sparse_grids) {
+    if (lines.size() < 4) return {};
+
+    std::vector<PdfLineSegment> h_lines, v_lines, h_frags;
+    for (auto& l : lines) {
+        if (l.is_horizontal()) {
+            double y = (l.y0 + l.y1) / 2.0;
+            if (y < 0 || y > page_height) continue;
+            double lx = std::min((double)l.x0, (double)l.x1);
+            double rx = std::max((double)l.x0, (double)l.x1);
+            if (lx < -10 || rx > page_width + 10) continue;
+            // Too short to be a rule on its own, but per-cell borders and
+            // dashed rules arrive as exactly such fragments: hold them for
+            // the collinear merge below instead of dropping them outright.
+            if (rx - lx < 50.0) { h_frags.push_back(l); continue; }
+            h_lines.push_back(l);
+        } else if (l.is_vertical()) {
+            double x = (l.x0 + l.x1) / 2.0;
+            if (x < 0 || x > page_width) continue;
+            double ly = std::min((double)l.y0, (double)l.y1);
+            double ry = std::max((double)l.y0, (double)l.y1);
+            if (ly < -10 || ry > page_height + 10) continue;
+            v_lines.push_back(l);
+        }
+    }
+
+    // Rules drawn per cell (each border segment one column wide) or dashed
+    // fall under the length cut fragment by fragment. Touching fragments on
+    // one y level merge into a run, and a run of rule length is a rule.
+    struct ShortRun { double lo, hi, y; };
+    std::vector<ShortRun> short_runs;
+    if (!h_frags.empty()) {
+        std::vector<double> frag_ys;
+        for (auto& l : h_frags) frag_ys.push_back((l.y0 + l.y1) / 2.0);
+        constexpr double kFragJoinTol = 3.0;
+        for (double ly : cluster_values(frag_ys, 3.0)) {
+            std::vector<std::pair<double, double>> iv;
+            for (auto& l : h_frags) {
+                if (std::abs((l.y0 + l.y1) / 2.0 - ly) > 3.0) continue;
+                iv.push_back({std::min((double)l.x0, (double)l.x1),
+                              std::max((double)l.x0, (double)l.x1)});
+            }
+            std::sort(iv.begin(), iv.end());
+            double lo = iv[0].first, hi = iv[0].second;
+            auto flush = [&]() {
+                if (hi - lo >= 50.0)
+                    h_lines.push_back({static_cast<float>(lo),
+                                       static_cast<float>(ly),
+                                       static_cast<float>(hi),
+                                       static_cast<float>(ly)});
+                else
+                    short_runs.push_back({lo, hi, ly});
+            };
+            for (size_t i = 1; i < iv.size(); i++) {
+                if (iv[i].first <= hi + kFragJoinTol) {
+                    hi = std::max(hi, iv[i].second);
+                } else {
+                    flush();
+                    lo = iv[i].first;
+                    hi = iv[i].second;
+                }
+            }
+            flush();
+        }
+    }
+
+
+    // A narrow cell's border pieces stay under the length cut even when
+    // joined, and a table would lose that column. A short run that touches
+    // a rule on its level (it ends where the rule begins, or begins where it
+    // ends) and is boxed by vertical rules at both ends is part of that
+    // ruled row: keep it as a rule of its own, so the rule's end stays where
+    // the cell border meets it.
+    {
+        // Both ends must meet a vertical rule running up or down from the
+        // level, as a cell's corners do; a tick on a chart axis has a free
+        // end.
+        auto cornered = [&](double x, double y) {
+            for (const auto& v : v_lines) {
+                if (std::abs((v.x0 + v.x1) * 0.5 - x) > 2.0) continue;
+                double lo = std::min(v.y0, v.y1), hi = std::max(v.y0, v.y1);
+                if (hi - lo < 6.0) continue;
+                if (lo <= y + 2.0 && hi >= y - 2.0) return true;
+            }
+            return false;
+        };
+        std::vector<PdfLineSegment> kept_runs;
+        for (const auto& sr : short_runs) {
+            if (!cornered(sr.lo, sr.y) || !cornered(sr.hi, sr.y)) continue;
+            for (const auto& l : h_lines) {
+                if (std::abs((l.y0 + l.y1) / 2.0 - sr.y) > 1.0) continue;
+                double lo = std::min(l.x0, l.x1), hi = std::max(l.x0, l.x1);
+                if (std::abs(sr.hi - lo) > 3.0 && std::abs(sr.lo - hi) > 3.0) continue;
+                kept_runs.push_back({static_cast<float>(sr.lo), static_cast<float>(sr.y),
+                                     static_cast<float>(sr.hi), static_cast<float>(sr.y)});
+                break;
+            }
+        }
+        for (auto& r : kept_runs) h_lines.push_back(r);
+    }
+
+    // Extract compact grids before global endpoint grouping. Nearby plot
+    // bars and ticks must not enlarge a table with repeated full-width rules.
+    std::vector<TableData> isolated_grids;
+    std::vector<bool> consumed(h_lines.size(), false);
+    for (size_t seed = 0; seed < h_lines.size(); ++seed) {
+        if (consumed[seed]) continue;
+        double left = std::min(h_lines[seed].x0, h_lines[seed].x1);
+        double right = std::max(h_lines[seed].x0, h_lines[seed].x1);
+        std::vector<size_t> matching;
+        std::vector<double> ys;
+        for (size_t i = 0; i < h_lines.size(); ++i) {
+            if (consumed[i]) continue;
+            if (std::abs(std::min(h_lines[i].x0, h_lines[i].x1) - left) > 2 ||
+                std::abs(std::max(h_lines[i].x0, h_lines[i].x1) - right) > 2) continue;
+            matching.push_back(i);
+            ys.push_back((h_lines[i].y0 + h_lines[i].y1) * 0.5);
+        }
+        auto levels = cluster_values(ys, 3.0);
+        if (levels.size() < 4 || levels.size() > 8 ||
+            levels.back() - levels.front() > 150) continue;
+        // A shorter rule can be a rowspan boundary inside a larger grid.
+        // Never carve that subgrid away from its surrounding table.
+        bool independent = true;
+        for (const auto& line : h_lines) {
+            double y = (line.y0 + line.y1) * 0.5;
+            double lo = std::min(line.x0, line.x1), hi = std::max(line.x0, line.x1);
+            if (y < levels.front() - 2 || y > levels.back() + 2 ||
+                hi <= left + 2 || lo >= right - 2) continue;
+            if (std::abs(lo - left) > 2 || std::abs(hi - right) > 2)
+                independent = false;
+        }
+        if (!independent) continue;
+        std::vector<PdfLineSegment> local_h, local_v;
+        for (size_t i : matching) local_h.push_back(h_lines[i]);
+        for (const auto& line : v_lines) {
+            double x = (line.x0 + line.x1) * 0.5;
+            double lo = std::min(line.y0, line.y1), hi = std::max(line.y0, line.y1);
+            if (x < left - 2 || x > right + 2 || lo < levels.front() - 2 ||
+                hi > levels.back() + 2) continue;
+            local_v.push_back(line);
+        }
+        std::vector<double> xs;
+        for (const auto& line : local_v) {
+            double x = (line.x0 + line.x1) * 0.5;
+            if (x > left + 5 && x < right - 5) xs.push_back(x);
+        }
+        auto dividers = cluster_values(xs, 3.0);
+        if (dividers.size() < 2) continue;
+        bool closed = true;
+        for (const auto& line : v_lines) {
+            double x = (line.x0 + line.x1) * 0.5;
+            double lo = std::min(line.y0, line.y1), hi = std::max(line.y0, line.y1);
+            if (x < left - 2 || x > right + 2) continue;
+            // Adjacent border fragments belong to preceding/following rows,
+            // even when the horizontal outer rule has a different width.
+            if ((lo < levels.front() - 2 && hi >= levels.front() - 2) ||
+                (hi > levels.back() + 2 && lo <= levels.back() + 2)) closed = false;
+        }
+        // Multiple physical records inside a band still need the existing
+        // sparse-rule row inference; this pass only isolates simple grids.
+        for (size_t r = 0; r + 1 < levels.size(); ++r) {
+            std::vector<double> text_ys;
+            for (const auto& ch : cache.chars) {
+                double x = (ch.left + ch.right) * 0.5;
+                if (x > left && x < right && ch.y > levels[r] && ch.y < levels[r + 1] &&
+                    ch.unicode != ' ' && ch.unicode != '\t' && ch.unicode != 0xA0)
+                    text_ys.push_back(ch.y);
+            }
+            if (cluster_values(text_ys, 3.0).size() != 1) closed = false;
+        }
+        for (double x : dividers) {
+            for (size_t r = 0; r + 1 < levels.size(); ++r) {
+                double lo = levels[r], hi = levels[r + 1], end = lo, covered = 0;
+                std::vector<std::pair<double,double>> spans;
+                for (const auto& line : local_v) {
+                    if (std::abs((line.x0 + line.x1) * 0.5 - x) > 3) continue;
+                    double a = std::max(lo, double(std::min(line.y0, line.y1)));
+                    double b = std::min(hi, double(std::max(line.y0, line.y1)));
+                    if (b > a) spans.push_back({a,b});
+                }
+                std::sort(spans.begin(), spans.end());
+                for (const auto& span : spans) {
+                    covered += std::max(0.0, span.second - std::max(end, span.first));
+                    end = std::max(end, span.second);
+                }
+                if (covered < (hi - lo) * 0.8) closed = false;
+            }
+        }
+        if (!closed) continue;
+        auto table = build_table(levels, local_h, local_v, cache);
+        if (table.rows.size() != levels.size() - 1) continue;
+        bool populated = true;
+        for (const auto& row : table.rows)
+            for (const auto& cell : row)
+                if (cell.empty() || cell.size() > 300) populated = false;
+        if (!populated) continue;
+        isolated_grids.push_back(std::move(table));
+        for (size_t i : matching) consumed[i] = true;
+        v_lines.erase(std::remove_if(v_lines.begin(), v_lines.end(),
+            [&](const PdfLineSegment& line) {
+                double x = (line.x0 + line.x1) * 0.5;
+                return x >= left - 2 && x <= right + 2 &&
+                    std::min(line.y0, line.y1) >= levels.front() - 2 &&
+                    std::max(line.y0, line.y1) <= levels.back() + 2;
+            }), v_lines.end());
+    }
+    std::vector<PdfLineSegment> remaining_h;
+    for (size_t i = 0; i < h_lines.size(); ++i)
+        if (!consumed[i]) remaining_h.push_back(h_lines[i]);
+    h_lines = std::move(remaining_h);
+
+    std::vector<TableData> result = std::move(isolated_grids);
+    detect_ruled_zoned(h_lines, v_lines, cache, sparse_grids, result, 0);
     // Detach a trailing caption row ("표 4.2 ...", "그림 ...") that was
     // absorbed when stacked tables were bridged across the caption line;
     // it belongs to the table directly below as its title.
@@ -1304,9 +2805,125 @@ std::vector<TableData> detect_tables(const std::vector<PdfLineSegment>& lines,
         if (below && below->title.empty()) {
             below->title = text;
             t.rows.pop_back();
+            mask_erase_row(t, t.rows.size());
         }
     }
     return result;
+}
+
+// Banded (zebra) tables commonly leave the first or last body row
+// unshaded: stripes start on the second body row, or the row count is odd
+// and the last stripe falls on a white row. The shading run then stops at
+// the last painted rect and the unshaded row is cut off. Extend the run
+// level by level over adjacent row slots (one row pitch each) whose text
+// is a single line that stays inside the table's width and whose word
+// spans each fall inside one column of the run's own text-inferred grid,
+// covering at least half the columns, and that keeps the run's row rhythm:
+// its line sits one pitch from the text of the run's edge row, and no other
+// line follows within most of a pitch (a header-only tint above a tighter
+// body is not a band; absorbing one body row of it would split the body).
+// A caption, a paragraph or a note fails: it crosses a column boundary,
+// spills past the table or wraps.
+static void extend_shading_run_to_aligned_rows(
+        std::vector<double>& run, double left, double right,
+        const PageCharCache& cache,
+        const std::vector<TableData>& existing_tables) {
+    if (run.size() < 3 || right - left < 30.0) return;
+    std::vector<double> gaps;
+    for (size_t i = 1; i < run.size(); i++) gaps.push_back(run[i] - run[i - 1]);
+    std::nth_element(gaps.begin(), gaps.begin() + gaps.size() / 2, gaps.end());
+    const double pitch = gaps[gaps.size() / 2];
+    if (pitch < 6.0) return;
+    const auto cols = infer_columns_from_text(cache, left, right, run);
+    if (cols.size() < 3) return;
+    const int n_cols = (int)cols.size() - 1;
+    double min_col_w = 1e9;
+    for (int c = 0; c < n_cols; c++)
+        min_col_w = std::min(min_col_w, cols[c + 1] - cols[c]);
+
+    auto in_x = [&](const PageCharCache::CharInfo& ch) {
+        return ch.unicode != ' ' && ch.unicode != 0xA0 && ch.unicode != '\t' &&
+               ch.x >= left - 2.0 && ch.x <= right + 2.0;
+    };
+    // Text line center of a run row (median glyph center), NaN when empty.
+    auto row_text_y = [&](double lo, double hi) {
+        std::vector<double> ys;
+        for (auto& ch : cache.chars)
+            if (in_x(ch) && ch.y > lo + 1.0 && ch.y < hi - 1.0) ys.push_back(ch.y);
+        if (ys.empty()) return std::nan("");
+        std::nth_element(ys.begin(), ys.begin() + ys.size() / 2, ys.end());
+        return ys[ys.size() / 2];
+    };
+
+    // dir < 0: slot below the run (lower y); dir > 0: above it.
+    auto slot_is_row = [&](double lo, double hi, double edge_text_y, int dir) {
+        if (std::isnan(edge_text_y)) return false;
+        for (auto& t : existing_tables) {
+            double tb = std::min(t.y0, t.y1), tt = std::max(t.y0, t.y1);
+            double tl = std::min(t.x0, t.x1), tr = std::max(t.x0, t.x1);
+            if (std::min(hi, tt) - std::max(lo, tb) > 2.0 &&
+                std::min(right, tr) - std::max(left, tl) > 2.0)
+                return false;
+        }
+        std::vector<std::pair<double,double>> ranges;
+        double y_lo = 1e9, y_hi = -1e9, h_max = 0;
+        for (auto& ch : cache.chars) {
+            if (ch.unicode == ' ' || ch.unicode == 0xA0 || ch.unicode == '\t')
+                continue;
+            if (ch.y <= lo + 1.0 || ch.y >= hi - 1.0) continue;
+            if (ch.x < left - 2.0 || ch.x > right + 2.0) {
+                // Text beside the table within a column width is the same
+                // line running past it (prose); farther off is another
+                // page column and says nothing about this slot.
+                if (ch.right > left - min_col_w && ch.left < right + min_col_w)
+                    return false;
+                continue;
+            }
+            // The glyph must sit inside the slot, not straddle its edge.
+            if (ch.top > hi + 1.0 || ch.bot < lo - 1.0) return false;
+            ranges.push_back({ch.left, ch.right});
+            y_lo = std::min(y_lo, ch.y);
+            y_hi = std::max(y_hi, ch.y);
+            h_max = std::max(h_max, ch.top - ch.bot);
+        }
+        if (ranges.size() < 2) return false;
+        if (y_hi - y_lo > std::max(2.0, h_max * 0.5)) return false;  // wraps
+        auto spans = merge_char_ranges(ranges);
+        if (spans.size() < 2) return false;
+        std::vector<bool> hit(n_cols, false);
+        for (auto& sp : spans) {
+            int col = -1;
+            for (int c = 0; c < n_cols; c++)
+                if (sp.first >= cols[c] - 2.0 && sp.second <= cols[c + 1] + 2.0) {
+                    col = c;
+                    break;
+                }
+            if (col < 0) return false;   // crosses a column boundary
+            hit[col] = true;
+        }
+        int n_hit = 0;
+        for (bool h : hit) n_hit += h ? 1 : 0;
+        if (n_hit < 2 || n_hit * 2 < n_cols) return false;
+        // Row rhythm: one pitch from the edge row's line, and no line
+        // crowding it from outside.
+        const double cand_y = (y_lo + y_hi) / 2.0;
+        if (std::abs(std::abs(edge_text_y - cand_y) - pitch) > pitch * 0.25)
+            return false;
+        for (auto& ch : cache.chars) {
+            if (!in_x(ch)) continue;
+            double d = (ch.y - cand_y) * dir;   // > 0: outward
+            if (d > std::max(2.0, h_max * 0.5) && d < pitch * 0.75) return false;
+        }
+        return true;
+    };
+
+    // Lower edge (smaller y) first, then the upper edge.
+    while (slot_is_row(run.front() - pitch, run.front(),
+                       row_text_y(run[0], run[1]), -1))
+        run.insert(run.begin(), run.front() - pitch);
+    while (slot_is_row(run.back(), run.back() + pitch,
+                       row_text_y(run[run.size() - 2], run.back()), +1))
+        run.push_back(run.back() + pitch);
 }
 
 // ── Shading-grid table detection ────────────────────────────────────
@@ -1459,7 +3076,7 @@ std::vector<TableData> detect_shading_tables(
     if (cur.size() >= 3) runs.push_back(cur);
 
     std::vector<TableData> result;
-    for (auto& run : runs) {
+    for (auto run : runs) {
         double y_min = run.front(), y_max = run.back();
 
         bool overlaps = false;
@@ -1481,20 +3098,86 @@ std::vector<TableData> detect_shading_tables(
         for (auto& r : grid)
             if (r.y0 >= y_min - 3.0 && r.y1 <= y_max + 3.0) rrects.push_back(&r);
 
+        // Unshaded first/last rows that continue the column alignment.
+        const double painted_min = y_min, painted_max = y_max;
+        {
+            double rl = 1e9, rr = -1e9;
+            for (auto* r : rrects) {
+                rl = std::min(rl, (double)r->x0);
+                rr = std::max(rr, (double)r->x1);
+            }
+            if (rr > rl) {
+                std::vector<TableData> others = existing_tables;
+                others.insert(others.end(), result.begin(), result.end());
+                extend_shading_run_to_aligned_rows(run, rl, rr, cache, others);
+                y_min = run.front();
+                y_max = run.back();
+            }
+        }
+
+        // Shading often starts several columns into a table (for example,
+        // forecast columns are tinted while row labels and historical values
+        // stay white).  Extend a long, coherent shading run to text-inferred
+        // boundaries outside its painted span.  When the inferred grid agrees
+        // with most painted edges, use it as one coherent grid so an
+        // unpainted historical column is not merged into its shaded neighbor.
+        std::vector<double> run_x_levels = x_levels;
+        double synth_left = x_levels.front(), synth_right = x_levels.back();
+        bool text_extended_grid = false;
+        if (run.size() >= 8) {
+            double text_left = 1e9, text_right = -1e9;
+            for (auto& ch : cache.chars) {
+                if (ch.unicode == ' ' || ch.unicode == 0xA0 ||
+                    ch.unicode == '\t') continue;
+                if (ch.y <= y_min + 1.0 || ch.y >= y_max - 1.0) continue;
+                text_left = std::min(text_left, ch.left);
+                text_right = std::max(text_right, ch.right);
+            }
+            if (text_right > text_left) {
+                auto inferred = infer_columns_from_text(
+                    cache, text_left - 2.0, text_right + 2.0, run);
+                int aligned = 0;
+                for (double sx : x_levels) {
+                    for (double tx : inferred) {
+                        if (std::abs(sx - tx) < 12.0) {
+                            aligned++;
+                            break;
+                        }
+                    }
+                }
+                bool expands = !inferred.empty() &&
+                    (inferred.front() < x_levels.front() - 8.0 ||
+                     inferred.back() > x_levels.back() + 8.0);
+                if (inferred.size() >= 4 && expands &&
+                    aligned * 10 >= (int)x_levels.size() * 7) {
+                    run_x_levels = std::move(inferred);
+                    synth_left = run_x_levels.front();
+                    synth_right = run_x_levels.back();
+                    text_extended_grid = true;
+                }
+            }
+        }
+
         std::vector<PdfLineSegment> h_synth, v_synth;
         for (double ry : run) {
             double lo = 1e9, hi = -1e9;
             for (auto* r : rrects) {
-                if (std::abs(r->y0 - ry) < 3.0 || std::abs(r->y1 - ry) < 3.0) {
+                // An extended (unshaded) level is bounded like the run.
+                bool extended = ry < painted_min - 1.0 || ry > painted_max + 1.0;
+                if (extended || std::abs(r->y0 - ry) < 3.0 ||
+                    std::abs(r->y1 - ry) < 3.0) {
                     lo = std::min(lo, (double)r->x0);
                     hi = std::max(hi, (double)r->x1);
                 }
             }
-            if (hi > lo)
+            if (hi > lo) {
+                lo = std::min(lo, synth_left);
+                hi = std::max(hi, synth_right);
                 h_synth.push_back({static_cast<float>(lo), static_cast<float>(ry),
                                    static_cast<float>(hi), static_cast<float>(ry)});
+            }
         }
-        for (double cx : x_levels) {
+        for (double cx : run_x_levels) {
             double lo = 1e9, hi = -1e9;
             for (auto* r : rrects) {
                 if (std::abs(r->x0 - cx) < 3.0 || std::abs(r->x1 - cx) < 3.0) {
@@ -1502,12 +3185,22 @@ std::vector<TableData> detect_shading_tables(
                     hi = std::max(hi, (double)r->y1);
                 }
             }
+            if (text_extended_grid) {
+                lo = y_min;
+                hi = y_max;
+            }
+            // A rule reaching the painted edge continues over the
+            // extended unshaded rows.
+            if (hi > lo) {
+                if (y_min < painted_min - 1.0 && lo < painted_min + 3.0) lo = y_min;
+                if (y_max > painted_max + 1.0 && hi > painted_max - 3.0) hi = y_max;
+            }
             if (hi > lo)
                 v_synth.push_back({static_cast<float>(cx), static_cast<float>(lo),
                                    static_cast<float>(cx), static_cast<float>(hi)});
         }
 
-        TableData t = build_table(run, h_synth, v_synth, cache);
+        TableData t = build_table(run, h_synth, v_synth, cache, false);
         if (t.rows.empty()) continue;
         size_t max_cell = 0;
         for (auto& row : t.rows)
@@ -1533,7 +3226,7 @@ std::vector<TableData> detect_shading_tables(
 namespace text_tables {
 
 struct CharInfo { double x, y, left, right, top, bot; unsigned int unicode;
-                  int16_t rot; };
+                  int16_t rot; bool is_bold; };
 
 struct TextRow {
     double y_center;
@@ -1542,6 +3235,13 @@ struct TextRow {
     std::vector<size_t> char_indices;                    // indices into chars
     double x_min, x_max;
     bool is_multi_cell;
+    // Dot leaders on the row ([x0, x1], left to right) and the label each
+    // one leads from ([first glyph left, last glyph right]). A leader joins
+    // one label to one value, so its label is a single cell however wide
+    // its word gaps. labels[i] belongs to leaders[i]; it is empty
+    // (first > second) when nothing precedes the leader.
+    std::vector<std::pair<double,double>> leaders;
+    std::vector<std::pair<double,double>> labels;
 };
 
 struct YBand {
@@ -1549,6 +3249,7 @@ struct YBand {
     size_t last_row;      // inclusive
     double y_top, y_bot;
     double x_min, x_max;
+    bool ruled_header = false;
 };
 
 // helper: is a row "multi-cell" given a cell-merge gap (≥ gap → multi-cell)
@@ -1563,10 +3264,54 @@ static bool row_is_multi_cell(const TextRow& tr, double cell_merge_gap) {
     return false;
 }
 
-// S1: find y-bands of consecutive multi-cell rows (with bounded 1-cell rows)
-static std::vector<YBand> find_y_bands(const std::vector<TextRow>& rows) {
+// A row that opens a table caption ("Table 2.", "표 3") ends any band above
+// it: the rows below belong to the next table. Figure captions do not split:
+// what follows one is a figure's own labels (or, captions set below, the
+// next block), and a band of chart labels is no table either way. Not
+// applied to
+// the full-width pass of a two-column page, where rows weld both page
+// columns and a caption in one column says nothing about the other; the
+// per-column passes split there.
+static bool row_is_table_caption(const TextRow& tr, const std::vector<CharInfo>& chars) {
+    std::vector<size_t> ci = tr.char_indices;
+    std::sort(ci.begin(), ci.end(), [&](size_t a, size_t b) {
+        return chars[a].x < chars[b].x;
+    });
+    std::vector<uint32_t> cps;
+    for (size_t i = 0; i < ci.size() && cps.size() < 16; i++)
+        cps.push_back(chars[ci[i]].unicode);
+    if (!is_caption_start(cps)) return false;
+    size_t i = 0;
+    if (cps[i] == '<' || cps[i] == '[' || cps[i] == 0x3008 || cps[i] == 0xFF1C) i++;
+    return i < cps.size() && (cps[i] == 'T' || cps[i] == 't' || cps[i] == 0xD45C);
+}
+
+// S1: find y-bands of consecutive multi-cell rows (with bounded 1-cell rows).
+// A 1-cell row lying wholly on one side of the band's river (the gap the
+// multi-cell rows so far share) is a wrapped cell's continuation line, as
+// the lines of a description set beside its term are, and does not count
+// against the band; a 1-cell row across the river is prose, and three of
+// those in a run end the band.
+static std::vector<YBand> find_y_bands(const std::vector<TextRow>& rows,
+                                       const std::vector<CharInfo>& chars,
+                                       bool split_at_captions,
+                                       double cell_merge_gap, double gutter_x) {
     std::vector<YBand> bands;
     const int kMaxSingleRunInside = 2;   // ≥3 consecutive 1-cell rows splits a band
+    // The widest gap of a multi-cell row.
+    auto widest_gap = [&](const TextRow& tr, double& g0, double& g1) {
+        auto sorted = tr.char_ranges;
+        std::sort(sorted.begin(), sorted.end());
+        double best = 0;
+        g0 = g1 = 0;
+        double reach = sorted.empty() ? 0 : sorted[0].second;
+        for (size_t i = 1; i < sorted.size(); i++) {
+            double gap = sorted[i].first - reach;
+            if (gap > best) { best = gap; g0 = reach; g1 = sorted[i].first; }
+            reach = std::max(reach, sorted[i].second);
+        }
+        return best >= cell_merge_gap;
+    };
 
     size_t i = 0;
     while (i < rows.size()) {
@@ -1576,12 +3321,34 @@ static std::vector<YBand> find_y_bands(const std::vector<TextRow>& rows) {
 
         size_t band_start = i;
         size_t band_end = i;          // last multi-cell row in band
+        size_t last_kept = i;         // last row kept: multi-cell or a wrapped line
         int multi = 1;
         int single_run = 0;
+        double river0 = 0, river1 = 0;
+        bool have_river = widest_gap(rows[i], river0, river1);
+        // The first cell of the last multi-cell row: a term is short, a
+        // line of prose fills its column up to the river's edge (the edge
+        // its justified neighbours set). Only a short term's lines hang: one
+        // ending half an em or more before the river, or shorter than three
+        // fifths of the column.
+        auto short_first = [&](const TextRow& tr, double r0) {
+            double l0 = 1e18, l1 = -1e18;
+            for (auto& cr : tr.char_ranges)
+                if (cr.second <= r0 + 0.5) { l0 = std::min(l0, cr.first); l1 = std::max(l1, cr.second); }
+            return l1 > l0 && (l1 < r0 - 0.6 * cell_merge_gap || (l1 - l0) < 0.6 * (r0 - l0));
+        };
+        bool term_above = have_river && short_first(rows[i], river0);
+        // Rows holding text left of the river, and those of them holding
+        // text right of it too. A term's lines hang only in a band whose
+        // terms nearly all stand beside text: a side column (an address, a
+        // note) beside a paragraph interleaves lines of its own instead.
+        size_t with_left = 1, with_both = 1;
+        auto paired = [&]() { return with_both * 100 >= with_left * 85; };
         size_t j = i + 1;
         while (j < rows.size()) {
-            // y-gap sanity: if the row is too far below the previous tracked row, stop
-            const auto& prev = rows[(band_end > i) ? band_end : i];
+            // y-gap sanity: if the row is too far below the previous kept row, stop
+            // (a description wrapped over many lines keeps its band alive).
+            const auto& prev = rows[last_kept];
             double vgap = std::abs(prev.y_bot - rows[j].y_top);
             // Use the typical line spacing as a guard; allow up to 3x font-size
             double fs_guard = std::max(prev.y_top - prev.y_bot, 8.0) * 3.5;
@@ -1589,11 +3356,80 @@ static std::vector<YBand> find_y_bands(const std::vector<TextRow>& rows) {
 
             if (rows[j].is_multi_cell) {
                 band_end = j;
+                last_kept = j;
                 multi++;
+                with_left++;
+                with_both++;
                 single_run = 0;
+                double g0, g1;
+                if (widest_gap(rows[j], g0, g1)) {
+                    if (have_river) {
+                        river0 = std::max(river0, g0);
+                        river1 = std::min(river1, g1);
+                        if (river1 - river0 < cell_merge_gap) have_river = false;
+                    } else if (band_end == j && multi == 2) {
+                        river0 = g0; river1 = g1; have_river = true;
+                    }
+                }
+                term_above = have_river && short_first(rows[j], river0);
             } else {
-                single_run++;
-                if (single_run > kMaxSingleRunInside) break;
+                if (split_at_captions && row_is_table_caption(rows[j], chars)) break;
+                // A wrapped cell's line: right of the river, under a row
+                // whose first cell was a short term.
+                if (have_river && rows[j].x_max <= river0 + 1.0) with_left++;
+                // Lines right of a river that the page's column boundary
+                // runs through are the other text column's, not a cell's
+                // wrapped lines (a short label in the left column pairs
+                // with the prose beside it the same way a term does).
+                const bool river_is_gutter = gutter_x > 0 && river0 < gutter_x && river1 > gutter_x;
+                // A wrapped line is a line of words, two ems wide at least;
+                // a lone glyph right of the river is a side tab's.
+                size_t glyphs = 0;
+                for (size_t ci : rows[j].char_indices) glyphs += chars[ci].unicode != ' ';
+                const bool line_of_words = glyphs >= 2 && rows[j].x_max - rows[j].x_min >= 2.0 * cell_merge_gap / 0.8;
+                bool continuation = have_river && term_above && paired() && !river_is_gutter && line_of_words &&
+                                    rows[j].x_min >= river1 - 1.0;
+                // A line across the river, running from the band's left
+                // edge to its right edge, after which the rows no longer
+                // share the river: the text between two tables of different
+                // make. A table's own spanning rows (a group label, a units
+                // note) are followed by rows that keep its columns. A line
+                // of prose is long (twenty ems or more) and comes after a
+                // table of three rows at least: a header's second line
+                // under a line of spanning headers is neither.
+                if (!continuation && have_river && multi >= 3 &&
+                    rows[j].x_max - rows[j].x_min >= 20.0 * cell_merge_gap / 0.8) {
+                    double bw = -1e18, bl = 1e18;
+                    for (size_t k = band_start; k <= band_end; k++)
+                        if (rows[k].is_multi_cell) { bl = std::min(bl, rows[k].x_min); bw = std::max(bw, rows[k].x_max); }
+                    // (one cell, so its gaps are word gaps: its extent is the line)
+                    const double em = cell_merge_gap / 0.8;
+                    bool crosses = rows[j].x_min < river0 - 0.5 && rows[j].x_max > river1 + 0.5;
+                    bool edge_to_edge = rows[j].x_min <= bl + em && rows[j].x_max >= bw - em;
+                    if (crosses && edge_to_edge) {
+                        bool river_goes_on = false;
+                        for (size_t j2 = j + 1; j2 < rows.size() && j2 <= j + 1 + (size_t)kMaxSingleRunInside; j2++) {
+                            if (!rows[j2].is_multi_cell) continue;
+                            // The next row keeps the river when its own
+                            // gap lies mostly in the river, or the river
+                            // mostly in its gap; a gap that only grazes the
+                            // river's end belongs to other columns.
+                            double g0, g1;
+                            if (widest_gap(rows[j2], g0, g1)) {
+                                double overlap = std::min(river1, g1) - std::max(river0, g0);
+                                double narrower = std::min(river1 - river0, g1 - g0);
+                                if (overlap >= cell_merge_gap && overlap >= 0.5 * narrower) river_goes_on = true;
+                            }
+                            break;
+                        }
+                        if (!river_goes_on) break;
+                    }
+                }
+                if (continuation) last_kept = j;
+                else {
+                    single_run++;
+                    if (single_run > kMaxSingleRunInside) break;
+                }
             }
             j++;
         }
@@ -1628,16 +3464,27 @@ static std::vector<YBand> find_y_bands(const std::vector<TextRow>& rows) {
 
 // S2: column boundaries inside a band by x-bin histogram of multi-cell rows.
 //   Returns boundaries (left, inner col-edges, right) — empty on failure.
+// column_evidence: also place boundaries from cell-stack evidence (sparse
+// columns, see below); false gives the gap-and-straddle columns alone.
 static std::vector<double> infer_columns_in_band(
         const std::vector<TextRow>& rows, const YBand& band,
-        double median_fs) {
+        double median_fs, bool column_evidence,
+        const std::vector<CharInfo>& chars, double gutter_x,
+        bool ruled_header = false) {
     // Collect multi-cell rows in the band
     std::vector<size_t> mc;
     for (size_t k = band.first_row; k <= band.last_row; k++)
-        if (rows[k].is_multi_cell) mc.push_back(k);
+        if (rows[k].is_multi_cell && (!band.ruled_header || k > band.first_row)) mc.push_back(k);
     if (mc.size() < 2) return {};
 
     double x_lo = band.x_min, x_hi = band.x_max;
+    if (band.ruled_header) {
+        x_lo = 1e18; x_hi = -1e18;
+        for (size_t k : mc) {
+            x_lo = std::min(x_lo, rows[k].x_min);
+            x_hi = std::max(x_hi, rows[k].x_max);
+        }
+    }
     if (x_hi - x_lo < 30) return {};
     double bin_w = std::max(median_fs * 0.15, 1.0);
     int n_bins = std::max(8, (int)std::ceil((x_hi - x_lo) / bin_w));
@@ -1659,6 +3506,12 @@ static std::vector<double> infer_columns_in_band(
         for (auto& cr : rows[ri].char_ranges) {
             int b0 = bin_idx(cr.first);
             int b1 = bin_idx(cr.second);
+            for (int b = b0; b <= b1; b++) row_hit[b] = true;
+        }
+        // A leader's label fills its word gaps: no column runs through it.
+        for (auto& lb : rows[ri].labels) {
+            int b0 = bin_idx(lb.first);
+            int b1 = bin_idx(lb.second);
             for (int b = b0; b <= b1; b++) row_hit[b] = true;
         }
         for (int b = 0; b < n_bins; b++) if (row_hit[b]) hit_count[b]++;
@@ -1696,35 +3549,319 @@ static std::vector<double> infer_columns_in_band(
         empty_runs.push_back({sx, ex});
     }
 
-    std::vector<double> col_edges;
+    // Glyph extent of row ri inside (a, b) — glyph centres decide.
+    auto row_extent = [&](size_t ri, double a, double b,
+                          double& l, double& r) {
+        l = 1e18; r = -1e18;
+        for (auto& cr : rows[ri].char_ranges) {
+            double c = (cr.first + cr.second) / 2.0;
+            if (c <= a || c >= b) continue;
+            l = std::min(l, cr.first);
+            r = std::max(r, cr.second);
+        }
+        return r > l;
+    };
+    // A column of a table is a stack of cells sharing an alignment: their
+    // left edges, right edges or centres line up (one header cell may set
+    // its own alignment once the stack has four or more cells). Lines of
+    // running text line up too (a paragraph beside a figure's labels), so
+    // a stack whose typical cell is a phrase of five or more words is
+    // prose, not a column. n receives the number of rows with text in
+    // (a, b).
+    // Whether every glyph centred in (a, b) is a currency sign.
+    auto only_currency = [&](double a, double b) {
+        bool any = false;
+        for (size_t ri : mc)
+            for (size_t ci : rows[ri].char_indices) {
+                const auto& c = chars[ci];
+                double m = (c.left + c.right) / 2.0;
+                if (m <= a || m >= b) continue;
+                uint32_t u = c.unicode;
+                if (u != '$' && u != 0x20AC && u != 0xA3 && u != 0xA5 && u != 0x20A9) return false;
+                any = true;
+            }
+        return any;
+    };
+    const double align_tol = std::max(median_fs * 0.5, 2.0);
+    const double word_gap = std::max(median_fs * 0.2, 1.5);
+    auto stack_aligned = [&](double a, double b, int& n) {
+        std::vector<double> L, R, C;
+        std::vector<int> words;
+        for (size_t ri : mc) {
+            double l, r;
+            if (!row_extent(ri, a, b, l, r)) continue;
+            L.push_back(l); R.push_back(r); C.push_back((l + r) / 2.0);
+            std::vector<std::pair<double, double>> in;
+            for (auto& cr : rows[ri].char_ranges) {
+                double c = (cr.first + cr.second) / 2.0;
+                if (c > a && c < b) in.push_back(cr);
+            }
+            std::sort(in.begin(), in.end());
+            int w = 1;
+            for (size_t k = 1; k < in.size(); k++)
+                if (in[k].first - in[k - 1].second > word_gap) w++;
+            words.push_back(w);
+        }
+        n = (int)L.size();
+        if (n < 2) return false;
+        std::nth_element(words.begin(), words.begin() + words.size() / 2, words.end());
+        if (words[words.size() / 2] >= 5) return false;
+        double header_l, header_r;
+        const bool separate_header = ruled_header && n == 3 &&
+            row_extent(band.first_row, a, b, header_l, header_r);
+        const int keep = n >= 4 ? n - 1 : n;
+        auto tight = [&](std::vector<double>& v) {
+            // In a compact ruled table only the actual first/header row
+            // may differ: both body cells must agree on their alignment.
+            if (separate_header) return std::abs(v[1] - v[2]) <= align_tol;
+            std::sort(v.begin(), v.end());
+            for (int st = 0; st + keep <= n; st++)
+                if (v[st + keep - 1] - v[st] <= align_tol) return true;
+            return false;
+        };
+        return tight(L) || tight(R) || tight(C);
+    };
+
+    // Candidate boundaries. A run of bins empty in most rows normally holds
+    // one boundary at its middle. A sparse column (values in fewer than
+    // 40% of the rows) is itself "mostly empty", so its run reaches from the
+    // previous column to the next one (or the band edge) with the sparse
+    // column inside as a hump of hits between bins no row touches at all.
+    // When the hump's cells form an aligned stack, the boundaries are the
+    // untouched sub-runs around it, not the middle of the whole run.
+    // z_*: untouched sub-run; lo/hi: the empty run around the boundary
+    struct Cand { double e; double z_lo, z_hi; double lo, hi; };
+    std::vector<Cand> cands;
+    auto zero_runs_in = [&](int b0, int b1) {
+        std::vector<std::pair<int, int>> z;   // [start, end) bins, hit == 0
+        int st = -1;
+        for (int b = b0; b < b1; b++) {
+            if (hit_count[b] == 0) { if (st < 0) st = b; }
+            else if (st >= 0) { z.push_back({st, b}); st = -1; }
+        }
+        if (st >= 0) z.push_back({st, b1});
+        std::vector<std::pair<int, int>> wide;
+        for (auto& r : z)
+            if ((r.second - r.first) * bin_w >= col_gap_min) wide.push_back(r);
+        return wide;
+    };
     for (auto& run : empty_runs) {
         double width = run.second - run.first;
         if (width < col_gap_min) continue;
+        int b0 = (int)std::lround((run.first - x_lo) / bin_w);
+        int b1 = std::min(n_bins, (int)std::lround((run.second - x_lo) / bin_w));
+        auto zr = zero_runs_in(b0, b1);
+        bool hump = false;
+        for (int b = b0; b < b1; b++) if (hit_count[b] > 0) { hump = true; break; }
+        if (column_evidence && hump && !zr.empty()) {
+            // Boundaries at the untouched sub-runs that are not margins;
+            // the stretches between them (and the run's ends) are columns.
+            std::vector<Cand> inner;
+            for (auto& z : zr) {
+                double zl = x_lo + z.first * bin_w, zh = x_lo + z.second * bin_w;
+                double mid = (zl + zh) / 2.0;
+                if (mid <= x_lo + 2.0 || mid >= x_hi - 2.0) continue;
+                inner.push_back({mid, zl, zh, zl, zh});
+            }
+            bool stacks_ok = !inner.empty();
+            for (size_t k = 0; stacks_ok && k <= inner.size(); k++) {
+                double a = (k == 0) ? run.first : inner[k - 1].z_hi;
+                double b = (k == inner.size()) ? run.second : inner[k].z_lo;
+                // A stretch holding no glyph centre is the frayed edge of
+                // the neighbouring column; one holding cells must stack.
+                // Currency signs set apart from their amounts ("$  1,111")
+                // stack too, but they are the amounts' prefix, not a column.
+                int n = 0;
+                bool aligned = stack_aligned(a, b, n);
+                if (n > 0 && (!aligned || only_currency(a, b))) stacks_ok = false;
+            }
+            if (stacks_ok) {
+                for (auto& c : inner) cands.push_back(c);
+                continue;
+            }
+        }
         double mid = (run.first + run.second) / 2.0;
         // skip runs hugging the band edges (those are just margins)
         if (mid <= x_lo + 2.0) continue;
         if (mid >= x_hi - 2.0) continue;
-        col_edges.push_back(mid);
+        // The untouched sub-run nearest the middle, if any, for the
+        // alignment test below.
+        double zl = NAN, zh = NAN, best = 1e18;
+        for (auto& z : zr) {
+            double l = x_lo + z.first * bin_w, h = x_lo + z.second * bin_w;
+            double d = std::abs((l + h) / 2.0 - mid);
+            if (d < best) { best = d; zl = l; zh = h; }
+        }
+        cands.push_back({mid, zl, zh, run.first, run.second});
     }
-    if (col_edges.empty()) return {};
+    if (cands.empty()) return {};
+    std::sort(cands.begin(), cands.end(),
+              [](const Cand& a, const Cand& b) { return a.e < b.e; });
+    if (table_debug()) {
+        fprintf(stderr, "[band-cols] x %.1f..%.1f runs", x_lo, x_hi);
+        for (auto& r : empty_runs) fprintf(stderr, " [%.1f,%.1f]", r.first, r.second);
+        fprintf(stderr, " cands");
+        for (auto& c : cands) fprintf(stderr, " %.1f(%.1f-%.1f)", c.e, c.z_lo, c.z_hi);
+        fprintf(stderr, "\n");
+    }
 
     // Validate: for each candidate boundary, ≥70% of multi-cell rows that
     // overlap a neighborhood of the boundary must "straddle" it (chars on
     // both sides). Rows that have no chars near the boundary are ignored — a
     // row of body text on the opposite side of the page does not invalidate
     // a column boundary inside a data table.
+    //
+    // A sparse first or last column fails that test by construction: rows
+    // with its cell empty have nothing on one side. Such a boundary still
+    // stands on column evidence: no row's glyphs touch a gap at least a
+    // column gap wide around it, and the cells on each side form an aligned
+    // stack — two or more cells on the sparse side, three or more on the
+    // other. Prose torn there leaves no such stacks.
     std::vector<double> kept;
     double neigh = std::max(median_fs * 6.0, 60.0);
-    for (double e : col_edges) {
+    // A wide gutter whose right side opens with figures on most rows is the
+    // label/value split of a financial statement ("Revenues ...... 100.0%").
+    // No glyph lies within reach of its midpoint, so nearness to it is taken
+    // from the edges of the empty run; otherwise the boundary was dropped for
+    // lack of evidence however many rows straddled it. Other wide gutters
+    // keep the midpoint test: the gap between the two text columns of a page
+    // is wide too, and must not split prose into a table.
+    auto figure_first = [&](const TextRow& r, double x) {
+        double best = 1e18; unsigned int u = 0;
+        for (size_t idx : r.char_indices) {
+            const auto& c = chars[idx];
+            if (c.left >= x && c.left < best) { best = c.left; u = c.unicode; }
+        }
+        return (u >= '0' && u <= '9') || u == '$' || u == '(' || u == '-' ||
+               u == 0x2014 || u == 0x2013 || u == '%' || u == 0x20AC || u == 0xA3;
+    };
+    // The figure that opens a row's text from x on, as a number ("2,500",
+    // "(3.4)", "–15"); NaN when the row's first token there is not one.
+    auto first_number = [&](const TextRow& r, double x) {
+        std::vector<size_t> idx;
+        for (size_t i : r.char_indices) if (chars[i].left >= x) idx.push_back(i);
+        std::sort(idx.begin(), idx.end(),
+                  [&](size_t p, size_t q) { return chars[p].left < chars[q].left; });
+        std::string tok;
+        double prev_right = 0;
+        for (size_t k = 0; k < idx.size(); k++) {
+            const auto& c = chars[idx[k]];
+            double h = std::max(c.top - c.bot, 1.0);
+            if (k > 0 && c.left - prev_right > 0.2 * h) break;   // word space
+            unsigned int u = c.unicode;
+            if (u >= '0' && u <= '9') tok += (char)u;
+            else if (u == '.') tok += '.';
+            else if (u == '-' || u == 0x2212 || u == 0x2013 || u == '(') { if (tok.empty()) tok += '-'; }
+            else if (u != ',' && u != ')' && u != '%') break;
+            prev_right = c.right;
+        }
+        if (tok.empty() || tok == "-") return std::nan("");
+        return std::strtod(tok.c_str(), nullptr);
+    };
+    // Figures falling by even steps down the rows (30, 20, 10, 0) are the
+    // tick labels of a chart's value axis, which rises up the page; amounts
+    // in a statement never step evenly, and page references in a contents
+    // list rise down it. Other chart text (data labels, legend entries) may
+    // sit on rows between the ticks or open a tick's row, so the ladder is
+    // sought in row order with rows skipped and a single rung missing at a
+    // time. True when such a ladder of three or more covers at least half
+    // of the values.
+    auto ticks = [](const std::vector<double>& v) {
+        size_t n = v.size(), best = 0;
+        for (size_t i = 0; i < n; i++) {
+            if (std::isnan(v[i])) continue;
+            for (size_t j = i + 1; j < n; j++) {
+                double d = v[j] - v[i];
+                if (std::isnan(d) || d >= 0) continue;
+                size_t len = 2;
+                long rung = 1;
+                for (size_t k = j + 1; k < n; k++) {
+                    if (std::isnan(v[k])) continue;
+                    double q = (v[k] - v[i]) / d;
+                    long r = std::lround(q);
+                    if (std::abs(q - r) > 1e-6 || r <= rung || r > rung + 2) continue;
+                    len++;
+                    rung = r;
+                }
+                best = std::max(best, len);
+            }
+        }
+        return best >= 3 && best * 2 >= n;
+    };
+    for (size_t ci = 0; ci < cands.size(); ci++) {
+        const Cand& ed = cands[ci];
+        double e = ed.e;
+        bool wide = ed.hi - ed.lo > median_fs * 6.0;
+        bool figures = false;
+        // A wide gap most rows straddle cleanly (text ending at its left
+        // edge and resuming at its right) is a column gap whatever follows
+        // it; a glossary's short terms sit several ems clear of their
+        // definitions, nowhere near the gap's midpoint.
+        bool straddled = false;
+        if (wide) {
+            int straddle = 0, fig = 0;
+            std::vector<double> right_vals;
+            for (size_t ri : mc) {
+                bool l = false, rr = false;
+                for (auto& cr : rows[ri].char_ranges) {
+                    if (cr.second <= ed.lo + 0.5) l = true;
+                    if (cr.first >= ed.hi - 0.5) rr = true;
+                }
+                if (l && rr) {
+                    straddle++;
+                    if (figure_first(rows[ri], ed.hi - 0.5)) {
+                        fig++;
+                        right_vals.push_back(first_number(rows[ri], e));
+                    }
+                }
+            }
+            figures = straddle >= 3 && fig * 10 >= straddle * 7 && !ticks(right_vals);
+            // The gap the page's two text columns leave between them is
+            // straddled by every row too; the page's column boundary
+            // (which a label column does not set, see label_column) lies
+            // in it, and such a gap is no column gap of a table.
+            straddled = straddle >= 3 && static_cast<size_t>(straddle) * 10 >= mc.size() * 7 &&
+                        !(gutter_x > 0 && gutter_x > ed.lo && gutter_x < ed.hi);
+            // ... and hardly a line of the band, one cell or several,
+            // reaches across the gap (a tenth at most): a line entering it
+            // from the left and ending within a cell gap of its far edge
+            // meets the text there, as the long lines of two text columns'
+            // footnotes meet the gutter's far side while their short lines
+            // (the multi-cell rows) stop well before it. A glossary's long
+            // terms end a cell gap or more before the definitions.
+            if (straddled) {
+                const double reach = ed.hi - std::max(median_fs * 0.8, 8.0);
+                size_t crossing = 0, all = 0;
+                for (size_t k = band.first_row; k <= band.last_row; k++) {
+                    if (rows[k].char_ranges.empty()) continue;
+                    all++;
+                    for (auto& cr : rows[k].char_ranges)
+                        if (cr.first < ed.lo + 0.5 && cr.second > reach) { crossing++; break; }
+                }
+                straddled = crossing * 10 <= all;
+            }
+            if (table_debug()) {
+                fprintf(stderr, "[fig-gutter] %.1f-%.1f straddle %d fig %d ticks %d:",
+                        ed.lo, ed.hi, straddle, fig, (int)ticks(right_vals));
+                for (double v : right_vals) fprintf(stderr, " %g", v);
+                fprintf(stderr, "\n");
+            }
+        }
         int agree = 0;
         int relevant = 0;
         for (size_t ri : mc) {
             bool has_left = false, has_right = false;
             bool near = false;
+            bool splits_label = false;
+            for (auto& lb : rows[ri].labels)
+                if (lb.first < e - 0.5 && lb.second > e + 0.5) splits_label = true;
+            if (splits_label) { relevant++; continue; }
             for (auto& cr : rows[ri].char_ranges) {
                 if (cr.second <= e) has_left = true;
                 else if (cr.first >= e) has_right = true;
-                if (cr.first <= e + neigh && cr.second >= e - neigh) near = true;
+                if ((figures || straddled) ? (cr.first <= ed.hi + neigh && cr.second >= ed.lo - neigh)
+                                           : (cr.first <= e + neigh && cr.second >= e - neigh))
+                    near = true;
                 if (has_left && has_right && near) break;
             }
             if (!near) continue;
@@ -1732,15 +3869,80 @@ static std::vector<double> infer_columns_in_band(
             if (has_left && has_right) agree++;
         }
         int needed = std::max(2, (int)std::ceil(relevant * 0.70));
-        if (relevant >= 2 && agree >= needed) kept.push_back(e);
+        if (relevant >= 2 && agree >= needed) { kept.push_back(e); continue; }
+        if (!column_evidence || std::isnan(cands[ci].z_lo)) continue;
+        double a = ci > 0 ? cands[ci - 1].e : x_lo - 1.0;
+        double b = ci + 1 < cands.size() ? cands[ci + 1].e : x_hi + 1.0;
+        int nl = 0, nr = 0;
+        bool al = stack_aligned(a, cands[ci].z_lo, nl);
+        bool ar = stack_aligned(cands[ci].z_hi, b, nr);
+        if (al && ar && std::min(nl, nr) >= 2 && std::max(nl, nr) >= 3)
+            kept.push_back((cands[ci].z_lo + cands[ci].z_hi) / 2.0);
     }
     if (kept.empty()) return {};
 
     std::vector<double> bounds;
-    bounds.push_back(x_lo);
+    bounds.push_back(band.x_min);
     for (double e : kept) bounds.push_back(e);
-    bounds.push_back(x_hi);
+    bounds.push_back(band.x_max);
     return bounds;
+}
+
+// A torn top row may be a spanning header ("BLEU" centred over EN-DE and
+// EN-FR) rather than drifted prose: each of its glyph runs sits centred over
+// a run of whole columns instead of being cut mid-word by a boundary the
+// rows below agree on. Fills the header cells (each run in its leftmost
+// column) and the span per column; false when the row is not that shape.
+static bool spanning_header_cells(const std::vector<size_t>& ci,
+                                  const std::vector<CharInfo>& chars,
+                                  const std::vector<double>& row_bounds,
+                                  double min_split_gap, double word_gap,
+                                  std::vector<std::string>& cells,
+                                  std::vector<int>& spans) {
+    int n_cols = (int)row_bounds.size() - 1;
+    struct Run { std::string text; double left, right; };
+    std::vector<Run> runs;
+    double prev_right = -1e9;
+    for (size_t idx : ci) {
+        const auto& ch = chars[idx];
+        if (ch.rot != 0) return false;
+        if (runs.empty() || ch.left - prev_right >= min_split_gap)
+            runs.push_back({"", ch.left, ch.right});
+        else if (ch.left - prev_right >= word_gap)
+            runs.back().text += ' ';
+        append_glyph_text(runs.back().text, ch.unicode);
+        runs.back().right = std::max(runs.back().right, ch.right);
+        prev_right = std::max(prev_right, ch.right);
+    }
+    if (runs.empty() || (int)runs.size() > n_cols) return false;
+    auto col_of = [&](double x) {
+        for (int c = 0; c < n_cols; c++)
+            if (x < row_bounds[c + 1]) return c;
+        return n_cols - 1;
+    };
+    cells.assign(n_cols, "");
+    spans.assign(n_cols, 0);
+    bool any_span = false, any_letter = false;
+    for (auto& r : runs) {
+        // A header names something; a row of affiliation marks ("1 2* 1")
+        // over an author block has no letter in it.
+        for (unsigned char ch : r.text)
+            if ((ch | 0x20) - 'a' < 26u || ch >= 0x80) { any_letter = true; break; }
+        int lo = col_of(r.left), hi = col_of(r.right);
+        int span = hi - lo + 1;
+        // A run across every column is a caption line, and a long one is
+        // prose; a second run landing in a taken column is ordinary text.
+        if (span >= n_cols || r.text.size() > 60 || !cells[lo].empty()) return false;
+        if (span >= 2) {
+            double span_l = row_bounds[lo], span_r = row_bounds[hi + 1];
+            double off = std::fabs((r.left + r.right) / 2.0 - (span_l + span_r) / 2.0);
+            if (off > (span_r - span_l) * 0.3) return false;
+            any_span = true;
+        }
+        cells[lo] = r.text;
+        spans[lo] = span;
+    }
+    return any_span && any_letter;
 }
 
 // S3: build the table from a band + columns.
@@ -1773,18 +3975,33 @@ static TableData build_table_from_band(
     std::vector<int> near_cnt(n_cols + 1, 0), torn_cnt(n_cols + 1, 0);
     double torn_gap = std::max(median_fs * 0.2, 1.2);
     double near_win = median_fs * 3.0;
+    std::vector<bool> row_has_tear;   // parallel to table.rows
+    // A spanning header found at the top waits until the body is built: it
+    // only joins a table that stands on three data rows of its own, so an
+    // author block (marker row over two name rows) cannot reach the row
+    // minimum by counting its markers as a header.
+    bool have_pending_header = false;
+    std::vector<std::string> pending_header;
+    std::vector<int> pending_spans, pending_near, pending_torn;
+
+    // Per-row scratch, reused across rows.
+    std::vector<size_t> ci;
+    std::vector<std::pair<double,double>> gap_runs;
+    std::vector<double> row_bounds, last_right;
+    std::vector<int> row_near, row_torn_at, glyphs, bold_glyphs;
+    std::vector<int16_t> last_rot;
 
     for (size_t k = band.first_row; k <= band.last_row; k++) {
         const auto& tr = rows[k];
         // gather chars sorted by x (use char_indices into the per-page chars[])
-        std::vector<size_t> ci = tr.char_indices;
+        ci = tr.char_indices;
         std::sort(ci.begin(), ci.end(), [&](size_t a, size_t b) {
             return chars[a].x < chars[b].x;
         });
 
         // Find natural gap midpoints in this row (gaps between consecutive chars
         // ≥ min_split_gap), used for snapping column boundaries.
-        std::vector<std::pair<double,double>> gap_runs;   // (gap_start, gap_end)
+        gap_runs.clear();   // (gap_start, gap_end)
         for (size_t i = 1; i < ci.size(); i++) {
             double prev_r = chars[ci[i-1]].right;
             double cur_l  = chars[ci[i]].left;
@@ -1794,7 +4011,7 @@ static TableData build_table_from_band(
         }
 
         // For each inner boundary, snap to nearest gap midpoint within snap_tol.
-        std::vector<double> row_bounds(col_bounds.size());
+        row_bounds.assign(col_bounds.size(), 0.0);
         row_bounds.front() = col_bounds.front();
         row_bounds.back()  = col_bounds.back();
         for (int c = 1; c < (int)col_bounds.size() - 1; c++) {
@@ -1811,12 +4028,57 @@ static TableData build_table_from_band(
             }
             row_bounds[c] = best;
         }
+        // A boundary that would cut a leader's label moves to that leader:
+        // the label is one cell and the leader is where it ends (a long
+        // entry runs past the point where shorter entries' leaders start).
+        for (int c = 1; c < (int)col_bounds.size() - 1; c++)
+            for (size_t li = 0; li < tr.labels.size(); li++) {
+                const auto& lb = tr.labels[li];
+                if (lb.first < row_bounds[c] && row_bounds[c] < lb.second)
+                    row_bounds[c] = (tr.leaders[li].first + tr.leaders[li].second) / 2.0;
+            }
         // Ensure monotonic
         for (int c = 1; c < (int)row_bounds.size(); c++) {
             if (row_bounds[c] < row_bounds[c-1] + 0.1)
                 row_bounds[c] = row_bounds[c-1] + 0.1;
         }
 
+        if (band.ruled_header && k == band.first_row) {
+            std::vector<std::string> labels(n_cols);
+            std::vector<int> counts(n_cols, 0), bold_counts(n_cols, 0);
+            bool valid = true;
+            for (size_t start = 0; start < ci.size(); ) {
+                size_t end = start + 1;
+                while (end < ci.size() && chars[ci[end]].left - chars[ci[end - 1]].right < std::max(median_fs * 0.8, 8.0))
+                    ++end;
+                double center = (chars[ci[start]].left + chars[ci[end - 1]].right) * 0.5;
+                int c = 0;
+                while (c + 1 < n_cols && center >= col_bounds[c + 1]) ++c;
+                if (!labels[c].empty()) { valid = false; break; }
+                for (size_t j = start; j < end; ++j) {
+                    if (j > start && chars[ci[j]].left - chars[ci[j - 1]].right >= word_gap)
+                        labels[c] += ' ';
+                    util::append_utf8(labels[c], chars[ci[j]].unicode);
+                    ++counts[c]; bold_counts[c] += chars[ci[j]].is_bold;
+                }
+                start = end;
+            }
+            if (!valid) { table.rows.clear(); return table; }
+            table.rows.push_back(std::move(labels));
+            row_has_tear.push_back(false);
+            table.cell_bold.push_back(std::vector<uint8_t>(n_cols, 0));
+            for (int c = 0; c < n_cols; ++c)
+                table.cell_bold.back()[c] = counts[c] > 0 && counts[c] == bold_counts[c];
+            continue;
+        }
+        int row_torn = 0, row_overflow = 0;
+        row_near.assign(n_cols + 1, 0);
+        row_torn_at.assign(n_cols + 1, 0);
+        // The row's own type size: a display title's word spaces scale with
+        // it, so the gap that separates an overflowing label from the next
+        // cell is measured against the row, not the page median.
+        double row_fs = 0;
+        for (size_t idx : ci) row_fs = std::max(row_fs, chars[idx].top - chars[idx].bot);
         for (int c = 1; c < (int)row_bounds.size() - 1; c++) {
             double b = row_bounds[c];
             const CharInfo* prev = nullptr;
@@ -1830,12 +4092,80 @@ static TableData build_table_from_band(
             if (b - prev->right > near_win || next->left - b > near_win)
                 continue;
             near_cnt[c]++;
-            if (next->left - prev->right < torn_gap) torn_cnt[c]++;
+            row_near[c]++;
+            if (next->left - prev->right < torn_gap) {
+                // A label longer than its column overflows into the
+                // neighbour's whitespace but still ends in a real gap before
+                // the neighbour's own text ("GoogLeNet [44] (ILSVRC'14)"
+                // beside "-"); a prose line torn by a phantom boundary runs
+                // on with word spaces only. Overflow is not a tear.
+                // The gap that ends an overflowing label is cell padding, a
+                // font size or more; a word space in a large title (which
+                // can exceed the split gap) is not.
+                const double overflow_gap = std::max({median_fs, row_fs, 8.0});
+                bool overflow = false;
+                double run_end = next->right;
+                for (size_t idx : ci) {
+                    const auto& ch = chars[idx];
+                    if (ch.left < next->left) continue;
+                    if (ch.left - run_end >= overflow_gap) {
+                        overflow = run_end <= row_bounds[c + 1];
+                        break;
+                    }
+                    run_end = std::max(run_end, ch.right);
+                }
+                if (!overflow) {
+                    torn_cnt[c]++;
+                    row_torn_at[c]++;
+                    row_torn++;
+                } else {
+                    row_overflow++;
+                }
+            }
         }
+        // A row whose glyphs are cut mid-word by two or more boundaries is
+        // prose that drifted into the band (a paragraph line right below a
+        // table): evict it. The capture check in the markdown pass returns
+        // the line to the prose flow. Above the first data row the same
+        // shape is a spanning header, which tears by construction; it is
+        // kept, and its tears are not evidence against the boundaries.
+        if (table_debug()) {
+            std::string dbg;
+            for (size_t idx : ci) util::append_utf8(dbg, chars[idx].unicode);
+            fprintf(stderr, "[text-row] y %.1f torn %d n %zu: %s\n",
+                    tr.y_center, row_torn, ci.size(), dbg.c_str());
+        }
+        // A header needs a body: three or more rows below it, or the band
+        // is a display equation whose aligned pieces line up. Any glyph run
+        // across a boundary (torn or overflowing) qualifies the top row.
+        if (table.rows.empty() && band.last_row - k >= 3 &&
+            row_torn + row_overflow >= 1) {
+            std::vector<std::string> hcells;
+            std::vector<int> hspans;
+            if (!have_pending_header &&
+                spanning_header_cells(ci, chars, row_bounds, min_split_gap,
+                                      word_gap, hcells, hspans)) {
+                for (int c = 1; c < n_cols; c++) {
+                    near_cnt[c] -= row_near[c];
+                    torn_cnt[c] -= row_torn_at[c];
+                }
+                have_pending_header = true;
+                pending_header = std::move(hcells);
+                pending_spans = std::move(hspans);
+                pending_near = row_near;
+                pending_torn = row_torn_at;
+                continue;
+            }
+        }
+        if (row_torn >= 2) continue;
 
         std::vector<std::string> cells(n_cols);
-        std::vector<double> last_right(n_cols, -1e9);
-        std::vector<int16_t> last_rot(n_cols, 0);
+        last_right.assign(n_cols, -1e9);
+        last_rot.assign(n_cols, 0);
+        glyphs.assign(n_cols, 0);
+        bold_glyphs.assign(n_cols, 0);
+        int run_col = 0;
+        double run_right = -1e9;
 
         // Column assignment above works in page space, but the text of a cell
         // has to be emitted in the run's own reading order — a 180° run
@@ -1865,6 +4195,12 @@ static TableData build_table_from_band(
         for (size_t idx : *order) {
             const auto& ch = chars[idx];
             double cmid = (ch.left + ch.right) / 2.0;
+            // A char well outside the inferred column span never belongs to a
+            // cell (margin stamp grouped into the row by y); leave it to the
+            // prose flow instead of prepending it to an edge cell.
+            if (cmid < table.x0 - median_fs * 2.0 ||
+                cmid > table.x1 + median_fs * 2.0)
+                continue;
             int col = -1;
             for (int c = 0; c < n_cols; c++) {
                 // Use strict less-than-or-equal on the right edge so chars that
@@ -1884,6 +4220,18 @@ static TableData build_table_from_band(
                 if (cmid < row_bounds.front()) col = 0;
                 else col = n_cols - 1;
             }
+            // A run of glyphs with no cell-sized gap inside it is one cell's
+            // text even where a boundary (placed by the other rows) cuts it:
+            // a label wider than its column keeps its tail rather than
+            // dropping "’14)" into the neighbour. Upright rows only — a
+            // rotated run's page-space gaps do not measure its advance.
+            if (!rotated) {
+                if (run_right > -1e8 && ch.left - run_right < min_split_gap)
+                    col = run_col;
+                else
+                    run_col = col;
+                run_right = std::max(run_right, ch.right);
+            }
             // Word gaps are measured along the advance too, so a rotated run
             // does not read as one gapless word (its page-space gaps run
             // backwards and never clear the threshold). Across a direction
@@ -1895,13 +4243,48 @@ static TableData build_table_from_band(
             if (!cells[col].empty() &&
                 (ch.rot != last_rot[col] || (lo - last_right[col]) >= word_gap))
                 cells[col] += ' ';
-            util::append_utf8(cells[col], ch.unicode);
+            append_glyph_text(cells[col], ch.unicode);
             last_right[col] = hi;
             last_rot[col] = ch.rot;
+            glyphs[col]++;
+            if (ch.is_bold) bold_glyphs[col]++;
         }
 
-        for (auto& c : cells) c = util::trim(c);
+        std::vector<uint8_t> bold_mask(n_cols, 0);
+        for (int c = 0; c < n_cols; c++) {
+            cells[c] = util::trim(cells[c]);
+            // A cell set entirely in a bold face keeps the emphasis (the
+            // best value in a results table); a mixed cell stays plain.
+            bold_mask[c] = !cells[c].empty() && glyphs[c] > 0 && bold_glyphs[c] == glyphs[c];
+        }
         table.rows.push_back(std::move(cells));
+        table.cell_bold.push_back(std::move(bold_mask));
+        row_has_tear.push_back(row_torn > 0);
+    }
+
+    if (have_pending_header) {
+        // The header stands only on a body of three rows that each fill two
+        // or more cells; an author block (a marker row, a name row, a lone
+        // keyword) does not reach that by having a title above it.
+        int body_rows = 0;
+        for (auto& row : table.rows) {
+            int filled = 0;
+            for (auto& c : row) if (!c.empty()) filled++;
+            if (filled >= 2) body_rows++;
+        }
+        if (body_rows >= 3) {
+            table.rows.insert(table.rows.begin(), std::move(pending_header));
+            table.cell_bold.insert(table.cell_bold.begin(), std::vector<uint8_t>(n_cols, 0));
+            row_has_tear.insert(row_has_tear.begin(), false);
+            table.header_spans = std::move(pending_spans);
+        } else {
+            // Not a header after all: its tears count against the boundaries
+            // like any other row's.
+            for (int c = 1; c < n_cols; c++) {
+                near_cnt[c] += pending_near[c];
+                torn_cnt[c] += pending_torn[c];
+            }
+        }
     }
 
     // A boundary that cuts through touching glyphs on 30%+ of its populated
@@ -1909,18 +4292,41 @@ static TableData build_table_from_band(
     // bands (diagram labels) rarely repeat a tear on one boundary, so tears
     // are also summed across boundaries: real cells have padding, and any
     // substantial overall tear rate marks a non-table.
+    bool tear_rate_bad = false;
     int total_torn = 0, total_near = 0;
     for (int c = 1; c < n_cols; c++) {
         total_torn += torn_cnt[c];
         total_near += near_cnt[c];
-        if (torn_cnt[c] >= 2 && torn_cnt[c] * 10 >= near_cnt[c] * 3) {
+        if (torn_cnt[c] >= 2 && torn_cnt[c] * 10 >= near_cnt[c] * 3)
+            tear_rate_bad = true;
+    }
+    if (total_torn >= 1 && total_torn * 20 >= total_near * 7)
+        tear_rate_bad = true;
+    if (tear_rate_bad) {
+        // The tears often come from a wrapped caption or a stray prose line
+        // lying inside the band, not from a phantom boundary: several visual
+        // lines of one caption tear the same boundary and dominate the rate.
+        // When an untorn majority still fills the band, evict the torn rows
+        // to the prose flow and keep the table; the band is prose only when
+        // torn rows rival the clean ones.
+        int clean = 0, torn_rows = 0;
+        for (bool t : row_has_tear) t ? torn_rows++ : clean++;
+        if (clean >= 3 && torn_rows * 2 <= clean) {
+            size_t w = 0;
+            for (size_t r = 0; r < table.rows.size(); r++) {
+                if (row_has_tear[r]) continue;
+                if (w != r) {
+                    table.rows[w] = std::move(table.rows[r]);
+                    table.cell_bold[w] = std::move(table.cell_bold[r]);
+                }
+                w++;
+            }
+            table.rows.resize(w);
+            table.cell_bold.resize(w);
+        } else {
             table.rows.clear();
             return table;
         }
-    }
-    if (total_torn >= 1 && total_torn * 20 >= total_near * 7) {
-        table.rows.clear();
-        return table;
     }
     return table;
 }
@@ -1970,6 +4376,9 @@ static void strip_prose_columns(TableData& table) {
                     stripped_bytes += row.front().size();
                     row.erase(row.begin());
                 }
+            if (!table.header_spans.empty())
+                table.header_spans.erase(table.header_spans.begin());
+            mask_erase_col(table, 0);
             stripped = true;
         }
         // Right edge prose (recompute n_cols if changed)
@@ -1980,6 +4389,8 @@ static void strip_prose_columns(TableData& table) {
                     stripped_bytes += row.back().size();
                     row.pop_back();
                 }
+            if (!table.header_spans.empty()) table.header_spans.pop_back();
+            mask_pop_col(table);
             stripped = true;
         }
         if (!stripped) break;
@@ -1997,12 +4408,53 @@ static void strip_prose_columns(TableData& table) {
 }
 
 // S4: rejection / cleanup heuristics.
-// Returns true if the table is acceptable (kept).
-static bool accept_table(TableData& table) {
+// A figure cell: an amount, a ratio, a year or a short range ("$(55,218)",
+// "2.1", "12.5%", "5 to 20", "F-2"). It holds a digit and at most a few
+// letters; a cell of words is a label or prose.
+static bool is_value_cell(const std::string& s) {
+    if (s.empty() || s.size() > 20) return false;
+    int digits = 0, letters = 0;
+    for (unsigned char c : s) {
+        if (c >= '0' && c <= '9') digits++;
+        else if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c >= 0xC2) letters++;
+    }
+    return digits > 0 && letters <= 4;
+}
+
+// Returns true if the table is acceptable (kept). gutter is the empty gap
+// between the two columns of a 2-column candidate, in font sizes, when it
+// is the widest gap of its rows (0 otherwise or for other widths).
+// structured: rules part the band's rows (see detect_text_tables_range);
+// such a band is a table whatever its cells read like, so the tests that
+// tell prose torn at a phantom boundary from a table do not apply to it
+// (lists and contents still do). shaped: the shape of a two-column band
+// says table (a narrow label column, ragged cells beside their terms, a
+// bold header over both columns); the tests on cell length do not apply,
+// but a word running on across the gap still marks torn prose. ragged:
+// the lines of a 2-column candidate's second column end where their words
+// end, well short of the column's right edge on a third of the rows at
+// least, as a table's cells do and a column of prose does not.
+static bool accept_table(TableData& table, double gutter = 0.0, int led_rows = 0,
+                         bool ragged = false, bool structured = false, bool shaped = false,
+                         bool narrow = false) {
     if (table.rows.empty()) return false;
     // pre-step: strip body-text columns adjacent to the table
     strip_prose_columns(table);
     if (table.rows.empty()) return false;
+
+    // A display equation: the pieces of a fraction align into short rows,
+    // with the equation number "(5)" alone in the last column. Rows of a
+    // real table never end in a bare parenthesised number.
+    if (table.rows.size() <= 5) {
+        auto eq_label = [](const std::string& s) {
+            if (s.size() < 3 || s.size() > 6 || s.front() != '(' || s.back() != ')') return false;
+            for (size_t i = 1; i + 1 < s.size(); i++)
+                if (s[i] < '0' || s[i] > '9') return false;
+            return true;
+        };
+        for (auto& row : table.rows)
+            if (!row.empty() && eq_label(row.back())) return false;
+    }
     int n_cols = (int)table.rows[0].size();
     if (n_cols < 2) return false;
 
@@ -2015,23 +4467,98 @@ static bool accept_table(TableData& table) {
     }
     // Three rows is the minimum for a real multi-column table — anything
     // smaller is almost always a stray body paragraph that happened to
-    // have a short token in a column-like position. (2-col tables stay at 4
-    // because key-value lists are easy to mistake otherwise.)
-    int min_rows = (n_cols == 2) ? 4 : 3;
+    // have a short token in a column-like position. 2-col tables need 4,
+    // because key-value lists are easy to mistake otherwise — unless a stub
+    // of labels is followed by columns of figures ("Balance as of January 1
+    // | $208,840"). Prose torn by a phantom boundary leaves word fragments on
+    // the right, never a column of values, so such a table is also exempt
+    // from the long-label prose tests below. Two kinds of figure columns do
+    // not qualify: one beside a stub that is not mostly labels (axis ticks
+    // of a chart), and whole numbers that nearly always rise (the page
+    // references of a contents list, which is a list rather than a table).
+    // Whole numbers that nearly always rise down the rows, entries sharing
+    // a page now and then: the page references of a contents list.
+    auto page_refs = [&](int c) {
+        int filled = 0, ints = 0, rises = 0;
+        long last = -1;
+        std::vector<long> seen;
+        for (auto& row : table.rows) {
+            if (c >= (int)row.size() || row[c].empty()) continue;
+            filled++;
+            char* end = nullptr;
+            long v = std::strtol(row[c].c_str(), &end, 10);
+            if (*end != '\0' || end == row[c].c_str()) continue;
+            if (ints++ > 0 && v >= last) rises++;
+            last = v;
+            seen.push_back(v);
+        }
+        std::sort(seen.begin(), seen.end());
+        size_t distinct = std::unique(seen.begin(), seen.end()) - seen.begin();
+        return filled >= 3 && ints * 10 >= filled * 8 && rises * 10 >= (ints - 1) * 9 &&
+               distinct * 10 >= seen.size() * 4;
+    };
+    // A contents list is a list, not a table: titles (with their numbers,
+    // "표 I-1. | 주요국 경제성장률") beside the page references above. Data
+    // tables with a rising count stay: their stub is short labels, not titles.
+    // Nor is a contents list a table of words whatever its shape says: a
+    // column of page references is not a column of words.
+    if (shaped && n_cols == 2 && page_refs(1)) shaped = false;
+    if (n_cols <= 3 && page_refs(n_cols - 1)) {
+        size_t title_chars = 0, titles = 0;
+        for (auto& row : table.rows) {
+            size_t len = 0;
+            for (int c = 0; c + 1 < (int)row.size(); c++) len += row[c].size();
+            if (len) { title_chars += len; titles++; }
+        }
+        if (titles > 0 && title_chars >= titles * 15) return false;
+    }
+    bool value_cols = n_cols >= 2;
+    for (int c = 0; c < n_cols && value_cols; c++) {
+        int filled = 0, values = 0;
+        for (auto& row : table.rows) {
+            if (c >= (int)row.size() || row[c].empty()) continue;
+            filled++;
+            if (is_value_cell(row[c])) values++;
+        }
+        bool figures = filled >= 2 && values * 10 >= filled * 8;
+        if (c == 0 ? values * 5 > filled : (!figures || page_refs(c))) value_cols = false;
+    }
+    // Entries joined to their values by dot leaders (a contents list, a
+    // statement's line items) are pairs by construction, not prose torn at
+    // a phantom boundary: the leader is drawn to tie the two cells together.
+    // When most rows are such entries the prose tests below do not apply.
+    bool leader_pairs = led_rows >= 2 && led_rows * 10 >= meaningful * 6;
+    int min_rows = (n_cols == 2 && !value_cols && !leader_pairs && !structured && !shaped) ? 4 : 3;
     if (meaningful < min_rows) return false;
 
     // Merge continuation rows: row with a single filled cell in column c, after
     // a row whose column c was already filled → join with " " in same cell.
-    for (size_t r = 1; r < table.rows.size(); r++) {
+    // keep_group_headers leaves a stub label that heads the rows below it on
+    // its own row (see below).
+    auto merge_continuations = [n_cols](TableData& t, bool keep_group_headers) {
+    for (size_t r = 1; r < t.rows.size(); r++) {
         int filled = 0;
         int filled_col = -1;
         for (int c = 0; c < n_cols; c++) {
-            if (!table.rows[r][c].empty()) { filled++; filled_col = c; }
+            if (!t.rows[r][c].empty()) { filled++; filled_col = c; }
         }
         if (filled == 1 && filled_col >= 0 && r > 0 &&
-            !table.rows[r-1][filled_col].empty()) {
-            std::string& prev = table.rows[r-1][filled_col];
-            const std::string& next = table.rows[r][filled_col];
+            !t.rows[r-1][filled_col].empty()) {
+            std::string& prev = t.rows[r-1][filled_col];
+            const std::string& next = t.rows[r][filled_col];
+            // A label alone in the stub column is a group header of the rows
+            // below it ("Costs of revenues:", "Operating expenses:") rather
+            // than the wrapped tail of the row above when it ends in a colon,
+            // or when it opens with a capital after a row that is already
+            // complete (its figures filled). Folding it in glued the group
+            // name to the previous line item and the grouping was lost.
+            if (keep_group_headers && filled_col == 0 && !next.empty()) {
+                int prev_filled = 0;
+                for (auto& c : t.rows[r-1]) if (!c.empty()) prev_filled++;
+                bool colon = next.back() == ':';
+                bool capital = next[0] >= 'A' && next[0] <= 'Z';
+                if (colon || (capital && prev_filled >= 2)) continue;
+            }
             // Wrapped numbers ("991225-" / "1234567") continue without a
             // space, matching get_text_in_rect.
             bool digit_wrap = prev.size() >= 2 && prev.back() == '-' &&
@@ -2040,10 +4567,21 @@ static bool accept_table(TableData& table) {
                               !next.empty() && next[0] >= '0' && next[0] <= '9';
             if (!digit_wrap) prev += " ";
             prev += next;
-            table.rows.erase(table.rows.begin() + r);
+            t.rows.erase(t.rows.begin() + r);
+            mask_erase_row(t, r);
             r--;
         }
     }
+    };
+    // Whether the band is a table is judged on its rows with every
+    // continuation folded in: keeping group headers apart is a choice of
+    // how an accepted table reads, and must not decide acceptance — split
+    // into more, shorter rows, the lines of a chart (titles, legend entries,
+    // tick labels) pass the prose tests below that they fail as wrapped
+    // text. The accepted table is the one with its group headers kept.
+    TableData grouped = table;
+    merge_continuations(grouped, true);
+    merge_continuations(table, false);
     if ((int)table.rows.size() < 2) return false;
 
     // Reject tables with too many empty cells (likely a degenerate band).
@@ -2070,8 +4608,8 @@ static bool accept_table(TableData& table) {
                 if (c.size() > max_cell) max_cell = c.size();
             }
         }
-        if (max_cell > 250) return false;
-        if (filled >= 4 && sum > filled * 60) return false;
+        if (!structured && !shaped && max_cell > 250) return false;
+        if (!structured && !shaped && filled >= 4 && sum > filled * 60) return false;
     }
 
     // Reject tables where most cells consist only of junk characters
@@ -2098,6 +4636,54 @@ static bool accept_table(TableData& table) {
             }
         }
         if (total >= 4 && junk >= total * 0.4) return false;
+    }
+
+    // Author/affiliation blocks on title pages align into phantom columns:
+    // superscript affiliation digits and daggers form their own visual row
+    // ("1 | 2* | 1", "† | †† | †††") beside the author names. A row whose
+    // cells are all such markers never occurs in a real data table, and
+    // sinks the candidate.
+    {
+        int marker_rows = 0;
+        for (auto& row : table.rows) {
+            int filled = 0;
+            bool all_marker = true, has_sym = false;
+            for (auto& cell : row) {
+                if (cell.empty()) continue;
+                filled++;
+                int units = 0;
+                bool ok = true;
+                for (size_t i = 0; i < cell.size(); ) {
+                    unsigned char c = cell[i];
+                    if (c == ' ') { i++; continue; }
+                    if (c >= '0' && c <= '9') { units++; i++; continue; }
+                    if (c == '*') { units++; has_sym = true; i++; continue; }
+                    if (c == 0xE2 && i + 2 < cell.size() &&
+                        (unsigned char)cell[i+1] == 0x80 &&
+                        ((unsigned char)cell[i+2] == 0xA0 ||    // dagger
+                         (unsigned char)cell[i+2] == 0xA1)) {   // double dagger
+                        units++; has_sym = true; i += 3; continue;
+                    }
+                    // The interpunct that joins Korean author names ("권석재⋅
+                    // 이정호") rides along in the marker row; it separates
+                    // marks, it is not one.
+                    if (c == 0xE2 && i + 2 < cell.size() &&
+                        (unsigned char)cell[i+1] == 0x8B &&
+                        (unsigned char)cell[i+2] == 0x85) {     // U+22C5
+                        i += 3; continue;
+                    }
+                    if (c == 0xC2 && i + 1 < cell.size() &&
+                        (unsigned char)cell[i+1] == 0xB7) {     // U+00B7
+                        i += 2; continue;
+                    }
+                    ok = false;
+                    break;
+                }
+                if (!ok || units == 0 || units > 4) all_marker = false;
+            }
+            if (filled >= 2 && all_marker && has_sym) marker_rows++;
+        }
+        if (marker_rows >= 1) return false;
     }
 
     // --- list / prose rejection heuristics (mirrored from v1, tightened) ---
@@ -2196,7 +4782,7 @@ static bool accept_table(TableData& table) {
                 if (code) code_cells++;
             }
         }
-        if (total >= 6 && code_cells * 10 >= total * 3) return false;
+        if (!structured && !shaped && total >= 6 && code_cells * 10 >= total * 3) return false;
     }
 
     // Wide but ragged: real 6+ column grids are densely filled; torn prose
@@ -2231,6 +4817,27 @@ static bool accept_table(TableData& table) {
             }
         }
         if (content_rows >= 2 && marker_rows >= content_rows * 0.6) return false;
+    }
+    // Numbered notes ("12 | See Arslan et al (2020).") are a list too: the
+    // first column counts up by one row after row, and the second holds
+    // sentences, not a value or a short label.
+    if (n_cols == 2) {
+        int rows_n = 0, counted = 0;
+        size_t text_chars = 0;
+        long prev = -1;
+        for (auto& row : table.rows) {
+            if (row[0].empty() || row[1].empty()) continue;
+            rows_n++;
+            text_chars += row[1].size();
+            char* end = nullptr;
+            long v = std::strtol(row[0].c_str(), &end, 10);
+            if (*end == '\0' && end != row[0].c_str()) {
+                if (prev >= 0 && v == prev + 1) counted++;
+                prev = v;
+            }
+        }
+        if (rows_n >= 3 && counted * 10 >= (rows_n - 1) * 8 && text_chars >= (size_t)rows_n * 25)
+            return false;
     }
 
     // continuation rows (lower-letter ↔ lower-letter across column boundary)
@@ -2274,8 +4881,38 @@ static bool accept_table(TableData& table) {
                 continuation_rows++;
             checked_rows++;
         }
+        // A glossary ("Drug | effects", "L | set of city locations") pairs
+        // lowercase terms with lowercase definitions, so its rows read as
+        // continued words too. Its terms are short and a wide empty gutter
+        // (well beyond a stretched word space) parts them from the
+        // definitions; a phantom boundary in justified prose has neither.
+        // Every entry has both parts, and the definitions run longer than
+        // the terms (side-by-side chart labels pair alike text) yet stay
+        // shorter than a line of prose.
+        bool glossary = n_cols == 2 && gutter >= 1.5;
+        size_t term_chars = 0, def_chars = 0;
+        for (auto& row : table.rows) {
+            if (row.size() < 2 || row[0].empty() || row[1].empty() || row[0].size() > 30)
+                glossary = false;
+            else {
+                term_chars += row[0].size();
+                def_chars += row[1].size();
+            }
+        }
+        // Definitions of a line or less each, or longer ones whose lines
+        // end where their words end (ragged): a column of prose beside a
+        // column of chart labels fills its lines to the right edge.
+        bool short_defs = def_chars >= term_chars * 2 && def_chars <= table.rows.size() * 30;
+        bool long_defs = ragged && def_chars * 2 >= term_chars * 3;
+        if (!short_defs && !long_defs) glossary = false;
         double ct = (n_cols == 2) ? 0.15 : 0.30;
-        if (checked_rows >= 2 && continuation_rows >= checked_rows * ct)
+        // A narrow column of terms beside a wide one of descriptions: a
+        // term wrapped onto a second line ("Consumables and" / "reagents")
+        // beside the description's second line reads as continued words
+        // too, but prose torn by a phantom boundary leaves two columns of
+        // like width, never a narrow one.
+        if (!glossary && !leader_pairs && !structured && !narrow && checked_rows >= 2 &&
+            continuation_rows >= checked_rows * ct)
             return false;
         if (total_cells > 0 && filler_cells >= total_cells * 0.35)
             return false;
@@ -2290,7 +4927,7 @@ static bool accept_table(TableData& table) {
                     for (char ch : c) if (ch >= '0' && ch <= '9') { has_digits++; break; }
                 }
             bool numeric_table = total_cells > 0 && has_digits >= total_cells * 0.30;
-            if (!numeric_table && total_cells >= 4 &&
+            if (!structured && !numeric_table && total_cells >= 4 &&
                 hyphen_end_cells >= total_cells * 0.20)
                 return false;
         }
@@ -2300,7 +4937,7 @@ static bool accept_table(TableData& table) {
     // long-first-column test: prose with a stray fringe never fills three
     // columns row after row, while question/answer tables (long question,
     // short verdict columns) legitimately do.
-    if (n_cols <= 3) {
+    if (n_cols <= 3 && !leader_pairs && !structured && !shaped) {
         int total_rows = 0;
         double sum_first = 0, sum_second = 0;
         int unbalanced = 0, third_filled = 0;
@@ -2317,12 +4954,12 @@ static bool accept_table(TableData& table) {
             double avg_first = sum_first / total_rows;
             double avg_second = (n_cols >= 2) ? sum_second / total_rows : 0;
             bool dense_third = n_cols >= 3 && third_filled * 10 >= total_rows * 7;
-            if (!dense_third &&
+            if (!dense_third && !value_cols &&
                 avg_first > 30 && avg_second > 0 && avg_first > avg_second * 2.5)
                 return false;
             if (n_cols == 2 && avg_first > 30 && avg_second > 30)
                 return false;
-            if (unbalanced >= total_rows * 0.4) return false;
+            if (!value_cols && unbalanced >= total_rows * 0.4) return false;
         }
     }
 
@@ -2359,33 +4996,140 @@ static bool accept_table(TableData& table) {
             // definitions table: col 0 short labels in ≥70% of rows
             bool is_definitions = col0_filled >= 3 &&
                                   short_col0 >= col0_filled * 0.70;
-            if (!is_definitions && long_cells >= data_cells * 0.3) return false;
+            if (!is_definitions && !structured && !shaped && long_cells >= data_cells * 0.3) return false;
         }
     }
 
+    table = std::move(grouped);
     trim_table(table);
     if (table.rows.empty()) return false;
     return true;
 }
 
+// Empty gap at boundary x, in the band's rows that have text on both sides
+// of it, when it is the widest gap in nearly all of them (median, else 0).
+// A row whose own text has a gap at least half as wide is a grid of more
+// columns than the boundary splits (an author block), not two columns.
+static double clean_gutter(const std::vector<TextRow>& rows, const YBand& band, double x) {
+    std::vector<double> gaps;
+    std::vector<std::pair<double, double>> cr;
+    int rows_both = 0;
+    for (size_t k = band.first_row; k <= band.last_row; k++) {
+        cr = rows[k].char_ranges;
+        std::sort(cr.begin(), cr.end());
+        double gutter = 0, other = 0, reach = -1e18;
+        bool left = false, right = false;
+        for (auto& c : cr) {
+            double g = c.first - reach;
+            if (reach > -1e17 && reach < x && c.first + c.second >= 2 * x) gutter = std::max(gutter, g);
+            else if (reach > -1e17) other = std::max(other, g);
+            (c.first + c.second < 2 * x ? left : right) = true;
+            reach = std::max(reach, c.second);
+        }
+        if (!left || !right) continue;
+        rows_both++;
+        if (other < gutter * 0.5) gaps.push_back(gutter);
+    }
+    if (gaps.empty() || gaps.size() * 10 < (size_t)rows_both * 8) return 0.0;
+    std::nth_element(gaps.begin(), gaps.begin() + gaps.size() / 2, gaps.end());
+    return gaps[gaps.size() / 2];
+}
+
 } // namespace text_tables
+
+// Dot leaders ("Revenues ........ 100.0%") fill the gap between a row
+// label and its first value, so no empty vertical gutter separates the
+// two columns and the row reads as one cell. A run of four or more
+// periods on one baseline is a leader: it carries no text and is left
+// out of both the column evidence and the cell text. Two ellipsis glyphs
+// in a row are one too ("……" in Hangul documents); a single one after a
+// period ("B. …together") is punctuation.
+// Returns one flag per character of the cache, and each leader's extent.
+struct DotLeaders {
+    std::vector<bool> is_leader;
+    struct Span { double x0, x1, y; };
+    std::vector<Span> spans;
+};
+static DotLeaders dot_leader_mask(const PageCharCache& cache) {
+    DotLeaders out;
+    std::vector<bool>& is_leader = out.is_leader;
+    is_leader.assign(cache.chars.size(), false);
+    std::vector<size_t> dots;
+    for (size_t i = 0; i < cache.chars.size(); i++) {
+        uint32_t u = cache.chars[i].unicode;
+        if (u == '.' || u == 0x2024 || u == 0x2026 || u == 0x00B7) dots.push_back(i);
+    }
+    // Top to bottom, then left to right within a baseline. Baselines jitter
+    // by fractions of a point, so the dots are cut into lines first (a gap
+    // over 1pt in y) and each line is ordered by x; a comparator that
+    // treated near-equal y as equal would not be a strict weak ordering.
+    std::sort(dots.begin(), dots.end(), [&](size_t a, size_t b) {
+        return cache.chars[a].y > cache.chars[b].y;
+    });
+    for (size_t lo = 0, hi; lo < dots.size(); lo = hi) {
+        for (hi = lo + 1; hi < dots.size() &&
+             cache.chars[dots[hi - 1]].y - cache.chars[dots[hi]].y <= 1.0; hi++) {}
+        std::sort(dots.begin() + lo, dots.begin() + hi, [&](size_t a, size_t b) {
+            return cache.chars[a].x < cache.chars[b].x;
+        });
+    }
+    size_t run_start = 0;
+    auto flush = [&](size_t end) {
+        size_t ellipses = 0;
+        double y = 0;
+        for (size_t k = run_start; k < end; k++) {
+            if (cache.chars[dots[k]].unicode == 0x2026) ellipses++;
+            y += cache.chars[dots[k]].y;
+        }
+        if (end - run_start < 4 && ellipses < 2) return;
+        for (size_t k = run_start; k < end; k++) is_leader[dots[k]] = true;
+        out.spans.push_back({cache.chars[dots[run_start]].left,
+                             cache.chars[dots[end - 1]].right,
+                             y / (double)(end - run_start)});
+    };
+    for (size_t k = 1; k <= dots.size(); k++) {
+        bool cont = false;
+        if (k < dots.size()) {
+            const auto& a = cache.chars[dots[k - 1]];
+            const auto& b = cache.chars[dots[k]];
+            double h = std::max(a.top - a.bot, 1.0);
+            cont = std::abs(a.y - b.y) <= 1.0 && b.left - a.right < 1.5 * h;
+        }
+        if (!cont) { flush(k); run_start = k; }
+    }
+    return out;
+}
 
 static std::vector<TableData> detect_text_tables_range(
         const PageCharCache& cache,
         const std::vector<TableData>& existing_tables,
         double page_width, double page_height,
-        double x_lo, double x_hi) {
+        double x_lo, double x_hi,
+        const DotLeaders& leaders,
+        double gutter_x = 0.0,
+        const std::vector<std::array<double, 4>>* figures = nullptr,
+        const std::vector<PdfLineSegment>* rules = nullptr,
+        const std::vector<std::array<double, 4>>* excluded = nullptr) {
+    const std::vector<bool>& is_leader = leaders.is_leader;
     using namespace text_tables;
     if (cache.chars.size() < 10) return {};
 
     std::vector<CharInfo> chars;
     chars.reserve(cache.chars.size());
-    for (auto& ch : cache.chars) {
+    for (size_t ci = 0; ci < cache.chars.size(); ci++) {
+        const auto& ch = cache.chars[ci];
         if (ch.unicode == ' ' || ch.unicode == '\t' || ch.unicode == 0xA0) continue;
+        if (is_leader[ci]) continue;
         if (ch.x < 0 || ch.x > page_width || ch.y < 0 || ch.y > page_height) continue;
         if (ch.x < x_lo || ch.x >= x_hi) continue;
+        if (excluded) {
+            bool out = false;
+            for (const auto& b : *excluded)
+                out |= ch.x >= b[0] && ch.x <= b[2] && ch.y >= b[1] && ch.y <= b[3];
+            if (out) continue;
+        }
         chars.push_back({ch.x, ch.y, ch.left, ch.right, ch.top, ch.bot,
-                         ch.unicode, ch.rot});
+                         ch.unicode, ch.rot, ch.is_bold});
     }
     if (chars.size() < 10) return {};
 
@@ -2411,12 +5155,22 @@ static std::vector<TableData> detect_text_tables_range(
     // build TextRows
     std::vector<TextRow> rows;
     {
+        // Rotated runs (a vertical arXiv stamp in the margin, CAD labels)
+        // contribute cell TEXT if a table stands, but must not act as column
+        // evidence: a margin stamp beside a prose block otherwise fabricates
+        // a phantom first column and the "table" swallows the block. Only
+        // upright chars enter char_ranges (multi-cell + histogram evidence);
+        // rotated chars still ride along in char_indices.
+        auto push_char = [&](TextRow& r, size_t idx) {
+            if (chars[idx].rot == 0)
+                r.char_ranges.push_back({chars[idx].left, chars[idx].right});
+            r.char_indices.push_back(idx);
+        };
         TextRow cur;
         cur.y_center = chars[0].y;
         cur.y_top = chars[0].top;
         cur.y_bot = chars[0].bot;
-        cur.char_ranges.push_back({chars[0].left, chars[0].right});
-        cur.char_indices.push_back(0);
+        push_char(cur, 0);
         auto finalize_row = [](TextRow& r) {
             r.x_min = 1e18;
             r.x_max = -1e18;
@@ -2427,12 +5181,11 @@ static std::vector<TableData> detect_text_tables_range(
         };
         for (size_t i = 1; i < chars.size(); i++) {
             if (std::abs(chars[i].y - cur.y_center) < std::max(median_fs * 0.4, 3.0)) {
-                cur.char_ranges.push_back({chars[i].left, chars[i].right});
-                cur.char_indices.push_back(i);
+                push_char(cur, i);
                 cur.y_top = std::max(cur.y_top, chars[i].top);
                 cur.y_bot = std::min(cur.y_bot, chars[i].bot);
-                cur.y_center = (cur.y_center * (cur.char_ranges.size() - 1) +
-                                chars[i].y) / cur.char_ranges.size();
+                cur.y_center = (cur.y_center * (cur.char_indices.size() - 1) +
+                                chars[i].y) / cur.char_indices.size();
             } else {
                 if (!cur.char_ranges.empty()) {
                     finalize_row(cur);
@@ -2442,8 +5195,7 @@ static std::vector<TableData> detect_text_tables_range(
                 cur.y_center = chars[i].y;
                 cur.y_top = chars[i].top;
                 cur.y_bot = chars[i].bot;
-                cur.char_ranges.push_back({chars[i].left, chars[i].right});
-                cur.char_indices.push_back(i);
+                push_char(cur, i);
             }
         }
         if (!cur.char_ranges.empty()) {
@@ -2452,6 +5204,49 @@ static std::vector<TableData> detect_text_tables_range(
         }
     }
     if (rows.size() < 3) return {};
+
+    // Attach each dot leader to its row, with the label it leads from: the
+    // row's glyphs left of it, back to the value of an earlier leader on the
+    // same row (contents set in two columns) — that value is the first word
+    // after the earlier leader.
+    for (const auto& sp : leaders.spans) {
+        if (sp.x0 < x_lo || sp.x1 > x_hi) continue;
+        TextRow* row = nullptr;
+        double best = std::max(median_fs * 0.4, 3.0);
+        for (auto& r : rows) {
+            double d = std::abs(r.y_center - sp.y);
+            if (d < best) { best = d; row = &r; }
+        }
+        if (!row) continue;
+        row->leaders.push_back({sp.x0, sp.x1});
+    }
+    for (auto& r : rows) {
+        if (r.leaders.empty()) continue;
+        std::sort(r.leaders.begin(), r.leaders.end());
+        auto cr = r.char_ranges;
+        std::sort(cr.begin(), cr.end());
+        double word_gap = std::max(median_fs * 0.3, 1.5);
+        double from = -1e18;
+        for (auto& ld : r.leaders) {
+            double lo = 1e18, hi = -1e18;
+            for (auto& c : cr)
+                if (c.first >= from && c.second <= ld.first + 0.5) {
+                    lo = std::min(lo, c.first);
+                    hi = std::max(hi, c.second);
+                }
+            r.labels.push_back({lo, hi});   // lo > hi: the leader has no label
+            // skip the value this leader leads to
+            double reach = ld.second;
+            bool started = false;
+            for (auto& c : cr) {
+                if (c.first < ld.second - 0.5) continue;
+                if (started && c.first - reach > word_gap) break;
+                started = true;
+                reach = std::max(reach, c.second);
+            }
+            from = reach + 0.01;
+        }
+    }
 
     // multi-cell: at least one gap ≥ cell_merge_gap
     double cell_merge_gap = std::max(median_fs * 0.8, 8.0);
@@ -2480,7 +5275,94 @@ static std::vector<TableData> detect_text_tables_range(
     }
 
     // S1: find y-bands
-    auto bands = find_y_bands(rows);
+    // The page's text body lies between the 5th percentile of its lines'
+    // left ends and the 95th of their right ends; a column outside them is
+    // in the margin (a side tab, a page number). Lines, not glyphs: a
+    // column of short terms holds few glyphs but opens as many lines as
+    // the text beside it.
+    double body_x0 = 0, body_x1 = page_width;
+    {
+        std::vector<double> l, r;
+        for (const auto& tr : rows) {
+            if (tr.char_ranges.empty()) continue;
+            l.push_back(tr.x_min);
+            r.push_back(tr.x_max);
+        }
+        if (!l.empty()) {
+            std::sort(l.begin(), l.end());
+            std::sort(r.begin(), r.end());
+            body_x0 = l[l.size() / 20];
+            body_x1 = r[r.size() * 19 / 20];
+        }
+    }
+    auto bands = find_y_bands(rows, chars, gutter_x <= 0, cell_merge_gap, gutter_x);
+    if (table_debug())
+        for (auto& b : bands) {
+            size_t multi = 0;
+            for (size_t k = b.first_row; k <= b.last_row; k++) multi += rows[k].is_multi_cell;
+            std::vector<size_t> ci = rows[b.first_row].char_indices;
+            std::sort(ci.begin(), ci.end(), [&](size_t a, size_t c) { return chars[a].x < chars[c].x; });
+            std::string head;
+            for (size_t i = 0; i < ci.size() && head.size() < 24; i++) append_glyph_text(head, chars[ci[i]].unicode);
+            fprintf(stderr, "[band] rows %zu..%zu multi %zu x %.0f..%.0f y %.0f..%.0f first='%s'\n", b.first_row, b.last_row, multi, b.x_min, b.x_max, b.y_bot, b.y_top, head.c_str());
+        }
+    // Recover compact tables with an empty header stub using body-only
+    // alignment, but only within three actual rules: top/header/bottom.
+    // Restrict this retry to one header and two short, aligned body rows.
+    if (rules) {
+        std::vector<const PdfLineSegment*> horizontal;
+        for (const auto& line : *rules)
+            if (line.is_horizontal() && std::abs(line.x1 - line.x0) >= 50)
+                horizontal.push_back(&line);
+        std::sort(horizontal.begin(), horizontal.end(), [](const auto* a, const auto* b) {
+            return a->y0 > b->y0;
+        });
+        for (size_t i = 0; i + 2 < horizontal.size(); ++i) {
+            const auto& top = *horizontal[i];
+            const auto& header = *horizontal[i + 1];
+            const auto& bottom = *horizontal[i + 2];
+            double left = std::min(top.x0, top.x1), right = std::max(top.x0, top.x1);
+            if (left < x_lo || right > x_hi) continue;
+            bool same_span = true;
+            for (const auto* line : {&header, &bottom})
+                same_span &= std::abs(std::min(line->x0, line->x1) - left) < 3 &&
+                             std::abs(std::max(line->x0, line->x1) - right) < 3;
+            if (!same_span || top.y0 - bottom.y0 > median_fs * 9) continue;
+            std::vector<size_t> enclosed;
+            for (size_t k = 0; k < rows.size(); ++k) {
+                const auto& row = rows[k];
+                if (row.y_center <= bottom.y0 || row.y_center >= top.y0) continue;
+                if (row.x_min < left - 2 || row.x_max > right + 2 || row_in_existing(row)) {
+                    enclosed.clear(); break;
+                }
+                enclosed.push_back(k);
+            }
+            if (enclosed.size() != 3 || enclosed[2] != enclosed[0] + 2) continue;
+            size_t first = enclosed[0], last = enclosed[2];
+            if (rows[first].y_bot <= header.y0 || rows[first + 1].y_top >= header.y0) continue;
+            if (top.y0 - rows[first].y_top > median_fs * 1.5 ||
+                rows[last].y_bot - bottom.y0 > median_fs * 1.5) continue;
+            YBand compact{first, last, rows[first].y_top, rows[last].y_bot, left, right, true};
+            auto edges = infer_columns_in_band(rows, compact, median_fs, false, chars, gutter_x);
+            if (edges.size() < 4) continue;
+            bool aligned = true;
+            for (size_t c = 0; c + 1 < edges.size(); ++c) {
+                double starts[2] = {1e18, 1e18}, ends[2] = {-1e18, -1e18};
+                for (int r = 0; r < 2; ++r)
+                    for (const auto& cr : rows[first + 1 + r].char_ranges)
+                        if ((cr.first + cr.second) * 0.5 >= edges[c] &&
+                            (cr.first + cr.second) * 0.5 < edges[c + 1]) {
+                            starts[r] = std::min(starts[r], cr.first);
+                            ends[r] = std::max(ends[r], cr.second);
+                        }
+                aligned &= starts[0] < 1e18 && starts[1] < 1e18 &&
+                    (std::abs(starts[0] - starts[1]) <= median_fs * 0.4 ||
+                     std::abs(ends[0] - ends[1]) <= median_fs * 0.4 ||
+                     std::abs((starts[0] + ends[0]) - (starts[1] + ends[1])) <= median_fs * 0.8);
+            }
+            if (aligned) bands.push_back(compact);
+        }
+    }
     if (bands.empty()) return {};
 
     std::vector<TableData> result;
@@ -2508,16 +5390,60 @@ static std::vector<TableData> detect_text_tables_range(
             if (has_biblio_row) continue;
         }
 
-        // S2: infer columns
-        auto bounds = infer_columns_in_band(rows, band, median_fs);
-        if (bounds.size() < 3) continue;        // need ≥1 inner boundary
+        // S2-S4 for one set of column bounds: the gutter check, wrap-line
+        // absorption, cell building and rejection. False when no table.
+        auto build_band = [&](const std::vector<double>& bounds,
+                              TableData& table) -> bool {
+        if (bounds.size() < 3) return false;    // need ≥1 inner boundary
+
+        // On a two-column page a full-width band whose inferred columns
+        // split right at the page gutter is usually the two columns'
+        // unrelated content welded side by side; the per-column retries see
+        // each half on its own. So is a band whose rows all leave the gutter
+        // empty, wherever its inferred columns fall (a column of equations
+        // or a figure's labels moves them off it), when the three lines above
+        // and below it leave it empty too: a page gutter runs on past the
+        // band, while a gap between a table's columns on a one-column page
+        // ends at the prose around the table (past a heading or two). A
+        // genuine page-wide table
+        // also straddles the gutter, but then nearly every row holds cells on
+        // both sides, while welded content pairs rows only where the sides
+        // happen to overlap — so only sparse straddling skips the band.
+        if (gutter_x > 0) {
+            bool at_gutter = false;
+            for (size_t b = 1; b + 1 < bounds.size(); b++)
+                if (std::abs(bounds[b] - gutter_x) < 20.0) at_gutter = true;
+            bool gutter_clear = true;
+            int band_rows = 0, both_sides = 0;
+            for (size_t k = band.first_row; k <= band.last_row; k++) {
+                if (rows[k].char_ranges.empty()) continue;
+                band_rows++;
+                bool left = false, right = false;
+                for (auto& cr : rows[k].char_ranges) {
+                    if (cr.second < gutter_x - 10.0) left = true;
+                    if (cr.first > gutter_x + 10.0) right = true;
+                    if (cr.first < gutter_x && cr.second > gutter_x) gutter_clear = false;
+                }
+                if (left && right) both_sides++;
+            }
+            auto crosses = [&](size_t k) {
+                for (auto& cr : rows[k].char_ranges)
+                    if (cr.first < gutter_x && cr.second > gutter_x) return true;
+                return false;
+            };
+            for (size_t d = 1; d <= 3 && gutter_clear; d++) {
+                if (band.first_row >= d && crosses(band.first_row - d)) gutter_clear = false;
+                if (band.last_row + d < rows.size() && crosses(band.last_row + d)) gutter_clear = false;
+            }
+            if ((at_gutter || gutter_clear) && both_sides * 10 < band_rows * 7) return false;
+        }
 
         // S2.5: absorb trailing wrapped cell lines — single-cell rows just
         // below the band whose text lies entirely inside one inferred column
         // (the last row's wrap continuation). Captions and prose span wider
         // than a column or sit further away, so they stay out.
         YBand ext = band;
-        {
+        if (!band.ruled_header) {
             size_t k = ext.last_row + 1;
             int absorbed = 0;
             while (k < rows.size() && absorbed < 2) {
@@ -2543,13 +5469,474 @@ static std::vector<TableData> detect_text_tables_range(
             }
         }
 
+        // Rules across the band (four fifths of its width or more), away
+        // from the page's head and foot where running heads are underlined.
+        // The band is ruled when two rules or more part its rows, a quarter
+        // of its row gaps at least; a rule
+        // under the first row alone (a running head is underlined too) or a
+        // frame alone is not enough. A chart's gridlines part its labels the
+        // same way, so a band over a drawing is not ruled, and a candidate
+        // whose cells hide cell gaps (a wide table read as two columns) is
+        // not trusted on its rules.
+        // Cells that hold a cell gap inside them are several cells the
+        // column inference did not part (a wide table read as two columns
+        // at the page gutter, an author block read as a name column beside
+        // the rest); such a candidate is trusted neither on its rules nor
+        // on its shape.
+        bool hidden_cells = false;
+        {
+            // In one sorted pass per row: a range wholly inside a column
+            // that starts a cell gap after the previous such range there.
+            size_t hidden = 0, checked = 0;
+            std::vector<std::pair<double, double>> sorted;
+            std::vector<double> last_end(bounds.size());
+            for (size_t r = ext.first_row; r <= ext.last_row; r++) {
+                checked++;
+                sorted.assign(rows[r].char_ranges.begin(), rows[r].char_ranges.end());
+                std::sort(sorted.begin(), sorted.end());
+                std::fill(last_end.begin(), last_end.end(), -1e18);
+                bool hid = false;
+                for (const auto& cr : sorted) {
+                    for (size_t c = 0; c + 1 < bounds.size(); c++) {
+                        if (cr.first < bounds[c] || cr.second > bounds[c + 1]) continue;
+                        if (last_end[c] > -1e17 && cr.first - last_end[c] >= cell_merge_gap)
+                            hid = true;
+                        last_end[c] = cr.second;
+                    }
+                    if (hid) break;
+                }
+                if (hid) hidden++;
+            }
+            hidden_cells = checked > 0 && hidden * 10 >= checked * 3;
+        }
+        bool ruled = false;
+        if (rules && ext.last_row >= ext.first_row) {
+            const double bx0 = bounds.front(), bx1 = bounds.back();
+            const double fs = std::max(median_fs, 4.0);
+            const double margin = 0.08 * page_height;
+            std::vector<double> span_y;
+            for (const auto& seg : *rules) {
+                if (!seg.is_horizontal()) continue;
+                double y = (seg.y0 + seg.y1) / 2.0;
+                if (y < margin || y > page_height - margin) continue;
+                double sx0 = std::min(seg.x0, seg.x1), sx1 = std::max(seg.x0, seg.x1);
+                if (std::min(sx1, bx1) - std::max(sx0, bx0) >= 0.8 * (bx1 - bx0)) span_y.push_back(y);
+            }
+            // Rules parting the rows: strictly between two rows, not under
+            // the first (a header's underline, or a running head's). A rule
+            // drawn twice (a double rule) counts once.
+            int inner = 0;
+            std::vector<double> ys = span_y;
+            std::sort(ys.begin(), ys.end());
+            for (size_t k = 0; k < ys.size(); k++) {
+                if (k > 0 && ys[k] - ys[k - 1] < 0.5 * fs) continue;
+                for (size_t r = ext.first_row + 1; r < ext.last_row; r++)
+                    if (ys[k] < rows[r].y_bot && ys[k] > rows[r + 1].y_top) { inner++; break; }
+            }
+            bool over_drawing = false;
+            if (figures) {
+                double ty0 = rows[ext.last_row].y_bot, ty1 = rows[ext.first_row].y_top;
+                double area = std::max(1.0, (bx1 - bx0) * (ty1 - ty0)), covered = 0;
+                for (const auto& f : *figures) {
+                    double ox = std::min(bx1, f[2]) - std::max(bx0, f[0]);
+                    double oy = std::min(ty1, f[3]) - std::max(ty0, f[1]);
+                    if (ox > 0 && oy > 0) covered += ox * oy;
+                }
+                over_drawing = covered >= 0.2 * area;
+            }
+            // The rules must part the band's rows, not a few rows at one end
+            // of it: a ruled table glued to the paragraphs above it is not
+            // ruled as a whole. A quarter of the row gaps at least.
+            const size_t gaps = ext.last_row - ext.first_row;
+            ruled = inner >= 2 && static_cast<size_t>(inner) * 4 >= gaps && !over_drawing && !hidden_cells;
+        }
+
         // S3: build cells
-        TableData table = build_table_from_band(rows, ext, bounds, chars,
-                                                median_fs);
+        table = build_table_from_band(rows, ext, bounds, chars, median_fs);
+
+        // Two physical lines inside the same ruled cell band can have
+        // content in every value column but only one stub. Preserve their
+        // logical row only when the band contains exactly those two lines
+        // and every internal column has a drawn separator through both.
+        if (rules && table.rows.size() == ext.last_row - ext.first_row + 1) {
+            for (size_t r = table.rows.size(); r-- > 1; ) {
+                auto& prev = table.rows[r - 1];
+                const auto& next = table.rows[r];
+                if (prev.empty() || prev[0].empty() || !next[0].empty()) continue;
+                bool filled = true;
+                for (size_t c = 1; c < next.size(); ++c)
+                    filled &= !prev[c].empty() && !next[c].empty();
+                if (!filled || next.size() < 3) continue;
+                double upper = rows[ext.first_row + r - 1].y_center;
+                double lower = rows[ext.first_row + r].y_center;
+                double top = 1e18, bottom = -1e18;
+                bool separated = false;
+                for (const auto& line : *rules) {
+                    if (!line.is_horizontal()) continue;
+                    double lo = std::min(line.x0, line.x1), hi = std::max(line.x0, line.x1);
+                    if (std::min(hi, table.x1) - std::max(lo, table.x0) <
+                        (table.x1 - table.x0) * 0.8) continue;
+                    double y = (line.y0 + line.y1) * 0.5;
+                    if (y > upper) top = std::min(top, y);
+                    else if (y < lower) bottom = std::max(bottom, y);
+                    else separated = true;
+                }
+                if (separated || top - upper > median_fs * 2 ||
+                    lower - bottom > median_fs * 2) continue;
+                int physical = 0;
+                for (const auto& row : rows)
+                    if (row.y_center > bottom && row.y_center < top) ++physical;
+                if (physical != 2) continue;
+                bool columns_ruled = true;
+                for (size_t c = 1; c + 1 < bounds.size(); ++c) {
+                    std::vector<std::pair<double, double>> spans;
+                    for (const auto& line : *rules) {
+                        if (!line.is_vertical()) continue;
+                        double x = (line.x0 + line.x1) * 0.5;
+                        if (std::abs(x - bounds[c]) > median_fs * 2.0) continue;
+                        double lo = std::max(lower, double(std::min(line.y0, line.y1)));
+                        double hi = std::min(upper, double(std::max(line.y0, line.y1)));
+                        if (hi > lo) spans.push_back({lo, hi});
+                    }
+                    std::sort(spans.begin(), spans.end());
+                    double coverage = 0, end = lower;
+                    for (const auto& span : spans) {
+                        coverage += std::max(0.0, span.second - std::max(end, span.first));
+                        end = std::max(end, span.second);
+                    }
+                    bool found = coverage >= upper - lower - 0.5;
+                    columns_ruled &= found;
+                }
+                if (table_debug()) {
+                    fprintf(stderr, "[cell-wrap] y %.1f..%.1f ruled %d bounds", lower, upper, columns_ruled);
+                    for (double x : bounds) fprintf(stderr, " %.1f", x);
+                    fprintf(stderr, "\n");
+                }
+                if (!columns_ruled) continue;
+                for (size_t c = 1; c < next.size(); ++c) {
+                    prev[c] += " " + next[c];
+                    table.cell_bold[r - 1][c] &= table.cell_bold[r][c];
+                }
+                table.rows.erase(table.rows.begin() + r);
+                mask_erase_row(table, r);
+            }
+        }
 
         // S4-S5: rejection
-        if (!accept_table(table)) continue;
+        double gutter = bounds.size() == 3
+                            ? clean_gutter(rows, ext, bounds[1]) / median_fs : 0.0;
+        // Rows whose dot leader leads to a column boundary — the boundary
+        // lies on the leader or in the empty space beside it (a leader set
+        // in several runs, or ending short of a right-aligned value): the
+        // leader itself pairs the cells on its two sides.
+        int led_rows = 0;
+        for (size_t k = ext.first_row; k <= ext.last_row; k++) {
+            bool led = false;
+            for (auto& ld : rows[k].leaders)
+                for (size_t b = 1; b + 1 < bounds.size() && !led; b++) {
+                    if (ld.first <= bounds[b] + 0.5 && ld.second >= bounds[b] - 0.5) {
+                        led = true;
+                        break;
+                    }
+                    // the stretch between the leader and the boundary
+                    double lo = bounds[b] < ld.first ? bounds[b] : ld.second;
+                    double hi = bounds[b] < ld.first ? ld.first : bounds[b];
+                    bool clear = true;
+                    for (auto& cr : rows[k].char_ranges)
+                        if (cr.second > lo && cr.first < hi) clear = false;
+                    led = clear;
+                }
+            if (led) led_rows++;
+        }
+        // Second-column lines of a two-column candidate that stop well
+        // short of the column's right edge (over a quarter of its width):
+        // a third of the rows or more makes the column ragged.
+        bool ragged = false;
+        if (bounds.size() == 3) {
+            double left = 1e18, right = -1e18;
+            std::vector<double> ends;
+            for (size_t k = ext.first_row; k <= ext.last_row; k++) {
+                double e = -1e18;
+                for (auto& cr : rows[k].char_ranges)
+                    if (cr.first >= bounds[1]) {
+                        left = std::min(left, cr.first);
+                        e = std::max(e, cr.second);
+                    }
+                if (e > -1e18) ends.push_back(e);
+            }
+            for (double e : ends) right = std::max(right, e);
+            size_t shortn = 0;
+            for (double e : ends)
+                if (e < right - 0.25 * (right - left)) shortn++;
+            ragged = ends.size() >= 3 && shortn * 3 >= ends.size();
+        }
+        // The shape of a two-column band, read before its words: a table of
+        // terms beside their values keeps a narrow first column beside a
+        // wide one, or ends its cells where their words end (ragged) while
+        // every term stands beside a value, or opens with a header set bold
+        // over a plain body. Two columns of prose do none of these: both
+        // columns are wide, their lines fill the column, nothing is set
+        // apart. What else pairs that way is ruled out below: cells that
+        // hide cell gaps, twin lists, sideways or cut-off columns, a stack
+        // of lone glyphs, a cell torn by the boundary, a caption first.
+        bool shape = false, narrow_label = false;
+        if (bounds.size() == 3 && ext.last_row > ext.first_row) {
+            const double split = bounds[1];
+            double L0 = 1e18, L1 = -1e18, R0 = 1e18, R1 = -1e18;
+            size_t n = 0, withL = 0, withLR = 0;
+            std::vector<double> lends, rends;
+            double bold_first = 0, bold_rest = 0, bl_l = 0, bl_r = 0;
+            size_t glyphs_first = 0, glyphs_rest = 0, gl_l = 0, gl_r = 0;
+            for (size_t k = ext.first_row; k <= ext.last_row; k++) {
+                const auto& tr = rows[k];
+                double l0 = 1e18, l1 = -1e18, r0 = 1e18, r1 = -1e18;
+                for (auto& cr : tr.char_ranges) {
+                    if (cr.second <= split + 0.5) { l0 = std::min(l0, cr.first); l1 = std::max(l1, cr.second); }
+                    else if (cr.first >= split - 0.5) { r0 = std::min(r0, cr.first); r1 = std::max(r1, cr.second); }
+                }
+                n++;
+                bool hl = l1 > l0, hr = r1 > r0;
+                if (hl) { withL++; lends.push_back(l1); L0 = std::min(L0, l0); L1 = std::max(L1, l1); }
+                if (hr) { rends.push_back(r1); R0 = std::min(R0, r0); R1 = std::max(R1, r1); }
+                if (hl && hr) withLR++;
+                for (size_t ci : tr.char_indices) {
+                    if (chars[ci].unicode == ' ') continue;
+                    if (k == ext.first_row) {
+                        glyphs_first++; bold_first += chars[ci].is_bold;
+                        if (chars[ci].x < split) { gl_l++; bl_l += chars[ci].is_bold; } else { gl_r++; bl_r += chars[ci].is_bold; }
+                    } else { glyphs_rest++; bold_rest += chars[ci].is_bold; }
+                }
+            }
+            const double em = std::max(median_fs, 4.0);
+            const double bold_first_l = gl_l ? bl_l / gl_l : 0, bold_first_r = gl_r ? bl_r / gl_r : 0;
+            const double lw = L1 > L0 ? (L1 - L0) / em : 0, rw = R1 > R0 ? (R1 - R0) / em : 0;
+            auto ragged_of = [](const std::vector<double>& ends, double x0, double x1) {
+                if (ends.size() < 3 || x1 <= x0) return 0.0;
+                size_t shortn = 0;
+                for (double e : ends) if (e < x1 - 0.25 * (x1 - x0)) shortn++;
+                return static_cast<double>(shortn) / ends.size();
+            };
+            const double rag_l = ragged_of(lends, L0, L1), rag_r = ragged_of(rends, R0, R1);
+            const double rag = std::max(rag_l, rag_r);
+            const double pair = withL ? static_cast<double>(withLR) / withL : 0;
+            // A header is set bold on both sides over a plain body; a bold
+            // heading in one column of two of prose is not one.
+            const double body_bold = glyphs_rest ? bold_rest / glyphs_rest : 1.0;
+            const bool bold_header = pair >= 0.85 && body_bold <= 0.2 && bold_first_l >= 0.6 && bold_first_r >= 0.6;
+            // A column in the page's outer margin (a side tab, a page
+            // number) is page furniture, not a table's column: the page's
+            // text lies between the 5th and 95th percentiles of its lines'
+            // ends (body_x0, body_x1), and a column outside them is in the
+            // margin.
+            const bool in_margin = (L1 > L0 && L1 <= body_x0) || (R0 < R1 && R0 >= body_x1);
+            // A column of glyphs set sideways is a margin tab or a rotated
+            // caption, not a table's column; a column cut off by the edge
+            // of a per-column pass (the first letters of the next column's
+            // lines, when the page's column boundary falls inside that
+            // column) is the neighbouring column's, not this band's.
+            size_t rot_l = 0, rot_r = 0, gl_all_l = 0, gl_all_r = 0;
+            for (size_t k = ext.first_row; k <= ext.last_row; k++)
+                for (size_t ci : rows[k].char_indices) {
+                    if (chars[ci].unicode == ' ') continue;
+                    if (chars[ci].x < split) { gl_all_l++; rot_l += chars[ci].rot != 0; }
+                    else { gl_all_r++; rot_r += chars[ci].rot != 0; }
+                }
+            const bool sideways = (gl_all_l && rot_l * 2 >= gl_all_l) || (gl_all_r && rot_r * 2 >= gl_all_r);
+            const bool cut_off = (x_hi < page_width - 1.0 && R1 > R0 && R1 >= x_hi - 0.5 * em) ||
+                                 (x_lo > 1.0 && L1 > L0 && L0 <= x_lo + 0.5 * em);
+            // A stack of lone glyphs down the right of the text (a side tab
+            // reading down the margin, glyph by glyph) is no column of
+            // values: a marker column of lone glyphs precedes its items.
+            // And a one-cell line across the split is a line of prose in
+            // the band (a note under a chart beside its legend): a table's
+            // one-cell lines are wrapped cells, inside one column.
+            // A run of glyphs that starts left of the split and reaches into
+            // the right column's text (past where its cells begin) is torn
+            // by the boundary: two footnotes set side by side, prose beside
+            // a legend. A long term of a glossary ends before the
+            // definitions begin.
+            bool glyph_stack = false, prose_across = false;
+            {
+                size_t rcells = 0, lone = 0;
+                for (size_t k = ext.first_row; k <= ext.last_row; k++) {
+                    const auto& tr = rows[k];
+                    size_t gr = 0;
+                    for (size_t ci : tr.char_indices)
+                        if (chars[ci].unicode != ' ' && chars[ci].x >= split) gr++;
+                    if (gr) { rcells++; lone += gr <= 3; }
+                    if (!tr.is_multi_cell && tr.x_min < split - 0.5 * em && tr.x_max > split + 0.5 * em)
+                        prose_across = true;
+                    // Words a cell gap or less apart form one cell; a cell
+                    // from left of the split reaching into the right
+                    // column's text is torn by the boundary.
+                    if (R0 < R1) {
+                        auto words = tr.char_ranges;
+                        std::sort(words.begin(), words.end());
+                        double c0 = 0, c1 = -1e18;
+                        for (auto& w : words) {
+                            if (c1 > -1e18 && w.first - c1 < cell_merge_gap) { c1 = std::max(c1, w.second); continue; }
+                            if (c1 > -1e18 && c0 < split && c1 > R0 + 0.5 * em) prose_across = true;
+                            c0 = w.first; c1 = w.second;
+                        }
+                        if (c1 > -1e18 && c0 < split && c1 > R0 + 0.5 * em) prose_across = true;
+                    }
+                }
+                glyph_stack = R1 > R0 && (R1 - R0) <= 1.5 * em && rcells >= 3 && lone == rcells;
+            }
+            // A label column is under twelve ems wide (a term of a few words,
+            // wrapped when longer) beside a column two and a half times
+            // wider or more; the columns of a two-column page are wider
+            // and alike.
+            narrow_label = !in_margin && pair >= 0.85 && lw > 0 && rw > 0 &&
+                           std::min(lw, rw) <= 12.0 && std::max(lw, rw) >= 2.5 * std::min(lw, rw);
+            // Two columns of prose are both wide and of a width (the page's
+            // column width); a table's two columns of words differ in
+            // width, or are both narrow.
+            const bool prose_wide = std::min(lw, rw) >= 18.0 && std::max(lw, rw) <= 1.3 * std::min(lw, rw);
+            const bool ragged_pairs = !in_margin && !prose_wide && rag >= 0.33 && pair >= 0.85;
+            // Twin lists: an index or a contents list set in two columns,
+            // every line of either column ending in its own figure (a page
+            // number). The columns are two of the same list, not a label
+            // beside its value; the figures tell the lists from a table of
+            // words, which the shape test is for.
+            bool twin_lists = false;
+            {
+                size_t both = 0, digits = 0;
+                for (size_t k = ext.first_row; k <= ext.last_row; k++) {
+                    const auto& tr = rows[k];
+                    size_t li = SIZE_MAX, ri = SIZE_MAX;
+                    for (size_t ci : tr.char_indices) {
+                        const auto& ch = chars[ci];
+                        if (ch.unicode == ' ') continue;
+                        if (ch.x < split) { if (li == SIZE_MAX || ch.x > chars[li].x) li = ci; }
+                        else if (ri == SIZE_MAX || ch.x > chars[ri].x) ri = ci;
+                    }
+                    if (li == SIZE_MAX || ri == SIZE_MAX) continue;
+                    both++;
+                    auto digit = [](uint32_t u) { return u >= '0' && u <= '9'; };
+                    if (digit(chars[li].unicode) && digit(chars[ri].unicode)) digits++;
+                }
+                twin_lists = both >= 3 && digits * 10 >= both * 6;
+            }
+            // Three or four rows are too few for a shape to speak: a figure
+            // caption beside a table caption, two columns of prose cut to a
+            // few lines by a heading, pair that way too.
+            // A band opening with a figure or table caption is captions set
+            // side by side, not a table of them.
+            bool caption_first = false;
+            {
+                std::vector<size_t> ci = rows[ext.first_row].char_indices;
+                std::sort(ci.begin(), ci.end(), [&](size_t a, size_t b) { return chars[a].x < chars[b].x; });
+                std::vector<uint32_t> cps;
+                for (size_t i = 0; i < ci.size() && cps.size() < 16; i++) cps.push_back(chars[ci[i]].unicode);
+                caption_first = !cps.empty() && is_caption_start(cps);
+            }
+            shape = n >= 5 && !caption_first && !hidden_cells && !twin_lists && !sideways && !cut_off &&
+                    !glyph_stack && !prose_across &&
+                    (narrow_label || ragged_pairs || (!in_margin && bold_header));
+            (void)bold_first; (void)glyphs_first;
+            if (table_debug())
+                fprintf(stderr, "[band-shape] rows %zu withL %zu withLR %zu lw %.1f rw %.1f ragl %.2f ragr %.2f pair %.2f boldLR %.2f/%.2f body %.2f hidden %d -> %s%s%s%s%s first='%s'\n", n, withL, withLR, lw, rw, rag_l, rag_r, pair, bold_first_l, bold_first_r, body_bold, (int)hidden_cells,
+                        narrow_label ? "narrow " : "", ragged_pairs ? "ragged " : "", bold_header ? "bold" : "", in_margin ? " MARGIN" : (sideways ? " SIDEWAYS" : (cut_off ? " CUT" : (glyph_stack ? " STACK" : (prose_across ? " ACROSS" : "")))), caption_first ? " CAPTION" : (twin_lists ? " TWIN" : ""), table.rows.empty() || table.rows[0].empty() ? "" : table.rows[0][0].substr(0, 24).c_str());
+        }
+        return accept_table(table, gutter, led_rows, ragged, ruled, shape, shape && narrow_label);
+        };
 
+        // Whether the band is a table at all, and which rows it holds, is
+        // decided on the columns its gaps support. Cell-stack evidence (a
+        // sparse column, see infer_columns_in_band) then only re-divides
+        // those rows into columns: aligned stacks are what chart legends and
+        // axis ticks are made of too, so they must neither turn a band into
+        // a table nor change which lines a table keeps.
+        TableData table;
+        auto bounds = infer_columns_in_band(rows, band, median_fs, false, chars, gutter_x);
+        if (table_debug()) {
+            fprintf(stderr, "[band-bounds] rows %zu..%zu:", band.first_row, band.last_row);
+            for (double b : bounds) fprintf(stderr, " %.0f", b);
+            fprintf(stderr, "\n");
+        }
+        if (!build_band(bounds, table)) {
+            // A sparse stub (often blank in the header) can fail the initial
+            // 70% straddling vote. Recover it only when actual rules enclose
+            // the band and explicitly separate its header. This is stronger
+            // evidence than aligned chart labels or two columns of prose.
+            bool top_rule = false, bottom_rule = false, header_rule = false;
+            if (rules && band.last_row > band.first_row) {
+                const double fs = std::max(median_fs, 4.0);
+                const auto& first = rows[band.first_row];
+                const auto& second = rows[band.first_row + 1];
+                const auto& last = rows[band.last_row];
+                for (const auto& line : *rules) {
+                    if (!line.is_horizontal()) continue;
+                    double lo = std::min(line.x0, line.x1);
+                    double hi = std::max(line.x0, line.x1);
+                    if (std::min(hi, band.x_max) - std::max(lo, band.x_min) <
+                        0.8 * (band.x_max - band.x_min)) continue;
+                    double y = (line.y0 + line.y1) * 0.5;
+                    top_rule |= y >= first.y_top - 1.0 && y <= first.y_top + fs;
+                    bottom_rule |= y <= last.y_bot + 1.0 && y >= last.y_bot - fs;
+                    header_rule |= y < first.y_bot && y > second.y_top;
+                }
+            }
+            if (!(top_rule && bottom_rule && header_rule)) continue;
+            auto enclosed = infer_columns_in_band(rows, band, median_fs, true,
+                                                   chars, gutter_x, true);
+            // At least three columns: a framed pair of prose columns is
+            // still not a table. The usual content/figure rejection remains.
+            if (enclosed.size() < 4 || !build_band(enclosed, table)) continue;
+            bounds = std::move(enclosed);
+        }
+        if (table_debug())
+            fprintf(stderr, "[band-accepted] rows %zu..%zu cols %zu rows %zu\n", band.first_row, band.last_row, bounds.size() - 1, table.rows.size());
+        auto refined = infer_columns_in_band(rows, band, median_fs, true, chars, gutter_x);
+        if (refined != bounds) {
+            TableData t2;
+            auto row_text = [](const std::vector<std::string>& row) {
+                std::string t;
+                for (auto& c : row)
+                    for (char ch : c) if (ch != ' ') t += ch;
+                return t;
+            };
+            bool same_rows = build_band(refined, t2) &&
+                             t2.rows.size() == table.rows.size();
+            for (size_t r = 0; same_rows && r < t2.rows.size(); r++)
+                if (row_text(t2.rows[r]) != row_text(table.rows[r]))
+                    same_rows = false;
+            if (same_rows) table = std::move(t2);
+        }
+
+        // Text aligned inside a drawing is a figure's labels (drawing_regions):
+        // the candidate's box lies half or more over a drawing, or half its
+        // glyphs or more do (axis ticks stand just outside the plot, so the
+        // box test reaches what the glyph test misses, and the glyph test a
+        // narrow candidate the box test misses).
+        if (figures && !figures->empty()) {
+            size_t total = 0, inside = 0;
+            for (size_t k = band.first_row; k <= band.last_row && k < rows.size(); k++)
+                for (size_t ci : rows[k].char_indices) {
+                    const auto& ch = chars[ci];
+                    total++;
+                    for (const auto& f : *figures)
+                        if (ch.x >= f[0] && ch.x <= f[2] && ch.y >= f[1] && ch.y <= f[3]) { inside++; break; }
+                }
+            double tx0 = std::min(table.x0, table.x1), tx1 = std::max(table.x0, table.x1);
+            double ty0 = std::min(table.y0, table.y1), ty1 = std::max(table.y0, table.y1);
+            // Drawings overlapping the box, summed: a candidate spanning the
+            // panels of one figure lies over several regions at once.
+            double area = std::max(1.0, (tx1 - tx0) * (ty1 - ty0)), covered = 0;
+            for (const auto& f : *figures) {
+                double ox = std::min(tx1, f[2]) - std::max(tx0, f[0]);
+                double oy = std::min(ty1, f[3]) - std::max(ty0, f[1]);
+                if (ox > 0 && oy > 0) covered += ox * oy;
+            }
+            covered = std::min(covered, area);
+            if ((total > 0 && inside * 2 >= total) || covered >= 0.5 * area) continue;
+        }
+        bool duplicate = false;
+        for (const auto& known : result)
+            if (std::min(known.y1, table.y1) > std::max(known.y0, table.y0) &&
+                std::min(known.x1, table.x1) > std::max(known.x0, table.x0)) duplicate = true;
+        if (duplicate) continue;
         table.kind = TableData::TEXT;
         result.push_back(std::move(table));
     }
@@ -2559,10 +5946,17 @@ static std::vector<TableData> detect_text_tables_range(
 std::vector<TableData> detect_text_tables(const PageCharCache& cache,
                                            const std::vector<TableData>& existing_tables,
                                            double page_width, double page_height,
-                                           double col_boundary) {
+                                           double col_boundary,
+                                           const std::vector<std::array<double, 4>>& figures,
+                                           const std::vector<PdfLineSegment>* rules,
+                                           const std::vector<std::array<double, 4>>* excluded) {
+    // Leaders are found once for the page: the per-column passes below
+    // would otherwise sort every period of the page again.
+    const DotLeaders leaders = dot_leader_mask(cache);
     auto result = detect_text_tables_range(cache, existing_tables,
                                            page_width, page_height,
-                                           0.0, page_width);
+                                           0.0, page_width, leaders,
+                                           col_boundary, &figures, rules, excluded);
 
     // Two-column pages: rows built across the gutter glue a column's table
     // to the prose beside it, so the full-width pass misses column-local
@@ -2576,7 +5970,7 @@ std::vector<TableData> detect_text_tables(const PageCharCache& cache,
             double x_hi = side == 0 ? col_boundary : page_width;
             auto part = detect_text_tables_range(cache, known,
                                                  page_width, page_height,
-                                                 x_lo, x_hi);
+                                                 x_lo, x_hi, leaders, 0.0, &figures, rules, excluded);
             for (auto& t : part) {
                 known.push_back(t);
                 result.push_back(std::move(t));
@@ -2586,49 +5980,183 @@ std::vector<TableData> detect_text_tables(const PageCharCache& cache,
     return result;
 }
 
+// Whether a cell reads as a header label: short and holding a letter. A
+// number, a reference mark ("[39]") or a dash is what a data row is made of.
+static bool header_like_cell(const std::string& s, size_t max_len) {
+    if (s.empty()) return true;
+    if (s.size() > max_len) return false;
+    for (unsigned char c : s)
+        if ((c | 0x20) - 'a' < 26u || c >= 0x80) return true;
+    return false;
+}
+
+static bool header_like_row(const std::vector<std::string>& row, size_t max_len) {
+    int filled = 0;
+    for (auto& c : row) {
+        if (!header_like_cell(c, max_len)) return false;
+        if (!c.empty()) filled++;
+    }
+    return filled > 0;
+}
+
+void merge_header_rows(TableData& table) {
+    for (int pass = 0; pass < 2; pass++) {
+        if (table.rows.size() < 3) break;
+        auto& r0 = table.rows[0];
+        auto& r1 = table.rows[1];
+        size_t n = std::min(r0.size(), r1.size());
+        if (n == 0 || !header_like_row(r0, 48) || !header_like_row(r1, 30)) break;
+        // r1 completes r0 when it is a units row (every cell under a label:
+        // "(Acc)" under "MNLI-m"), when its few cells fill columns r0 left
+        // empty ("Model" set between the header lines), or when r0's labels
+        // are known spans over it. A wide sub-label row under two sparse
+        // labels with no span information ("Consonant … Vowel" over 35
+        // jamo) stays a row of its own: folding it would lose both labels.
+        int r0_filled = 0, r1_filled = 0, overlap = 0;
+        for (size_t c = 0; c < n; c++) {
+            if (!r0[c].empty()) r0_filled++;
+            if (!r1[c].empty()) r1_filled++;
+            if (!r0[c].empty() && !r1[c].empty()) overlap++;
+        }
+        const bool units_row = r1[0].empty() && overlap == r1_filled;
+        const bool sparse_fill = overlap == 0 && r1_filled <= r0_filled;
+        if (!units_row && !sparse_fill && table.header_spans.empty()) break;
+
+        const auto& spans = table.header_spans;
+        bool spans_used = false;
+        std::vector<std::string> merged(r0.size());
+        for (size_t c = 0; c < r0.size(); c++) {
+            std::string top = r0[c];
+            if (top.empty() && c < n && !r1[c].empty() && !spans.empty()) {
+                // Inherit the spanning label whose columns cover c.
+                for (size_t s = c + 1; s-- > 0;) {
+                    if (s < spans.size() && spans[s] > 0) {
+                        if (c < s + (size_t)spans[s]) { top = r0[s]; spans_used = true; }
+                        break;
+                    }
+                }
+            }
+            std::string below = (c < n) ? r1[c] : "";
+            if (top.empty()) merged[c] = below;
+            else if (below.empty()) merged[c] = top;
+            else merged[c] = top + " " + below;
+        }
+        table.rows[0] = std::move(merged);
+        table.rows.erase(table.rows.begin() + 1);
+        mask_erase_row(table, 1);
+        if (!table.cell_bold.empty())
+            std::fill(table.cell_bold[0].begin(), table.cell_bold[0].end(), 0);
+        if (spans_used) table.header_spans.clear();
+    }
+}
+
 std::string format_table(const TableData& table) {
     if (table.rows.empty()) return "";
 
+    // The bold mask is applied here, at the end, and only while it still
+    // matches the rows it was built for.
+    const bool use_mask = table.cell_bold.size() == table.rows.size();
     std::vector<std::vector<std::string>> filtered;
     for (size_t r = 0; r < table.rows.size(); r++) {
         bool all_empty = true;
         for (auto& cell : table.rows[r])
             if (!cell.empty()) { all_empty = false; break; }
-        if (!all_empty || r == 0)
+        if (!all_empty || r == 0) {
             filtered.push_back(table.rows[r]);
+            if (use_mask) {
+                auto& row = filtered.back();
+                const auto& m = table.cell_bold[r];
+                for (size_t c = 0; c < row.size() && c < m.size(); c++)
+                    if (m[c] && !row[c].empty()) row[c] = "**" + row[c] + "**";
+            }
+        }
     }
     if (filtered.empty()) return "";
 
     int n_cols = filtered[0].size();
     if (n_cols == 0) return "";
 
-    std::vector<size_t> widths(n_cols, 3);
-    for (auto& row : filtered)
-        for (int c = 0; c < n_cols && c < (int)row.size(); c++)
-            widths[c] = std::max(widths[c], row[c].size());
+    return util::format_padded_markdown_table(filtered, n_cols);
+}
 
-    std::string md;
-    for (size_t r = 0; r < filtered.size(); r++) {
-        md += "|";
-        for (int c = 0; c < n_cols; c++) {
-            std::string cell = (c < (int)filtered[r].size()) ? filtered[r][c] : "";
-            md += " " + cell;
-            for (size_t p = cell.size(); p < widths[c]; p++) md += ' ';
-            md += " |";
-        }
-        md += '\n';
-
-        if (r == 0) {
-            md += "|";
-            for (int c = 0; c < n_cols; c++) {
-                md += " ";
-                for (size_t p = 0; p < widths[c]; p++) md += '-';
-                md += " |";
+TableData lead_grid_row(const std::vector<PdfLineSegment>& segments,
+                        const PageCharCache& cache, double page_width) {
+    TableData none;
+    // Horizontal rules, collinear pieces joined (borders drawn per cell).
+    struct Rule { double y, x0, x1; };
+    std::vector<Rule> pieces;
+    for (const auto& l : segments)
+        if (l.is_horizontal())
+            pieces.push_back({(l.y0 + l.y1) / 2.0, std::min<double>(l.x0, l.x1),
+                              std::max<double>(l.x0, l.x1)});
+    std::sort(pieces.begin(), pieces.end(), [](const Rule& a, const Rule& b) {
+        return a.y != b.y ? a.y > b.y : a.x0 < b.x0;
+    });
+    std::vector<Rule> rules;
+    for (size_t i = 0; i < pieces.size();) {
+        size_t j = i;
+        std::vector<std::pair<double, double>> iv;
+        while (j < pieces.size() && pieces[i].y - pieces[j].y <= 1.5)
+            iv.push_back({pieces[j].x0, pieces[j].x1}), j++;
+        std::sort(iv.begin(), iv.end());
+        double lo = iv[0].first, hi = iv[0].second;
+        for (size_t k = 1; k <= iv.size(); k++) {
+            if (k < iv.size() && iv[k].first <= hi + 3.0) {
+                hi = std::max(hi, iv[k].second);
+                continue;
             }
-            md += '\n';
+            if (hi - lo >= 0.3 * page_width) rules.push_back({pieces[i].y, lo, hi});
+            if (k < iv.size()) { lo = iv[k].first; hi = iv[k].second; }
         }
+        i = j;
     }
-    return md;
+    // The topmost pair of rules of one width with a closed row between them.
+    for (size_t a = 0; a + 1 < rules.size(); a++) {
+        const Rule& top = rules[a];
+        for (size_t b = a + 1; b < rules.size(); b++) {
+            const Rule& bot = rules[b];
+            double h = top.y - bot.y;
+            if (h < 8.0) continue;
+            if (std::abs(top.x0 - bot.x0) > 3.0 || std::abs(top.x1 - bot.x1) > 3.0) break;
+            std::vector<double> xs;
+            for (const auto& l : segments) {
+                if (!l.is_vertical()) continue;
+                double lo = std::min<double>(l.y0, l.y1), hi = std::max<double>(l.y0, l.y1);
+                if (lo > bot.y + 2.0 || hi < top.y - 2.0) continue;
+                double x = (l.x0 + l.x1) / 2.0;
+                if (x < top.x0 - 3.0 || x > top.x1 + 3.0) continue;
+                xs.push_back(x);
+            }
+            std::sort(xs.begin(), xs.end());
+            std::vector<double> cols;
+            for (double x : xs)
+                if (cols.empty() || x - cols.back() > 2.0) cols.push_back(x);
+            if (cols.size() < 3 || std::abs(cols.front() - top.x0) > 3.0 ||
+                std::abs(cols.back() - top.x1) > 3.0)
+                break;
+            TableData t;
+            t.kind = TableData::RULED;
+            t.col_xs = cols;
+            t.x0 = cols.front();
+            t.x1 = cols.back();
+            t.y0 = bot.y;
+            t.y1 = top.y;
+            t.rows.emplace_back();
+            t.cell_bold.emplace_back();
+            int filled = 0;
+            for (size_t c = 0; c + 1 < cols.size(); c++) {
+                bool bold = false;
+                std::string cell = cache.get_text_in_rect(cols[c], top.y, cols[c + 1], bot.y, &bold);
+                filled += !cell.empty();
+                t.cell_bold.back().push_back(bold && !cell.empty());
+                t.rows.back().push_back(std::move(cell));
+            }
+            if (filled < 2) break;
+            return t;
+        }
+        break;  // only the page's first rule opens its lead row
+    }
+    return none;
 }
 
 // ── CCITTFax Decoder (lookup-table based, algorithm from ITU-T T.4/T.6) ──

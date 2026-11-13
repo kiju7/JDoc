@@ -1,7 +1,9 @@
 #include "pdf_extract.h"
+#include "common/metadata.h"
 #include "common/string_utils.h"
 #include <algorithm>
 #include <cassert>
+#include <cctype>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -286,6 +288,133 @@ std::vector<AnnotEntry> extract_annotations(PdfDoc& doc, const PdfObj& page_obj,
 
 // ── Markdown Formatting ──────────────────────────────────
 
+// Whitespace-stripped copy, for order-preserving containment checks.
+static std::string squash_ws(const std::string& s) {
+    std::string out;
+    out.reserve(s.size());
+    for (size_t i = 0; i < s.size(); i++) {
+        char c = s[i];
+        // A no-break space (U+00A0) is whitespace too: the table builder
+        // drops it from cells, so a line keeping it would never match.
+        if (c == '\xC2' && i + 1 < s.size() && s[i + 1] == '\xA0') { i++; continue; }
+        if (c != ' ' && c != '\t' && c != '\n' && c != '\r') out += c;
+    }
+    return out;
+}
+
+// Per-table concatenation of all cell text (row-major, whitespace stripped).
+// A line that geometrically falls inside a table region is only dropped from
+// the prose flow when its characters actually made it into the table's cells;
+// otherwise a detector that claimed a region but captured a subset of its
+// text would silently delete the rest (an author block swallowed by a phantom
+// column once lost six of eight names this way).
+std::vector<std::string> table_captured_text(const std::vector<TableData>& tables) {
+    std::vector<std::string> joined;
+    joined.reserve(tables.size());
+    for (auto& t : tables) {
+        std::string j;
+        for (auto& row : t.rows)
+            for (auto& cell : row) j += cell;
+        joined.push_back(squash_ws(j));
+    }
+    return joined;
+}
+
+// Letters and digits only. ASCII punctuation goes, and so does the U+2000–
+// U+2FFF block (daggers, math operators, arrows) that a marker or symbol
+// glyph contributes; Hangul and CJK (0xE3–0xED lead bytes) stay.
+static std::string alnum_only(const std::string& s) {
+    std::string out;
+    out.reserve(s.size());
+    for (size_t i = 0; i < s.size();) {
+        unsigned char c = s[i];
+        if (c < 0x80) {
+            if ((c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z'))
+                out += static_cast<char>(c);
+            i++;
+            continue;
+        }
+        size_t n = (c < 0xE0) ? 2 : (c < 0xF0) ? 3 : 4;
+        bool nbsp = c == 0xC2 && i + 1 < s.size() && (unsigned char)s[i + 1] == 0xA0;
+        if (c != 0xE2 && !nbsp) out.append(s, i, n);
+        i += n;
+    }
+    return out;
+}
+
+// Whether the line's words are (nearly) all present in a table's cell text,
+// alphanumerics only. Tokens under two characters carry no evidence either
+// way; the rest must be found by 75% of their length, with at least one
+// word of three or more characters among the found.
+static bool line_words_in_cells(const std::string& line_text,
+                                const std::string& captured_ws_stripped) {
+    const std::string cap = alnum_only(captured_ws_stripped);
+    if (cap.empty()) return false;
+    size_t total = 0, found = 0;
+    bool found_word = false;
+    size_t i = 0;
+    while (i < line_text.size()) {
+        while (i < line_text.size() &&
+               (line_text[i] == ' ' || line_text[i] == '\t' || line_text[i] == '\n'))
+            i++;
+        size_t j = i;
+        while (j < line_text.size() &&
+               line_text[j] != ' ' && line_text[j] != '\t' && line_text[j] != '\n')
+            j++;
+        if (j > i) {
+            std::string tok = alnum_only(line_text.substr(i, j - i));
+            if (tok.size() >= 2) {
+                total += tok.size();
+                bool hit = cap.find(tok) != std::string::npos;
+                // A footnote mark set on the word's baseline in the line
+                // ("경제성장률1)", "2024년e)") may sit in a cell of its own:
+                // the word without its trailing digits, or one lowercase
+                // letter, is the word the cell holds.
+                if (!hit) {
+                    size_t k = tok.size();
+                    while (k > 0 && tok[k - 1] >= '0' && tok[k - 1] <= '9') k--;
+                    if (k == tok.size() && tok[k - 1] >= 'a' && tok[k - 1] <= 'z') k--;
+                    hit = k >= 2 && k < tok.size() &&
+                          cap.find(tok.substr(0, k)) != std::string::npos;
+                }
+                if (hit) {
+                    found += tok.size();
+                    if (tok.size() >= 3) found_word = true;
+                }
+            }
+        }
+        i = j;
+    }
+    return total >= 3 && found_word && found * 100 >= total * 75;
+}
+
+// Text of a line that several cells of one boxed row feed (a two-line label
+// beside its value) is printed as one run, with the cells' words glued at
+// their seams ("(W3,740,000)Total"), so the word test above misses it.
+// Without spaces or bold marks, a line made of pieces of at least three
+// bytes that are all in the cells' text, covering 90% of it, was captured.
+static bool line_pieces_in_cells(const std::string& line_text,
+                                 const std::string& cells_text) {
+    auto compact = [](const std::string& s) {
+        std::string out;
+        for (char c : s)
+            if (c != ' ' && c != '\t' && c != '\n' && c != '*') out += c;
+        return out;
+    };
+    std::string l = compact(line_text), c = compact(cells_text);
+    if (l.size() < 6 || c.empty()) return false;
+    size_t i = 0, covered = 0;
+    while (i < l.size()) {
+        size_t best = 0;
+        for (size_t len = l.size() - i; len >= 3; --len) {
+            if (c.find(l.data() + i, 0, len) != std::string::npos) { best = len; break; }
+        }
+        if (best) { covered += best; i += best; }
+        else ++i;
+    }
+    return covered * 10 >= l.size() * 9;
+}
+
 bool line_in_table(const TextLine& line, const std::vector<TableData>& tables) {
     for (auto& t : tables) {
         double t_bottom = std::min(t.y0, t.y1) - 10.0;
@@ -310,12 +439,128 @@ bool line_in_table(const TextLine& line, const std::vector<TableData>& tables) {
     return false;
 }
 
+// line_in_table plus capture check: true only when the line lies in a table
+// region AND its text is present in that table's cells (see
+// table_captured_text). A geometric hit whose text was not captured keeps the
+// line in the prose flow instead of losing it.
+bool line_swallowed_by_table(const TextLine& line,
+                             const std::vector<TableData>& tables,
+                             const std::vector<std::string>& captured) {
+    std::string lt = squash_ws(line.text);
+    for (size_t ti = 0; ti < tables.size(); ti++) {
+        auto& t = tables[ti];
+        double t_bottom = std::min(t.y0, t.y1) - 10.0;
+        double t_top = std::max(t.y0, t.y1) + 5.0;
+        double t_left = std::min(t.x0, t.x1) - 15.0;
+        double t_right = std::max(t.x0, t.x1) + 15.0;
+        if (line.y_center < t_bottom || line.y_center > t_top) continue;
+        bool geo = false;
+        if (line.x_left >= t_left && line.x_right <= t_right) {
+            geo = true;
+        } else {
+            double overlap_l = std::max(line.x_left, t_left);
+            double overlap_r = std::min(line.x_right, t_right);
+            if (overlap_r > overlap_l) {
+                double overlap = overlap_r - overlap_l;
+                double line_width = line.x_right - line.x_left;
+                if (line_width > 0 && overlap >= line_width * 0.6) geo = true;
+            }
+        }
+        if (!geo) continue;
+        // Fully-filler lines ('|', spaces) carry no text to preserve.
+        if (lt.empty()) return true;
+        if (ti < captured.size() &&
+            captured[ti].find(lt) != std::string::npos)
+            return true;
+        // The cells and the line spell the same glyphs differently when a
+        // superscript marker joined a neighbouring row ("8.43†" vs "8.43")
+        // or a bold run lost its word gap, so the exact match fails and the
+        // row is printed twice. Compare alphanumerics only, token by token:
+        // a line whose words are nearly all in the cells was captured.
+        if (ti < captured.size() && line_words_in_cells(line.text, captured[ti]))
+            return true;
+        if (t.single_box && ti < captured.size() &&
+            line_pieces_in_cells(line.text, captured[ti]))
+            return true;
+        // geometric hit but text not captured: check other tables too before
+        // deciding to keep the line.
+    }
+    return false;
+}
+
+static std::vector<TextLine> merge_upright_lines(const std::vector<TextLine>& lines);
+
 std::vector<TextLine> merge_colinear_lines(const std::vector<TextLine>& lines) {
     if (lines.size() < 2) return lines;
 
-    // Skip merging when lines have been column-reordered
-    for (auto& l : lines)
-        if (l.is_column_split) return lines;
+    // Skip merging when lines have been column-reordered. A column band's
+    // lines (TextLine::band) are in reading order already and stay as they
+    // are; the lines between bands merge as on any page.
+    bool bands = false;
+    for (auto& l : lines) {
+        if (l.is_column_split && l.band < 0) return lines;
+        bands |= l.band >= 0;
+    }
+    if (bands) {
+        std::vector<TextLine> out, seg;
+        auto flush_seg = [&]() {
+            if (seg.empty()) return;
+            auto m = merge_colinear_lines(seg);
+            out.insert(out.end(), m.begin(), m.end());
+            seg.clear();
+        };
+        for (auto& l : lines) {
+            if (l.band < 0) {
+                seg.push_back(l);
+                continue;
+            }
+            flush_seg();
+            out.push_back(l);
+        }
+        flush_seg();
+        return out;
+    }
+
+    // Rotated lines are complete already: chars_to_lines built each along
+    // its own baseline, in its direction's reading order. Page-space y says
+    // nothing about which of them belong together — every line of a 90° run
+    // can share one page-space midpoint (merging them welds a sideways table
+    // into one line), and a 180° run's first line is its lowest. So only the
+    // upright lines are merged and sorted by y; each run of rotated lines
+    // keeps its own order and goes in as a block, where its top line's
+    // midpoint falls among the upright lines (a lone rotated line lands
+    // exactly where sorting by y put it).
+    std::vector<TextLine> upright;
+    std::vector<std::pair<size_t, size_t>> runs;   // [begin, end) in lines
+    for (size_t i = 0; i < lines.size(); i++) {
+        if (lines[i].rot == 0) {
+            upright.push_back(lines[i]);
+        } else if (!runs.empty() && runs.back().second == i &&
+                   lines[runs.back().first].rot == lines[i].rot) {
+            runs.back().second = i + 1;
+        } else {
+            runs.push_back({i, i + 1});
+        }
+    }
+    if (runs.empty()) return merge_upright_lines(lines);
+    std::vector<TextLine> merged = merge_upright_lines(upright);
+    for (auto& run : runs) {
+        double top = -1e30;
+        for (size_t k = run.first; k < run.second; k++)
+            top = std::max(top, lines[k].y_center);
+        size_t at = 0;
+        while (at < merged.size() &&
+               (merged[at].rot != 0 || merged[at].y_center >= top))
+            at++;
+        merged.insert(merged.begin() + static_cast<std::ptrdiff_t>(at),
+                      lines.begin() + static_cast<std::ptrdiff_t>(run.first),
+                      lines.begin() + static_cast<std::ptrdiff_t>(run.second));
+    }
+    return merged;
+}
+
+static std::vector<TextLine> merge_upright_lines(const std::vector<TextLine>& lines) {
+    if (lines.size() < 2) return lines;
 
     std::vector<size_t> idx(lines.size());
     for (size_t i = 0; i < idx.size(); i++) idx[i] = i;
@@ -370,9 +615,12 @@ std::vector<TextLine> merge_colinear_lines(const std::vector<TextLine>& lines) {
             m.is_bold = lines[group[0]].is_bold;
             m.is_italic = lines[group[0]].is_italic;
             m.rot = dir;
+            m.first_gap = lines[group[0]].first_gap;
             for (size_t k = 0; k < group.size(); k++) {
                 if (k > 0) {
                     double gap = lines[group[k]].x_left - lines[group[k-1]].x_right;
+                    if (k == 1 && lines[group[0]].text.find(' ') == std::string::npos)
+                        m.first_gap = std::max(0.0, gap);
                     double avg_font = (lines[group[k]].font_size +
                                        lines[group[k-1]].font_size) / 2.0;
                     double col_gap = std::max(avg_font * 6.0, 60.0);
@@ -382,6 +630,9 @@ std::vector<TextLine> merge_colinear_lines(const std::vector<TextLine>& lines) {
                     else if (gap > word_gap)
                         m.text += " ";
                 }
+                const uint32_t base = static_cast<uint32_t>(m.text.size());
+                for (auto& sp : lines[group[k]].bold_spans)
+                    m.bold_spans.emplace_back(sp.first + base, sp.second + base);
                 m.text += lines[group[k]].text;
                 if (lines[group[k]].x_right > m.x_right)
                     m.x_right = lines[group[k]].x_right;
@@ -428,20 +679,332 @@ static bool is_page_number_footer(const std::string& text) {
     return false;
 }
 
-// Depth of a leading section number: "2.1 ..." → 2, "4.2.1 ..." → 3, else 0
-static int section_number_depth(const std::string& text) {
+// Widest gap, in ems, between a section number and its title (TextLine::
+// first_gap): a word space, a quad, or a tab stop — half an inch out at a
+// 9-pt heading is 4 em.
+constexpr double kMaxSectionGapEm = 4.0;
+
+// Section-number prefix "1", "1.", "2.1", "4.1.2)": numeric segments, an
+// optional closing '.' or ')' and required whitespace (ASCII or U+3000)
+// before the title text. A large first segment is a year or a data value,
+// never a section number.
+SectionNumber parse_section_number(const std::string& text) {
+    SectionNumber none;
     size_t i = 0;
     int depth = 0;
-    while (i < text.size()) {
+    long first = 0;
+    for (;;) {
         size_t start = i;
-        while (i < text.size() && std::isdigit(static_cast<unsigned char>(text[i]))) i++;
-        if (i == start) return 0;
+        long val = 0;
+        while (i < text.size() &&
+               std::isdigit(static_cast<unsigned char>(text[i]))) {
+            val = val * 10 + (text[i] - '0');
+            i++;
+        }
+        if (i == start) return none;
+        if (depth == 0) first = val;
         depth++;
-        if (i < text.size() && text[i] == '.') { i++; continue; }
+        if (i + 1 < text.size() && text[i] == '.' &&
+            std::isdigit(static_cast<unsigned char>(text[i + 1]))) {
+            i++;
+            continue;
+        }
         break;
     }
-    if (i >= text.size() || (text[i] != ' ' && text[i] != '\t')) return 0;
-    return depth;
+    // Sections count from 1 ("0.3" is a chart value); paren enumerations
+    // ("1) 항목") are list items, not sections, in this corpus.
+    if (first < 1 || first > 99 || depth > 4) return none;
+    SectionNumber sn;
+    if (i < text.size() && text[i] == '.') {
+        sn.closed = true;
+        i++;
+    }
+    size_t ws = 0;
+    while (i < text.size()) {
+        unsigned char c = text[i];
+        if (c == ' ' || c == '\t') { i++; ws++; continue; }
+        if (c == 0xE3 && i + 2 < text.size() &&
+            static_cast<unsigned char>(text[i + 1]) == 0x80 &&
+            static_cast<unsigned char>(text[i + 2]) == 0x80) {
+            i += 3;
+            ws++;
+            continue;
+        }
+        break;
+    }
+    if (ws == 0 || i >= text.size()) return none;
+    sn.depth = depth;
+    sn.text_pos = i;
+    return sn;
+}
+
+// Offset past a superscript footnote marker glued ahead of a section
+// number ("1)1. 서론"): an affiliation mark that merged into the heading
+// line in x order. Zero when the line has no such prefix.
+size_t glued_mark_offset(const std::string& text) {
+    size_t d = 0;
+    while (d < text.size() && std::isdigit(static_cast<unsigned char>(text[d]))) d++;
+    if (d >= 1 && d <= 2 && d < text.size() && text[d] == ')' &&
+        parse_section_number(text.substr(d + 1)).depth > 0)
+        return d + 1;
+    return 0;
+}
+
+// "TABLE 2.6.2 ..." / "그림 3 ..." caption headings never wrap onto a
+// following line — what follows a caption is its subtitle or the table.
+static bool is_caption_heading(const std::string& text) {
+    size_t i = 0;
+    auto match = [&](const char* w) {
+        size_t j = i, k = 0;
+        while (w[k] && j < text.size() &&
+               std::tolower(static_cast<unsigned char>(text[j])) == w[k]) {
+            j++; k++;
+        }
+        if (w[k]) return false;
+        i = j;
+        return true;
+    };
+    bool head = match("table") || match("figure") || match("fig");
+    if (!head) {
+        if (text.compare(0, 3, "\xed\x91\x9c") == 0) { i = 3; head = true; }
+        else if (text.compare(0, 6, "\xea\xb7\xb8\xeb\xa6\xbc") == 0) {
+            i = 6;
+            head = true;
+        }
+    }
+    if (!head) return false;
+    while (i < text.size() && (text[i] == ' ' || text[i] == '.')) i++;
+    return i < text.size() && std::isdigit(static_cast<unsigned char>(text[i]));
+}
+
+static size_t utf8_length(const std::string& s) {
+    size_t n = 0;
+    for (char c : s)
+        if ((static_cast<unsigned char>(c) & 0xC0) != 0x80) n++;
+    return n;
+}
+
+// The last code point of s (trailing spaces skipped), 0 if none.
+static uint32_t last_codepoint(const std::string& s) {
+    size_t end = s.find_last_not_of(' ');
+    if (end == std::string::npos) return 0;
+    size_t start = end;
+    while (start > 0 && (static_cast<unsigned char>(s[start]) & 0xC0) == 0x80) start--;
+    unsigned char c0 = s[start];
+    int len = c0 < 0x80 ? 1 : c0 < 0xE0 ? 2 : c0 < 0xF0 ? 3 : 4;
+    uint32_t cp = len == 1 ? c0 : c0 & (0xFF >> (len + 1));
+    for (int k = 1; k < len && start + k <= end; k++)
+        cp = (cp << 6) | (static_cast<unsigned char>(s[start + k]) & 0x3F);
+    return cp;
+}
+
+// A line set entirely in capitals ("ABSTRACT"): at least three Latin
+// capitals and not a single lowercase letter — sentence case never counts.
+// A letter of a caseless script (Hangul, kana, ideographs) makes it a
+// sentence that merely holds an acronym ("한편 SPV는 ...").
+bool line_all_caps(const std::string& text) {
+    int caps = 0;
+    for (size_t i = 0; i < text.size(); i++) {
+        unsigned char ch = static_cast<unsigned char>(text[i]);
+        if (ch >= 'a' && ch <= 'z') return false;
+        if (ch >= 'A' && ch <= 'Z') caps++;
+        if (ch >= 0xE0 && ch < 0xF0 && i + 2 < text.size()) {
+            uint32_t cp = ((ch & 0x0F) << 12) |
+                          ((static_cast<unsigned char>(text[i + 1]) & 0x3F) << 6) |
+                          (static_cast<unsigned char>(text[i + 2]) & 0x3F);
+            if ((cp >= 0x3040 && cp <= 0x30FF) || (cp >= 0x3130 && cp <= 0x318F) ||
+                (cp >= 0x4E00 && cp <= 0x9FFF) || (cp >= 0xAC00 && cp <= 0xD7A3))
+                return false;
+        }
+    }
+    return caps >= 3;
+}
+
+// A line whose glyphs are spaced out one by one ("참 고 문 헌", "요　약"):
+// every space-separated token is a single character, and there are at
+// least two of them. Body text never wears this shape; Korean section
+// names conventionally do.
+static bool at_ideographic_space(const std::string& s, size_t i) {
+    return static_cast<unsigned char>(s[i]) == 0xE3 && i + 2 < s.size() &&
+           static_cast<unsigned char>(s[i + 1]) == 0x80 &&
+           static_cast<unsigned char>(s[i + 2]) == 0x80;
+}
+bool line_letter_spaced(const std::string& text) {
+    int tokens = 0, singles = 0;
+    size_t i = 0, n = text.size();
+    while (i < n) {
+        if (text[i] == ' ' || text[i] == '\t') { i++; continue; }
+        if (at_ideographic_space(text, i)) { i += 3; continue; }
+        int cps = 0;
+        while (i < n && text[i] != ' ' && text[i] != '\t' &&
+               !at_ideographic_space(text, i)) {
+            if ((static_cast<unsigned char>(text[i]) & 0xC0) != 0x80) cps++;
+            i++;
+        }
+        tokens++;
+        if (cps == 1) singles++;
+    }
+    return tokens >= 2 && singles == tokens;
+}
+
+// Name-list punctuation that betrays an author line under the title:
+// interpunct-joined Korean names, affiliation daggers and asterisks, mail
+// addresses, a trailing comma continuing the author list.
+static bool looks_like_author_line(const std::string& s) {
+    std::string t = s;
+    while (!t.empty() && (t.back() == ' ' || t.back() == '\t')) t.pop_back();
+    if (!t.empty() && t.back() == ',') return true;
+    for (size_t i = 0; i < s.size(); i++) {
+        unsigned char c = s[i];
+        if (c == '@' || c == '*') return true;
+        if (c == 0xE2 && i + 2 < s.size()) {
+            unsigned char c1 = s[i + 1], c2 = s[i + 2];
+            if (c1 == 0x80 && (c2 == 0xA0 || c2 == 0xA1)) return true;  // dagger
+            if (c1 == 0x8B && c2 == 0x85) return true;                  // U+22C5
+            if (c1 == 0x88 && c2 == 0x97) return true;                  // U+2217
+        }
+    }
+    return false;
+}
+
+// Whether a line is written mostly in CJK script. A Korean title stacked
+// above its English translation is two headings, not one wrapped heading.
+static bool line_is_mostly_cjk(const std::string& s) {
+    size_t cjk = 0, letters = 0;
+    for (size_t k = 0; k < s.size();) {
+        unsigned char c = s[k];
+        uint32_t cp;
+        int n;
+        if (c < 0x80)      { cp = c; n = 1; }
+        else if (c < 0xE0) { cp = c & 0x1F; n = 2; }
+        else if (c < 0xF0) { cp = c & 0x0F; n = 3; }
+        else               { cp = c & 0x07; n = 4; }
+        for (int b = 1; b < n && k + b < s.size(); b++)
+            cp = (cp << 6) | (static_cast<unsigned char>(s[k + b]) & 0x3F);
+        k += n;
+        if (cp > 0x3040) { letters++; if (cp >= 0xAC00 && cp <= 0xD7A3) cjk++; }
+        else if ((cp | 0x20) - 'a' < 26u) letters++;
+    }
+    return letters > 0 && cjk * 2 >= letters;
+}
+
+// Whether the text holds at least one letter (Latin, Hangul, CJK) — a line
+// of digits and punctuation (a page number, a lone value) is never a
+// heading whatever its size.
+static bool has_letter_codepoint(const std::string& s) {
+    for (size_t i = 0; i < s.size();) {
+        unsigned char c = s[i];
+        uint32_t cp;
+        int n;
+        if (c < 0x80)      { cp = c; n = 1; }
+        else if (c < 0xE0) { cp = c & 0x1F; n = 2; }
+        else if (c < 0xF0) { cp = c & 0x0F; n = 3; }
+        else               { cp = c & 0x07; n = 4; }
+        for (int b = 1; b < n && i + b < s.size(); b++)
+            cp = (cp << 6) | (static_cast<unsigned char>(s[i + b]) & 0x3F);
+        i += n;
+        if ((cp | 0x20) - 'a' < 26u || cp >= 0x3040) return true;
+    }
+    return false;
+}
+
+// A text line that a layout block reproduces: same writing direction and
+// wholly inside the block's box, so every glyph of it is in the block's grid.
+// The box is measured without space glyphs, so a line's trailing space may
+// overhang it by up to a font size. A line reaching further keeps its place
+// in the prose flow, duplicating the block's part of it rather than losing
+// the rest.
+static bool line_in_layout_block(const TextLine& line,
+                                 const std::vector<LayoutFallback>& fallbacks) {
+    for (auto& fb : fallbacks) {
+        if (line.rot != fb.rot) continue;
+        if (line.y_center >= fb.y0 - 2.0 && line.y_center <= fb.y1 + 2.0 &&
+            line.x_left >= fb.x0 - 3.0 &&
+            line.x_right <= fb.x1 + 3.0 + line.font_size)
+            return true;
+    }
+    return false;
+}
+
+// Page-end block listing a page's annotations: links, then text notes.
+static std::string annotations_markdown(const std::vector<AnnotEntry>& annots) {
+    std::string md;
+    if (annots.empty()) return md;
+    bool has_links = false, has_notes = false;
+    for (auto& a : annots) {
+        if (!a.uri.empty()) has_links = true;
+        if (!a.text.empty() && a.subtype != "Link") has_notes = true;
+    }
+    if (has_links) {
+        md += "\n**Links:**\n";
+        for (auto& a : annots) {
+            if (a.uri.empty()) continue;
+            if (!a.text.empty())
+                md += "- [" + a.text + "](" + a.uri + ")\n";
+            else
+                md += "- <" + a.uri + ">\n";
+        }
+    }
+    if (has_notes) {
+        md += "\n**Notes:**\n";
+        for (auto& a : annots) {
+            if (a.text.empty() || a.subtype == "Link") continue;
+            md += "> " + a.text + "\n\n";
+        }
+    }
+    return md;
+}
+
+// True when every visible byte of the line lies inside a bold run, i.e. the
+// whole line is set bold (the case the line-level `**...**` always covered).
+static bool bold_covers_line(const TextLine& l) {
+    if (l.bold_spans.empty()) return false;
+    size_t pos = 0;
+    for (auto& sp : l.bold_spans) {
+        for (size_t k = pos; k < sp.first && k < l.text.size(); k++)
+            if (l.text[k] != ' ' && l.text[k] != '\t' && l.text[k] != '\n') return false;
+        pos = std::max(pos, static_cast<size_t>(sp.second));
+    }
+    for (size_t k = pos; k < l.text.size(); k++)
+        if (l.text[k] != ' ' && l.text[k] != '\t' && l.text[k] != '\n') return false;
+    return true;
+}
+
+// The line text with `**` around each bold run. Runs are byte ranges built on
+// glyph boundaries, so the markers never split a UTF-8 sequence.
+static std::string with_inline_bold(const TextLine& l) {
+    std::string out;
+    out.reserve(l.text.size() + 4 * l.bold_spans.size());
+    size_t pos = 0;
+    for (auto& sp : l.bold_spans) {
+        size_t a = std::max(pos, static_cast<size_t>(sp.first));
+        size_t b = std::min(l.text.size(), static_cast<size_t>(sp.second));
+        // Keep trailing punctuation outside the closing marker: CommonMark
+        // does not close "**" that follows punctuation and precedes a letter,
+        // so "**Adaptations—**If" would print its asterisks.
+        auto punct_tail = [&](size_t end) -> size_t {
+            unsigned char c = static_cast<unsigned char>(l.text[end - 1]);
+            if (c < 0x80 && std::ispunct(c)) return 1;
+            if (end - a >= 3 && static_cast<unsigned char>(l.text[end - 3]) == 0xE2 &&
+                (static_cast<unsigned char>(l.text[end - 2]) == 0x80 ||
+                 static_cast<unsigned char>(l.text[end - 2]) == 0x81))
+                return 3;   // U+2000..U+207F general punctuation (—, …, ’, ”)
+            return 0;
+        };
+        while (b > a) {
+            size_t n = punct_tail(b);
+            if (n == 0) break;
+            b -= n;
+        }
+        if (a >= b) continue;
+        out.append(l.text, pos, a - pos);
+        out += "**";
+        out.append(l.text, a, b - a);
+        out += "**";
+        pos = b;
+    }
+    out.append(l.text, pos, std::string::npos);
+    return out;
 }
 
 std::string page_to_markdown(const std::vector<TextLine>& raw_lines,
@@ -452,8 +1015,10 @@ std::string page_to_markdown(const std::vector<TextLine>& raw_lines,
                               const std::vector<TableData>& tables,
                               const std::vector<AnnotEntry>& annots = {},
                               double col_boundary = 0,
-                              const std::string& img_ref_prefix = "") {
+                              const std::string& img_ref_prefix = "",
+                              const std::vector<LayoutFallback>& fallbacks = {}) {
     auto lines = merge_colinear_lines(raw_lines);
+    auto captured_cells = table_captured_text(tables);
 
     // Detect if page has column-split lines (for image placement)
     bool has_columns = false;
@@ -465,6 +1030,272 @@ std::string page_to_markdown(const std::vector<TextLine>& raw_lines,
     for (auto& l : lines)
         if (l.y_center < bottom_y) bottom_y = l.y_center;
 
+    // ── Heading classification (pre-pass) ──
+    // Decide every line's heading level up front; the emit loop and the
+    // wrap-merge inside it both need the neighbour's verdict. Levels follow
+    // the typesetting convention — document title → H1; top-level sections
+    // (depth-1 numbers, standalone emphasized names, other prominent text)
+    // → H2; numbered subsections → H3 — because size ratios alone
+    // systematically shifted every level one to two steps down.
+    std::vector<int> line_level(lines.size(), 0);
+    std::vector<uint8_t> line_standalone(lines.size(), 0);
+    // Side 0 is the page's full width, 1 and 2 its columns, and 3 on the
+    // columns of its column bands (TextLine::band).
+    int sides = 3;
+    for (auto& l : lines) sides = std::max(sides, 3 + l.band + 1);
+    auto side_of = [&](const TextLine& t) -> int {
+        if (t.band >= 0) return 3 + t.band;
+        if (!t.is_column_split) return 0;
+        return ((t.x_left + t.x_right) / 2.0 < col_boundary) ? 1 : 2;
+    };
+    // Typical line pitch: median of same-side consecutive gaps.
+    double median_gap = stats.body_size * 1.4;
+    {
+        std::vector<double> gap_samples;
+        for (size_t i = 1; i < lines.size(); i++) {
+            if (side_of(lines[i]) != side_of(lines[i - 1])) continue;
+            double g = lines[i - 1].y_center - lines[i].y_center;
+            if (g > 0.5 && g < stats.body_size * 4.0) gap_samples.push_back(g);
+        }
+        if (!gap_samples.empty()) {
+            std::nth_element(gap_samples.begin(),
+                             gap_samples.begin() + gap_samples.size() / 2,
+                             gap_samples.end());
+            median_gap = gap_samples[gap_samples.size() / 2];
+        }
+    }
+    {
+        double top_y = -1e9, bot_y = 1e9, page_l = 1e9, page_r = 0;
+        for (auto& t : lines) {
+            top_y = std::max(top_y, t.y_center);
+            bot_y = std::min(bot_y, t.y_center);
+            page_l = std::min(page_l, t.x_left);
+            page_r = std::max(page_r, t.x_right);
+        }
+        auto gap_above = [&](size_t i) -> double {
+            int side = side_of(lines[i]);
+            for (size_t j = i; j-- > 0;) {
+                if (side_of(lines[j]) != side) continue;
+                return lines[j].y_center - lines[i].y_center;
+            }
+            return 1e9;   // first line of its column
+        };
+        // The page's document-title size: the largest heading-tier type in
+        // the top region. Only its lines may become H1.
+        double h1_size = 0;
+        bool has_display = false;
+        double max_bold_fs = 0;
+        for (auto& t : lines) {
+            if (t.rot != 0) continue;
+            if (t.font_size >= stats.body_size * 1.3) {
+                has_display = true;
+                if (t.y_center >= bot_y + (top_y - bot_y) * 0.70)
+                    h1_size = std::max(h1_size, t.font_size);
+            }
+            if (t.is_bold) max_bold_fs = std::max(max_bold_fs, t.font_size);
+        }
+
+        // Author lines run in blocks under the title; once one is
+        // recognized, its same-size neighbours directly below are authors
+        // too even without their own affiliation marks.
+        double auth_y = -1e9, auth_fs = 0;
+        int auth_side = -1, cover_script = -1;
+
+        for (size_t i = 0; i < lines.size(); i++) {
+            const auto& l = lines[i];
+            if (l.rot != 0) continue;   // margin banners, rotated stamps
+            if (!has_letter_codepoint(l.text)) continue;
+            // Pipes come from running heads and table fragments, never from
+            // a heading (they would break the markdown line anyway).
+            if (l.text.find('|') != std::string::npos) continue;
+            size_t cp_len = utf8_length(l.text);
+            int base = stats.heading_level(l.font_size, l.is_bold);
+
+            SectionNumber sn = parse_section_number(l.text);
+            size_t sn_off = 0;
+            if (sn.depth == 0) {
+                sn_off = glued_mark_offset(l.text);
+                if (sn_off) sn = parse_section_number(l.text.substr(sn_off));
+            }
+            if (sn.depth > 0 && cp_len <= 60 &&
+                l.y_center > bot_y + stats.body_size * 2.0) {
+                const std::string title = l.text.substr(sn_off + sn.text_pos);
+                char lastc = l.text.back();
+                bool ok = has_letter_codepoint(title) &&
+                          lastc != '.' && lastc != ',' && lastc != ';';
+                if (ok && !sn.closed) {
+                    // A bare number ("1 Introduction") is weaker evidence:
+                    // demand a capitalized or CJK title word.
+                    unsigned char c0 = title[0];
+                    ok = (c0 >= 'A' && c0 <= 'Z') || c0 >= 0xE0;
+                }
+                if (ok && base == 0 && !l.is_bold) {
+                    // Body-type numbered heading: isolation is the only
+                    // signal left — extra space above, and no same-depth
+                    // numbered line at normal pitch below (that is a list).
+                    ok = gap_above(i) >= median_gap * 1.25;
+                    if (ok && i + 1 < lines.size() &&
+                        side_of(lines[i + 1]) == side_of(l) &&
+                        l.y_center - lines[i + 1].y_center < median_gap * 1.2 &&
+                        parse_section_number(lines[i + 1].text).depth ==
+                            sn.depth)
+                        ok = false;
+                }
+                // A section number sits a word space, a quad or a tab stop
+                // from its title. A number several ems from the next word on
+                // its baseline is something else sharing the line: a page
+                // number beside the running head, a chart's axis tick
+                // beside a series label.
+                if (ok &&
+                    l.first_gap > kMaxSectionGapEm * std::max(1.0, l.font_size))
+                    ok = false;
+                if (ok) {
+                    line_level[i] = (sn.depth == 1) ? 2 : 3;
+                    continue;
+                }
+            }
+
+            // Standalone structural heading at body-tier size ("참 고 문 헌",
+            // "ABSTRACT", a bold "요약"): no word list — the signals are the
+            // line's own dress (weight, letter spacing, capitals), its
+            // isolation from the surrounding pitch, and, when weight is the
+            // only mark, the document's sparing use of that style. A press
+            // release that bolds half its lines offers no weight signal.
+            if (cp_len >= 2 && cp_len <= 32 && sn.depth == 0 &&
+                !is_caption_heading(l.text) &&
+                !looks_like_author_line(l.text) &&
+                // A name list wears commas a section name never does.
+                l.text.find(',') == std::string::npos &&
+                // A cover-like sparse page has its own title rule below;
+                // its spaced-out names and labels are not section headings.
+                (has_display || lines.size() > 30)) {
+                bool spaced = line_letter_spaced(l.text);
+                bool caps = line_all_caps(l.text);
+                bool weight_only = l.is_bold && !spaced && !caps;
+                bool emphasized = l.is_bold || spaced || caps;
+                char lastc = l.text[l.text.size() - 1];
+                // A trailing colon is a fragment of a wrapped title or a
+                // lead-in; a trailing digit is a running head carrying its
+                // page number. Neither is a finished section name.
+                bool clean_tail = lastc != '.' && lastc != ',' &&
+                                  lastc != ';' && lastc != '?' &&
+                                  lastc != '!' && lastc != ':' &&
+                                  !(lastc >= '0' && lastc <= '9');
+                bool rare = !weight_only ||
+                            stats.style_share(l.font_size, true) <= 0.25;
+                // The page title outranks this rule: a display-size line in
+                // the top region stays on the H1 path below.
+                bool h1_candidate = h1_size > 0 &&
+                                    l.font_size >= h1_size - 0.1 &&
+                                    l.y_center >= bot_y + (top_y - bot_y) * 0.70;
+                if (emphasized && clean_tail && rare && !h1_candidate &&
+                    gap_above(i) >= median_gap * 1.35) {
+                    // A line inside a run of same-style lines is a block
+                    // member — the wrapped second line of a display title,
+                    // the first line of a bold paragraph — not a standalone
+                    // heading. Check the nearest same-side neighbour on
+                    // each side for the same weight and size.
+                    bool block_member = false;
+                    if (weight_only) {
+                        // An address or name list above (an author block)
+                        // is not the candidate's own block: those styles
+                        // end exactly where the section heading begins.
+                        auto blockish = [](const std::string& s) {
+                            return s.find('@') == std::string::npos &&
+                                   s.find(',') == std::string::npos;
+                        };
+                        for (size_t j = i; j-- > 0;) {
+                            if (side_of(lines[j]) != side_of(l)) continue;
+                            block_member =
+                                lines[j].is_bold &&
+                                blockish(lines[j].text) &&
+                                std::fabs(lines[j].font_size - l.font_size) <
+                                    0.6 &&
+                                lines[j].y_center - l.y_center <
+                                    median_gap * 2.2;
+                            break;
+                        }
+                        // A heading heads something: text must follow
+                        // below it, under its own extent. A bold fragment
+                        // left at the foot of a column has no body under
+                        // it. Reading order may put other lines between the
+                        // two (a column band's side column), and the body
+                        // may sit on another side than the heading (a
+                        // column band starting under it).
+                        size_t nx = i + 1;
+                        while (nx < lines.size() &&
+                               !(lines[nx].y_center < l.y_center &&
+                                 lines[nx].x_left < l.x_right &&
+                                 lines[nx].x_right > l.x_left))
+                            nx++;
+                        bool has_body_below =
+                            nx < lines.size() &&
+                            l.y_center - lines[nx].y_center <
+                                median_gap * 2.5;
+                        if (!has_body_below) block_member = true;
+                        if (!block_member && lines[nx].is_bold &&
+                            std::fabs(lines[nx].font_size - l.font_size) <
+                                0.6 &&
+                            l.y_center - lines[nx].y_center <
+                                median_gap * 1.2)
+                            block_member = true;
+                    }
+                    if (!block_member) {
+                        line_level[i] = 2;
+                        line_standalone[i] = 1;
+                        continue;
+                    }
+                }
+            }
+
+            // Author lines are tracked whether or not they reach heading
+            // size: the marked names ("Colin Raffel∗") are often set in a
+            // different face from their unmarked neighbours, and the chain
+            // must not restart between them.
+            if (looks_like_author_line(l.text) ||
+                (auth_side == side_of(l) &&
+                 std::fabs(l.font_size - auth_fs) <= 0.6 &&
+                 auth_y - l.y_center > -1.0 &&
+                 auth_y - l.y_center <= median_gap * 2.5)) {
+                auth_side = side_of(l);
+                auth_fs = l.font_size;
+                auth_y = l.y_center;
+                continue;
+            }
+            if (base == 0) {
+                // Cover pages set the title at the page's own body size, so
+                // no size tier exists at all: the largest bold centered
+                // block near the top is the document title; a second block
+                // in the other script is its translation, one level down.
+                if (!has_display && lines.size() <= 30 && l.is_bold &&
+                    cp_len <= 40 && l.font_size >= max_bold_fs - 0.1 &&
+                    l.y_center >= bot_y + (top_y - bot_y) * 0.55) {
+                    double lm = l.x_left - page_l, rm = page_r - l.x_right;
+                    if (std::fabs(lm - rm) < (page_r - page_l) * 0.15) {
+                        int script = line_is_mostly_cjk(l.text) ? 1 : 0;
+                        if (cover_script < 0) cover_script = script;
+                        line_level[i] = (script == cover_script) ? 1 : 2;
+                    }
+                }
+                continue;
+            }
+            if (cp_len > 80 && !l.is_bold) continue;
+            bool is_h1 = h1_size > 0 && l.font_size >= h1_size - 0.1 &&
+                         l.y_center >= bot_y + (top_y - bot_y) * 0.70;
+            if (is_h1) {
+                // Titles are set centered (or unmistakably large); a
+                // left-aligned top section heading stays H2.
+                double lmarg = l.x_left - page_l, rmarg = page_r - l.x_right;
+                bool centered =
+                    std::fabs(lmarg - rmarg) < (page_r - page_l) * 0.15 &&
+                    l.x_right - l.x_left < (page_r - page_l) * 0.95;
+                if (!centered && l.font_size < stats.body_size * 1.6)
+                    is_h1 = false;
+            }
+            line_level[i] = is_h1 ? 1 : 2;
+        }
+    }
+
     std::string md;
     md.reserve(lines.size() * 80);
 
@@ -474,9 +1305,11 @@ std::string page_to_markdown(const std::vector<TextLine>& raw_lines,
         double x_pos;
         size_t idx;
         bool is_image; // false = table, true = image
+        bool is_layout = false; // a layout block (idx into fallbacks)
     };
     std::vector<InlineInsert> inserts;
     for (size_t ti = 0; ti < tables.size(); ti++) {
+        if (tables[ti].continued) continue;  // printed with the previous page's
         double tx = (tables[ti].x0 + tables[ti].x1) / 2.0;
         inserts.push_back({std::max(tables[ti].y0, tables[ti].y1), tx, ti, false});
     }
@@ -484,6 +1317,10 @@ std::string page_to_markdown(const std::vector<TextLine>& raw_lines,
         double y = (ii < image_y_pos.size()) ? image_y_pos[ii] : 0.0;
         double x = (ii < image_x_pos.size()) ? image_x_pos[ii] : 0.0;
         inserts.push_back({y, x, ii, true});
+    }
+    for (size_t fi = 0; fi < fallbacks.size(); fi++) {
+        auto& fb = fallbacks[fi];
+        inserts.push_back({fb.y1, (fb.x0 + fb.x1) / 2.0, fi, false, true});
     }
     std::sort(inserts.begin(), inserts.end(),
               [](const InlineInsert& a, const InlineInsert& b) { return a.y_pos > b.y_pos; });
@@ -493,8 +1330,80 @@ std::string page_to_markdown(const std::vector<TextLine>& raw_lines,
     // For column-split pages, defer inserts whose X doesn't match current text column
     std::vector<size_t> deferred_inserts;
 
+    // Paragraphs. A Markdown paragraph is a run of lines with no blank line
+    // between them, so a blank line goes before every line that opens one.
+    // Typesetting marks a paragraph's start by extra space above it, a
+    // first-line indent, or the line before it ending short of the
+    // column's right edge; a change of type size or weight starts one too.
+    // Each column's edges: where its lines start (median left) and where
+    // its full lines end (90th percentile right). In a column of under ten
+    // lines that percentile is the rightmost line itself, so there a line
+    // under a fifth of the column's median width (a page number, a running
+    // head cut at the gutter) does not count toward the right edge.
+    std::vector<double> col_left(sides, 0), col_right(sides, 0);
+    for (int sd = 0; sd < sides; sd++) {
+        std::vector<double> ws;
+        for (size_t k = 0; k < lines.size(); k++)
+            if (side_of(lines[k]) == sd && line_level[k] == 0)
+                ws.push_back(lines[k].x_right - lines[k].x_left);
+        double min_w = 0;
+        if (sd != 0 && !ws.empty() && ws.size() < 10) {
+            std::nth_element(ws.begin(), ws.begin() + ws.size() / 2, ws.end());
+            min_w = ws[ws.size() / 2] / 5.0;
+        }
+        std::vector<double> ls, rs;
+        for (size_t k = 0; k < lines.size(); k++)
+            if (side_of(lines[k]) == sd && line_level[k] == 0) {
+                ls.push_back(lines[k].x_left);
+                if (lines[k].x_right - lines[k].x_left >= min_w)
+                    rs.push_back(lines[k].x_right);
+            }
+        if (ls.empty() || rs.empty()) continue;
+        std::nth_element(ls.begin(), ls.begin() + ls.size() / 2, ls.end());
+        std::nth_element(rs.begin(), rs.begin() + rs.size() * 9 / 10, rs.end());
+        col_left[sd] = ls[ls.size() / 2];
+        col_right[sd] = rs[rs.size() * 9 / 10];
+    }
+    int prev_body = -1;   // last body line emitted, -1 after a heading or insert
+    auto opens_paragraph = [&](size_t i) {
+        if (prev_body < 0) return true;
+        const TextLine& p = lines[prev_body];
+        const TextLine& c = lines[i];
+        int sp = side_of(p), sc = side_of(c);
+        double fs = std::max(c.font_size, 1.0);
+        double width = std::max(col_right[sp] - col_left[sp], fs);
+        bool prev_full = p.x_right >= col_right[sp] - std::max(2.0 * fs, width * 0.1);
+        bool indented = c.x_left > col_left[sc] + 0.8 * fs;
+        uint32_t last = last_codepoint(p.text);
+        bool sentence_end = last == '.' || last == '?' || last == '!' || last == ':' ||
+                            last == 0x3002 || last == 0xFF01 || last == 0xFF1F || last == 0xFF1A;
+        // Into the next column (or back up the page): a paragraph runs on
+        // only from a full line that did not end a sentence into an
+        // unindented line.
+        if (sp != sc || c.y_center > p.y_center)
+            return !(prev_full && !sentence_end && !indented);
+        if (p.y_center - c.y_center > median_gap * 1.5) return true;
+        if (c.is_bold != p.is_bold ||
+            std::min(c.font_size, p.font_size) < std::max(c.font_size, p.font_size) * 0.85)
+            return true;
+        return !prev_full || indented;
+    };
+
     auto emit_insert = [&](const InlineInsert& ins) {
-        if (ins.is_image) {
+        prev_body = -1;
+        if (ins.is_layout) {
+            // A tabular region no detector accepted: its grid lines in a
+            // fence, so the column each value sits in survives. The fence
+            // outgrows any backtick run inside the text.
+            const std::string& text = fallbacks[ins.idx].text;
+            size_t ticks = 2, run = 0;
+            for (char c : text) {
+                run = c == '`' ? run + 1 : 0;
+                ticks = std::max(ticks, run);
+            }
+            std::string fence(ticks + 1, '`');
+            md += "\n" + fence + "text\n" + text + fence + "\n";
+        } else if (ins.is_image) {
             auto& img = images[ins.idx];
             const std::string ref =
                 util::image_ref_name(img.name, img.format, img.saved_path);
@@ -547,7 +1456,8 @@ std::string page_to_markdown(const std::vector<TextLine>& raw_lines,
             }
         }
 
-        if (line_in_table(l, tables)) continue;
+        if (line_swallowed_by_table(l, tables, captured_cells)) continue;
+        if (line_in_layout_block(l, fallbacks)) continue;
 
         {
             bool only_filler = true;
@@ -564,65 +1474,40 @@ std::string page_to_markdown(const std::vector<TextLine>& raw_lines,
         if ((i + 2 >= lines.size() || l.y_center <= bottom_y + 5.0) &&
             is_page_number_footer(l.text)) continue;
 
-        int hlevel = stats.heading_level(l.font_size, l.is_bold);
-
-        if (hlevel >= 3 && !l.is_bold && l.text.size() > 60)
-            hlevel = 0;
-
-        // Bold numbered section headings at body size ("2.1 ...", "4.2.1 ...")
-        if (hlevel == 0 && l.is_bold && l.text.size() < 120) {
-            int depth = section_number_depth(l.text);
-            if (depth >= 2) hlevel = std::min(depth + 2, 6);
-        }
+        int hlevel = line_level[i];
 
         if (hlevel > 0) {
             // A heading that wraps onto several visual lines is one heading.
-            // Fold in immediately following heading lines in the same column
-            // whose vertical gap is a single line height — a wrapped
-            // continuation, never a separate heading (those have body text, and
-            // thus a larger gap, between them). Font size need only be close,
-            // not identical, so a small-caps title (whose lines measure at two
-            // sizes) still merges; the merged heading takes the strongest level.
-            // Whether a line is written mostly in CJK script. Two heading lines
-            // in different scripts (a Korean title stacked above its English
-            // translation) are separate headings, not a wrapped one.
-            auto is_cjk_line = [](const std::string& s) {
-                size_t cjk = 0, letters = 0;
-                for (size_t k = 0; k < s.size();) {
-                    unsigned char c = s[k];
-                    uint32_t cp;
-                    int n;
-                    if (c < 0x80)      { cp = c; n = 1; }
-                    else if (c < 0xE0) { cp = c & 0x1F; n = 2; }
-                    else if (c < 0xF0) { cp = c & 0x0F; n = 3; }
-                    else               { cp = c & 0x07; n = 4; }
-                    for (int b = 1; b < n && k + b < s.size(); b++)
-                        cp = (cp << 6) | (s[k + b] & 0x3F);
-                    k += n;
-                    if (cp > 0x3040) { letters++; if (cp >= 0xAC00 && cp <= 0xD7A3) cjk++; }
-                    else if ((cp | 0x20) - 'a' < 26u) letters++;
-                }
-                return letters > 0 && cjk * 2 >= letters;
-            };
-            std::string heading = l.text;
-            bool head_cjk = is_cjk_line(l.text);
-            while (i + 1 < lines.size()) {
+            // Fold in immediately following lines of the SAME level in the
+            // same column whose vertical gap is about a line height — a
+            // wrapped continuation, never a separate heading. Numbered and
+            // keyword lines always start their own heading; two scripts (a
+            // Korean title over its English translation) stay separate.
+            // Font size need only be close, not identical, so a small-caps
+            // title (whose lines measure at two sizes) still merges.
+            std::string heading = l.text.substr(glued_mark_offset(l.text));
+            bool head_cjk = line_is_mostly_cjk(l.text);
+            while (!is_caption_heading(heading) && i + 1 < lines.size()) {
                 const auto& nx = lines[i + 1];
-                int nx_level = stats.heading_level(nx.font_size, nx.is_bold);
                 bool same_col = nx.is_column_split == l.is_column_split &&
                     ((nx.x_left + nx.x_right) / 2.0 < col_boundary) ==
                     ((l.x_left + l.x_right) / 2.0 < col_boundary);
                 double gap = std::fabs(nx.y_center - lines[i].y_center);
                 double ratio = std::min(nx.font_size, l.font_size) /
                                std::max(nx.font_size, l.font_size);
-                if (nx_level == 0 || line_in_table(nx, tables) || !same_col ||
+                if (line_level[i + 1] == 0 ||
+                    parse_section_number(nx.text).depth > 0 ||
+                    line_standalone[i + 1] != 0 ||
+                    line_swallowed_by_table(nx, tables, captured_cells) ||
+                    line_in_layout_block(nx, fallbacks) ||
+                    !same_col ||
                     nx.is_bold != l.is_bold || ratio < 0.75 ||
-                    is_cjk_line(nx.text) != head_cjk ||
-                    gap > l.font_size * 1.5)
+                    line_is_mostly_cjk(nx.text) != head_cjk ||
+                    gap > l.font_size * 1.9)
                     break;
                 heading += ' ';
                 heading += nx.text;
-                hlevel = std::min(hlevel, nx_level);
+                hlevel = std::min(hlevel, line_level[i + 1]);
                 i++;
             }
             if (i > 0) md += '\n';
@@ -630,6 +1515,19 @@ std::string page_to_markdown(const std::vector<TextLine>& raw_lines,
             md += ' ';
             md += heading;
             md += '\n';
+            prev_body = -1;
+            continue;
+        }
+        if (opens_paragraph(i) && !md.empty() &&
+            !(md.size() >= 2 && md[md.size() - 1] == '\n' && md[md.size() - 2] == '\n'))
+            md += '\n';
+        prev_body = static_cast<int>(i);
+        if (bold_covers_line(l)) {
+            md += (l.is_italic ? "***" : "**") + l.text + (l.is_italic ? "***\n" : "**\n");
+        } else if (!l.bold_spans.empty()) {
+            // Partly bold body line: mark each bold run in place.
+            std::string body = with_inline_bold(l);
+            md += l.is_italic ? "*" + body + "*\n" : body + "\n";
         } else if (l.is_bold && l.is_italic) {
             md += "***" + l.text + "***\n";
         } else if (l.is_bold) {
@@ -650,30 +1548,7 @@ std::string page_to_markdown(const std::vector<TextLine>& raw_lines,
         emit_insert(inserts[di]);
 
     // Append annotations (links, text notes) at end of page
-    if (!annots.empty()) {
-        bool has_links = false, has_notes = false;
-        for (auto& a : annots) {
-            if (!a.uri.empty()) has_links = true;
-            if (!a.text.empty() && a.subtype != "Link") has_notes = true;
-        }
-        if (has_links) {
-            md += "\n**Links:**\n";
-            for (auto& a : annots) {
-                if (a.uri.empty()) continue;
-                if (!a.text.empty())
-                    md += "- [" + a.text + "](" + a.uri + ")\n";
-                else
-                    md += "- <" + a.uri + ">\n";
-            }
-        }
-        if (has_notes) {
-            md += "\n**Notes:**\n";
-            for (auto& a : annots) {
-                if (a.text.empty() || a.subtype == "Link") continue;
-                md += "> " + a.text + "\n\n";
-            }
-        }
-    }
+    md += annotations_markdown(annots);
 
     return md;
 }
@@ -733,6 +1608,23 @@ static std::string format_bookmarks(const std::vector<BookmarkEntry>& bookmarks,
     return out;
 }
 
+// Plain-text page: the layout grid (layout_page_text), then what a grid of
+// glyphs cannot show — the page's images and annotations — as the same
+// "[image: …]" and link/note lines plain text has always carried.
+static std::string page_to_layout_text(const ExtractResult& r, int p,
+                                       const ConvertOptions& opts) {
+    std::string text = p < (int)r.layout_text.size() ? r.layout_text[p] : "";
+    std::string tail;
+    for (auto& img : r.all_images[p]) {
+        const std::string ref =
+            util::image_ref_name(img.name, img.format, img.saved_path);
+        tail += "\n![" + img.name + "](" + opts.image_ref_prefix + ref + ")\n";
+    }
+    if (p < (int)r.all_annots.size()) tail += annotations_markdown(r.all_annots[p]);
+    if (!tail.empty()) text += util::strip_markdown(tail);
+    return text;
+}
+
 std::string result_to_markdown(ExtractResult& r, const ConvertOptions& opts) {
     std::vector<int> page_indices;
     if (opts.pages.empty()) {
@@ -758,18 +1650,19 @@ std::string result_to_markdown(ExtractResult& r, const ConvertOptions& opts) {
         if (p < 0 || p >= r.total_pages) continue;
         if (!full_md.empty()) full_md += '\n';
         full_md += "--- Page " + std::to_string(p + 1) + " ---\n\n";
+        if (plaintext) {
+            full_md += page_to_layout_text(r, p, opts);
+            continue;
+        }
         std::string page_md = page_to_markdown(r.all_lines[p], r.stats,
                                                 r.all_images[p], r.all_image_y[p], r.all_image_x[p],
                                                 r.all_tables[p],
                                                 p < (int)r.all_annots.size() ? r.all_annots[p] : std::vector<AnnotEntry>{},
                                                 r.col_boundaries[p],
-                                                opts.image_ref_prefix);
-        if (plaintext)
-            full_md += util::strip_markdown(page_md);
-        else
-            full_md += page_md;
-        if (p < (int)r.page_diags.size() && r.page_diags[p].images_failed > 0 &&
-            !plaintext)
+                                                opts.image_ref_prefix,
+                                                p < (int)r.all_fallbacks.size() ? r.all_fallbacks[p] : std::vector<LayoutFallback>{});
+        full_md += page_md;
+        if (p < (int)r.page_diags.size() && r.page_diags[p].images_failed > 0)
             full_md += "<!-- jdoc: " +
                        std::to_string(r.page_diags[p].images_failed) +
                        " image(s) failed to decode on this page -->\n";
@@ -787,13 +1680,17 @@ static PageChunk build_page_chunk(ExtractResult& r, const ConvertOptions& opts,
     chunk.page_width = r.page_widths[p];
     chunk.page_height = r.page_heights[p];
     chunk.body_font_size = r.stats.body_size;
-    std::string page_md = page_to_markdown(r.all_lines[p], r.stats,
-                                            r.all_images[p], r.all_image_y[p], r.all_image_x[p],
-                                            r.all_tables[p],
-                                            p < (int)r.all_annots.size() ? r.all_annots[p] : std::vector<AnnotEntry>{},
-                                            r.col_boundaries[p],
-                                            opts.image_ref_prefix);
-    chunk.text = plaintext ? util::strip_markdown(page_md) : page_md;
+    if (plaintext) {
+        chunk.text = page_to_layout_text(r, p, opts);
+    } else {
+        chunk.text = page_to_markdown(r.all_lines[p], r.stats,
+                                      r.all_images[p], r.all_image_y[p], r.all_image_x[p],
+                                      r.all_tables[p],
+                                      p < (int)r.all_annots.size() ? r.all_annots[p] : std::vector<AnnotEntry>{},
+                                      r.col_boundaries[p],
+                                      opts.image_ref_prefix,
+                                      p < (int)r.all_fallbacks.size() ? r.all_fallbacks[p] : std::vector<LayoutFallback>{});
+    }
     if (p < (int)r.page_diags.size() && r.page_diags[p].images_failed > 0) {
         chunk.degraded_images = r.page_diags[p].images_failed;
         if (!plaintext)
@@ -847,6 +1744,8 @@ void stream_result_chunks(ExtractResult& r, const ConvertOptions& opts,
             r.all_lines[p] = {};
             r.all_tables[p] = {};
             if (p < (int)r.all_annots.size()) r.all_annots[p] = {};
+            if (p < (int)r.layout_text.size()) r.layout_text[p] = {};
+            if (p < (int)r.all_fallbacks.size()) r.all_fallbacks[p] = {};
             r.all_image_y[p] = {};
             r.all_image_x[p] = {};
         }
@@ -867,5 +1766,51 @@ std::vector<PageChunk> result_to_chunks(ExtractResult& r,
     return chunks;
 }
 
+// "D:YYYYMMDDHHmmSS+HH'mm'" as ISO 8601; missing fields take their earliest
+// value. A string that is not a PDF date is kept as written.
+static std::string pdf_date_iso(const std::string& s) {
+    size_t i = s.compare(0, 2, "D:") == 0 ? 2 : 0;
+    std::string d;
+    while (i < s.size() && d.size() < 14 && isdigit(static_cast<unsigned char>(s[i])))
+        d.push_back(s[i++]);
+    if (d.size() < 4) return s;
+    for (size_t k = d.size(); k < 14; k++) d.push_back("00000101000000"[k]);
+    std::string out = d.substr(0, 4) + '-' + d.substr(4, 2) + '-' + d.substr(6, 2) +
+                      'T' + d.substr(8, 2) + ':' + d.substr(10, 2) + ':' + d.substr(12, 2);
+    if (i < s.size() && s[i] == 'Z') return out + 'Z';
+    if (i < s.size() && (s[i] == '+' || s[i] == '-')) {
+        std::string z;
+        for (size_t k = i + 1; k < s.size() && z.size() < 4; k++)
+            if (isdigit(static_cast<unsigned char>(s[k]))) z.push_back(s[k]);
+        if (z.size() >= 2) out += s[i] + z.substr(0, 2) + ':' + (z.size() == 4 ? z.substr(2) : "00");
+    }
+    return out;
+}
 
 }} // namespace jdoc::pdf_detail
+
+namespace jdoc {
+
+void read_pdf_properties(const uint8_t* data, size_t size, DocProps& props) {
+    using namespace pdf_detail;
+    PdfDoc doc(data, size);
+    if (!doc.parse()) return;
+    if (doc.trailer.has("Encrypt") && !doc.init_encryption("")) return;
+    PdfObj info = doc.resolve(doc.trailer.get("Info"));
+    if (!info.is_dict()) return;
+    static const struct { const char* key; DocProp prop; } kFields[] = {
+        {"Title", PROP_TITLE}, {"Subject", PROP_SUBJECT}, {"Author", PROP_AUTHOR},
+        {"Keywords", PROP_KEYWORDS}, {"Creator", PROP_APPLICATION},
+        {"Producer", PROP_APPLICATION}, {"CreationDate", PROP_CREATED},
+        {"ModDate", PROP_MODIFIED},
+    };
+    for (const auto& f : kFields) {
+        PdfObj v = doc.resolve(info.get(f.key));
+        if (!v.is_str()) continue;
+        std::string s = decode_pdf_text(v.str_val);
+        bool date = f.prop == PROP_CREATED || f.prop == PROP_MODIFIED;
+        add_property(props, f.prop, date ? pdf_date_iso(s) : s);
+    }
+}
+
+} // namespace jdoc

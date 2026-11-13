@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -42,6 +43,15 @@ public:
     // Check if a stream with the given name exists.
     bool has_stream(const std::string& name) const;
 
+    // Names of the storages directly under `parent` ("" = the root), e.g. the
+    // embedded objects under "ObjectPool".
+    std::vector<std::string> storages(const std::string& parent) const;
+
+    // A reader that sees the storage at `path` as its root, so an object
+    // embedded as a storage (a workbook inside a .doc) reads like a file of
+    // its own. nullptr when there is no such storage.
+    std::unique_ptr<OleReader> open_storage(const std::string& path) const;
+
 private:
     struct DirEntry {
         std::string name;
@@ -53,7 +63,11 @@ private:
         int right_id;
     };
 
+    OleReader() = default;
+
     FILE* fp_ = nullptr;
+    std::string path_;      // file source, reopened by open_storage
+    int root_ = 0;          // directory entry seen as the root
     const uint8_t* mem_data_ = nullptr;
     size_t mem_size_ = 0;
     uint64_t source_size_ = 0;
@@ -93,8 +107,12 @@ private:
     // Supports "/" separated paths (e.g., "BinData/BIN0001.png").
     int find_entry(const std::string& name) const;
 
-    // Find a storage entry index by name, or -1.
+    // Find a storage entry index by name or "/" path, or -1.
     int find_storage(const std::string& name) const;
+    // A direct child of storage `parent` named `name` and of a wanted type
+    // (stream or storage), or -1. At the true root a stray entry anywhere is
+    // accepted, tolerating imperfect sibling links.
+    int find_child(int parent, const std::string& name, bool storage) const;
 
     // Find a direct child named `name` within the sibling tree rooted at
     // `sibling_root` (does not descend into grandchildren). Returns -1 if none.

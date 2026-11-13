@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(jdoc VERSION 1.6.3 LANGUAGES CXX C)
+project(jdoc VERSION 1.7.0 LANGUAGES CXX C)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -222,6 +222,9 @@ add_library(jdoc_lib STATIC
     src/common/inflate.cpp
     src/common/emf_text.cpp
     src/common/wmf_text.cpp
+    src/common/embedded.cpp
+    src/common/chart_text.cpp
+    src/common/metadata.cpp
     src/zip_reader.cpp
     # archive containers + walker
     src/archive/input_stream.cpp
@@ -234,10 +237,15 @@ add_library(jdoc_lib STATIC
     src/archive/archive_walker.cpp
     # pdf
     src/pdf/pdf_core.cpp
+    src/pdf/pdf_base14.cpp
+    src/pdf/pdf_cid_unicode.cpp
     src/pdf/pdf_content.cpp
     src/pdf/pdf_tables.cpp
     src/pdf/pdf_visual.cpp
+    src/pdf/pdf_glyphs.cpp
     src/pdf/pdf_markdown.cpp
+    src/pdf/pdf_layout.cpp
+    src/pdf/pdf_figures.cpp
     src/pdf/pdf.cpp
     src/pdf/pdf_crypt.cpp
     src/pdf/jbig2.cpp
@@ -302,7 +310,7 @@ target_include_directories(jdoc_shared PUBLIC include PRIVATE src)
 set_target_properties(jdoc_shared PROPERTIES
     OUTPUT_NAME "jdoc"
     VERSION ${PROJECT_VERSION}
-    SOVERSION 5
+    SOVERSION 6
 )
 
 

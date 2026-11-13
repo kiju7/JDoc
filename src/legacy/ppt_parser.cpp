@@ -3,6 +3,8 @@
 // record type (0x3EE=slide, 0x3F8=master, 0x3F0=notes) → extract text per slide.
 
 #include "ppt_parser.h"
+#include "common/embedded.h"
+#include "common/inflate.h"
 #include "common/emf_text.h"
 #include "common/string_utils.h"
 #include "common/binary_utils.h"
@@ -241,6 +243,16 @@ static void collect_blip_refs(const char* data, size_t opt_data_start,
         out.push_back(static_cast<int>(fill_blip));
 }
 
+// A slide-number (or date) field is stored as the character '*' and drawn
+// by PowerPoint from the field record. On its own it is not text; a notes
+// page always carries one, which printed "> **Notes:** *" for every slide.
+static bool is_field_placeholder(const std::string& text) {
+    size_t b = text.find_first_not_of(" \t\r\n\v");
+    if (b == std::string::npos) return false;
+    size_t e = text.find_last_not_of(" \t\r\n\v");
+    return b == e && text[b] == '*';
+}
+
 static SlideText extract_slide_text(const char* data, size_t size,
                                      size_t container_start, uint32_t container_len) {
     SlideText result;
@@ -269,6 +281,7 @@ static SlideText extract_slide_text(const char* data, size_t size,
             text_type = util::read_u32_le(atom);
         } else if (hdr.rec_type == RT_TEXT_CHARS_ATOM) {
             std::string text = decode_text_chars(atom, hdr.rec_len);
+            if (is_field_placeholder(text)) text.clear();
             if (!text.empty()) {
                 if (text_type == 0) {
                     if (!result.title.empty()) result.title += " ";
@@ -281,6 +294,7 @@ static SlideText extract_slide_text(const char* data, size_t size,
             text_type = 0xFF;
         } else if (hdr.rec_type == RT_TEXT_BYTES_ATOM) {
             std::string text = decode_text_bytes(atom, hdr.rec_len);
+            if (is_field_placeholder(text)) text.clear();
             if (!text.empty()) {
                 if (text_type == 0) {
                     if (!result.title.empty()) result.title += " ";
@@ -300,6 +314,36 @@ static SlideText extract_slide_text(const char* data, size_t size,
     }
 
     return result;
+}
+
+// ── Embedded objects ────────────────────────────────────────
+
+// An embedded OLE object is an ExOleObjStg record at the top level of the
+// document stream: the object's compound file, zlib-compressed behind its
+// size when the record instance is 1.
+std::string PptParser::embedded_objects(const ConvertOptions& opts) {
+    constexpr uint16_t RT_EX_OLE_OBJ_STG = 0x1011;
+    std::vector<char> stream = ole_.read_stream("PowerPoint Document");
+    const char* data = stream.data();
+    size_t size = stream.size(), pos = 0;
+    std::string out;
+    int n = 0;
+    RecordHeader hdr;
+    while (read_header(data, size, pos, hdr) && hdr.rec_len <= size - pos - 8) {
+        const uint8_t* body = reinterpret_cast<const uint8_t*>(data + pos + 8);
+        if (hdr.rec_type == RT_EX_OLE_OBJ_STG) {
+            std::vector<uint8_t> obj;
+            if ((hdr.ver_inst >> 4) == 1 && hdr.rec_len > 4)
+                obj = inflate_zlib_lenient(body + 4, hdr.rec_len - 4);
+            else
+                obj.assign(body, body + hdr.rec_len);
+            std::string text = embedded_document_text(obj.data(), obj.size(), "", opts);
+            if (!text.empty())
+                out += "- Embedded object " + std::to_string(++n) + "\n\n" + text + "\n\n";
+        }
+        pos += 8 + hdr.rec_len;
+    }
+    return out.empty() ? out : "\n\n## Attachments\n\n" + out;
 }
 
 // ── Main document parsing ───────────────────────────────────
@@ -524,11 +568,13 @@ static void for_each_line(std::string_view text, Fn&& fn) {
     }
 }
 
-std::string PptParser::slide_to_markdown(const Slide& slide) {
+std::string PptParser::slide_to_markdown(const Slide& slide, bool page_marker) {
     std::string out;
 
-    if (slide.number > 1) out += "\n";
-    out += "--- Page " + std::to_string(slide.number) + " ---\n\n";
+    if (page_marker) {
+        if (slide.number > 1) out += "\n";
+        out += "--- Page " + std::to_string(slide.number) + " ---\n\n";
+    }
 
     if (!slide.title.empty()) {
         out += "# " + slide.title + "\n\n";
@@ -730,7 +776,7 @@ std::string PptParser::to_markdown(const ConvertOptions& opts) {
         }
     }
 
-    return md;
+    return md + embedded_objects(opts);
 }
 
 std::vector<PageChunk> PptParser::to_chunks(const ConvertOptions& opts) {
@@ -757,7 +803,7 @@ std::vector<PageChunk> PptParser::to_chunks(const ConvertOptions& opts) {
 
         PageChunk chunk;
         chunk.page_number = slide.number;
-        std::string slide_md = slide_to_markdown(slide);
+        std::string slide_md = slide_to_markdown(slide, false);
 
         // Attach images to this slide by BLIP index
         for (int blip_idx : slide.blip_indices) {
@@ -782,6 +828,8 @@ std::vector<PageChunk> PptParser::to_chunks(const ConvertOptions& opts) {
         chunks.push_back(std::move(chunk));
     }
 
+    std::string att = embedded_objects(opts);
+    if (!att.empty() && !chunks.empty()) chunks.back().text += att;
     return chunks;
 }
 

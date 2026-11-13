@@ -2,6 +2,7 @@
 // Supports Word 6/95 and Word 97-2003 formats.
 
 #include "doc_parser.h"
+#include "common/embedded.h"
 #include "common/string_utils.h"
 #include "common/binary_utils.h"
 #include "common/emf_text.h"
@@ -1283,13 +1284,7 @@ std::string DocParser::text_to_markdown(const std::string& raw_text) {
 // Magic-byte format detection is shared (util::image_magic, common/image_magic.h).
 
 size_t DocParser::find_jpeg_end(const char* data, size_t len) {
-    for (size_t i = 2; i + 1 < len; ++i) {
-        if (static_cast<uint8_t>(data[i]) == 0xFF &&
-            static_cast<uint8_t>(data[i + 1]) == 0xD9) {
-            return i + 2;
-        }
-    }
-    return len;
+    return util::jpeg_length(data, len);
 }
 
 size_t DocParser::find_png_end(const char* data, size_t len) {
@@ -1357,7 +1352,12 @@ std::vector<ImageData> DocParser::extract_images(unsigned min_image_size) {
         size_t img_end = stream.size();
 
         if (mfmt == util::ImageFormat::Jpeg) {
-            img_end = img_start + find_jpeg_end(stream.data() + img_start, stream.size() - img_start);
+            size_t n = find_jpeg_end(stream.data() + img_start, stream.size() - img_start);
+            if (n == 0) {  // not a JPEG after all
+                ++pos;
+                continue;
+            }
+            img_end = img_start + n;
         } else if (mfmt == util::ImageFormat::Png) {
             img_end = img_start + find_png_end(stream.data() + img_start, stream.size() - img_start);
         } else {
@@ -1493,9 +1493,9 @@ std::string DocParser::to_markdown(const ConvertOptions& opts) {
 
     // No images and no object markers → nothing to rewrite; avoid a full copy
     // of a potentially large body.
-    if (images.empty() && md.find("\xEF\xBF\xBC") == std::string::npos)
-        return md;
-    return replace_image_markers(md, images, refs, opts.image_ref_prefix);
+    if (!images.empty() || md.find("\xEF\xBF\xBC") != std::string::npos)
+        md = replace_image_markers(md, images, refs, opts.image_ref_prefix);
+    return md + ole_storage_attachments(ole_, opts);
 }
 
 std::vector<PageChunk> DocParser::to_chunks(const ConvertOptions& opts) {
@@ -1538,6 +1538,7 @@ std::vector<PageChunk> DocParser::to_chunks(const ConvertOptions& opts) {
     chunk.page_height = 792.0;
     chunk.body_font_size = 12.0;
 
+    chunk.text += ole_storage_attachments(ole_, opts);
     chunks.push_back(std::move(chunk));
     return chunks;
 }

@@ -203,8 +203,265 @@ inline std::string format_markdown_table(
     return out;
 }
 
+// ── Markdown tables as plain text ──────────────────────────
+// Plain-text output renders a markdown table as space-aligned columns: the
+// pipes and the |---| row go, and every cell is padded to its column's
+// display width. Gluing the cells together instead ("구분구성", "South920")
+// and dropping empty cells shifts later values into the wrong column, which
+// is exactly what a reader of the text cannot recover from.
+
+// Split one table row ("| a | b \\| c |") into raw cell texts. "\\|" is the
+// escaped pipe the producers write for a literal '|' inside a cell.
+inline std::vector<std::string> split_markdown_row(const std::string& line) {
+    std::vector<std::string> cells;
+    size_t s = 0, e = line.size();
+    while (e > s && (line[e - 1] == '\r' || line[e - 1] == ' ')) e--;
+    if (s < e && line[s] == '|') s++;
+    if (e > s && line[e - 1] == '|' && !(e - 1 > s && line[e - 2] == '\\')) e--;
+    std::string cell;
+    for (size_t i = s; i < e; i++) {
+        if (line[i] == '\\' && i + 1 < e && line[i + 1] == '|') {
+            cell += '|';
+            i++;
+        } else if (line[i] == '|') {
+            cells.push_back(std::move(cell));
+            cell.clear();
+        } else {
+            cell += line[i];
+        }
+    }
+    cells.push_back(std::move(cell));
+    return cells;
+}
+
+// The header separator row: only pipes, dashes, colons and spaces.
+inline bool is_markdown_separator_row(const std::string& line) {
+    for (char c : line)
+        if (c != '|' && c != '-' && c != ' ' && c != ':' && c != '\r')
+            return false;
+    return line.find('-') != std::string::npos;
+}
+
+// A cell's text without inline markdown, measured and padded as plain text:
+// emphasis markers go, an image reference becomes "[image: alt]", and an
+// in-cell "<br>" line break becomes a space.
+inline std::string plain_cell_text(const std::string& cell) {
+    std::string out;
+    out.reserve(cell.size());
+    for (size_t k = 0; k < cell.size(); ) {
+        if (cell[k] == '*') {
+            while (k < cell.size() && cell[k] == '*') k++;
+        } else if (cell[k] == '!' && k + 1 < cell.size() && cell[k + 1] == '[') {
+            size_t j = cell.find(']', k + 2);
+            if (j != std::string::npos && j + 1 < cell.size() && cell[j + 1] == '(') {
+                size_t m = cell.find(')', j + 2);
+                if (m != std::string::npos) {
+                    std::string alt = cell.substr(k + 2, j - k - 2);
+                    if (!alt.empty()) out += "[image: " + alt + "]";
+                    k = m + 1;
+                    continue;
+                }
+            }
+            out += cell[k++];
+        } else if (cell.compare(k, 4, "<br>") == 0) {
+            out += ' ';
+            k += 4;
+        } else {
+            out += cell[k++];
+        }
+    }
+    return trim(out);
+}
+
+// Render a block of markdown table lines as aligned plain-text columns.
+// Each column is as wide as its widest cell (East Asian wide characters count
+// two columns); cells are left-aligned with two spaces between columns, and
+// an empty cell is padded like any other so the values after it stay put.
+inline std::string render_text_table(const std::vector<std::string>& lines) {
+    std::vector<std::vector<std::string>> rows;
+    for (auto& line : lines) {
+        if (is_markdown_separator_row(line)) continue;
+        auto raw = split_markdown_row(line);
+        std::vector<std::string> row;
+        row.reserve(raw.size());
+        for (auto& c : raw) row.push_back(plain_cell_text(c));
+        rows.push_back(std::move(row));
+    }
+    size_t cols = 0;
+    for (auto& r : rows) cols = std::max(cols, r.size());
+    std::vector<size_t> widths(cols, 0);
+    for (auto& r : rows)
+        for (size_t c = 0; c < r.size(); c++)
+            widths[c] = std::max(widths[c], display_width(r[c]));
+
+    std::string out;
+    for (auto& r : rows) {
+        std::string line;
+        for (size_t c = 0; c < r.size(); c++) {
+            line += r[c];
+            if (c + 1 < r.size())
+                line.append(widths[c] - display_width(r[c]) + 2, ' ');
+        }
+        size_t end = line.find_last_not_of(' ');
+        line.resize(end == std::string::npos ? 0 : end + 1);
+        out += line;
+        out += '\n';
+    }
+    return out;
+}
+
+// Render rows as a GitHub-flavored markdown table whose pipes line up in a
+// monospace view: every cell is padded with spaces, and the header separator
+// drawn with dashes, to its column's width (at least 3). Widths are display
+// columns (util::display_width), not UTF-8 bytes, so a Hangul or CJK cell
+// takes two columns per character and lines up with Latin cells instead of
+// being under-padded. The first row is the header; n_cols cells are written
+// per row, missing cells as "" and extra cells dropped.
+inline std::string format_padded_markdown_table(
+    const std::vector<std::vector<std::string>>& rows, size_t n_cols) {
+    if (rows.empty() || n_cols == 0) return "";
+    std::vector<size_t> widths(n_cols, 3);
+    std::vector<std::vector<size_t>> cell_w(rows.size());
+    for (size_t r = 0; r < rows.size(); r++) {
+        cell_w[r].assign(n_cols, 0);
+        for (size_t c = 0; c < n_cols && c < rows[r].size(); c++) {
+            cell_w[r][c] = display_width(rows[r][c]);
+            widths[c] = std::max(widths[c], cell_w[r][c]);
+        }
+    }
+    std::string md;
+    for (size_t r = 0; r < rows.size(); r++) {
+        md += "|";
+        for (size_t c = 0; c < n_cols; c++) {
+            md += ' ';
+            if (c < rows[r].size()) md += rows[r][c];
+            md.append(widths[c] - cell_w[r][c], ' ');
+            md += " |";
+        }
+        md += '\n';
+        if (r == 0) {
+            md += "|";
+            for (size_t c = 0; c < n_cols; c++) {
+                md += ' ';
+                md.append(widths[c], '-');
+                md += " |";
+            }
+            md += '\n';
+        }
+    }
+    return md;
+}
+
+// Markdown tables in `md` as layout blocks: each table (a run of '|' lines
+// whose second line is the header separator) becomes a fenced "text" block
+// of the same cells in space-aligned columns (render_text_table). Used when
+// tables are off: the table's text and its columns stay, the markdown table
+// syntax goes. Everything else passes through unchanged.
+inline std::string markdown_tables_to_layout(const std::string& md) {
+    std::string out;
+    out.reserve(md.size());
+    size_t i = 0, len = md.size();
+    auto line_at = [&](size_t s) {
+        size_t e = md.find('\n', s);
+        return md.substr(s, (e == std::string::npos ? len : e) - s);
+    };
+    while (i < len) {
+        size_t e = md.find('\n', i);
+        size_t next = e == std::string::npos ? len : e + 1;
+        if (md[i] == '|' && next < len && md[next] == '|' &&
+            is_markdown_separator_row(line_at(next))) {
+            std::vector<std::string> block;
+            while (i < len && md[i] == '|') {
+                block.push_back(line_at(i));
+                size_t f = md.find('\n', i);
+                i = f == std::string::npos ? len : f + 1;
+            }
+            std::string grid = render_text_table(block);
+            size_t ticks = 3;
+            for (size_t run = 0, k = 0; k < grid.size(); k++) {
+                run = grid[k] == '`' ? run + 1 : 0;
+                ticks = std::max(ticks, run + 1);
+            }
+            std::string fence(ticks, '`');
+            out += fence + "text\n" + grid + fence + "\n";
+            continue;
+        }
+        out.append(md, i, next - i);
+        i = next;
+    }
+    return out;
+}
+
+// Text without references to images that were never written anywhere: the
+// "![alt](ref)" a parser emits for an extracted image, and the
+// "[image: alt]" plain text makes of it. A reference to a URL ("://") names a
+// file outside the document and stays. A line that held nothing but such
+// references goes, and so does the blank line it leaves doubled; blank lines
+// the document itself had stay.
+inline std::string drop_image_refs(const std::string& text) {
+    auto strip_line = [](const std::string& line, bool& removed) {
+        std::string out;
+        size_t i = 0, len = line.size();
+        while (i < len) {
+            if (line.compare(i, 2, "![") == 0) {
+                size_t close = line.find("](", i + 2);
+                size_t end = close == std::string::npos ? std::string::npos
+                                                        : line.find(')', close + 2);
+                if (end != std::string::npos &&
+                    line.substr(close + 2, end - close - 2).find("://") == std::string::npos) {
+                    i = end + 1;
+                    removed = true;
+                    continue;
+                }
+            }
+            if (line.compare(i, 8, "[image: ") == 0) {
+                size_t end = line.find(']', i + 8);
+                if (end != std::string::npos) {
+                    i = end + 1;
+                    removed = true;
+                    continue;
+                }
+            }
+            out += line[i++];
+        }
+        return out;
+    };
+    auto blank = [](const std::string& l) {
+        return l.find_first_not_of(" \t\r") == std::string::npos;
+    };
+    std::vector<std::string> lines;
+    for (size_t pos = 0; pos <= text.size();) {
+        size_t nl = text.find('\n', pos);
+        if (nl == std::string::npos) nl = text.size();
+        lines.push_back(text.substr(pos, nl - pos));
+        pos = nl + 1;
+    }
+    std::vector<std::string> kept;
+    bool skip_blank = false;
+    for (auto& line : lines) {
+        bool removed = false;
+        std::string rest = strip_line(line, removed);
+        if (removed && blank(rest)) {
+            // The line was only references: drop it, and the blank line after
+            // it when one already stands before it.
+            skip_blank = !kept.empty() && blank(kept.back());
+            continue;
+        }
+        if (skip_blank && blank(rest)) { skip_blank = false; continue; }
+        skip_blank = false;
+        kept.push_back(removed ? rest : line);
+    }
+    std::string out;
+    for (size_t i = 0; i < kept.size(); i++) {
+        if (i) out += '\n';
+        out += kept[i];
+    }
+    return out;
+}
+
 // Strip markdown formatting from text, returning plain text.
-// Removes: # headings, **bold**, *italic*, ![img](ref), table pipes, --- separators
+// Removes: # headings, **bold**, *italic*, ![img](ref), --- separators; table
+// blocks become aligned columns (render_text_table).
 inline std::string strip_markdown(const std::string& md) {
     std::string result;
     result.reserve(md.size());
@@ -227,19 +484,17 @@ inline std::string strip_markdown(const std::string& md) {
                 i = j;
                 continue;
             }
-            // Skip table separator lines (| --- | --- |)
+            // Table block: every consecutive line starting with '|'
             if (md[i] == '|') {
-                j = i;
-                while (j < len && md[j] != '\n') j++;
-                std::string line = md.substr(i, j - i);
-                bool is_sep = true;
-                for (char c : line) {
-                    if (c != '|' && c != '-' && c != ' ' && c != ':') { is_sep = false; break; }
-                }
-                if (is_sep && line.find('-') != std::string::npos) {
+                std::vector<std::string> block;
+                while (i < len && md[i] == '|') {
+                    j = i;
+                    while (j < len && md[j] != '\n') j++;
+                    block.push_back(md.substr(i, j - i));
                     i = (j < len) ? j + 1 : j;
-                    continue;
                 }
+                result += render_text_table(block);
+                continue;
             }
         }
         // Image: ![alt](path) -> [image: alt]
@@ -264,39 +519,6 @@ inline std::string strip_markdown(const std::string& md) {
             size_t stars = 0;
             while (i + stars < len && md[i + stars] == '*') stars++;
             i += stars;
-            continue;
-        }
-        // Table row: strip leading/trailing | and replace inner | with tab
-        if ((i == 0 || md[i - 1] == '\n') && md[i] == '|') {
-            size_t j = i;
-            while (j < len && md[j] != '\n') j++;
-            std::string line = md.substr(i, j - i);
-            size_t s = 0, e = line.size();
-            if (s < e && line[s] == '|') s++;
-            if (e > s && line[e - 1] == '|') e--;
-            std::string row;
-            size_t ci = s;
-            while (ci < e) {
-                size_t pipe = line.find('|', ci);
-                if (pipe == std::string::npos || pipe >= e) pipe = e;
-                std::string cell = trim(line.substr(ci, pipe - ci));
-                // Strip bold/italic markers from cell text
-                std::string clean;
-                for (size_t k = 0; k < cell.size(); ) {
-                    if (cell[k] == '*') {
-                        while (k < cell.size() && cell[k] == '*') k++;
-                    } else {
-                        clean += cell[k++];
-                    }
-                }
-                cell = std::move(clean);
-                if (!row.empty()) row += "  ";
-                row += cell;
-                ci = pipe + 1;
-            }
-            result += row;
-            result += '\n';
-            i = (j < len) ? j + 1 : j;
             continue;
         }
         result += md[i];

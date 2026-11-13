@@ -12,7 +12,7 @@ C++17 기반 문서 → 마크다운 변환기. 무거운 의존성 없이 zlib,
 - **제목(헤딩) 감지** — 폰트 크기 비율 분석 + 굵은 글씨·절 번호 패턴 인식 (H1–H5)
 - **표 추출** — 괘선 기반 그리드 + 무괘선 텍스트 표 감지
 - **이미지 추출** — JPEG 패스스루, 150~300 DPI 적응형 벡터 렌더링, CCITTFax G3/G4, 최소 크기 필터
-- **한글 문서 지원** — HWP/HWPX 표·이미지·제목 완전 지원, HWP 3.x 텍스트 추출, HWP로 생성된 PDF 대응(Type3 폰트, 렌더 모드 기반 굵은 글씨 인식)
+- **한글 문서 지원** — HWP/HWPX 표·이미지·제목 완전 지원, HWP 2.x·3.x 텍스트 추출, HWP로 생성된 PDF 대응(Type3 폰트, 렌더 모드 기반 굵은 글씨 인식)
 - **암호화 PDF** — RC4 표준 보안 핸들러 (40/128비트)
 - **손상 PDF 복구** — xref 재구축, 스트림 길이 복구
 - **CJK 인코딩** — CP949, CP932, CMap 기반 유니코드 매핑
@@ -54,13 +54,15 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j
 ```bash
 jdoc input.pdf                              # 마크다운을 stdout으로 출력
 jdoc input.pdf output.md                    # 파일로 저장
-jdoc input.docx --format text               # 일반 텍스트 출력
+jdoc input.docx --format text               # 일반 텍스트 출력 (배치 보존)
+jdoc input.pdf --format text --no-columns   # 다단을 나누지 않고 원본 줄 그대로
+jdoc input.pdf --no-tables                  # 표를 마크다운 표 대신 열 맞춘 배치 블록으로
 jdoc input.pdf --pages 0,1,2                # 페이지 선택 (0부터 시작)
 jdoc input.pdf --chunks                     # 페이지별 출력
-jdoc input.pdf --images ./imgs              # 기본 추출 이미지를 디스크에도 저장
-jdoc input.pdf --no-images                   # 이미지 추출 비활성화
+jdoc input.pdf --images ./imgs              # 이미지를 저장하고 링크 (없으면 이미지 링크 없음)
 jdoc input.pdf --images ./imgs --min-image-size 100   # 100px 미만 이미지 제외
 jdoc input.pdf --images ./imgs --min-image-size 0     # 모든 이미지 추출
+jdoc input.hwp --metadata                   # 문서 맨 앞에 요약정보(제목·작성자·날짜 등)
 
 # 아카이브: 압축 해제 없이 내부 문서를 멤버별로 변환
 jdoc docs.zip                               # === 멤버 경로 === 구분으로 출력
@@ -249,13 +251,15 @@ CLI는 각 환경의 관례에 맞는 대응 필드·플래그를 제공한다.
 | 옵션 | 기본값 | 설명 | CLI |
 |---|---|---|---|
 | `pages` | 전체 | 추출할 페이지 번호 목록 (0부터 시작) | `--pages 0,1,2` |
-| `tables` | `true` | 표를 마크다운 표로 추출 | `--no-tables` (비활성화) |
+| `tables` | `true` | 표를 마크다운 표로 추출. `false`면 표 내용을 열 맞춘 배치 블록(```` ```text ````)으로 출력 | `--no-tables` |
+| `columns` | `true` | `text` 형식에서 다단 페이지를 단별로 읽음. `false`면 원본 줄 그대로(`pdftotext -layout`과 같음). 마크다운에는 영향 없음 | `--no-columns` |
 | `page_chunks` | `false` | 페이지/슬라이드/시트별 청크로 출력 | `--chunks` |
-| `images` | `true` | 이미지 추출 | `--no-images` (비활성화) |
-| `image_dir` | `""` (메모리 유지) | 이미지 저장 디렉토리. 빈 값이면 바이트로만 반환 | `--images DIR` |
+| `images` | `true` | 이미지 추출 | — |
+| `image_dir` | `""` | 이미지 저장 디렉토리. 빈 값이면 본문에 이미지 링크를 넣지 않음. 문자열 변환(`convert`)은 이미지를 추출하지 않고, 페이지별 변환(`convert_pages`)은 이미지를 메모리로만 돌려줌 | `--images DIR` |
 | `image_ref_prefix` | `""` | 마크다운 이미지 참조 경로 앞에 붙일 접두사 | — |
 | `min_image_size` | `50` | 문서에 포함된 이미지 중 N×N px 미만 제외 (`0` = 필터 없음). 이미지 파일 자체를 변환하는 경우에는 적용되지 않음 | `--min-image-size N` |
-| `format` | `markdown` | `markdown` 또는 `text` | `--format F` |
+| `metadata` | `false` | 요약정보(제목·주제·작성자·마지막 저장자·키워드·설명·회사·날짜 등)를 본문 앞 `---` 블록으로 출력. HWP·HWPX·DOC/XLS/PPT·OOXML·ODF·PDF | `--metadata` |
+| `format` | `markdown` | `markdown` 또는 `text` (예전 이름 `plaintext`, `--text`, `--plaintext`는 경고와 함께 계속 받음) | `--format F` |
 
 ### 아카이브 한도 (`ConvertOptions::archive`)
 
@@ -301,6 +305,7 @@ HTML의 이미지는 문서가 실제로 담고 있는 `data:` URI만 추출한�
 | libjpeg-turbo | IJG/BSD | PDF 이미지 JPEG 디코딩 |
 | pugixml | MIT | XML 파싱 (번들 포함) |
 | LZMA SDK | public domain | 7z 컨테이너·LZMA 디코딩 (번들 포함, 디코더 전용) |
+| Adobe Core14 AFM 메트릭 · Adobe Glyph List | Adobe AFM 라이선스 · BSD-3 | PDF 표준 14 폰트 글리프 폭·내장 인코딩 (`src/pdf/pdf_base14_data.inc`에 수치만 내장, 고지 포함. 재생성: `tools/gen_base14_metrics.py`) |
 | libbz2 | BSD | BZ2/TAR.BZ2, ALZ/EGG bzip2 멤버 (선택, `JDOC_WITH_BZIP2`) |
 | pybind11 | BSD-3 | Python 바인딩 (선택) |
 

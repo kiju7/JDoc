@@ -80,7 +80,15 @@ struct ArchiveLimits {
 
 struct ConvertOptions {
     std::vector<int> pages;
+    // Tables as markdown tables. Off, a table keeps its layout instead: a
+    // fenced block of space-aligned columns in markdown, aligned columns in
+    // text. Its text is never dropped.
     bool tables = true;
+    // Plain text (format PLAINTEXT) of multi-column pages (PDF) reads column
+    // by column. Off, every line keeps the page's physical row across the
+    // columns, as `pdftotext -layout` prints it. Markdown always reads
+    // column by column; tabular regions keep their layout there regardless.
+    bool columns = true;
     bool page_chunks = false;
     bool images = true;
     std::string image_dir;
@@ -88,6 +96,10 @@ struct ConvertOptions {
     unsigned min_image_size = 50;   // skip images smaller than NxN pixels (0 = no filter)
     OutputFormat format = OutputFormat::MARKDOWN;
     ArchiveLimits archive;
+    // Document properties (title, author, last saved by, company, dates...)
+    // as a front-matter block ahead of the body. Embedded objects never
+    // print theirs; each archive member prints its own.
+    bool metadata = false;
 };
 
 } // namespace jdoc

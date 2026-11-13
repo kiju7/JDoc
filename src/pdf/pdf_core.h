@@ -1,6 +1,7 @@
 #pragma once
 // pdf_core.h — internal: PDF object model, lexer, xref, crypt mapping, document, fonts.
 #include "jdoc/pdf.h"
+#include "pdf_cid_unicode.h"
 #include "pdf_crypt.h"
 #include "common/string_utils.h"
 #include "common/file_utils.h"
@@ -472,12 +473,33 @@ struct PdfFont {
     bool is_dingbat = false;     // symbol font (Wingdings etc.) — letters are glyph codes, not text
     double glyph_space_scale = 0.001; // glyph-space→text-space width factor (FontMatrix[0] for Type3)
     std::unordered_map<uint32_t, uint32_t> to_unicode;  // char code → Unicode
-    std::unordered_map<uint32_t, uint32_t> cid_to_unicode; // CID → Unicode from ToUnicode
+    // Codes whose ToUnicode target is several characters (an unencoded "fi"
+    // ligature glyph mapping to "f","i"). to_unicode keeps the first one so
+    // single-char consumers still work; text extraction emits the full run.
+    std::unordered_map<uint32_t, std::vector<uint32_t>> to_unicode_multi;
+    // Adobe character collection the CIDs of an Identity-encoded CID font
+    // number in (adobe_cid_collection; -1 if none or another registry).
+    int cid_collection = -1;
     const uint32_t* encoding_table = nullptr; // WinAnsi, MacRoman, etc.
     std::unordered_map<int, std::string> differences; // /Differences array
+    // Glyph names of the encoding built into the embedded Type1 program, read
+    // when the PDF names no base encoding (Computer Modern math fonts).
+    std::unordered_map<int, std::string> builtin_names;
     std::unordered_map<uint32_t, double> widths; // char code → width in 1/1000 of text space
     double default_width = 1000; // default glyph width in 1/1000 units
     double missing_width = 0;    // /MissingWidth from FontDescriptor
+
+    // Embedded font program, read by the compositor to draw glyphs.
+    // program_kind: 1 Type1 (/FontFile), 2 TrueType (/FontFile2),
+    // 3 CFF (/FontFile3 Type1C or CIDFontType0C), 4 OpenType (/FontFile3).
+    int program_ref = -1, program_gen = 0;
+    uint8_t program_kind = 0;
+    bool symbolic = false;        // FontDescriptor /Flags bit 3
+    bool cid_font = false;        // CIDFontType0/2 descendant of a Type0 font
+    int cid_to_gid_ref = -1;      // /CIDToGIDMap stream; -1 = Identity
+    // Base encoding the PDF names (glyph selection by name): 0 = none (the
+    // program's built-in encoding), 1 WinAnsi, 2 MacRoman, 3 Standard.
+    uint8_t named_base_encoding = 0;
     int cmap_code_bytes = 0;     // 0=auto, 1 or 2 from codespacerange
 
     // Type3 fonts whose codes map to nothing readable (no ToUnicode, private
@@ -508,10 +530,13 @@ struct PdfFont {
             return u;
         }
 
-        // 2. CID fonts (Identity-H/V)
+        // 2. CID fonts: under Identity-H/V the code is the CID, which the
+        // font's character collection maps to text.
         if (is_identity || is_type0) {
-            auto cu = cid_to_unicode.find(code);
-            if (cu != cid_to_unicode.end()) return cu->second;
+            if (is_identity && cid_collection >= 0) {
+                uint32_t u = adobe_cid_to_unicode(cid_collection, code);
+                if (u) return u;
+            }
             return code; // fallback: assume code is Unicode
         }
 
@@ -522,11 +547,20 @@ struct PdfFont {
             if (u) return u;
         }
 
-        // 4. Encoding table
+        // 4. The program's own encoding, by glyph name
+        if (!builtin_names.empty()) {
+            auto bn = builtin_names.find(static_cast<int>(code));
+            if (bn != builtin_names.end()) {
+                uint32_t u = glyph_name_to_unicode(bn->second);
+                if (u) return u;
+            }
+        }
+
+        // 5. Encoding table
         if (encoding_table && code < 256)
             return encoding_table[code];
 
-        // 5. Fallback
+        // 6. Fallback
         return (code < 128) ? code : 0xFFFD;
     }
 };

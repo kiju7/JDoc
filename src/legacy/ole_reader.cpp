@@ -27,6 +27,7 @@ static const uint8_t kOleMagic[8] = {
 OleReader::OleReader(const std::string& path) {
     fp_ = util::fopen_utf8(path, "rb");
     if (!fp_) return;
+    path_ = path;
 #ifdef _WIN32
     if (_fseeki64(fp_, 0, SEEK_END) != 0) return;
     const auto end = _ftelli64(fp_);
@@ -96,7 +97,10 @@ void OleReader::parse_header_and_fat() {
         throw std::runtime_error("Invalid OLE sector size");
     sector_size_ = uint32_t{1} << sector_pow;
     mini_sector_size_ = uint32_t{1} << mini_pow;
-    if (source_size_ < sector_size_ || source_size_ % sector_size_ != 0)
+    // Bytes past the last whole sector (some writers and transfers append a
+    // few) are not part of any sector and are ignored; a chain that needs a
+    // sector the file does not hold whole still fails below.
+    if (source_size_ < 2 * uint64_t{sector_size_})
         throw std::runtime_error("Truncated OLE sector data");
     sector_count_ = source_size_ / sector_size_ - 1;
 
@@ -413,38 +417,99 @@ int OleReader::find_in_siblings(int sibling_root, const std::string& name) const
     return -1;
 }
 
+int OleReader::find_child(int parent, const std::string& name, bool storage) const {
+    auto wanted = [&](int i) {
+        uint8_t t = dirs_[static_cast<size_t>(i)].type;
+        return storage ? (t == 1 || t == 5) : t == 2;
+    };
+    if (parent == 0) {
+        // Top level: a global scan by name, tolerant of imperfect sibling
+        // links, which some writers (and our test fixtures) produce.
+        for (size_t i = 0; i < dirs_.size(); ++i)
+            if (dirs_[i].name == name && wanted(static_cast<int>(i)))
+                return static_cast<int>(i);
+        return -1;
+    }
+    // Scoped to this storage's own subtree: CFB packages (e.g. Outlook .msg
+    // with multiple recipient storages) reuse leaf names across storages.
+    int found = find_in_siblings(dirs_[static_cast<size_t>(parent)].child_id, name);
+    return found >= 0 && wanted(found) ? found : -1;
+}
+
+// Resolve a "/" path from the root: every segment but the last is a storage.
 int OleReader::find_entry(const std::string& name) const {
-    // Support "/" separated paths like "BinData/BIN0001.png".
-    auto slash = name.find('/');
-    if (slash != std::string::npos) {
-        std::string parent = name.substr(0, slash);
-        std::string child = name.substr(slash + 1);
-        int storage_id = find_storage(parent);
-        if (storage_id < 0) return -1;
-        // Scope the child lookup to this storage's own subtree. CFB packages
-        // (e.g. Outlook .msg with multiple recipient storages) reuse the same
-        // leaf name across sibling storages, so a global scan would return the
-        // wrong stream.
-        int found = find_in_siblings(
-            dirs_[static_cast<size_t>(storage_id)].child_id, child);
-        return (found >= 0 &&
-                dirs_[static_cast<size_t>(found)].type == 2) ? found : -1;
+    int cur = root_;
+    size_t pos = 0;
+    for (;;) {
+        size_t slash = name.find('/', pos);
+        std::string seg = name.substr(pos, slash == std::string::npos ? std::string::npos
+                                                                        : slash - pos);
+        if (slash == std::string::npos) return find_child(cur, seg, false);
+        cur = find_child(cur, seg, true);
+        if (cur < 0) return -1;
+        pos = slash + 1;
     }
-    // Top-level stream: a global scan by name, tolerant of imperfect sibling
-    // links, which some writers (and our test fixtures) produce.
-    for (size_t i = 0; i < dirs_.size(); ++i) {
-        if (dirs_[i].name == name && dirs_[i].type == 2)
-            return static_cast<int>(i);
-    }
-    return -1;
 }
 
 int OleReader::find_storage(const std::string& name) const {
-    for (size_t i = 0; i < dirs_.size(); ++i) {
-        if (dirs_[i].name == name && (dirs_[i].type == 1 || dirs_[i].type == 5))
-            return static_cast<int>(i);
+    int cur = root_;
+    size_t pos = 0;
+    while (cur >= 0 && pos <= name.size()) {
+        size_t slash = name.find('/', pos);
+        if (slash == std::string::npos) slash = name.size();
+        cur = find_child(cur, name.substr(pos, slash - pos), true);
+        pos = slash + 1;
     }
-    return -1;
+    return cur;
+}
+
+std::vector<std::string> OleReader::storages(const std::string& parent) const {
+    std::vector<std::string> out;
+    if (!valid_ || dirs_.empty()) return out;
+    int sid = parent.empty() ? root_ : find_storage(parent);
+    if (sid < 0) return out;
+    std::vector<int> stack{dirs_[static_cast<size_t>(sid)].child_id};
+    std::vector<bool> visited(dirs_.size(), false);
+    while (!stack.empty()) {
+        int id = stack.back();
+        stack.pop_back();
+        if (id < 0 || id >= static_cast<int>(dirs_.size()) || visited[id]) continue;
+        visited[id] = true;
+        const DirEntry& e = dirs_[static_cast<size_t>(id)];
+        if (e.type == 1) out.push_back(e.name);
+        stack.push_back(e.right_id);
+        stack.push_back(e.left_id);
+    }
+    return out;
+}
+
+std::unique_ptr<OleReader> OleReader::open_storage(const std::string& path) const {
+    int sid = find_storage(path);
+    if (sid <= 0) return nullptr;
+    std::unique_ptr<OleReader> sub(new OleReader());
+    if (!path_.empty()) {
+        sub->fp_ = util::fopen_utf8(path_, "rb");
+        if (!sub->fp_) return nullptr;
+        sub->path_ = path_;
+    }
+    sub->mem_data_ = mem_data_;
+    sub->mem_size_ = mem_size_;
+    sub->source_size_ = source_size_;
+    sub->sector_count_ = sector_count_;
+    sub->valid_ = valid_;
+    sub->major_version_ = major_version_;
+    sub->sector_size_ = sector_size_;
+    sub->mini_sector_size_ = mini_sector_size_;
+    sub->mini_cutoff_ = mini_cutoff_;
+    sub->first_dir_sector_ = first_dir_sector_;
+    sub->first_mini_fat_sector_ = first_mini_fat_sector_;
+    sub->num_mini_fat_sectors_ = num_mini_fat_sectors_;
+    sub->fat_ = fat_;
+    sub->mini_fat_ = mini_fat_;
+    sub->dirs_ = dirs_;
+    sub->mini_stream_ = mini_stream_;
+    sub->root_ = sid;
+    return sub;
 }
 
 // ---------- public API -------------------------------------------------------
@@ -452,7 +517,7 @@ int OleReader::find_storage(const std::string& name) const {
 std::vector<std::string> OleReader::list_streams() const {
     std::vector<std::string> names;
     if (!valid_ || dirs_.empty()) return names;
-    traverse_dir(dirs_[0].child_id, names);
+    traverse_dir(dirs_[static_cast<size_t>(root_)].child_id, names);
     return names;
 }
 

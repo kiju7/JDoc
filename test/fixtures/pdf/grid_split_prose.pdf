@@ -1,0 +1,49 @@
+%PDF-1.4
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [3 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 5 0 R /F2 6 0 R >> >> /Contents 4 0 R >>
+endobj
+4 0 obj
+<< /Length 767 >>
+stream
+0.5 w 100.00 542.00 m 500.00 542.00 l S
+0.5 w 100.00 480.00 m 500.00 480.00 l S
+0.5 w 100.00 542.00 m 100.00 480.00 l S
+0.5 w 300.00 542.00 m 300.00 480.00 l S
+0.5 w 500.00 542.00 m 500.00 480.00 l S
+BT /F1 10.0 Tf 131.32 528.00 Td (Parks lower the air temperature of the) Tj ET
+BT /F1 10.0 Tf 301.39 528.00 Td (streets around them) Tj ET
+BT /F1 10.0 Tf 125.19 514.00 Td (but by how much depends on their size) Tj ET
+BT /F1 10.0 Tf 301.39 514.00 Td (their trees and the wind) Tj ET
+BT /F1 10.0 Tf 108.54 500.00 Td (as twelve parks of one city measured twice) Tj ET
+BT /F1 10.0 Tf 301.39 500.00 Td (a day for a year show) Tj ET
+BT /F1 10.0 Tf 119.08 486.00 Td (with readings taken at the same hours in) Tj ET
+BT /F1 10.0 Tf 301.39 486.00 Td (the streets nearby) Tj ET
+
+endstream
+endobj
+5 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>
+endobj
+6 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold /Encoding /WinAnsiEncoding >>
+endobj
+xref
+0 7
+0000000000 65535 f 
+0000000009 00000 n 
+0000000058 00000 n 
+0000000115 00000 n 
+0000000251 00000 n 
+0000001069 00000 n 
+0000001166 00000 n 
+trailer
+<< /Size 7 /Root 1 0 R >>
+startxref
+1268
+%%EOF

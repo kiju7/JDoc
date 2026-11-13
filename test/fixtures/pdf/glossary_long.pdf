@@ -1,0 +1,71 @@
+%PDF-1.4
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [3 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 5 0 R /F2 6 0 R >> >> /Contents 4 0 R >>
+endobj
+4 0 obj
+<< /Length 2155 >>
+stream
+BT /F1 10.0 Tf 72.00 752.00 Td (Table 1: notation used throughout the paper.) Tj ET
+BT /F2 10.0 Tf 72.00 726.00 Td (Symbol) Tj ET
+BT /F2 10.0 Tf 140.00 726.00 Td (Description) Tj ET
+BT /F1 10.0 Tf 72.00 713.00 Td (A) Tj ET
+BT /F1 10.0 Tf 140.00 713.00 Td (sender agent) Tj ET
+BT /F1 10.0 Tf 72.00 700.00 Td (R) Tj ET
+BT /F1 10.0 Tf 140.00 700.00 Td (receiver agent) Tj ET
+BT /F1 10.0 Tf 72.00 687.00 Td (S) Tj ET
+BT /F1 10.0 Tf 140.00 687.00 Td (set of all possible messages used for communication by both agents) Tj ET
+BT /F1 10.0 Tf 72.00 674.00 Td (O) Tj ET
+BT /F1 10.0 Tf 140.00 674.00 Td (set of mammal classes) Tj ET
+BT /F1 10.0 Tf 72.00 661.00 Td (Q) Tj ET
+BT /F1 10.0 Tf 140.00 661.00 Td (set of mammal images available to the sender) Tj ET
+BT /F1 10.0 Tf 72.00 648.00 Td (W) Tj ET
+BT /F1 10.0 Tf 140.00 648.00 Td (set of mammal descriptions available to the receiver) Tj ET
+BT /F1 10.0 Tf 72.00 635.00 Td (g) Tj ET
+BT /F1 10.0 Tf 140.00 635.00 Td (ground-truth map between the images and the descriptions) Tj ET
+BT /F1 10.0 Tf 72.00 622.00 Td (m) Tj ET
+BT /F1 10.0 Tf 140.00 622.00 Td (binary message sent by the sender) Tj ET
+BT /F1 10.0 Tf 72.00 609.00 Td (n) Tj ET
+BT /F1 10.0 Tf 140.00 609.00 Td (binary message sent by the receiver) Tj ET
+BT /F1 10.0 Tf 72.00 596.00 Td (T) Tj ET
+BT /F1 10.0 Tf 140.00 596.00 Td (maximal number of time steps in a conversation) Tj ET
+BT /F1 10.0 Tf 72.00 583.00 Td (t) Tj ET
+BT /F1 10.0 Tf 140.00 583.00 Td (time step in conversation between sender and receiver) Tj ET
+BT /F1 10.0 Tf 72.00 570.00 Td (h) Tj ET
+BT /F1 10.0 Tf 140.00 570.00 Td (hidden state vector of the sender) Tj ET
+BT /F1 10.0 Tf 72.00 557.00 Td (k) Tj ET
+BT /F1 10.0 Tf 140.00 557.00 Td (hidden state of the receiver at time step t) Tj ET
+BT /F1 10.0 Tf 72.00 544.00 Td (B) Tj ET
+BT /F1 10.0 Tf 140.00 544.00 Td (baseline feedforward network of the sender) Tj ET
+BT /F1 10.0 Tf 72.00 531.00 Td (L) Tj ET
+BT /F1 10.0 Tf 140.00 531.00 Td (per-instance reinforcement learning loss) Tj ET
+BT /F1 10.0 Tf 72.00 518.00 Td (H) Tj ET
+BT /F1 10.0 Tf 140.00 518.00 Td (entropy regularization coefficient for the binary message distributions) Tj ET
+
+endstream
+endobj
+5 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>
+endobj
+6 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold /Encoding /WinAnsiEncoding >>
+endobj
+xref
+0 7
+0000000000 65535 f 
+0000000009 00000 n 
+0000000058 00000 n 
+0000000115 00000 n 
+0000000251 00000 n 
+0000002458 00000 n 
+0000002555 00000 n 
+trailer
+<< /Size 7 /Root 1 0 R >>
+startxref
+2657
+%%EOF

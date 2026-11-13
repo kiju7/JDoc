@@ -1,12 +1,15 @@
 // test_office.cpp - Basic tests for Office document to Markdown conversion
 // License: MIT
 
+#include "jdoc/jdoc.h"
 #include "jdoc/office.h"
 #include "jdoc/archive.h"
 #include "jdoc/detect.h"
 #include "zip_reader.h"
+#include "common/file_utils.h"
 #include "common/string_utils.h"
 #include "legacy/ole_reader.h"
+#include "common/image_magic.h"
 #include "ooxml/xlsb_parser.h"
 #include <iostream>
 #include <cassert>
@@ -130,6 +133,53 @@ void test_rtf_parser() {
     TEST_END
 
     std::remove(rtf_path.c_str());
+
+    auto rtf_md = [](const std::string& body) {
+        std::string doc = "{\\rtf1\\ansi\\ansicpg949 " + body + "}";
+        jdoc::ConvertOptions opts;
+        opts.images = false;
+        return jdoc::office_to_markdown_mem(
+            reinterpret_cast<const uint8_t*>(doc.data()), doc.size(), "t.rtf", opts);
+    };
+
+    TEST(rtf_picture_subgroups_do_not_end_the_picture)
+        // Word writes {\*\picprop ...} and {\*\blipuid ...} inside \pict.
+        // Closing one used to end the picture: the rest of its hex data was
+        // printed as text, and the \* left pending hid the body after it.
+        auto md = rtf_md(
+            "before\\par {\\*\\shppict{\\pict{\\*\\picprop{\\sp{\\sn a}{\\sv 1}}}"
+            "\\pngblip{\\*\\blipuid 0123456789abcdef}89504e470d0a1a0a0000}}"
+            "{\\nonshppict{\\pict\\wmetafile8 0100090000}}"
+            "\\sectd after\\par");
+        ASSERT(md.find("before") != std::string::npos);
+        ASSERT(md.find("after") != std::string::npos);
+        ASSERT(md.find("89504e47") == std::string::npos);
+        ASSERT(md.find("0123456789") == std::string::npos);
+    TEST_END
+
+    TEST(rtf_bold_runs_in_separate_groups_join)
+        // Word gives every run its own {\b ...} group.
+        auto md = rtf_md("{\\b Bold}{\\b  text} plain\\par");
+        ASSERT(md.find("**Bold text**") != std::string::npos);
+        ASSERT(md.find("****") == std::string::npos);
+    TEST_END
+
+    TEST(rtf_unicode_fallback_after_line_break_skipped)
+        // A line break in the file between \uN and its fallback byte is not
+        // text; counting it let the fallback ('_') through.
+        auto md = rtf_md("{\\uc1\\u51452\r\n\\'5f\\u48124\\'5f}\\par");
+        ASSERT(md.find("\xEC\xA3\xBC\xEB\xAF\xBC") != std::string::npos);  // 주민
+        ASSERT(md.find('_') == std::string::npos);
+    TEST_END
+
+    TEST(rtf_dbcs_trail_written_as_itself)
+        // CP949 trail bytes in the ASCII range follow the lead's escape as
+        // plain characters: "\'b0A" is one syllable. A lead byte with no
+        // trail right after it is dropped, not paired with later text.
+        auto md = rtf_md("\\'b0A\\'b0{\\b0 }[x]\\par");
+        ASSERT(md.find("[x]") != std::string::npos);
+        ASSERT(md.find("\xEF\xBF\xBD") == std::string::npos);  // U+FFFD
+    TEST_END
 }
 
 // ── PPTX shape tree ─────────────────────────────────────────
@@ -394,6 +444,57 @@ void test_dwfx_not_office() {
         auto info = detect_zip(zip);
         ASSERT(info.format == "ZIP");
         ASSERT(info.convertible);
+    TEST_END
+
+    // A deck carrying a chart's workbook lists spreadsheetml (and a pasted
+    // Word object wordprocessingml) among its content types. Under a name that
+    // does not say pptx (Hancom Show saves .show) the main part must decide,
+    // or the slides are dropped and only the chart data comes out.
+    const std::string slide =
+        "<?xml version=\"1.0\"?>"
+        "<p:sld xmlns:p=\"http://schemas.openxmlformats.org/presentationml/2006/main\""
+        " xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\">"
+        "<p:cSld><p:spTree>" + text_shape("sp", "show slide body") +
+        "</p:spTree></p:cSld></p:sld>";
+    const std::string mixed_ct =
+        "<?xml version=\"1.0\"?><Types xmlns=\"http://schemas.openxmlformats.org/"
+        "package/2006/content-types\">"
+        "<Default Extension=\"docx\" ContentType=\"application/vnd.openxmlformats-"
+        "officedocument.wordprocessingml.document\"/>"
+        "<Default Extension=\"xlsx\" ContentType=\"application/vnd.openxmlformats-"
+        "officedocument.spreadsheetml.sheet\"/>"
+        "<Override PartName=\"/ppt/presentation.xml\" ContentType=\"application/"
+        "vnd.openxmlformats-officedocument.presentationml.presentation.main+xml\"/>"
+        "</Types>";
+
+    TEST(deck_with_embedded_workbook_detected_by_main_part)
+        auto zip = make_zip(
+            {{"[Content_Types].xml", mixed_ct},
+             {"_rels/.rels",
+              "<?xml version=\"1.0\"?><Relationships xmlns=\"http://schemas."
+              "openxmlformats.org/package/2006/relationships\"><Relationship "
+              "Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/"
+              "2006/relationships/officeDocument\" Target=\"ppt/presentation.xml\"/>"
+              "</Relationships>"},
+             {"ppt/presentation.xml", "<?xml version=\"1.0\"?><p:presentation/>"},
+             {"ppt/slides/slide1.xml", slide},
+             {"ppt/embeddings/Microsoft_Excel_Worksheet1.xlsx", std::string(64, 'x')}});
+        ASSERT(jdoc::detect_office_format_mem(
+                   reinterpret_cast<const uint8_t*>(zip.data()), zip.size(),
+                   "deck.show") == jdoc::DocFormat::PPTX);
+        auto md = jdoc::office_to_markdown_mem(
+            reinterpret_cast<const uint8_t*>(zip.data()), zip.size(), "deck.show");
+        ASSERT(md.find("show slide body") != std::string::npos);
+    TEST_END
+
+    TEST(deck_without_package_rels_detected_by_part_path)
+        auto zip = make_zip(
+            {{"[Content_Types].xml", mixed_ct},
+             {"ppt/presentation.xml", "<?xml version=\"1.0\"?><p:presentation/>"},
+             {"ppt/slides/slide1.xml", slide}});
+        ASSERT(jdoc::detect_office_format_mem(
+                   reinterpret_cast<const uint8_t*>(zip.data()), zip.size(),
+                   "oleObject1.bin") == jdoc::DocFormat::PPTX);
     TEST_END
 }
 
@@ -1156,6 +1257,43 @@ void test_image_reference_matches_file() {
         ASSERT(image_targets(first) != image_targets(second));
         std::filesystem::remove_all(dir);
     TEST_END
+
+    // A workbook pasted into a report shows its pictures to the reader as
+    // much as its cells. They used to be dropped: the nested conversion ran
+    // with images off. Each embedded object gets a subfolder of its own, so
+    // its page1_img0 cannot overwrite the host's.
+    auto report = make_docx({"report body"},
+                            {{"word/media/image1.png", png_bytes()},
+                             {"word/embeddings/Book1.xlsx", make_media_xlsx()}});
+
+    TEST(embedded_document_pictures_extracted_into_own_folder)
+        std::string dir = temp_image_dir("embedded_pictures");
+        jdoc::ConvertOptions opts;
+        opts.min_image_size = 0;
+        opts.image_dir = dir;
+        auto md = jdoc::office_to_markdown_mem(
+            reinterpret_cast<const uint8_t*>(report.data()), report.size(),
+            "report.docx", opts);
+        ASSERT(md.find("report body") != std::string::npos);
+        bool nested = false;
+        for (const auto& t : image_targets(md)) {
+            ASSERT(std::filesystem::exists(std::filesystem::path(dir) / t));
+            if (t.find("embedded_Book1.xlsx/") == 0) nested = true;
+        }
+        ASSERT(nested);
+        std::filesystem::remove_all(dir);
+    TEST_END
+
+    TEST(embedded_document_pictures_not_linked_without_a_folder)
+        // In memory (no image_dir) the nested bytes have no way out, so
+        // nothing of the embedded document is linked.
+        jdoc::ConvertOptions opts;
+        opts.min_image_size = 0;
+        auto md = jdoc::office_to_markdown_mem(
+            reinterpret_cast<const uint8_t*>(report.data()), report.size(),
+            "report.docx", opts);
+        ASSERT(md.find("embedded_") == std::string::npos);
+    TEST_END
 }
 
 // ── Legacy .xls image extraction ─────────────────────────────
@@ -1285,6 +1423,103 @@ static std::string workbook_with_png_blip() {
 
 void test_xls_images() {
     std::cerr << "\nLegacy .xls images:\n";
+
+    TEST(hancom_cell_biff_dialect)
+        // Hancom Cell's BIFF8: every string UTF-16 under an 8-bit flag, a
+        // rich string's runs after its characters (flag bit 0), cell records
+        // with a 32-bit row, and the drawing group as one record whose length
+        // field does not hold its size. Each derailed the whole workbook.
+        auto u16s = [](const std::string& ascii) {
+            std::string o;
+            for (char c : ascii) { o.push_back(c); o.push_back('\0'); }
+            return o;
+        };
+        std::string wb;
+        put_u16(wb, 0x0809); put_u16(wb, 4); put_u16(wb, 0x0600); put_u16(wb, 0x0005);
+        put_u16(wb, 0x0085); put_u16(wb, 8 + 10);
+        put_u32(wb, 0); put_u16(wb, 0);
+        wb.push_back(5); wb.push_back(0); wb += u16s("cells");
+        // Drawing group: a 100-byte container under a 20-byte record length,
+        // after the two bytes Hancom puts first.
+        put_u16(wb, 0x00EB); put_u16(wb, 20);
+        wb += std::string("\x74\x00", 2);
+        put_u16(wb, 0x000F); put_u16(wb, 0xF000); put_u32(wb, 92);
+        wb += std::string(92, '\x55');
+        // SST: a plain string, then a rich one with its runs after the text.
+        std::string sst;
+        put_u32(sst, 2); put_u32(sst, 2);
+        put_u16(sst, 5); sst.push_back(0); sst += u16s("alpha");
+        put_u16(sst, 4); sst.push_back(1); sst += u16s("beta");
+        put_u16(sst, 1); put_u16(sst, 0); put_u16(sst, 0);
+        put_u16(wb, 0x00FC); put_u16(wb, static_cast<uint16_t>(sst.size())); wb += sst;
+        put_u16(wb, 0x000A); put_u16(wb, 0);
+        // Sheet: LABELSST and RK with 32-bit rows.
+        put_u16(wb, 0x0809); put_u16(wb, 4); put_u16(wb, 0x0600); put_u16(wb, 0x0010);
+        put_u16(wb, 0x00FD); put_u16(wb, 12);
+        put_u32(wb, 0); put_u16(wb, 0); put_u16(wb, 15); put_u32(wb, 0);
+        put_u16(wb, 0x00FD); put_u16(wb, 12);
+        put_u32(wb, 1); put_u16(wb, 0); put_u16(wb, 15); put_u32(wb, 1);
+        put_u16(wb, 0x027E); put_u16(wb, 12);
+        put_u32(wb, 1); put_u16(wb, 1); put_u16(wb, 15); put_u32(wb, (4321u << 2) | 2u);
+        put_u16(wb, 0x000A); put_u16(wb, 0);
+        auto book = make_ole_workbook(wb);
+        auto md = jdoc::office_to_markdown_mem(
+            reinterpret_cast<const uint8_t*>(book.data()), book.size(), "h.cell");
+        ASSERT(md.find("## cells") != std::string::npos);
+        ASSERT(md.find("| alpha |") != std::string::npos);
+        ASSERT(md.find("| beta | 4321 |") != std::string::npos);
+    TEST_END
+
+    TEST(excel_drawing_group_split_across_records_left_alone)
+        // Excel splits a large group over MSODRAWINGGROUP + CONTINUE records;
+        // its container length then exceeds the first record by design and
+        // must not be taken for Hancom's overrun (that pasted the record
+        // headers into the picture bytes).
+        std::string wb;
+        put_u16(wb, 0x0809); put_u16(wb, 4); put_u16(wb, 0x0600); put_u16(wb, 0x0005);
+        put_u16(wb, 0x0085); put_u16(wb, 8 + 5);
+        put_u32(wb, 0); put_u16(wb, 0); wb.push_back(5); wb.push_back(0); wb += "cells";
+        put_u16(wb, 0x00EB); put_u16(wb, 16);
+        put_u16(wb, 0x000F); put_u16(wb, 0xF000); put_u32(wb, 16);
+        wb += std::string(8, '\x11');
+        put_u16(wb, 0x003C); put_u16(wb, 8); wb += std::string(8, '\x22');
+        put_u16(wb, 0x000A); put_u16(wb, 0);
+        put_u16(wb, 0x0809); put_u16(wb, 4); put_u16(wb, 0x0600); put_u16(wb, 0x0010);
+        put_u16(wb, 0x0204); put_u16(wb, 9 + 2);
+        put_u16(wb, 0); put_u16(wb, 0); put_u16(wb, 0); put_u16(wb, 2); wb.push_back(0); wb += "ok";
+        put_u16(wb, 0x000A); put_u16(wb, 0);
+        auto book = make_ole_workbook(wb);
+        auto md = jdoc::office_to_markdown_mem(
+            reinterpret_cast<const uint8_t*>(book.data()), book.size(), "e.xls");
+        ASSERT(md.find("## cells") != std::string::npos);
+        ASSERT(md.find("| ok |") != std::string::npos);
+    TEST_END
+
+    TEST(hancom_utf16_sheet_name_flagged_8bit)
+        // Hancom Cell writes the sheet name as UTF-16 but flags it 8-bit; it
+        // came out as "t\0e\0" with NULs in the output.
+        std::string wb;
+        put_u16(wb, 0x0809); put_u16(wb, 4); put_u16(wb, 0x0600); put_u16(wb, 0x0005);
+        put_u16(wb, 0x0085); put_u16(wb, 8 + 8);
+        put_u32(wb, 0); put_u16(wb, 0);
+        wb.push_back(4);     // cch
+        wb.push_back(0);     // flagged 8-bit
+        wb += std::string("t\0e\0x\0t\0", 8);
+        put_u16(wb, 0x000A); put_u16(wb, 0);
+        // The sheet: one LABEL cell.
+        put_u16(wb, 0x0809); put_u16(wb, 4); put_u16(wb, 0x0600); put_u16(wb, 0x0010);
+        put_u16(wb, 0x0204); put_u16(wb, 9 + 10);   // its text UTF-16 too
+        put_u16(wb, 0); put_u16(wb, 0); put_u16(wb, 0); put_u16(wb, 5);
+        wb.push_back(0);
+        wb += std::string("h\0e\0l\0l\0o\0", 10);
+        put_u16(wb, 0x000A); put_u16(wb, 0);
+        auto book = make_ole_workbook(wb);
+        auto md = jdoc::office_to_markdown_mem(
+            reinterpret_cast<const uint8_t*>(book.data()), book.size(), "h.cell");
+        ASSERT(md.find("## text") != std::string::npos);
+        ASSERT(md.find("hello") != std::string::npos);
+        ASSERT(md.find('\0') == std::string::npos);
+    TEST_END
 
     TEST(blip_is_written_to_image_dir)
         // .xls used to emit an image reference without ever writing the file:
@@ -1534,6 +1769,76 @@ void test_xlsx_streaming() {
     TEST_END
 }
 
+// Cells as de-identification and export tools write them: shared strings
+// under a name of the tool's choosing, cells and rows without r=, an inline
+// string without t="inlineStr", a formula's text result under a date style.
+void test_xlsx_cell_values() {
+    std::cerr << "\nXLSX cell values from other writers:\n";
+
+    const std::string sheet =
+        "<row r=\"1\"><c t=\"s\"><v>0</v></c><c><is><t>inline no type</t></is></c>"
+        "<c t=\"str\" s=\"1\"><f>A1</f><v>010-1234-5678</v></c></row>"
+        "<row><c><v>7</v></c><c t=\"s\"><v>1</v></c></row>";
+    const std::string sst =
+        "<?xml version=\"1.0\"?><sst xmlns=\"http://schemas.openxmlformats.org/"
+        "spreadsheetml/2006/main\"><si><r><t>홍</t></r><r><t>길동</t></r>"
+        "<rPh sb=\"0\" eb=\"1\"><t>ホン</t></rPh></si><si><t>second</t></si></sst>";
+    const std::string styles =
+        "<?xml version=\"1.0\"?><styleSheet xmlns=\"http://schemas.openxmlformats.org/"
+        "spreadsheetml/2006/main\"><cellXfs count=\"2\"><xf numFmtId=\"0\"/>"
+        "<xf numFmtId=\"14\" applyNumberFormat=\"1\"/></cellXfs></styleSheet>";
+
+    auto check = [](const std::string& md) {
+        return md.find("홍길동") != std::string::npos &&
+               md.find("ホン") == std::string::npos &&
+               md.find("inline no type") != std::string::npos &&
+               md.find("010-1234-5678") != std::string::npos &&
+               md.find("| 7 | second |") != std::string::npos;
+    };
+
+    // Shared strings found ignoring case, as OPC part names compare.
+    auto cased = make_xlsx("worksheets/sheet1.xml", sheet,
+                           {{"xl/SharedStrings.xml", sst}, {"xl/styles.xml", styles}});
+    // Shared strings named by the workbook's relationships.
+    auto named = make_zip({
+        {"[Content_Types].xml",
+         "<?xml version=\"1.0\"?><Types xmlns=\"http://schemas.openxmlformats.org/"
+         "package/2006/content-types\"/>"},
+        {"xl/workbook.xml",
+         "<?xml version=\"1.0\"?><workbook xmlns=\"http://schemas.openxmlformats.org/"
+         "spreadsheetml/2006/main\" xmlns:r=\"http://schemas.openxmlformats.org/"
+         "officeDocument/2006/relationships\"><sheets>"
+         "<sheet name=\"Sheet1\" sheetId=\"1\" r:id=\"rId1\"/></sheets></workbook>"},
+        {"xl/_rels/workbook.xml.rels",
+         "<?xml version=\"1.0\"?><Relationships xmlns=\"http://schemas.openxmlformats.org/"
+         "package/2006/relationships\"><Relationship Id=\"rId1\" Type=\""
+         "http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\""
+         " Target=\"worksheets/sheet1.xml\"/><Relationship Id=\"rId2\" Type=\""
+         "http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings\""
+         " Target=\"/xl/strings.xml\"/><Relationship Id=\"rId3\" Type=\""
+         "http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles\""
+         " Target=\"style.xml\"/></Relationships>"},
+        {"xl/strings.xml", sst},
+        {"xl/style.xml", styles},
+        {"xl/worksheets/sheet1.xml",
+         "<?xml version=\"1.0\"?><worksheet xmlns=\"http://schemas.openxmlformats.org/"
+         "spreadsheetml/2006/main\"><sheetData>" + sheet + "</sheetData></worksheet>"},
+    });
+
+    TEST(cell_values_dom)
+        unset_env("JDOC_XLSX_STREAM_THRESHOLD");
+        ASSERT(check(convert_xlsx(cased)));
+        ASSERT(check(convert_xlsx(named)));
+    TEST_END
+
+    TEST(cell_values_streamed)
+        set_env("JDOC_XLSX_STREAM_THRESHOLD", "0");
+        bool ok = check(convert_xlsx(cased)) && check(convert_xlsx(named));
+        unset_env("JDOC_XLSX_STREAM_THRESHOLD");
+        ASSERT(ok);
+    TEST_END
+}
+
 // ── XLS SST CONTINUE-boundary decoding ───────────────────────
 
 void test_xls_sst_continue() {
@@ -1549,6 +1854,96 @@ void test_xls_sst_continue() {
         ASSERT(md.find("unique_string_number_0000@example.com") != std::string::npos);
         ASSERT(md.find("unique_string_number_0446@example.com") != std::string::npos);
         ASSERT(md.find("unique_string_number_0999@example.com") != std::string::npos);
+    TEST_END
+
+    // Excel and LibreOffice keep every picture of a workbook in the global
+    // MSODRAWINGGROUP record (a BStore of FBSE entries, each with its BLIP
+    // inline); the sheet's MSODRAWING only points at them. Reading the sheet
+    // records alone extracted no picture from any .xls.
+    TEST(picture_in_drawing_group_extracted)
+        std::string dir = temp_image_dir("xls_drawing_group");
+        jdoc::ConvertOptions opts;
+        opts.images = true;
+        opts.image_dir = dir;
+        auto md = jdoc::office_to_markdown(
+            "test/fixtures/xls/drawing_group_picture.xls", opts);
+        ASSERT(md.find("picture sheet") != std::string::npos);
+        ASSERT(md.find("![page1_img0.png]") != std::string::npos);
+        assert_targets_exist(md, dir);
+        std::filesystem::remove_all(dir);
+    TEST_END
+
+    TEST(no_picture_link_without_image_extraction)
+        // As in every other parser: no extraction, no link to a file that
+        // was never written (an .xls inside a report converts this way).
+        jdoc::ConvertOptions opts;
+        opts.images = false;
+        auto md = jdoc::office_to_markdown("test/fixtures/xls/drawing_group_picture.xls",
+                                           opts);
+        ASSERT(md.find("picture sheet") != std::string::npos);
+        ASSERT(md.find("![") == std::string::npos);
+    TEST_END
+}
+
+// ── PPT notes and page markers ──────────────────────────────
+
+void test_ppt_notes_and_pages() {
+    std::cerr << "\nPPT notes and page markers:\n";
+    const char* path = "test/fixtures/ppt/notes_two_slides.ppt";
+
+    TEST(slide_number_field_is_not_a_note)
+        // Every notes page carries the slide-number field, stored as '*'.
+        // It printed "> **Notes:** *" under every slide.
+        auto md = jdoc::office_to_markdown(path);
+        ASSERT(md.find("> **Notes:** speaker note two") != std::string::npos);
+        ASSERT(md.find("**Notes:** *") == std::string::npos);
+        ASSERT(md.find("\n> *\n") == std::string::npos);
+    TEST_END
+
+    TEST(plain_text_marks_each_page_once)
+        // The slide chunks carried their own marker and the plain-text join
+        // added another: "--- Page 2 ---" twice.
+        jdoc::ConvertOptions opts;
+        opts.format = jdoc::OutputFormat::PLAINTEXT;
+        auto txt = jdoc::office_to_markdown(path, opts);
+        ASSERT(count_occurrences(txt, "--- Page 2 ---") == 1);
+        ASSERT(txt.find("Slide title 2") != std::string::npos);
+    TEST_END
+}
+
+// ── DOC picture scan: JPEG bounds ───────────────────────────
+
+void test_doc_jpeg_bounds() {
+    std::cerr << "\nDOC JPEG bounds:\n";
+    auto seg = [](unsigned char m, const std::string& body) {
+        std::string s = "\xFF";
+        s += static_cast<char>(m);
+        size_t n = body.size() + 2;
+        s += static_cast<char>(n >> 8);
+        s += static_cast<char>(n & 0xFF);
+        return s + body;
+    };
+    const std::string thumb = "\xFF\xD8\xFF\xD9";  // a JPEG inside APP1
+    const std::string jpeg = std::string("\xFF\xD8", 2) +
+                             seg(0xE1, "Exif" + thumb) + seg(0xDB, std::string(4, '\x01')) +
+                             seg(0xDA, std::string(3, '\x02')) +
+                             std::string("\x11\xFF\x00\x22\xFF\xD3\x33", 7) +
+                             std::string("\xFF\xD9", 2);
+
+    TEST(jpeg_end_skips_thumbnail_eoi)
+        // The first FF D9 belongs to the EXIF thumbnail; cutting there left
+        // a photo that does not open.
+        std::string buf = jpeg + "trailing bytes";
+        ASSERT(jdoc::util::jpeg_length(buf.data(), buf.size()) == jpeg.size());
+    TEST_END
+
+    TEST(jpeg_end_at_end_of_stream)
+        ASSERT(jdoc::util::jpeg_length(jpeg.data(), jpeg.size()) == jpeg.size());
+    TEST_END
+
+    TEST(random_ff_d8_ff_is_not_a_jpeg)
+        std::string junk("\xFF\xD8\xFF\xAD\x2F\x47\xFF\xC2\xB4\x97\xE3\x73\xFF\xD9", 14);
+        ASSERT(jdoc::util::jpeg_length(junk.data(), junk.size()) == 0);
     TEST_END
 }
 
@@ -1650,6 +2045,59 @@ static std::string convert_html_with(const std::string& html,
     return jdoc::office_to_markdown_mem(
         reinterpret_cast<const uint8_t*>(html.data()), html.size(),
         "page.html", opts);
+}
+
+// ── Markdown table padding by display width ─────────────────
+
+// Pipe tables are padded so their columns line up in a monospace view. The
+// padding counts display columns: East Asian wide/full-width characters take
+// two, combining marks none. Counting UTF-8 bytes instead left Hangul cells
+// (3 bytes, 2 columns) short of their Latin neighbours.
+void test_table_display_width() {
+    std::cerr << "\nMarkdown table padding by display width:\n";
+    using jdoc::util::display_width;
+
+    TEST(display_width_rule)
+        ASSERT(display_width(std::string("abc 12")) == 6);
+        ASSERT(display_width(std::string("공원")) == 4);               // Hangul syllables
+        ASSERT(display_width(std::string("\xE3\x84\xB1")) == 2);       // U+3131 compat jamo
+        ASSERT(display_width(std::string("\xE1\x84\x80\xE1\x85\xA1\xE1\x86\xA8")) == 2);  // NFD 각
+        ASSERT(display_width(std::string("漢字")) == 4);               // CJK ideographs
+        ASSERT(display_width(std::string("カナ")) == 4);               // katakana
+        ASSERT(display_width(std::string("\xE3\x81\x8B\xE3\x82\x99")) == 2);  // か + U+3099
+        ASSERT(display_width(std::string("ＡＢ")) == 4);               // full-width forms
+        ASSERT(display_width(std::string("e\xCC\x81")) == 1);          // e + U+0301
+        ASSERT(display_width(std::string("a\xE2\x80\x8B" "b")) == 2);  // zero-width space
+        ASSERT(display_width(std::string("\xC3\xA9\xC3\x9F")) == 2);   // Latin-1 letters
+        ASSERT(display_width(std::string("\xE2\x80\x94")) == 1);       // em dash stays narrow
+    TEST_END
+
+    TEST(format_padded_markdown_table_hangul)
+        const std::string md = jdoc::util::format_padded_markdown_table(
+            {{"구분", "Value"}, {"중앙공원", "42"}, {"Riverside Park", "7"}}, 2);
+        ASSERT(md ==
+               "| 구분           | Value |\n"
+               "| -------------- | ----- |\n"
+               "| 중앙공원       | 42    |\n"
+               "| Riverside Park | 7     |\n");
+        // Short rows are filled, n_cols bounds the row, empty input yields "".
+        ASSERT(jdoc::util::format_padded_markdown_table({{"가"}, {"a", "b"}}, 1) ==
+               "| 가  |\n| --- |\n| a   |\n");
+        ASSERT(jdoc::util::format_padded_markdown_table({}, 2).empty());
+    TEST_END
+
+    TEST(html_table_hangul_alignment)
+        const std::string md = convert_html(
+            "<html><head><meta charset=\"utf-8\"></head><body><table>"
+            "<tr><td>공원</td><td>면적 ha</td></tr>"
+            "<tr><td>중앙공원</td><td>42</td></tr>"
+            "<tr><td>North Park</td><td>7</td></tr>"
+            "</table></body></html>");
+        ASSERT(md.find("| 공원       | 면적 ha |\n"
+                       "| ---------- | ------- |\n"
+                       "| 중앙공원   | 42      |\n"
+                       "| North Park | 7       |\n") != std::string::npos);
+    TEST_END
 }
 
 void test_html_images() {
@@ -1918,6 +2366,52 @@ void test_markdown_and_chunk_apis_agree() {
     TEST_END
 }
 
+void test_table_and_image_options() {
+    std::cerr << "\nTables off and unsaved images:\n";
+
+    TEST(markdown_tables_to_layout)
+        const std::string md =
+            "Intro\n\n| 구분 | Value |\n| --- | --- |\n| 중앙공원 | 42 |\n\nAfter | not a table\n";
+        const std::string out = jdoc::util::markdown_tables_to_layout(md);
+        ASSERT(out.find("```text\n구분      Value\n중앙공원  42\n```\n") != std::string::npos);
+        ASSERT(out.find("| 구분") == std::string::npos);
+        ASSERT(out.find("Intro") == 0);
+        ASSERT(out.find("After | not a table") != std::string::npos);
+    TEST_END
+
+    TEST(drop_image_refs)
+        const std::string t =
+            "Text\n\n![page1_img0](page1_img0.png)\n\nMore ![x](http://e.com/x.png) end\n[image: fig]\nLast\n";
+        const std::string out = jdoc::util::drop_image_refs(t);
+        ASSERT(out.find("page1_img0") == std::string::npos);
+        ASSERT(out.find("[image:") == std::string::npos);
+        ASSERT(out.find("![x](http://e.com/x.png)") != std::string::npos);
+        ASSERT(out.find("\n\n\n") == std::string::npos);
+        ASSERT(out.find("Last") != std::string::npos);
+    TEST_END
+
+    // An HTML table with tables off keeps its cells as a layout block; an
+    // embedded (data URI) image with no image_dir is neither saved nor
+    // linked, while a remote image stays as the author linked it.
+    TEST(html_tables_off_and_images)
+        const std::string html =
+            "<html><body><p>Before</p>"
+            "<table><tr><th>Name</th><th>Score</th></tr>"
+            "<tr><td>Kim</td><td>90</td></tr></table>"
+            "<img src=\"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==\" alt=\"dot\">"
+            "<img src=\"https://example.com/remote.png\" alt=\"remote\">"
+            "</body></html>";
+        jdoc::ConvertOptions o;
+        o.tables = false;
+        const std::string md = jdoc::convert(html.data(), html.size(), "t.html", o);
+        ASSERT(md.find("```text") != std::string::npos);
+        ASSERT(md.find("| Name") == std::string::npos);
+        ASSERT(md.find("Kim") != std::string::npos && md.find("90") != std::string::npos);
+        ASSERT(md.find("![dot]") == std::string::npos);
+        ASSERT(md.find("https://example.com/remote.png") != std::string::npos);
+    TEST_END
+}
+
 int main() {
     std::cerr << "=== jdoc office tests ===\n\n";
 
@@ -1937,11 +2431,16 @@ int main() {
     test_rtf_images();
     test_markdown_and_chunk_apis_agree();
     test_xlsx_streaming();
+    test_xlsx_cell_values();
     test_xls_sst_continue();
+    test_ppt_notes_and_pages();
+    test_doc_jpeg_bounds();
     test_xlsb_sparse_cells();
     test_html_charset();
     test_html_images();
+    test_table_display_width();
     test_pptx_linebreak();
+    test_table_and_image_options();
 
     std::cerr << "\n=== Results: " << tests_passed << " passed, "
               << tests_failed << " failed ===\n";

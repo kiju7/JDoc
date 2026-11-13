@@ -7,6 +7,7 @@
 // License: MIT
 
 #include "common/wmf_text.h"
+#include "common/emf_text.h"
 #include "common/string_utils.h"
 
 #include <algorithm>
@@ -40,15 +41,31 @@ inline uint32_t rd_u32(const uint8_t* p) {
            uint32_t(p[3]) << 24;
 }
 
-struct Run { int32_t x = 0; int32_t y = 0; std::string text; };
+using Run = MetafileRun;
 
-// Decode an ANSI string of `count` bytes at parm+off, if in range.
+// An 8-bit string of `count` bytes at parm+off, if in range (decoded with
+// the metafile's other runs, see metafile_runs_text). When the record
+// carries advances (META_EXTTEXTOUT's Dx: one int16 per byte after the
+// word-padded string), the run's right edge comes with it.
 void take_text(const uint8_t* parm, size_t parm_len, size_t off, size_t count,
-               int32_t x, int32_t y, std::vector<Run>& out) {
+               int32_t x, int32_t y, std::vector<Run>& out, bool with_dx = false) {
     if (count == 0 || off > parm_len || count > parm_len - off) return;
-    std::string t = util::plain_text_to_utf8(
-        std::string(reinterpret_cast<const char*>(parm + off), count));
-    if (!t.empty()) out.push_back({x, y, std::move(t)});
+    Run run;
+    run.x = x;
+    run.y = y;
+    run.ansi = true;
+    run.text.assign(reinterpret_cast<const char*>(parm + off), count);
+    size_t dx = off + ((count + 1) & ~size_t(1));
+    if (with_dx && dx <= parm_len && (parm_len - dx) / 2 >= count) {
+        int32_t w = 0;
+        for (size_t i = 0; i < count; ++i) w += rd_i16(parm + dx + i * 2);
+        if (w > 0) {
+            run.has_end = true;
+            run.end_x = x + w;
+            run.char_width = double(w) / count;
+        }
+    }
+    out.push_back(std::move(run));
 }
 
 // DIB-carrying WMF records → byte offset of the DIB within rdParm.
@@ -162,7 +179,7 @@ MetafileContent wmf_extract(const uint8_t* data, size_t size,
                 uint16_t opts = rd_u16(parm + 6);
                 size_t str_off = 8;
                 if (opts & (ETO_OPAQUE | ETO_CLIPPED)) str_off += 8;
-                take_text(parm, parm_len, str_off, count, x, y, runs);
+                take_text(parm, parm_len, str_off, count, x, y, runs, true);
             }
         } else if (want_images) {
             if (const DibRecord* dr = dib_record(func)) {
@@ -176,21 +193,7 @@ MetafileContent wmf_extract(const uint8_t* data, size_t size,
         ++seen;
     }
 
-    if (want_text && !runs.empty()) {
-        std::stable_sort(runs.begin(), runs.end(), [](const Run& a, const Run& b) {
-            if (a.y != b.y) return a.y < b.y;
-            return a.x < b.x;
-        });
-        int32_t prev_y = runs.front().y;
-        bool first = true;
-        for (auto& r : runs) {
-            if (!first && r.y != prev_y) content.text += '\n';
-            content.text += r.text;
-            prev_y = r.y;
-            first = false;
-            if (content.text.size() > MAX_OUTPUT) break;
-        }
-    }
+    if (want_text) content.text = metafile_runs_text(runs, MAX_OUTPUT);
     return content;
 }
 

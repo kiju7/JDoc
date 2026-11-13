@@ -63,6 +63,10 @@ private:
         std::string file_path;  // resolved path (e.g. "xl/worksheets/sheet1.xml")
     };
     std::vector<SheetInfo> sheets_;
+    // Parts the workbook's relationships name (Excel's default names unless
+    // a writer chose others).
+    std::string shared_strings_path_ = "xl/sharedStrings.xml";
+    std::string styles_path_ = "xl/styles.xml";
 
     // Number format: style index (xf) -> numFmtId
     std::vector<int> xf_num_fmt_ids_;
@@ -96,7 +100,13 @@ private:
     // without materializing SheetData. Grid semantics match parse_sheet +
     // format_sheet_as_table. Returns the number of nonempty cells emitted.
     // Throws std::runtime_error on a corrupt or oversized part.
-    uint64_t stream_sheet_markdown(const SheetInfo& info, std::string& out);
+    uint64_t stream_sheet_markdown(const SheetInfo& info, std::string& out,
+                                   std::vector<std::string>* header_footer = nullptr);
+    // Text printed around a sheet rather than in its cells: the page header
+    // and footer (raw &-coded strings), and text boxes and shapes drawn on
+    // it. "" when there is none, else a block to follow the sheet's table.
+    std::string sheet_extras(const SheetInfo& info,
+                             const std::vector<std::string>& header_footer);
 
     // Parse a cell reference like "A1" -> (col_index, row_index) both 0-based
     static std::pair<int, int> parse_cell_ref(const std::string& ref);
@@ -136,6 +146,7 @@ private:
         // cursor instead of an O(log n) lookup per cell. Stays sparse (no dense
         // grid) so a huge but mostly-empty sheet cannot blow up memory.
         std::vector<Cell> cells;
+        std::vector<std::string> header_footer;   // raw &-coded strings
         int max_row = 0;
         int max_col = 0;
     };

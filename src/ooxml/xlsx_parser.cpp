@@ -49,7 +49,11 @@ static std::string resolve_package_path(std::string target,
 // pugixml; the hard cap bounds decompression of a part whose header lies
 // (nothing legitimate approaches it — Excel itself cannot save a part that
 // large).
-constexpr uint64_t kDefaultStreamThreshold = 256ull << 20;  // 256 MiB
+// A DOM costs about 14 times its sheet XML (the XML itself, pugixml's nodes,
+// the cell vector), so 8 MiB of XML (~1 MiB zipped) already holds ~110 MiB;
+// above it the streaming path's memory tracks the output instead. A streamed
+// sheet gives no structured chunk.tables (its markdown is the same).
+constexpr uint64_t kDefaultStreamThreshold = 8ull << 20;    // 8 MiB
 constexpr uint64_t kMaxStreamPartBytes = 16ull << 30;       // 16 GiB
 // Excel grid limits, used to clamp attacker-controlled row/col references so
 // a lying r="..." attribute cannot force a multi-gigabyte gap fill.
@@ -64,14 +68,39 @@ static void sanitize_cell(std::string& v) {
     }
 }
 
+// Header/footer elements of a sheet's <headerFooter>.
+static bool is_header_footer(std::string_view n) {
+    return n == "oddHeader" || n == "oddFooter" || n == "evenHeader" ||
+           n == "evenFooter" || n == "firstHeader" || n == "firstFooter";
+}
+
+// The printed text of an &-coded header/footer string: section codes (&L
+// &C &R) become breaks between parts; fonts (&"name,style"), sizes (&12),
+// colors (&K...) and fields (&P page, &D date, &F file, ...) are dropped;
+// "&&" is a literal ampersand.
+static std::string header_footer_text(const std::string& code) {
+    std::string out;
+    for (size_t i = 0; i < code.size(); ++i) {
+        char c = code[i];
+        if (c != '&' || i + 1 >= code.size()) { out += c; continue; }
+        char k = code[++i];
+        if (k == '&') out += '&';
+        else if (k == 'L' || k == 'C' || k == 'R') { if (!out.empty()) out += ' '; }
+        else if (k == '"') { size_t e = code.find('"', i + 1); i = e == std::string::npos ? code.size() : e; }
+        else if (k >= '0' && k <= '9') { while (i + 1 < code.size() && code[i + 1] >= '0' && code[i + 1] <= '9') ++i; }
+        else if (k == 'K') i = std::min(code.size() - 1, i + 6);
+    }
+    return util::trim(out);
+}
+
 } // namespace
 
 // ── Constructor ─────────────────────────────────────────
 
 XlsxParser::XlsxParser(ZipReader& zip) : zip_(zip) {
-    parse_shared_strings();
     parse_workbook();
     parse_workbook_rels();
+    parse_shared_strings();
     parse_persons();
     parse_styles();
 }
@@ -79,7 +108,7 @@ XlsxParser::XlsxParser(ZipReader& zip) : zip_(zip) {
 // ── Shared strings (xl/sharedStrings.xml) ───────────────
 
 void XlsxParser::parse_shared_strings() {
-    const auto* entry = zip_.find_entry("xl/sharedStrings.xml");
+    const auto* entry = zip_.find_entry(shared_strings_path_);
     if (!entry) return;
 
     if (entry->uncompressed_size > stream_threshold()) {
@@ -89,7 +118,7 @@ void XlsxParser::parse_shared_strings() {
 
     std::vector<char> data;
     pugi::xml_document doc;
-    if (!xml_load_part(zip_, "xl/sharedStrings.xml", doc, data,
+    if (!xml_load_part(zip_, shared_strings_path_, doc, data,
                        pugi::parse_default | pugi::parse_ws_pcdata))
         return;
 
@@ -108,13 +137,12 @@ void XlsxParser::parse_shared_strings() {
             continue;
         }
 
-        // Fall back to rich text: <r><t> runs
+        // Rich text: the <r><t> runs. <rPh> holds a phonetic reading of the
+        // text (furigana), not more of it.
         std::string text;
-        std::vector<pugi::xml_node> t_nodes;
-        xml_find_all(si, "t", t_nodes);
-        for (auto& t : t_nodes) {
-            text += xml_text_content(t);
-        }
+        for (auto r = si.first_child(); r; r = r.next_sibling())
+            if (strcmp(xml_local_name(r), "r") == 0)
+                if (auto t = xml_child(r, "t")) text += xml_text_content(t);
         shared_strings_.push(text);
     }
 }
@@ -147,9 +175,8 @@ bool XlsxParser::sheet_is_streamed(const SheetInfo& info) const {
 
 void XlsxParser::parse_shared_strings_streamed(const ZipReader::Entry& entry) {
     // Mirrors the DOM rule: a <si> with a direct <t> child contributes only
-    // that text; otherwise every descendant <t> outside mc:Fallback counts
-    // (rich-text <r><t> runs, and — matching the DOM walker — <rPh> phonetic
-    // runs as well).
+    // that text; otherwise every descendant <t> outside mc:Fallback and
+    // <rPh> (a phonetic reading) counts — the rich-text <r><t> runs.
     struct SstHandler {
         SharedStringStore& store;
         uint64_t part_size;
@@ -188,7 +215,7 @@ void XlsxParser::parse_shared_strings_streamed(const ZipReader::Entry& entry) {
                 return;
             }
             si_depth++;
-            if (name == "Fallback") fallback_depth++;
+            if (name == "Fallback" || name == "rPh") fallback_depth++;
             else if (name == "t" && fallback_depth == 0) {
                 in_any_t = true;
                 if (si_depth == 1) { has_direct_t = true; in_direct_t = true; }
@@ -204,7 +231,8 @@ void XlsxParser::parse_shared_strings_streamed(const ZipReader::Entry& entry) {
                 return;
             }
             if (name == "t") { in_any_t = false; in_direct_t = false; }
-            else if (name == "Fallback" && fallback_depth > 0) fallback_depth--;
+            else if ((name == "Fallback" || name == "rPh") && fallback_depth > 0)
+                fallback_depth--;
             si_depth--;
         }
         void on_text(const char* d, size_t n) {
@@ -294,6 +322,15 @@ void XlsxParser::parse_workbook_rels() {
         if (id[0] && target[0]) {
             id_to_target[id] = target;
         }
+        std::string type = xml_attr(rel, "Type");
+        auto ends = [&](const char* suffix) {
+            size_t n = strlen(suffix);
+            return type.size() >= n && type.compare(type.size() - n, n, suffix) == 0;
+        };
+        if (target[0] && ends("/sharedStrings"))
+            shared_strings_path_ = resolve_package_path(target, "xl");
+        else if (target[0] && ends("/styles"))
+            styles_path_ = resolve_package_path(target, "xl");
     }
 
     // Resolve sheet file paths
@@ -312,7 +349,7 @@ void XlsxParser::parse_workbook_rels() {
 void XlsxParser::parse_styles() {
     std::vector<char> data;
     pugi::xml_document doc;
-    if (!xml_load_part(zip_, "xl/styles.xml", doc, data,
+    if (!xml_load_part(zip_, styles_path_, doc, data,
                        pugi::parse_default | pugi::parse_ws_pcdata))
         return;
 
@@ -802,11 +839,18 @@ XlsxParser::SheetData XlsxParser::parse_sheet(const SheetInfo& info) {
     auto sheetData = sheet_data_nodes[0];
 
     // Walk <row> elements
+    int next_row = 0;
     for (auto row_node = sheetData.first_child(); row_node;
          row_node = row_node.next_sibling()) {
 
         const char* rlocal = xml_local_name(row_node);
         if (strcmp(rlocal, "row") != 0) continue;
+
+        // A row or cell without its r= reference follows the previous one.
+        int row_r = std::atoi(xml_attr(row_node, "r"));
+        int row_idx = row_r >= 1 && row_r <= kMaxExcelRows ? row_r - 1 : next_row;
+        next_row = row_idx + 1;
+        int next_col = 0;
 
         // Walk <c> (cell) elements within this row
         for (auto cell = row_node.first_child(); cell;
@@ -817,9 +861,10 @@ XlsxParser::SheetData XlsxParser::parse_sheet(const SheetInfo& info) {
 
             // Get cell reference (e.g. "A1")
             const char* ref = xml_attr(cell, "r");
-            if (!ref[0]) continue;
-
-            auto [col, row] = parse_cell_ref(ref);
+            int col = next_col, row = row_idx;
+            if (ref[0]) std::tie(col, row) = parse_cell_ref(ref);
+            if (col < 0 || col >= kMaxExcelCols) col = next_col;
+            next_col = col + 1;
 
             // Determine cell value based on type
             const char* cell_type = xml_attr(cell, "t");
@@ -844,20 +889,20 @@ XlsxParser::SheetData XlsxParser::parse_sheet(const SheetInfo& info) {
                         }
                     }
                 }
-            } else if (strcmp(cell_type, "inlineStr") == 0) {
-                // Inline string: <is><t>text</t></is>
+            } else if (strcmp(cell_type, "inlineStr") == 0 ||
+                       (!xml_child(cell, "v") && xml_child(cell, "is"))) {
+                // Inline string: <is><t>text</t></is> (some writers leave
+                // out t="inlineStr")
                 auto is_node = xml_child(cell, "is");
                 if (is_node) {
                     auto t_node = xml_child(is_node, "t");
                     if (t_node) {
                         value = xml_text_content(t_node);
                     } else {
-                        // Rich text inside <is>
-                        std::vector<pugi::xml_node> t_nodes;
-                        xml_find_all(is_node, "t", t_nodes);
-                        for (auto& t : t_nodes) {
-                            value += xml_text_content(t);
-                        }
+                        // Rich text inside <is>: its <r><t> runs, not <rPh>
+                        for (auto r = is_node.first_child(); r; r = r.next_sibling())
+                            if (strcmp(xml_local_name(r), "r") == 0)
+                                if (auto t = xml_child(r, "t")) value += xml_text_content(t);
                     }
                 }
             } else if (strcmp(cell_type, "b") == 0) {
@@ -867,8 +912,8 @@ XlsxParser::SheetData XlsxParser::parse_sheet(const SheetInfo& info) {
                     std::string v = xml_text_content(v_node);
                     value = (v == "1") ? "TRUE" : "FALSE";
                 }
-            } else if (strcmp(cell_type, "e") == 0) {
-                // Error
+            } else if (strcmp(cell_type, "e") == 0 || strcmp(cell_type, "str") == 0) {
+                // Error, or a formula's text result: shown as written
                 auto v_node = xml_child(cell, "v");
                 if (v_node) {
                     value = xml_text_content(v_node);
@@ -935,6 +980,11 @@ XlsxParser::SheetData XlsxParser::parse_sheet(const SheetInfo& info) {
     // Row-major order so the table renderer can walk the cells with a single
     // advancing cursor. xlsx usually emits cells in this order already, but
     // comment-anchored cells were appended out of band, so sort to be safe.
+    for (auto hf = xml_child(doc.document_element(), "headerFooter").first_child(); hf;
+         hf = hf.next_sibling())
+        if (is_header_footer(xml_local_name(hf)))
+            sheet.header_footer.push_back(xml_text_content(hf));
+
     std::sort(sheet.cells.begin(), sheet.cells.end(),
               [](const Cell& a, const Cell& b) {
                   return a.row != b.row ? a.row < b.row : a.col < b.col;
@@ -953,7 +1003,8 @@ XlsxParser::SheetData XlsxParser::parse_sheet(const SheetInfo& info) {
 // nonempty cell.
 
 uint64_t XlsxParser::stream_sheet_markdown(const SheetInfo& info,
-                                           std::string& out) {
+                                           std::string& out,
+                                           std::vector<std::string>* header_footer) {
     const auto* entry = zip_.find_entry(info.file_path);
     if (!entry) return 0;
 
@@ -986,6 +1037,10 @@ uint64_t XlsxParser::stream_sheet_markdown(const SheetInfo& info,
         int emitted_rows = 0;
         uint64_t cells_out = 0;
 
+        // <headerFooter> strings, collected for sheet_extras
+        std::vector<std::string> hf;
+        bool in_hf = false;
+
         // Current-row state
         bool in_sheet_data = false;
         bool in_row = false;
@@ -997,7 +1052,8 @@ uint64_t XlsxParser::stream_sheet_markdown(const SheetInfo& info,
         bool in_c = false;
         int cell_col = 0;
         int next_auto_col = 0;
-        char cell_type = 'n';       // 's'hared, 'i'nlineStr, 'b'ool, 'e'rror, 'n'umeric
+        char cell_type = 'n';       // 's'hared, 'i'nlineStr, 'b'ool, 'e'rror,
+                                    // 'r'aw text (str), 'n'umeric
         int style_idx = -1;
         bool in_v = false, v_seen = false;
         std::string vtext;
@@ -1027,7 +1083,7 @@ uint64_t XlsxParser::stream_sheet_markdown(const SheetInfo& info,
                     is_direct.clear(); is_all.clear();
                 } else if (in_is) {
                     is_depth++;
-                    if (name == "Fallback") fallback_depth++;
+                    if (name == "Fallback" || name == "rPh") fallback_depth++;
                     else if (name == "t" && fallback_depth == 0) {
                         in_is_any_t = true;
                         if (is_depth == 1) { is_has_direct = true; in_is_direct_t = true; }
@@ -1040,6 +1096,9 @@ uint64_t XlsxParser::stream_sheet_markdown(const SheetInfo& info,
                 v_seen = false;
                 vtext.clear();
                 in_is = false;
+                is_has_direct = false;
+                is_direct.clear();
+                is_all.clear();
                 style_idx = -1;
                 cell_type = 'n';
 
@@ -1065,7 +1124,8 @@ uint64_t XlsxParser::stream_sheet_markdown(const SheetInfo& info,
                 else if (t == "inlineStr") cell_type = 'i';
                 else if (t == "b") cell_type = 'b';
                 else if (t == "e") cell_type = 'e';
-                else cell_type = 'n';   // numeric, "str", or absent
+                else if (t == "str") cell_type = 'r';   // a formula's text result
+                else cell_type = 'n';   // numeric, or absent
 
                 auto s = xml_stream_attr(tag_body, "s");
                 if (!s.empty()) style_idx = parse_int(s);
@@ -1083,6 +1143,11 @@ uint64_t XlsxParser::stream_sheet_markdown(const SheetInfo& info,
                 return;
             }
             if (name == "sheetData") { in_sheet_data = true; return; }
+            if (!in_sheet_data && is_header_footer(name)) {
+                in_hf = true;
+                hf.emplace_back();
+                return;
+            }
             if (name == "dimension" && total_cols == 0) {
                 // "A1:AS1000000" → column extent from the part after ':'
                 auto ref = xml_stream_attr(tag_body, "ref");
@@ -1107,17 +1172,20 @@ uint64_t XlsxParser::stream_sheet_markdown(const SheetInfo& info,
                 else if (name == "is" && is_depth == 0) in_is = false;
                 else if (in_is) {
                     if (name == "t") { in_is_any_t = false; in_is_direct_t = false; }
-                    else if (name == "Fallback" && fallback_depth > 0) fallback_depth--;
+                    else if ((name == "Fallback" || name == "rPh") && fallback_depth > 0)
+                        fallback_depth--;
                     is_depth--;
                 }
                 return;
             }
             if (in_row && name == "row") { finish_row(); in_row = false; }
             else if (name == "sheetData") in_sheet_data = false;
+            else if (in_hf && is_header_footer(name)) in_hf = false;
         }
 
         void on_text(const char* d, size_t n) {
-            if (in_v) vtext.append(d, n);
+            if (in_hf) hf.back().append(d, n);
+            else if (in_v) vtext.append(d, n);
             else if (in_is_any_t) {
                 is_all.append(d, n);
                 if (in_is_direct_t) is_direct.append(d, n);
@@ -1146,10 +1214,13 @@ uint64_t XlsxParser::stream_sheet_markdown(const SheetInfo& info,
                 if (v_seen) value = (vtext == "1") ? "TRUE" : "FALSE";
                 break;
             case 'e':
+            case 'r':
                 if (v_seen) value = vtext;
                 break;
             default:
+                // A writer may give an inline string without t="inlineStr".
                 if (v_seen) value = p->format_number(vtext, style_idx);
+                else value = is_has_direct ? is_direct : is_all;
                 break;
             }
 
@@ -1282,7 +1353,62 @@ uint64_t XlsxParser::stream_sheet_markdown(const SheetInfo& info,
     }
 
     handler.flush_trailing();
+    if (header_footer) *header_footer = std::move(handler.hf);
     return handler.cells_out;
+}
+
+// ── Header/footer and drawing text ──────────────────────
+
+std::string XlsxParser::sheet_extras(const SheetInfo& info,
+                                     const std::vector<std::string>& header_footer) {
+    std::vector<std::string> lines;
+    std::set<std::string> seen;   // the odd/even/first variants usually repeat
+    auto add = [&](std::string t) {
+        t = util::trim(t);
+        if (!t.empty() && seen.insert(t).second) lines.push_back(std::move(t));
+    };
+    for (auto& h : header_footer) add(header_footer_text(h));
+
+    // Text boxes and shapes on the sheet's drawing part: one line per
+    // paragraph of each shape's text body.
+    auto slash = info.file_path.rfind('/');
+    if (slash != std::string::npos) {
+        std::string dir = info.file_path.substr(0, slash);
+        std::string rels_path = dir + "/_rels/" + info.file_path.substr(slash + 1) + ".rels";
+        std::vector<char> rels_data;
+        pugi::xml_document rels_doc;
+        if (xml_load_part(zip_, rels_path, rels_doc, rels_data)) {
+            std::vector<pugi::xml_node> rels;
+            xml_find_all(rels_doc, "Relationship", rels);
+            for (auto& rel : rels) {
+                std::string type = xml_attr(rel, "Type");
+                if (type.size() < 8 || type.compare(type.size() - 8, 8, "/drawing") != 0)
+                    continue;
+                std::vector<char> data;
+                pugi::xml_document doc;
+                if (!xml_load_part(zip_, resolve_package_path(xml_attr(rel, "Target"), dir),
+                                   doc, data, pugi::parse_default | pugi::parse_ws_pcdata))
+                    continue;
+                std::vector<pugi::xml_node> bodies;
+                xml_find_all(doc, "txBody", bodies);
+                for (auto& body : bodies)
+                    for (auto para = body.first_child(); para; para = para.next_sibling()) {
+                        if (strcmp(xml_local_name(para), "p") != 0) continue;
+                        std::string line;
+                        for (auto r = para.first_child(); r; r = r.next_sibling()) {
+                            const char* l = xml_local_name(r);
+                            if (!strcmp(l, "br")) line += ' ';
+                            else if (!strcmp(l, "r") || !strcmp(l, "fld"))
+                                line += xml_text_content(xml_child(r, "t"));
+                        }
+                        add(line);
+                    }
+            }
+        }
+    }
+    std::string out;
+    for (auto& l : lines) out += l + "\n\n";
+    return out;
 }
 
 // ── Format sheet data as markdown table ─────────────────
@@ -1498,10 +1624,12 @@ std::string XlsxParser::to_markdown(const ConvertOptions& opts) {
                 ? ("Sheet " + std::to_string(sheet_num))
                 : sheets_[i].name;
             out += "## "; out += display_name; out += "\n\n";
-            if (stream_sheet_markdown(sheets_[i], out) == 0)
+            std::vector<std::string> hf;
+            if (stream_sheet_markdown(sheets_[i], out, &hf) == 0)
                 out += "*Empty sheet*\n\n";
             else
                 out += "\n";
+            out += sheet_extras(sheets_[i], hf);
             continue;
         }
 
@@ -1515,10 +1643,10 @@ std::string XlsxParser::to_markdown(const ConvertOptions& opts) {
 
         if (sheet.cells.empty()) {
             out += "*Empty sheet*\n\n";
-            continue;
+        } else {
+            out += format_sheet_as_table(sheet); out += "\n";
         }
-
-        out += format_sheet_as_table(sheet); out += "\n";
+        out += sheet_extras(sheets_[i], sheet.header_footer);
     }
 
     // Extract and reference images
@@ -1534,7 +1662,7 @@ std::string XlsxParser::to_markdown(const ConvertOptions& opts) {
         out += ")\n\n";
     }
 
-    out += format_embedded_parts(zip_);
+    out += format_embedded_parts(zip_, opts);
     return out;
 }
 
@@ -1559,10 +1687,12 @@ PageChunk XlsxParser::build_sheet_chunk(size_t i, const ConvertOptions& opts) {
             ? ("Sheet " + std::to_string(sheet_num))
             : sheets_[i].name;
         chunk.text += "## "; chunk.text += display_name; chunk.text += "\n\n";
-        if (stream_sheet_markdown(sheets_[i], chunk.text) == 0)
+        std::vector<std::string> hf;
+        if (stream_sheet_markdown(sheets_[i], chunk.text, &hf) == 0)
             chunk.text += "*Empty sheet*\n\n";
         else
             chunk.text += "\n";
+        chunk.text += sheet_extras(sheets_[i], hf);
         // Structured chunk.tables are intentionally skipped for streamed
         // sheets: a per-cell std::string grid over tens of millions of cells
         // is exactly the allocation pattern this path exists to avoid. The
@@ -1623,6 +1753,7 @@ PageChunk XlsxParser::build_sheet_chunk(size_t i, const ConvertOptions& opts) {
     } else {
         text += "*Empty sheet*\n\n";
     }
+    text += sheet_extras(sheets_[i], sheet.header_footer);
 
     chunk.text = std::move(text);
     return chunk;
@@ -1634,7 +1765,7 @@ std::vector<PageChunk> XlsxParser::to_chunks(const ConvertOptions& opts) {
         chunks.push_back(std::move(c));
         return true;
     });
-    append_embedded_parts(zip_, chunks);
+    append_embedded_parts(zip_, opts, chunks);
     return chunks;
 }
 

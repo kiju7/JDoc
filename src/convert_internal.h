@@ -48,6 +48,12 @@ std::string convert_from_memory_as(FileFormat fmt,
                                    const std::string& name_hint,
                                    const ConvertOptions& opts);
 
+class OleReader;
+// A Word, Excel or PowerPoint document kept as a storage of another OLE file
+// (office.cpp). "" when the storage holds none of them.
+std::string office_storage_to_markdown(const OleReader& host, const std::string& storage,
+                                      const ConvertOptions& opts);
+
 // ── Archive walker (archive_walker.cpp) ─────────────────
 
 // Cumulative accounting shared across the whole convert_archive call,

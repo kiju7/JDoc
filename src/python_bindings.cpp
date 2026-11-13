@@ -32,7 +32,7 @@ static jdoc::OutputFormat parse_output_format(const std::string& format) {
     if (format == "text" || format == "plaintext" || format == "plain")
         return jdoc::OutputFormat::PLAINTEXT;
     throw std::invalid_argument(
-        "format must be 'markdown', 'text', 'plaintext', or 'plain'");
+        "format must be 'markdown' or 'text'");
 }
 
 // Lazy page iterator backing convert_pages_stream(). A background thread runs
@@ -226,7 +226,8 @@ PYBIND11_MODULE(_jdoc, m) {
                        &jdoc::ConvertOptions::image_ref_prefix)
         .def_readwrite("min_image_size", &jdoc::ConvertOptions::min_image_size)
         .def_readwrite("format", &jdoc::ConvertOptions::format)
-        .def_readwrite("archive", &jdoc::ConvertOptions::archive);
+        .def_readwrite("archive", &jdoc::ConvertOptions::archive)
+        .def_readwrite("metadata", &jdoc::ConvertOptions::metadata);
 
     // DocFormat enum
     py::enum_<jdoc::DocFormat>(m, "DocFormat")
@@ -279,14 +280,16 @@ PYBIND11_MODULE(_jdoc, m) {
     m.def("convert", [](const std::string& file_path,
                          const std::string& format,
                          const std::vector<int>& pages,
-                         bool tables,
+                         bool tables, bool columns,
                          bool images,
                          const std::string& image_dir,
                          const std::string& image_ref_prefix,
-                         unsigned min_image_size) -> std::string {
+                         unsigned min_image_size, bool metadata) -> std::string {
         jdoc::ConvertOptions opts;
         opts.pages = pages;
         opts.tables = tables;
+        opts.columns = columns;
+        opts.metadata = metadata;
         opts.images = images;
         opts.image_dir = image_dir;
         opts.image_ref_prefix = image_ref_prefix;
@@ -297,21 +300,24 @@ PYBIND11_MODULE(_jdoc, m) {
     py::arg("file_path"),
     py::arg("format") = "markdown",
     py::arg("pages") = std::vector<int>{},
-    py::arg("tables") = true,
+    py::arg("tables") = true, py::arg("columns") = true,
     py::arg("images") = true,
     py::arg("image_dir") = "",
     py::arg("image_ref_prefix") = "",
-    py::arg("min_image_size") = 50,
+    py::arg("min_image_size") = 50, py::arg("metadata") = false,
     py::call_guard<py::gil_scoped_release>(),
     R"doc(Convert a document file to text.
 
 Args:
     file_path: Path to the document file (PDF, DOCX, XLSX, PPTX, DOC, XLS, PPT, RTF, HWP, HWPX)
-    format: Output format - "markdown" (default) or "text"/"plaintext"
+    format: Output format - "markdown" (default) or "text"
     pages: List of page numbers (0-based). Empty = all pages.
+    tables: True = markdown tables; False = tables keep their layout (aligned columns)
+    columns: format="text" only. True = read multi-column pages column by column; False = keep the page's physical lines (PDF)
     images: Whether to extract images
     image_dir: Directory to save extracted images (if empty, images kept in memory only)
     min_image_size: Skip images smaller than NxN pixels (default: 50, 0=no filter)
+    metadata: Prepend document properties (title, author, dates...) as front matter
 
 Returns:
     Converted text as string
@@ -320,15 +326,17 @@ Returns:
     m.def("convert_pages", [](const std::string& file_path,
                                const std::string& format,
                                const std::vector<int>& pages,
-                               bool tables,
+                               bool tables, bool columns,
                                bool images,
                                const std::string& image_dir,
                                const std::string& image_ref_prefix,
-                               unsigned min_image_size)
+                               unsigned min_image_size, bool metadata)
                                -> std::vector<jdoc::PageChunk> {
         jdoc::ConvertOptions opts;
         opts.pages = pages;
         opts.tables = tables;
+        opts.columns = columns;
+        opts.metadata = metadata;
         opts.images = images;
         opts.image_dir = image_dir;
         opts.image_ref_prefix = image_ref_prefix;
@@ -339,18 +347,20 @@ Returns:
     py::arg("file_path"),
     py::arg("format") = "markdown",
     py::arg("pages") = std::vector<int>{},
-    py::arg("tables") = true,
+    py::arg("tables") = true, py::arg("columns") = true,
     py::arg("images") = true,
     py::arg("image_dir") = "",
     py::arg("image_ref_prefix") = "",
-    py::arg("min_image_size") = 50,
+    py::arg("min_image_size") = 50, py::arg("metadata") = false,
     py::call_guard<py::gil_scoped_release>(),
     R"doc(Convert a document file to per-page chunks.
 
 Args:
     file_path: Path to the document file
-    format: Output format - "markdown" (default) or "text"/"plaintext"
+    format: Output format - "markdown" (default) or "text"
     pages: List of page numbers (0-based). Empty = all pages.
+    tables: True = markdown tables; False = tables keep their layout (aligned columns)
+    columns: format="text" only. True = read multi-column pages column by column; False = keep the page's physical lines (PDF)
     images: Whether to extract images (accessible via chunk.images)
     image_dir: Directory to save images (if empty, images available via ImageData.data bytes)
     min_image_size: Skip images smaller than NxN pixels (default: 50, 0=no filter)
@@ -369,15 +379,17 @@ Returns:
     m.def("convert_pages_stream", [](const std::string& file_path,
                                      const std::string& format,
                                      const std::vector<int>& pages,
-                                     bool tables,
+                                     bool tables, bool columns,
                                      bool images,
                                      const std::string& image_dir,
                                      const std::string& image_ref_prefix,
                                      unsigned min_image_size,
-                                     unsigned buffer_size) {
+                                     unsigned buffer_size, bool metadata) {
         jdoc::ConvertOptions opts;
         opts.pages = pages;
         opts.tables = tables;
+        opts.columns = columns;
+        opts.metadata = metadata;
         opts.images = images;
         opts.image_dir = image_dir;
         opts.image_ref_prefix = image_ref_prefix;
@@ -390,12 +402,12 @@ Returns:
     py::arg("file_path"),
     py::arg("format") = "markdown",
     py::arg("pages") = std::vector<int>{},
-    py::arg("tables") = true,
+    py::arg("tables") = true, py::arg("columns") = true,
     py::arg("images") = true,
     py::arg("image_dir") = "",
     py::arg("image_ref_prefix") = "",
     py::arg("min_image_size") = 50,
-    py::arg("buffer_size") = 4,
+    py::arg("buffer_size") = 4, py::arg("metadata") = false,
     R"doc(Convert a document to per-page chunks, lazily.
 
 Returns an iterator that yields one PageChunk at a time as the document is
@@ -414,12 +426,14 @@ Yields:
     m.def("convert_pages_bytes_stream",
           [](py::bytes data, const std::string& name_hint,
              const std::string& format, const std::vector<int>& pages,
-             bool tables, bool images, const std::string& image_dir,
+             bool tables, bool columns, bool images, const std::string& image_dir,
              const std::string& image_ref_prefix, unsigned min_image_size,
-             unsigned buffer_size) {
+             unsigned buffer_size, bool metadata) {
               jdoc::ConvertOptions opts;
               opts.pages = pages;
               opts.tables = tables;
+              opts.columns = columns;
+              opts.metadata = metadata;
               opts.images = images;
               opts.image_dir = image_dir;
               opts.image_ref_prefix = image_ref_prefix;
@@ -436,10 +450,10 @@ Yields:
           },
           py::arg("data"), py::arg("name_hint") = "",
           py::arg("format") = "markdown",
-          py::arg("pages") = std::vector<int>{}, py::arg("tables") = true,
+          py::arg("pages") = std::vector<int>{}, py::arg("tables") = true, py::arg("columns") = true,
           py::arg("images") = true, py::arg("image_dir") = "",
           py::arg("image_ref_prefix") = "", py::arg("min_image_size") = 50,
-          py::arg("buffer_size") = 4,
+          py::arg("buffer_size") = 4, py::arg("metadata") = false,
           "Lazily convert an in-memory document to per-page chunks.");
 
     // ── Archive conversion ────────────────────────────────
@@ -476,7 +490,7 @@ Yields:
     m.def("convert_archive", [](const std::string& file_path,
                                  const std::string& format,
                                  const std::vector<int>& pages,
-                                 bool tables,
+                                 bool tables, bool columns,
                                  bool images,
                                  const std::string& image_dir,
                                  const std::string& image_ref_prefix,
@@ -486,12 +500,14 @@ Yields:
                                  long long max_total_bytes,
                                  long long max_entries,
                                  long long max_ratio,
-                                 bool include_unsupported)
+                                 bool include_unsupported, bool metadata)
                                  -> std::vector<jdoc::MemberResult> {
         jdoc::ConvertOptions opts;
         opts.format = parse_output_format(format);
         opts.pages = pages;
         opts.tables = tables;
+        opts.columns = columns;
+        opts.metadata = metadata;
         opts.images = images;
         opts.image_dir = image_dir;
         opts.image_ref_prefix = image_ref_prefix;
@@ -512,7 +528,7 @@ Yields:
     py::arg("file_path"),
     py::arg("format") = "markdown",
     py::arg("pages") = std::vector<int>{},
-    py::arg("tables") = true,
+    py::arg("tables") = true, py::arg("columns") = true,
     py::arg("images") = true,
     py::arg("image_dir") = "",
     py::arg("image_ref_prefix") = "",
@@ -522,7 +538,7 @@ Yields:
     py::arg("max_total_bytes") = (long long)(64) << 30,
     py::arg("max_entries") = 200000,
     py::arg("max_ratio") = 10000,
-    py::arg("include_unsupported") = false,
+    py::arg("include_unsupported") = false, py::arg("metadata") = false,
     py::call_guard<py::gil_scoped_release>(),
     R"doc(Convert every supported document inside an archive (zip/gz/tar/tar.gz/
 7z/alz/egg) without extracting to disk. Members are decompressed into memory
@@ -545,13 +561,15 @@ Returns:
 
     m.def("convert_bytes", [](py::bytes data, const std::string& name_hint,
                                const std::string& format,
-                               const std::vector<int>& pages, bool tables,
+                               const std::vector<int>& pages, bool tables, bool columns,
                                bool images, const std::string& image_dir,
                                const std::string& image_ref_prefix,
-                               unsigned min_image_size) -> std::string {
+                               unsigned min_image_size, bool metadata) -> std::string {
         jdoc::ConvertOptions opts;
         opts.pages = pages;
         opts.tables = tables;
+        opts.columns = columns;
+        opts.metadata = metadata;
         opts.images = images;
         opts.image_dir = image_dir;
         opts.image_ref_prefix = image_ref_prefix;
@@ -566,19 +584,21 @@ Returns:
                              name_hint, opts);
     },
     py::arg("data"), py::arg("name_hint") = "", py::arg("format") = "markdown",
-    py::arg("pages") = std::vector<int>{}, py::arg("tables") = true,
+    py::arg("pages") = std::vector<int>{}, py::arg("tables") = true, py::arg("columns") = true,
     py::arg("images") = true, py::arg("image_dir") = "",
-    py::arg("image_ref_prefix") = "", py::arg("min_image_size") = 50,
+    py::arg("image_ref_prefix") = "", py::arg("min_image_size") = 50, py::arg("metadata") = false,
     "Convert a document held in bytes (no file I/O).");
 
     m.def("convert_pages_bytes",
           [](py::bytes data, const std::string& name_hint,
              const std::string& format, const std::vector<int>& pages,
-             bool tables, bool images, const std::string& image_dir,
-             const std::string& image_ref_prefix, unsigned min_image_size) {
+             bool tables, bool columns, bool images, const std::string& image_dir,
+             const std::string& image_ref_prefix, unsigned min_image_size, bool metadata) {
               jdoc::ConvertOptions opts;
               opts.pages = pages;
               opts.tables = tables;
+              opts.columns = columns;
+              opts.metadata = metadata;
               opts.images = images;
               opts.image_dir = image_dir;
               opts.image_ref_prefix = image_ref_prefix;
@@ -594,9 +614,9 @@ Returns:
           },
           py::arg("data"), py::arg("name_hint") = "",
           py::arg("format") = "markdown",
-          py::arg("pages") = std::vector<int>{}, py::arg("tables") = true,
+          py::arg("pages") = std::vector<int>{}, py::arg("tables") = true, py::arg("columns") = true,
           py::arg("images") = true, py::arg("image_dir") = "",
-          py::arg("image_ref_prefix") = "", py::arg("min_image_size") = 50,
+          py::arg("image_ref_prefix") = "", py::arg("min_image_size") = 50, py::arg("metadata") = false,
           "Convert an in-memory document to per-page chunks.");
 
     // ── Per-format functions (for advanced usage) ────────

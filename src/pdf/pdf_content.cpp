@@ -3,6 +3,7 @@
 #include "common/string_utils.h"
 #include <algorithm>
 #include <cassert>
+#include <cctype>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -294,7 +295,7 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
 
     // Load fonts from resources, using cross-page cache when available.
     // The lock covers only lookup/insert; load_font runs outside it.
-    std::unordered_map<std::string, PdfFont> fonts;
+    std::unordered_map<std::string, std::shared_ptr<const PdfFont>> fonts;
     auto res = doc.resolve(resources);
     auto& font_dict = res.get("Font");
     if (!font_dict.is_none()) {
@@ -310,10 +311,11 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
                         continue;
                     }
                 }
-                fonts[name] = load_font(doc, ref);
+                auto font = std::make_shared<const PdfFont>(load_font(doc, ref));
+                fonts[name] = font;
                 if (font_cache && rn >= 0) {
                     std::lock_guard<std::mutex> lock(font_cache->mu);
-                    font_cache->map.emplace(rn, fonts[name]);
+                    font_cache->map.emplace(rn, std::move(font));
                 }
             }
         }
@@ -404,6 +406,21 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
         out[1] = static_cast<float>(g.clip_y0);
         out[2] = static_cast<float>(g.clip_x1);
         out[3] = static_cast<float>(g.clip_y1);
+    };
+    // The page box an image placed under `g` covers (the unit square under
+    // the CTM, cut to the clip), kept in every graphics mode so the table
+    // detectors know where rasters lie.
+    auto record_image_box = [&](const GfxState& g) {
+        double xs[4], ys[4];
+        const double cs[4][2] = {{0, 0}, {1, 0}, {1, 1}, {0, 1}};
+        for (int k = 0; k < 4; k++) transform_point(g.ctm, cs[k][0], cs[k][1], xs[k], ys[k]);
+        double x0 = std::max(*std::min_element(xs, xs + 4), g.clip_x0);
+        double x1 = std::min(*std::max_element(xs, xs + 4), g.clip_x1);
+        double y0 = std::max(*std::min_element(ys, ys + 4), g.clip_y0);
+        double y1 = std::min(*std::max_element(ys, ys + 4), g.clip_y1);
+        if (x1 > x0 && y1 > y0 && std::isfinite(x0) && std::isfinite(x1) && std::isfinite(y0) && std::isfinite(y1))
+            result.image_boxes.push_back({static_cast<float>(x0), static_cast<float>(y0),
+                                          static_cast<float>(x1), static_cast<float>(y1)});
     };
 
     // "Clip to the shape, then paint a covering rect" draws the clip shape;
@@ -832,6 +849,16 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
         return false;
     };
 
+    // Closing an already-closed subpath is a no-op (PDF 32000 8.5.2.1: h,
+    // s or b right after re or h adds no segment). Producers such as MuPDF
+    // emit `re h f`; a duplicate CLOSE would make the fill look like a
+    // non-rect path and leak its edges into the rule pool as fake borders.
+    auto close_subpath = [&]() {
+        if (!current_path.empty() &&
+            current_path.back().type != PathPoint::CLOSE)
+            current_path.push_back({0, 0, PathPoint::CLOSE});
+    };
+
     // Pure-fill (f/F/f*) rect handling: thin rects become rules, sizable
     // rects are cell shading recorded as PdfFillRect — their edges stay OUT
     // of the segment pool (a shading edge is not a drawn rule; the table
@@ -903,8 +930,65 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
         return true;
     };
 
+    // The painted path, summarised for the table detectors (DrawnShape),
+    // one summary per subpath.
+    auto record_shape = [&](bool do_fill, bool do_stroke) {
+        if (skip_graphics || current_path.empty()) return;
+        auto lum = [](double r, double g, double b) { return 0.299 * r + 0.587 * g + 0.114 * b; };
+        const bool dark = (do_stroke && lum(gs.stroke_r, gs.stroke_g, gs.stroke_b) < 0.7) ||
+                          (do_fill && lum(gs.fill_r, gs.fill_g, gs.fill_b) < 0.7);
+        const bool colored = do_fill && std::max({gs.fill_r, gs.fill_g, gs.fill_b}) -
+                                            std::min({gs.fill_r, gs.fill_g, gs.fill_b}) >= 0.25;
+        const double pad = do_stroke ? 0.5 * gs.line_width * ctm_pen_scale(gs.ctm) : 0.0;
+        double bx0 = 1e300, by0 = 1e300, bx1 = -1e300, by1 = -1e300;
+        bool curve = false, ortho = true, have = false;
+        double px = 0, py = 0, sx = 0, sy = 0;
+        auto flush = [&]() {
+            if (!have) return;
+            have = false;
+            if (!(bx0 <= bx1) || !std::isfinite(bx0) || !std::isfinite(bx1) ||
+                !std::isfinite(by0) || !std::isfinite(by1))
+                return;
+            double x0 = std::max(bx0 - pad, gs.clip_x0), y0 = std::max(by0 - pad, gs.clip_y0);
+            double x1 = std::min(bx1 + pad, gs.clip_x1), y1 = std::min(by1 + pad, gs.clip_y1);
+            if (x1 < x0 || y1 < y0) return;
+            double w = x1 - x0, h = y1 - y0, mind = std::min(w, h);
+            bool rule = !curve && mind <= 2.0 && std::max(w, h) >= 4.0 * std::max(mind, 0.05);
+            result.shapes.push_back({static_cast<float>(x0), static_cast<float>(y0),
+                                     static_cast<float>(x1), static_cast<float>(y1),
+                                     curve, ortho, rule, dark, colored, do_fill});
+        };
+        for (auto& pt : current_path) {
+            if (pt.type == PathPoint::MOVE) {
+                flush();
+                bx0 = bx1 = pt.x; by0 = by1 = pt.y;
+                curve = false; ortho = true; have = true;
+                sx = px = pt.x; sy = py = pt.y;
+                continue;
+            }
+            if (!have) continue;
+            if (pt.type == PathPoint::CLOSE) {
+                if (std::abs(sx - px) > 0.05 && std::abs(sy - py) > 0.05) ortho = false;
+                continue;
+            }
+            bx0 = std::min(bx0, pt.x); bx1 = std::max(bx1, pt.x);
+            by0 = std::min(by0, pt.y); by1 = std::max(by1, pt.y);
+            if (pt.type == PathPoint::CURVE) {
+                curve = true;
+                ortho = false;
+                bx0 = std::min({bx0, pt.cx1, pt.cx2}); bx1 = std::max({bx1, pt.cx1, pt.cx2});
+                by0 = std::min({by0, pt.cy1, pt.cy2}); by1 = std::max({by1, pt.cy1, pt.cy2});
+            } else if (std::abs(pt.x - px) > 0.05 && std::abs(pt.y - py) > 0.05) {
+                ortho = false;
+            }
+            px = pt.x; py = pt.y;
+        }
+        flush();
+    };
+
     auto record_render_path = [&](bool do_fill, bool do_stroke,
                                   bool even_odd = false) {
+        record_shape(do_fill, do_stroke);
         if (collect_render_paths) {
             // Shading-pattern fill: a rect-ish path becomes gradient strips
             // clipped to its box (exact for the title-bar idiom); other
@@ -1014,6 +1098,40 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
         }
     };
 
+    // Glyphs of embedded font programs, for the compositor. The result
+    // shares the font with this parse's font table (gs.font points into it).
+    std::unordered_map<const PdfFont*, int> glyph_font_index;
+    auto record_glyph = [&](const GfxState& gs, uint32_t code) {
+        auto [it, fresh] = glyph_font_index.try_emplace(
+            gs.font, static_cast<int>(result.glyph_fonts.size()));
+        if (fresh) {
+            std::shared_ptr<const PdfFont> owner;
+            for (auto& f : fonts)
+                if (f.second.get() == gs.font) { owner = f.second; break; }
+            if (!owner) owner = std::make_shared<const PdfFont>(*gs.font);
+            result.glyph_fonts.push_back(std::move(owner));
+        }
+        GlyphDraw g;
+        g.code = code;
+        g.font = it->second;
+        double trm[6];
+        double scale_mat[6] = {gs.font_size * gs.h_scaling / 100.0, 0, 0,
+                               gs.font_size, 0, gs.text_rise};
+        mat_multiply(trm, scale_mat, gs.text_mat);
+        mat_multiply(g.m, trm, gs.ctm);
+        g.fill_r = static_cast<float>(gs.fill_r);
+        g.fill_g = static_cast<float>(gs.fill_g);
+        g.fill_b = static_cast<float>(gs.fill_b);
+        g.alpha = static_cast<float>(gs.fill_alpha);
+        copy_clip(gs, g.clip);
+        g.seq = draw_seq++;
+        result.glyphs.push_back(g);
+    };
+
+    // Font of the last glyph emitted, for joining a spacing accent to the
+    // letter drawn next to it (compose_spacing_accent).
+    const void* last_glyph_font = nullptr;
+
     auto show_text_string = [&](GfxState& gs, const std::string& s) {
         double fs = gs.font_size;
         double h_scale = gs.h_scaling / 100.0;
@@ -1035,6 +1153,11 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
                 i++;
             }
 
+            // Invisible text (Tr 3, 7: OCR layers, clip-only text) is not drawn.
+            if (collect_render_paths && gs.font && gs.font->program_kind &&
+                gs.render_mode != 3 && gs.render_mode != 7)
+                record_glyph(gs, code);
+
             // Scrambled Type3: draw the glyph program, advance, emit no char.
             if (t3_expand) {
                 expand_type3_glyph(gs, code);
@@ -1048,6 +1171,14 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
 
             uint32_t unicode = gs.font ? gs.font->decode_char(code) : code;
             if (unicode == 0 || unicode == 0xFFFD) continue;
+            // Ligature glyphs mapped to several characters ("fi", "ffl"):
+            // every letter is emitted, not just the first. Dingbat fonts are
+            // excluded — decode_char already rewrote their value.
+            const std::vector<uint32_t>* multi = nullptr;
+            if (gs.font && !gs.font->is_dingbat) {
+                auto mu = gs.font->to_unicode_multi.find(code);
+                if (mu != gs.font->to_unicode_multi.end()) multi = &mu->second;
+            }
             // Private-use glyphs have no portable text value. Skip Unicode
             // noncharacters too, but retain valid supplementary characters
             // such as mathematical alphanumerics above U+FFFF.
@@ -1104,6 +1235,19 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
             tc.x = gx;
             tc.y = gy;
             tc.rot = rot;
+            // A rotated glyph's box: the baseline segment from `o` to `e`,
+            // raised by the ascender and dropped by the descender along the
+            // up vector (asc_*/desc_*), as a page-space AABB.
+            double asc_x = 0, asc_y = 0, desc_x = 0, desc_y = 0;
+            auto rotated_box = [&](TextChar& t, double ox, double oy,
+                                   double ex, double ey) {
+                double cx[4] = {ox + asc_x, ox + desc_x, ex + asc_x, ex + desc_x};
+                double cy[4] = {oy + asc_y, oy + desc_y, ey + asc_y, ey + desc_y};
+                t.left = *std::min_element(cx, cx + 4);
+                t.right = *std::max_element(cx, cx + 4);
+                t.top = *std::max_element(cy, cy + 4);
+                t.bot = *std::min_element(cy, cy + 4);
+            };
             if (rot == 0) {
                 tc.left = gx;
                 tc.right = next_gx;
@@ -1127,14 +1271,9 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
                     if (bl > 0) { ux = bx / bl * up_len; uy = by / bl * up_len; }
                     else { ux = 0; uy = up_len; }
                 }
-                double ax = ux * 0.8, ay = uy * 0.8;
-                double dxx = ux * -0.2, dyy = uy * -0.2;
-                double cx[4] = {gx + ax, gx + dxx, next_gx + ax, next_gx + dxx};
-                double cy[4] = {gy + ay, gy + dyy, next_gy + ay, next_gy + dyy};
-                tc.left = *std::min_element(cx, cx + 4);
-                tc.right = *std::max_element(cx, cx + 4);
-                tc.top = *std::max_element(cy, cy + 4);
-                tc.bot = *std::min_element(cy, cy + 4);
+                asc_x = ux * 0.8; asc_y = uy * 0.8;
+                desc_x = ux * -0.2; desc_y = uy * -0.2;
+                rotated_box(tc, gx, gy, next_gx, next_gy);
                 tc.font_size = up_len;
             }
             tc.unicode = unicode;
@@ -1146,7 +1285,65 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
             // for visible body text.
             if (gs.render_mode != 3 && gs.render_mode != 7)
                 result.visible_text_chars++;
-            result.chars.push_back(tc);
+            if (multi) {
+                // Split the glyph's advance across its letters so word gaps
+                // and column assignment stay glyph-accurate. A rotated run
+                // splits along its own baseline: given one shared box, the
+                // letters of an "ff" ligature would sit on one spot, and the
+                // plain-text grid (which lays rotated runs out in their own
+                // frame) would take the second for an overprint.
+                const double n = static_cast<double>(multi->size());
+                double step = (tc.right - tc.left) / n;
+                for (size_t mi = 0; mi < multi->size(); mi++) {
+                    TextChar part = tc;
+                    part.unicode = (*multi)[mi];
+                    if (tc.rot == 0) {
+                        part.left = tc.left + step * mi;
+                        part.right = (mi + 1 == multi->size())
+                            ? tc.right : tc.left + step * (mi + 1);
+                        part.x = part.left;
+                    } else {
+                        double t0 = mi / n, t1 = (mi + 1) / n;
+                        double ox = gx + (next_gx - gx) * t0;
+                        double oy = gy + (next_gy - gy) * t0;
+                        double ex = gx + (next_gx - gx) * t1;
+                        double ey = gy + (next_gy - gy) * t1;
+                        part.x = ox;
+                        part.y = oy;
+                        rotated_box(part, ox, oy, ex, ey);
+                    }
+                    result.chars.push_back(part);
+                }
+            } else {
+                // A spacing accent and the letter it sits on, drawn one after
+                // the other from the same font, become the precomposed letter
+                // when the accent lies over the letter (half its width or
+                // more). A hat over a variable in an equation comes from the
+                // roman font over a math-italic letter, and stays as drawn.
+                bool merged = false;
+                if (tc.rot == 0 && !result.chars.empty() && last_glyph_font == gs.font &&
+                    result.chars.back().rot == 0) {
+                    TextChar& prev = result.chars.back();
+                    bool tc_accent = is_spacing_accent(tc.unicode);
+                    const TextChar& acc = tc_accent ? tc : prev;
+                    const TextChar& let = tc_accent ? prev : tc;
+                    uint32_t form = compose_spacing_accent(let.unicode, acc.unicode);
+                    double ov = std::min(acc.right, let.right) - std::max(acc.left, let.left);
+                    if (form && acc.right > acc.left && ov >= 0.5 * (acc.right - acc.left) &&
+                        std::abs(acc.y - let.y) <= std::max(let.font_size, 1.0)) {
+                        if (tc_accent) {
+                            prev.unicode = form;
+                        } else {
+                            TextChar joined = tc;
+                            joined.unicode = form;
+                            prev = joined;
+                        }
+                        merged = true;
+                    }
+                }
+                if (!merged) result.chars.push_back(tc);
+            }
+            last_glyph_font = gs.font;
         }
     };
 
@@ -1421,6 +1618,7 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
             ip.seq = draw_seq++;
             result.images.push_back(std::move(ip));
         }
+        if (!skip_graphics) record_image_box(gs);
         lex.pos = resume;
     };
 
@@ -1668,7 +1866,7 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
                         operand_object(operands.size() - 2);
                     if (font_name) {
                         auto it = fonts.find(font_name->str_val);
-                        gs.font = (it != fonts.end()) ? &it->second : nullptr;
+                        gs.font = (it != fonts.end()) ? it->second.get() : nullptr;
                     } else {
                         gs.font = nullptr;
                     }
@@ -1814,7 +2012,7 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
                     current_path.push_back(pp);
                 }
             } else if (op.is("h")) {
-                current_path.push_back({0, 0, PathPoint::CLOSE});
+                close_subpath();
             } else if (op.is("re")) {
                 if (operands.size() >= 4) {
                     double x = pop_num(3), y = pop_num(2), w = pop_num(1), h = pop_num(0);
@@ -1838,7 +2036,7 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
                 commit_pending_clip(gs);
                 record_render_path(false, true);
             } else if (op.is("s")) {
-                current_path.push_back({0, 0, PathPoint::CLOSE});
+                close_subpath();
                 if (!filter_white_stroke() && !filter_small_rect())
                     flush_path_segments();
                 commit_pending_clip(gs);
@@ -1850,7 +2048,7 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
                 record_render_path(true, false, op.is("f*"));
             } else if (op.is("B") || op.is("B*") || op.is("b") || op.is("b*")) {
                 if (op.is("b") || op.is("b*"))
-                    current_path.push_back({0, 0, PathPoint::CLOSE});
+                    close_subpath();
                 apply_clip_substitution(gs);
                 if (!filter_white_stroke() && !filter_small_rect())
                     flush_path_segments();
@@ -1966,10 +2164,29 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
                                 result.fill_rects.insert(result.fill_rects.end(),
                                     std::make_move_iterator(sub.fill_rects.begin()),
                                     std::make_move_iterator(sub.fill_rects.end()));
+                                result.shapes.insert(result.shapes.end(),
+                                    sub.shapes.begin(), sub.shapes.end());
+                                result.image_boxes.insert(result.image_boxes.end(),
+                                    sub.image_boxes.begin(), sub.image_boxes.end());
                                 // Rebase the form's draw order to this Do's
                                 // position so z-order survives the merge.
                                 for (auto& si : sub.images) si.seq += draw_seq;
                                 for (auto& sp : sub.paths) sp.seq += draw_seq;
+                                {
+                                    // Fonts are shared, so a form drawn many
+                                    // times adds each of its fonts once.
+                                    std::vector<int> font_map;
+                                    font_map.reserve(sub.glyph_fonts.size());
+                                    for (auto& sf : sub.glyph_fonts) {
+                                        auto [fit, fresh] = glyph_font_index.try_emplace(
+                                            sf.get(), static_cast<int>(result.glyph_fonts.size()));
+                                        if (fresh) result.glyph_fonts.push_back(std::move(sf));
+                                        font_map.push_back(fit->second);
+                                    }
+                                    for (auto& sg : sub.glyphs) { sg.seq += draw_seq; sg.font = font_map[sg.font]; }
+                                    result.glyphs.insert(result.glyphs.end(),
+                                        sub.glyphs.begin(), sub.glyphs.end());
+                                }
                                 draw_seq += sub.draw_ops;
                                 result.images.insert(result.images.end(),
                                     std::make_move_iterator(sub.images.begin()),
@@ -1978,7 +2195,9 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
                                     std::make_move_iterator(sub.paths.begin()),
                                     std::make_move_iterator(sub.paths.end()));
                             }
-                        } else if (collect_render_paths) {
+                        } else {
+                            if (!skip_graphics) record_image_box(gs);
+                            if (collect_render_paths) {
                             ImagePlacement ip;
                             ip.xobj_name = xname;
                             if (xref.is_ref()) ip.xobj_ref = xref.ref_num;
@@ -1990,6 +2209,7 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
                             copy_clip(gs, ip.clip);
                             ip.seq = draw_seq++;
                             result.images.push_back(ip);
+                            }
                         }
                     }
                 }
@@ -2004,8 +2224,198 @@ ContentParseResult parse_content_stream(PdfDoc& doc, const std::vector<uint8_t>&
     return result;
 }
 
+// The text of one glyph. A ligature that decodes to a presentation form
+// (U+FB00–FB06, from a glyph name such as "fl") is spelt out, so "efﬂuents"
+// reads, and searches, as "effluents". It stays one glyph for layout: split
+// into letters it would change the set of glyphs that rows are sorted from.
+void append_glyph_text(std::string& out, uint32_t cp) {
+    static const char* const kLigatures[7] = {"ff", "fi", "fl", "ffi", "ffl", "st", "st"};
+    if (cp >= 0xFB00 && cp <= 0xFB06) {
+        out += kLigatures[cp - 0xFB00];
+        return;
+    }
+    util::append_utf8(out, cp);
+}
+
+// Spacing accents a producer draws over a letter as a glyph of their own
+// (TeX sets "Muñoz" as n and a tilde). The tables come from the Unicode
+// Character Database (tools/gen_accent_compose.py): every spacing accent and
+// its combining mark, and every letter that composes with such a mark.
+#include "pdf_accent_compose.inc"
+
+static uint32_t combining_mark_of(uint32_t spacing) {
+    for (const auto& a : kSpacingAccents)
+        if (a.spacing == spacing) return a.mark;
+    return 0;
+}
+
+bool is_spacing_accent(uint32_t cp) { return combining_mark_of(cp) != 0; }
+
+uint32_t compose_spacing_accent(uint32_t base, uint32_t accent) {
+    uint32_t mark = combining_mark_of(accent);
+    if (!mark) return 0;
+    // Producers set accents over a dotless i or j.
+    if (base == 0x131) base = 'i';
+    if (base == 0x237) base = 'j';
+    if (base > 0xFFFF) return 0;
+    const AccentCompose key{static_cast<uint16_t>(mark), static_cast<uint16_t>(base), 0};
+    auto less = [](const AccentCompose& x, const AccentCompose& y) {
+        return x.mark != y.mark ? x.mark < y.mark : x.base < y.base;
+    };
+    auto it = std::lower_bound(std::begin(kAccentCompose), std::end(kAccentCompose), key, less);
+    if (it == std::end(kAccentCompose) || it->mark != mark || it->base != base) return 0;
+    return it->composed;
+}
+
+void drop_overprinted_chars(std::vector<TextChar>& chars) {
+    // Along the line a copy sits within 0.12 em: overprints are struck
+    // within about 0.08 em (faked bold, outline stacks), while a doubled
+    // letter sits a whole advance on, at least 0.22 em even for "ll" or
+    // "II". Across the line, within a fifth of the type size. A glyph is a
+    // copy when it matches an earlier glyph that was kept.
+    auto tol_x = [](const TextChar& c) { return std::max(c.font_size * 0.12, 0.3); };
+    auto tol_y = [](const TextChar& c) { return std::max(c.font_size * 0.2, 0.5); };
+    const size_t n = chars.size();
+    if (n < 2) return;
+
+    // Candidate pairs: same character and direction, close in y. One sort,
+    // then a scan over the few glyphs within reach of each.
+    std::vector<uint32_t> order(n);
+    double reach = 0;
+    for (size_t i = 0; i < n; i++) {
+        order[i] = static_cast<uint32_t>(i);
+        reach = std::max(reach, tol_y(chars[i]));
+    }
+    std::sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) {
+        const TextChar& ca = chars[a];
+        const TextChar& cb = chars[b];
+        if (ca.unicode != cb.unicode) return ca.unicode < cb.unicode;
+        if (ca.rot != cb.rot) return ca.rot < cb.rot;
+        return ca.y < cb.y;
+    });
+    std::vector<std::pair<uint32_t, uint32_t>> pairs;   // (later, earlier)
+    for (size_t p = 0; p < n; p++) {
+        const TextChar& a = chars[order[p]];
+        for (size_t q = p + 1; q < n; q++) {
+            const TextChar& b = chars[order[q]];
+            if (b.unicode != a.unicode || b.rot != a.rot || b.y - a.y >= reach) break;
+            uint32_t later = std::max(order[p], order[q]);
+            uint32_t earlier = std::min(order[p], order[q]);
+            const TextChar& c = chars[later];
+            const TextChar& o = chars[earlier];
+            if (std::abs(o.x - c.x) < tol_x(c) && std::abs(o.y - c.y) < tol_y(c) &&
+                std::min(o.font_size, c.font_size) > std::max(o.font_size, c.font_size) * 0.8)
+                pairs.push_back({later, earlier});
+        }
+    }
+    if (pairs.empty()) return;
+
+    std::sort(pairs.begin(), pairs.end());
+    std::vector<char> kept(n, 1);
+    for (auto& [later, earlier] : pairs)
+        if (kept[earlier]) kept[later] = 0;
+    size_t out = 0;
+    for (size_t i = 0; i < n; i++)
+        if (kept[i]) chars[out++] = chars[i];
+    chars.resize(out);
+}
+
 // ── Layout Engine: TextChar → TextLine ───────────────────
 
+
+// Fewest rows a page needs for column detection at all. Pages with fewer
+// than ten rows (or a thin histogram) must also pass paired_rows().
+constexpr int kMinColumnRowsFew = 4;
+
+// Whether the rows of a page show two columns of text side by side around
+// `boundary`: at least three rows whose glyphs leave a gap wider than a word
+// space across the boundary and whose left and right pieces each fill most
+// of their column (the widest extent of that side's pieces over all rows)
+// in one run of text, starting at that column's left edge, with the gap at
+// the boundary at least twice as wide as any gap inside either piece.
+// Running text is set flush left in both columns, its word spaces far
+// narrower than the gutter; the cells of a borderless table are often
+// centred, and a row of table cells spreads its width over gaps as wide as
+// the one at the boundary, or wider. The two columns must be of comparable
+// width, so a form of short labels beside long values, or a key/value
+// table, does not pass for a two-column page, and the columns, not the space
+// between them, must fill the page: together they span three quarters of
+// its text width or more, each wider than the gutter (two short word lists
+// beside a figure do not). Only consulted for pages too sparse for the
+// histogram alone.
+static bool paired_rows(
+        const std::vector<std::vector<std::pair<double, double>>>& rows,
+        double boundary, double median_fs, double page_width) {
+    // A gap inside one column's line wider than this ends a run of text
+    // (the column gap of column_blocks in pdf_layout.cpp).
+    const double run_gap = std::max(median_fs * 1.2, 8.0);
+    struct Pieces { double l0, l1, r0, r1; double inner; bool runs; };
+    std::vector<Pieces> pairs;
+    double L0 = 1e18, L1 = -1e18, R0 = 1e18, R1 = -1e18;
+    for (auto g : rows) {
+        std::sort(g.begin(), g.end());
+        Pieces p{1e18, -1e18, 1e18, -1e18, 0, true};
+        bool straddle = false;
+        for (const auto& [l, r] : g) {
+            if (l < boundary && r > boundary) { straddle = true; break; }
+            double& x0 = r <= boundary ? p.l0 : p.r0;
+            double& x1 = r <= boundary ? p.l1 : p.r1;
+            if (x1 > x0) {
+                p.inner = std::max(p.inner, l - x1);
+                if (l - x1 > run_gap) p.runs = false;
+            }
+            x0 = std::min(x0, l);
+            x1 = std::max(x1, r);
+        }
+        if (straddle || p.l1 < p.l0 || p.r1 < p.r0) continue;
+        if (p.r0 - p.l1 < std::max(median_fs * 0.5, 2.0 * p.inner)) continue;
+        pairs.push_back(p);
+        L0 = std::min(L0, p.l0); L1 = std::max(L1, p.l1);
+        R0 = std::min(R0, p.r0); R1 = std::max(R1, p.r1);
+    }
+    if (pairs.size() < 3) return false;
+    double lw = L1 - L0, rw = R1 - R0;
+    if (lw <= 0 || rw <= 0 || lw < rw * 0.6 || rw < lw * 0.6) return false;
+    if (R1 - L0 < page_width * 0.75 || R0 - L1 >= std::min(lw, rw)) return false;
+    int filled = 0;
+    for (const auto& p : pairs)
+        if (p.runs && p.l1 - p.l0 >= lw * 0.6 && p.r1 - p.r0 >= rw * 0.6 &&
+            p.l0 - L0 <= median_fs && p.r0 - R0 <= median_fs)
+            filled++;
+    return filled >= 3;
+}
+
+// A page gutter parts two columns of text of comparable width. A strip of
+// text under twelve ems wide beside a column several times wider is a label
+// column (a glossary's terms beside their definitions, a list's markers),
+// and the dip beside it is the gap between a label and its text: the rows
+// must stay whole. Measured over the rows with text on both sides of the
+// boundary; rows that cross it are left out.
+static bool label_column(
+        const std::vector<std::vector<std::pair<double, double>>>& rows,
+        double boundary, double median_fs) {
+    double L0 = 1e18, L1 = -1e18, R0 = 1e18, R1 = -1e18;
+    size_t pairs = 0;
+    for (const auto& g : rows) {
+        double l0 = 1e18, l1 = -1e18, r0 = 1e18, r1 = -1e18;
+        bool straddle = false;
+        for (const auto& [l, r] : g) {
+            if (l < boundary && r > boundary) { straddle = true; break; }
+            double& x0 = r <= boundary ? l0 : r0;
+            double& x1 = r <= boundary ? l1 : r1;
+            x0 = std::min(x0, l);
+            x1 = std::max(x1, r);
+        }
+        if (straddle || l1 < l0 || r1 < r0) continue;
+        pairs++;
+        L0 = std::min(L0, l0); L1 = std::max(L1, l1);
+        R0 = std::min(R0, r0); R1 = std::max(R1, r1);
+    }
+    if (pairs < 3) return false;
+    const double narrow = std::min(L1 - L0, R1 - R0);
+    const double wide = std::max(L1 - L0, R1 - R0);
+    return narrow < 12.0 * median_fs && wide > 3.0 * narrow;
+}
 
 double detect_column_boundary(const std::vector<TextChar>& chars,
                               double median_fs, double y_tol) {
@@ -2024,57 +2434,96 @@ double detect_column_boundary(const std::vector<TextChar>& chars,
         return chars[a].y > chars[b].y;
     });
 
-    constexpr int NUM_BINS = 200;
-    int row_count[NUM_BINS] = {};
-    int total_rows = 0;
+    // Two passes: the first counts every row. On a mixed page (full-width
+    // title and abstract over a two-column body) those wide rows fill the
+    // gutter bins and hide the dip, so a failed first pass retries with
+    // only rows narrow enough to live inside one column. The retry cannot
+    // run first: aligned column pairs share a y and group into one wide
+    // row, which would starve exactly the cleanest two-column pages.
+    // Every row's glyph extents (the first pass), for the label-column
+    // check both passes make: what stands either side of the dip is a
+    // question about all of the page's rows, not the narrow ones alone.
+    std::vector<std::vector<std::pair<double, double>>> all_rows;
+    for (int narrow_only = 0; narrow_only < 2; narrow_only++) {
+        constexpr int NUM_BINS = 200;
+        int row_count[NUM_BINS] = {};
+        int total_rows = 0;
+        // Glyph extents of each counted row, for the side-by-side check a
+        // page with few rows has to pass (below).
+        std::vector<std::vector<std::pair<double, double>>> row_glyphs;
 
-    size_t ri = 0;
-    while (ri < y_sorted.size()) {
-        double row_y = chars[y_sorted[ri]].y;
-        bool bins_hit[NUM_BINS] = {};
-        while (ri < y_sorted.size() && std::abs(chars[y_sorted[ri]].y - row_y) <= y_tol) {
-            auto& ch = chars[y_sorted[ri]];
-            if (ch.unicode != ' ' && ch.unicode != 0xA0) {
-                int b0 = static_cast<int>((ch.left - page_left) / page_width * NUM_BINS);
-                int b1 = static_cast<int>((ch.right - page_left) / page_width * NUM_BINS);
-                if (b0 < 0) b0 = 0;
-                if (b1 >= NUM_BINS) b1 = NUM_BINS - 1;
-                for (int b = b0; b <= b1; b++) bins_hit[b] = true;
+        size_t ri = 0;
+        while (ri < y_sorted.size()) {
+            double row_y = chars[y_sorted[ri]].y;
+            bool bins_hit[NUM_BINS] = {};
+            double row_l = 1e9, row_r = 0;
+            std::vector<std::pair<double, double>> glyphs;
+            while (ri < y_sorted.size() &&
+                   std::abs(chars[y_sorted[ri]].y - row_y) <= y_tol) {
+                auto& ch = chars[y_sorted[ri]];
+                if (ch.unicode != ' ' && ch.unicode != 0xA0) {
+                    int b0 = static_cast<int>((ch.left - page_left) / page_width * NUM_BINS);
+                    int b1 = static_cast<int>((ch.right - page_left) / page_width * NUM_BINS);
+                    if (b0 < 0) b0 = 0;
+                    if (b1 >= NUM_BINS) b1 = NUM_BINS - 1;
+                    for (int b = b0; b <= b1; b++) bins_hit[b] = true;
+                    row_l = std::min(row_l, (double)ch.left);
+                    row_r = std::max(row_r, (double)ch.right);
+                    glyphs.emplace_back(ch.left, ch.right);
+                }
+                ri++;
             }
-            ri++;
+            if (narrow_only && row_r > row_l &&
+                row_r - row_l >= page_width * 0.82)
+                continue;
+            for (int b = 0; b < NUM_BINS; b++)
+                if (bins_hit[b]) row_count[b]++;
+            total_rows++;
+            if (!glyphs.empty()) row_glyphs.push_back(std::move(glyphs));
         }
-        for (int b = 0; b < NUM_BINS; b++)
-            if (bins_hit[b]) row_count[b]++;
-        total_rows++;
+
+        if (!narrow_only) all_rows = row_glyphs;
+
+        // A page with few rows (a short page, a one-page abstract, a page
+        // that is mostly figure) cannot show the dip against the counts a
+        // full column gives. It is still read as two columns when the dip
+        // is backed by rows that set text side by side (paired_rows below).
+        if (total_rows < kMinColumnRowsFew) continue;
+        bool few_rows = total_rows < 10;
+
+        // Find the deepest dip in row_count within center 50% of page
+        int center_start = NUM_BINS / 4;
+        int center_end = NUM_BINS * 3 / 4;
+
+        double left_avg = 0, right_avg = 0;
+        int lc = 0, rc = 0;
+        for (int b = NUM_BINS / 10; b < center_start; b++) { left_avg += row_count[b]; lc++; }
+        for (int b = center_end; b < NUM_BINS * 9 / 10; b++) { right_avg += row_count[b]; rc++; }
+        if (lc > 0) left_avg /= lc;
+        if (rc > 0) right_avg /= rc;
+        double body_avg = (left_avg + right_avg) / 2.0;
+        if (body_avg < 5) {
+            if (body_avg < 2) continue;
+            few_rows = true;
+        }
+
+        // Find the minimum row_count in center region (smoothed over 3 bins)
+        int best_bin = -1;
+        double best_val = 1e9;
+        for (int b = center_start + 1; b < center_end - 1; b++) {
+            double val = (row_count[b - 1] + row_count[b] + row_count[b + 1]) / 3.0;
+            if (val < best_val) { best_val = val; best_bin = b; }
+        }
+
+        // The dip must be significantly lower than body average (at least 30% lower)
+        if (best_val > body_avg * 0.7) continue;
+
+        double boundary = page_left + (best_bin + 0.5) / NUM_BINS * page_width;
+        if (few_rows && !paired_rows(row_glyphs, boundary, median_fs, page_width)) continue;
+        if (label_column(all_rows, boundary, median_fs)) continue;
+        return boundary;
     }
-
-    if (total_rows < 10) return 0;
-
-    // Find the deepest dip in row_count within center 50% of page
-    int center_start = NUM_BINS / 4;
-    int center_end = NUM_BINS * 3 / 4;
-
-    double left_avg = 0, right_avg = 0;
-    int lc = 0, rc = 0;
-    for (int b = NUM_BINS / 10; b < center_start; b++) { left_avg += row_count[b]; lc++; }
-    for (int b = center_end; b < NUM_BINS * 9 / 10; b++) { right_avg += row_count[b]; rc++; }
-    if (lc > 0) left_avg /= lc;
-    if (rc > 0) right_avg /= rc;
-    double body_avg = (left_avg + right_avg) / 2.0;
-    if (body_avg < 5) return 0;
-
-    // Find the minimum row_count in center region (smoothed over 3 bins)
-    int best_bin = -1;
-    double best_val = 1e9;
-    for (int b = center_start + 1; b < center_end - 1; b++) {
-        double val = (row_count[b - 1] + row_count[b] + row_count[b + 1]) / 3.0;
-        if (val < best_val) { best_val = val; best_bin = b; }
-    }
-
-    // The dip must be significantly lower than body average (at least 30% lower)
-    if (best_val > body_avg * 0.7) return 0;
-
-    return page_left + (best_bin + 0.5) / NUM_BINS * page_width;
+    return 0;
 }
 
 // Reorder lines so that within each column band, left-column lines
@@ -2101,7 +2550,7 @@ std::vector<TextLine> reorder_column_lines(std::vector<TextLine>& lines,
         bool straddles = l.x_left < col_boundary - 5 && l.x_right > col_boundary + 5;
         bool is_wide = line_width > span_min_width;
         bool is_centered = straddles && std::abs(line_center - page_center) < content_width * 0.15;
-        if (straddles && (is_wide || is_centered))
+        if (l.band >= 0 || (straddles && (is_wide || is_centered)))
             types[i] = SPANNING;
         else if ((l.x_left + l.x_right) / 2.0 < col_boundary)
             types[i] = LEFT;
@@ -2136,11 +2585,635 @@ std::vector<TextLine> reorder_column_lines(std::vector<TextLine>& lines,
     return result;
 }
 
+std::vector<int> explicit_word_spaces(const std::vector<TextChar>& chars) {
+    std::vector<int> sep(chars.size(), -1);
+    auto is_space = [](uint32_t cp) { return cp == ' ' || cp == 0xA0; };
+    for (size_t i = 1; i + 1 < chars.size(); i++) {
+        if (!is_space(chars[i].unicode) || is_space(chars[i - 1].unicode))
+            continue;
+        size_t k = i;
+        while (k < chars.size() && is_space(chars[k].unicode)) k++;
+        if (k >= chars.size()) break;
+        const TextChar& a = chars[i - 1];
+        const TextChar& b = chars[k];
+        if (a.rot != 0 || b.rot != 0 || b.x <= a.x) continue;
+        double fs = std::max(std::max(a.font_size, b.font_size), 2.0);
+        if (std::abs(a.y - b.y) > 0.5 * fs) continue;
+        // The spaces themselves must sit between the two, near their line:
+        // a space drawn elsewhere (a label's trailing blank, a run placed
+        // out of order) says nothing about these two glyphs.
+        const double ca = (a.left + a.right) / 2, cb = (b.left + b.right) / 2;
+        bool between = true;
+        for (size_t j = i; j < k && between; j++) {
+            const TextChar& sp = chars[j];
+            double cs = (sp.left + sp.right) / 2;
+            between = sp.rot == 0 && cs > ca && cs < cb &&
+                      std::abs(sp.y - b.y) <= fs;
+        }
+        // A space the next glyph is moved back over entirely is a break
+        // opportunity, not a space. Measured from the space itself: the
+        // previous glyph's box may run past it (an advance that already
+        // includes the space), so its right edge says nothing here.
+        if (between && b.left - chars[i].left > kWrittenSpaceMinEm * fs)
+            sep[k] = static_cast<int>(i - 1);
+    }
+    return sep;
+}
+
+// ── Column bands ─────────────────────────────────────────
+// detect_column_boundary finds one gutter per page, and only where it shows
+// over the page as a whole. Two kinds of two-column text slip past it: a few
+// rows of two columns between figures (the page's dip lands between the
+// bars of a chart instead), and a narrow side column beside a wide one (a
+// keywords and correspondence column next to an abstract, over a body whose
+// gutter sits mid-page). Their rows are glued across the gap.
+//
+// A column band is a run of consecutive rows that all leave one vertical
+// stretch of the page empty, at least a gutter wide (kBandGutterEm), with
+// text on both sides in three rows or more. The rows of running text in two
+// columns fill their column in one run each, both columns flush left: the
+// right pieces start at one x (kBandAlignEm), which a river of word spaces
+// through one wide column never does. Each column is wide enough for prose
+// (kBandMinColumnEm), which keeps a key/value or term/definition table, whose
+// label column is narrow, out, and holds words: letters make up most of each
+// column, where the cells of a table of figures are digits. (Most of the
+// column, not of each line: a side column's reference line, "J Med Sci 70
+// (2023) 310-318", is mostly digits.) A gap of several line heights ends a band, so
+// two bands on either side of a figure stay apart, and a band whose gutter is
+// the page's own column boundary is left to the page-wide split. When the
+// page's boundary falls inside one of the band's columns, that column's
+// lines must run across it: a column whose lines stop short of it is a page
+// column, and the band's gutter is a gap inside the other one (a bullet and
+// its indented text).
+constexpr double kBandGutterEm = 1.0;
+constexpr double kBandMinColumnEm = 10.0;
+constexpr double kBandAlignEm = 0.3;
+constexpr double kBandRowGapEm = 2.5;
+constexpr int kBandMinRows = 3;
+// A second kind of band: two flows set side by side whose baselines do not
+// meet, as in a patent gazette's bibliographic block (classification codes
+// and dates in one column, applicant and inventor with their addresses in
+// the other, each at its own line pitch). Neither side need be prose, so the
+// running-text tests above do not apply. What marks them is that the rows
+// interleave: row after row holds text on one side only, its baseline lying
+// between two lines of the other side. A table's cells share their rows; at
+// most half the band's rows may hold text on both sides, and each side needs
+// kStaggerMinRows rows that fall between the other's lines. A side's lines
+// may indent under its first line (label, then indented values). Rows that
+// share the band need not share a line: two flows at near the same leading
+// pair up row by row, but their baselines drift apart (kStaggerBaselineEm)
+// where a table's cells sit on one. Prose is left out: when most lines of
+// either side fill it (kStaggerFullLine) the side is running text.
+constexpr double kStaggerGutterEm = 2.0;
+constexpr double kStaggerMinColumnEm = 8.0;
+constexpr double kStaggerIndentEm = 4.0;
+constexpr double kStaggerBaselineEm = 0.05;
+constexpr double kStaggerFullLine = 0.85;
+constexpr int kStaggerMinRows = 3;
+
+struct BandCut {
+    double split = 0;  // x the row is cut at; 0 = not in a band
+    int band = -1;
+    bool staggered = false;
+};
+
+static std::vector<BandCut> find_column_bands(
+        const std::vector<TextChar>& chars, const std::vector<size_t>& idx,
+        const std::vector<int>& row_of, double median_fs, double col_boundary,
+        bool upright) {
+    int nrows = row_of.empty() ? 0 : row_of.back() + 1;
+    std::vector<BandCut> cut(nrows);
+    if (nrows < kBandMinRows) return cut;
+    // Per row: its y and its glyph extents merged into runs of touching ink.
+    std::vector<double> row_y(nrows, 0);
+    std::vector<std::vector<std::pair<double, double>>> ink(nrows);
+    // Glyph centres of each row, and whether each is a letter.
+    std::vector<std::vector<std::pair<double, bool>>> letters(nrows);
+    // Glyph centres of each row with their baselines.
+    std::vector<std::vector<std::pair<double, double>>> base(nrows);
+    auto is_letter = [](uint32_t cp) {
+        if (cp < 0x80) return (cp | 0x20) - 'a' < 26u;
+        return cp >= 0xC0 && !(cp >= 0x2000 && cp <= 0x2BFF) &&
+               !(cp >= 0x3000 && cp <= 0x303F) && !(cp >= 0xFF00 && cp <= 0xFF20);
+    };
+    for (size_t ii = 0; ii < idx.size(); ii++) {
+        const TextChar& c = chars[idx[ii]];
+        int r = row_of[ii];
+        if (ii == 0 || row_of[ii - 1] != r) row_y[r] = c.y;
+        if (c.unicode == ' ' || c.unicode == 0xA0 || c.right <= c.left) continue;
+        ink[r].emplace_back(c.left, c.right);
+        letters[r].emplace_back((c.left + c.right) / 2, is_letter(c.unicode));
+        base[r].emplace_back((c.left + c.right) / 2, c.y);
+    }
+    for (auto& v : ink) {
+        std::sort(v.begin(), v.end());
+        std::vector<std::pair<double, double>> m;
+        for (const auto& g : v)
+            if (!m.empty() && g.first <= m.back().second + 0.1)
+                m.back().second = std::max(m.back().second, g.second);
+            else
+                m.push_back(g);
+        v.swap(m);
+    }
+    const double gutter = median_fs * kBandGutterEm;
+    const double run_gap = std::max(median_fs * 1.2, 8.0);
+    // Widest stretch of [lo, hi] that row r leaves empty.
+    auto empty_part = [&](int r, double lo, double hi) {
+        std::pair<double, double> best{0, 0};
+        double from = lo;
+        for (const auto& g : ink[r]) {
+            if (g.second <= from) continue;
+            if (g.first >= hi) break;
+            if (g.first - from > best.second - best.first) best = {from, g.first};
+            from = std::max(from, g.second);
+        }
+        if (hi - from > best.second - best.first) best = {from, hi};
+        return best;
+    };
+    // Channels already grown from a row above and rejected: a table's
+    // gutter must not be grown again from each of its rows.
+    std::vector<std::vector<std::pair<double, double>>> tried(nrows);
+
+    // Two independent flows (see kStaggerMinRows): grown from row s, which
+    // sets text both sides of a gutter. Returns the band's last row and its
+    // channel, or -1.
+    // Channels a staggered band was grown along from a row above and
+    // rejected; as with `tried`, the rows below do not grow them again.
+    std::vector<std::vector<std::pair<double, double>>> stagger_tried(nrows);
+    auto staggered_band = [&](int s, std::pair<double, double>& out) -> int {
+        if (!upright) return -1;
+        const auto& row = ink[s];
+        for (size_t k = 0; k + 1 < row.size(); k++) {
+            double a = row[k].second, b = row[k + 1].first;
+            if (b - a < median_fs * kStaggerGutterEm) continue;
+            double mid = (a + b) / 2;
+            bool seen = false;
+            for (const auto& t : stagger_tried[s]) seen |= t.first <= mid && mid <= t.second;
+            if (seen) continue;
+            std::pair<double, double> ch{a, b};
+            const double left_at = row.front().first, right_at = b;
+            // A side's lines start at its first line's x or indented under
+            // it (a label over its indented values), never left of it.
+            auto starts_ok = [&](double x, double at) {
+                return x >= at - median_fs * 0.5 && x <= at + median_fs * kStaggerIndentEm;
+            };
+            int end = s;
+            // Each side's last line so far: a line far below its own side's
+            // last one starts a new block, however close the other side.
+            double last_y[2] = {row_y[s], row_y[s]};
+            for (int r = s + 1; r < nrows; r++) {
+                if (row_y[r - 1] - row_y[r] > median_fs * kBandRowGapEm) break;
+                if (ink[r].empty()) break;
+                auto e = empty_part(r, ch.first, ch.second);
+                if (e.second - e.first < median_fs * kStaggerGutterEm) break;
+                const auto& v = ink[r];
+                const bool has_left = v.front().first < e.first;
+                if (has_left && !starts_ok(v.front().first, left_at)) break;
+                auto rp = std::find_if(v.begin(), v.end(),
+                                       [&](const std::pair<double, double>& g) { return g.first >= e.second; });
+                if (rp != v.end() && !starts_ok(rp->first, right_at)) break;
+                if ((has_left && last_y[0] - row_y[r] > median_fs * kBandRowGapEm) ||
+                    (rp != v.end() && last_y[1] - row_y[r] > median_fs * kBandRowGapEm))
+                    break;
+                if (has_left) last_y[0] = row_y[r];
+                if (rp != v.end()) last_y[1] = row_y[r];
+                ch = e;
+                end = r;
+            }
+            // Every way out below but the last rejects the channel.
+            struct Reject {
+                std::vector<std::vector<std::pair<double, double>>>& tried;
+                const std::pair<double, double>& ch;
+                int s, end;
+                bool accepted = false;
+                ~Reject() {
+                    if (!accepted)
+                        for (int r = s + 1; r <= end; r++) tried[r].push_back(ch);
+                }
+            } reject{stagger_tried, ch, s, end};
+            if (end - s + 1 < 2 * kStaggerMinRows) continue;
+            // Side of each row: 1 left only, 2 right only, 3 both; and for a
+            // row with both, whether the two sides share a baseline.
+            std::vector<int> side;
+            int both = 0, offset = 0;
+            double L0 = 1e18, L1 = -1e18, R0 = 1e18, R1 = -1e18;
+            for (int r = s; r <= end; r++) {
+                int m = 0;
+                for (const auto& g : ink[r]) {
+                    if (g.second <= ch.first) { m |= 1; L0 = std::min(L0, g.first); L1 = std::max(L1, g.second); }
+                    else { m |= 2; R0 = std::min(R0, g.first); R1 = std::max(R1, g.second); }
+                }
+                side.push_back(m);
+                if (m != 3) continue;
+                both++;
+                std::vector<double> yl, yr;
+                for (const auto& [x, y] : base[r]) (x < ch.first ? yl : yr).push_back(y);
+                if (yl.empty() || yr.empty()) continue;
+                std::nth_element(yl.begin(), yl.begin() + yl.size() / 2, yl.end());
+                std::nth_element(yr.begin(), yr.begin() + yr.size() / 2, yr.end());
+                if (std::abs(yl[yl.size() / 2] - yr[yr.size() / 2]) >= median_fs * kStaggerBaselineEm)
+                    offset++;
+            }
+            if (L1 - L0 < median_fs * kStaggerMinColumnEm ||
+                R1 - R0 < median_fs * kStaggerMinColumnEm)
+                continue;
+            // The band holds the whole of both flows: no more than a line or
+            // two starting where either side starts (a right-aligned note,
+            // "examiner: ...", does not) between the band and the nearest
+            // rows above and below that cross its gutter (between the
+            // band's two sides, not the channel its first row opened). A side that runs
+            // on past the band is a page column, or a column of the layout
+            // around it, read whole by the page split. When
+            // the page's own boundary lies in this gutter the page split
+            // reads the band's rows right, but it also pulls every line down
+            // to the next full-width one into the left column, ahead of the
+            // band's right side; this test is what lets the band win there.
+            {
+                // -1 crosses the gutter; else bit 1 left text, bit 2 right.
+                auto side_of = [&](int r) {
+                    int m = 0;
+                    for (const auto& g : ink[r]) {
+                        if (g.first < R0 - median_fs * 0.5 && g.second > L1 + median_fs * 0.5) return -1;
+                        if (g.second <= ch.first && g.first == ink[r].front().first &&
+                            starts_ok(g.first, left_at)) m |= 1;
+                        if (g.first >= ch.second && starts_ok(g.first, right_at)) m |= 2;
+                    }
+                    return m;
+                };
+                int outside[2] = {0, 0};
+                auto count = [&](int r) {
+                    int t = side_of(r);
+                    if (t < 0) return false;
+                    outside[0] += t & 1;
+                    outside[1] += (t >> 1) & 1;
+                    return true;
+                };
+                for (int r = s - 1; r >= 0 && count(r); r--) {}
+                for (int r = end + 1; r < nrows && count(r); r++) {}
+                if (outside[0] >= kStaggerMinRows || outside[1] >= kStaggerMinRows) continue;
+            }
+            // Running text fills its column line after line; columns of
+            // prose are the page split's and the prose band's to read.
+            int full[2] = {0, 0}, lines_on[2] = {0, 0};
+            for (int r = s; r <= end; r++) {
+                double l0 = 1e18, l1 = -1e18, r0 = 1e18, r1 = -1e18;
+                for (const auto& g : ink[r])
+                    if (g.second <= ch.first) { l0 = std::min(l0, g.first); l1 = std::max(l1, g.second); }
+                    else { r0 = std::min(r0, g.first); r1 = std::max(r1, g.second); }
+                if (l1 > l0) { lines_on[0]++; full[0] += l1 - l0 >= kStaggerFullLine * (L1 - L0); }
+                if (r1 > r0) { lines_on[1]++; full[1] += r1 - r0 >= kStaggerFullLine * (R1 - R0); }
+            }
+            if (full[0] * 2 >= lines_on[0] || full[1] * 2 >= lines_on[1]) continue;
+            // Each side is a flow of words: most of its lines hold letters
+            // (axis ticks and columns of amounts do not), and no gutter of
+            // its own runs down it (a side that is itself two columns, or
+            // the columns of a table).
+            bool flows = true;
+            for (int k = 0; k < 2 && flows; k++) {
+                const double lo = k == 0 ? L0 : R0, hi = k == 0 ? L1 : R1;
+                int worded = 0;
+                for (int r = s; r <= end; r++) {
+                    int lt = 0;
+                    for (const auto& [x, letter] : letters[r])
+                        lt += letter && (k == 0 ? x < ch.first : x > ch.second);
+                    worded += lt >= 2;
+                }
+                if (worded * 3 < lines_on[k] * 2) flows = false;
+                // Inner gutter: an x stretch at least a gutter wide that most
+                // of the side's lines leave empty, with text either side of it
+                // on several lines.
+                for (double x = lo + gutter; x + gutter <= hi && flows; x += median_fs * 0.25) {
+                    int clear = 0, split = 0;
+                    for (int r = s; r <= end; r++) {
+                        bool any = false, hit = false, before = false, after = false;
+                        for (const auto& g : ink[r]) {
+                            if (g.second < lo - 0.5 || g.first > hi + 0.5) continue;
+                            any = true;
+                            hit |= g.first < x + gutter && g.second > x;
+                            before |= g.second <= x;
+                            after |= g.first >= x + gutter;
+                        }
+                        if (!any) continue;
+                        clear += !hit;
+                        split += !hit && before && after;
+                    }
+                    if (clear * 5 >= lines_on[k] * 4 && split >= kStaggerMinRows) flows = false;
+                }
+            }
+            if (!flows) continue;
+            int between[3] = {0, 0, 0};
+            const int n = static_cast<int>(side.size());
+            for (int i = 0; i < n; i++) {
+                if (side[i] == 3) continue;
+                // A one-sided row with the other side's text above and below
+                // it: its baseline falls between two lines of the other flow.
+                const int other = 3 - side[i];
+                bool above = false, below = false;
+                for (int j = 0; j < i; j++) above |= (side[j] & other) != 0;
+                for (int j = i + 1; j < n; j++) below |= (side[j] & other) != 0;
+                if (above && below) between[side[i]]++;
+            }
+            if (between[1] + between[2] + offset < 2 * kStaggerMinRows ||
+                (both - offset) * 2 > n)
+                continue;
+            reject.accepted = true;
+            out = ch;
+            return end;
+        }
+        return -1;
+    };
+    int next_band = 0;
+    int s = 0;
+    while (s < nrows) {
+        int best_end = -1;
+        std::pair<double, double> best_ch;
+        const auto& row = ink[s];
+        for (size_t k = 0; k + 1 < row.size(); k++) {
+            double a = row[k].second, b = row[k + 1].first;
+            if (b - a < gutter) continue;
+            double mid = (a + b) / 2;
+            bool seen = false;
+            for (const auto& t : tried[s]) seen |= t.first <= mid && mid <= t.second;
+            if (seen) continue;
+            std::pair<double, double> ch{a, b};
+            // Where the two columns start on the first row. A row joins the
+            // band only with its pieces starting there too (an indent aside):
+            // text that starts elsewhere belongs to the layout below.
+            const double left_at = row.front().first, right_at = b;
+            auto starts_with_band = [&](int r) {
+                bool ok = true;
+                const auto& v = ink[r];
+                if (v.front().first < ch.first)
+                    ok &= std::abs(v.front().first - left_at - median_fs * 0.5) <= median_fs * 1.5;
+                auto rp = std::find_if(v.begin(), v.end(),
+                                       [&](const std::pair<double, double>& g) { return g.first >= ch.second; });
+                if (rp != v.end())
+                    ok &= std::abs(rp->first - right_at - median_fs * 0.5) <= median_fs * 1.5;
+                return ok;
+            };
+            int end = s, paired = 1;
+            for (int r = s + 1; r < nrows; r++) {
+                if (row_y[r - 1] - row_y[r] > median_fs * kBandRowGapEm) break;
+                if (ink[r].empty()) break;
+                auto e = empty_part(r, ch.first, ch.second);
+                if (e.second - e.first < gutter) break;
+                auto keep = ch;
+                ch = e;
+                if (!starts_with_band(r)) { ch = keep; break; }
+                end = r;
+                if (ink[r].front().first < ch.first && ink[r].back().second > ch.second) paired++;
+            }
+            if (paired < kBandMinRows ||
+                (col_boundary > 0 && col_boundary > ch.first - median_fs &&
+                 col_boundary < ch.second + median_fs)) {
+                for (int r = s + 1; r <= end; r++) tried[r].push_back(ch);
+                continue;
+            }
+            // Running text on both sides (see the comment above).
+            struct P { double l0, l1, r0, r1; bool runs; };
+            std::vector<P> ps;
+            double L0 = 1e18, L1 = -1e18, R0 = 1e18, R1 = -1e18;
+            int lt[2] = {0, 0}, n[2] = {0, 0};
+            for (int r = s; r <= end; r++) {
+                P p{1e18, -1e18, 1e18, -1e18, true};
+                double last_l = -1e18, last_r = -1e18;
+                for (const auto& g : ink[r]) {
+                    bool left = g.second <= ch.first;
+                    double& last = left ? last_l : last_r;
+                    if (last > -1e17 && g.first - last > run_gap) p.runs = false;
+                    last = g.second;
+                    if (left) { p.l0 = std::min(p.l0, g.first); p.l1 = std::max(p.l1, g.second); }
+                    else { p.r0 = std::min(p.r0, g.first); p.r1 = std::max(p.r1, g.second); }
+                }
+                if (p.l1 < p.l0 || p.r1 < p.r0) continue;
+                for (const auto& [x, letter] : letters[r]) {
+                    int side = x < ch.first ? 0 : 1;
+                    n[side]++;
+                    lt[side] += letter;
+                }
+                ps.push_back(p);
+                L0 = std::min(L0, p.l0); L1 = std::max(L1, p.l1);
+                R0 = std::min(R0, p.r0); R1 = std::max(R1, p.r1);
+            }
+            double lw = L1 - L0, rw = R1 - R0;
+            if (col_boundary > 0) {
+                bool in_left = L0 < col_boundary && col_boundary < ch.first;
+                bool in_right = ch.second < col_boundary && col_boundary < R1;
+                int across = 0;
+                for (const auto& p : ps) {
+                    double a = in_left ? p.l0 : p.r0, b = in_left ? p.l1 : p.r1;
+                    across += a < col_boundary - median_fs && b > col_boundary + median_fs;
+                }
+                if ((in_left || in_right) && across * 2 < static_cast<int>(ps.size())) {
+                    for (int r = s + 1; r <= end; r++) tried[r].push_back(ch);
+                    continue;
+                }
+            }
+            int filled = 0;
+            if (lw >= median_fs * kBandMinColumnEm && rw >= median_fs * kBandMinColumnEm &&
+                lt[0] * 2 >= n[0] && lt[1] * 2 >= n[1])
+                for (const auto& p : ps)
+                    if (p.runs && p.l1 - p.l0 >= lw * 0.6 && p.r1 - p.r0 >= rw * 0.6 &&
+                        p.l0 - L0 <= median_fs && p.r0 - R0 <= median_fs * kBandAlignEm)
+                        filled++;
+            if (filled < kBandMinRows || filled * 2 < static_cast<int>(ps.size())) {
+                for (int r = s + 1; r <= end; r++) tried[r].push_back(ch);
+                continue;
+            }
+            if (end > best_end) { best_end = end; best_ch = ch; }
+        }
+        bool staggered = false;
+        if (best_end < 0) {
+            best_end = staggered_band(s, best_ch);
+            staggered = best_end >= 0;
+        }
+        if (best_end < 0) { s++; continue; }
+        double split = (best_ch.first + best_ch.second) / 2;
+        for (int r = s; r <= best_end; r++) cut[r] = BandCut{split, next_band, staggered};
+        next_band++;
+        s = best_end + 1;
+    }
+    return cut;
+}
+
+// Small glyphs set above or below the baseline of the word they touch
+// (exponents, footnote marks, citation numbers "[9]") moved onto that
+// word's baseline. Line grouping joins glyphs within 0.4 em, and a mark
+// raised a little more than that became a line of its own: "distH2" read
+// as "distH" under a stray line "2", "적용하였다[9]." as "적용하였다 ." under
+// a line "[9]". A run of such glyphs moves when
+//  - its first glyph touches a word at least a quarter larger on its left,
+//    or its last glyph touches one on its right;
+//  - the word's baseline lies 0.3 to 0.6 of the word's size away, and
+//    within the mark's own size (a mark closer to it already joins the
+//    word's line);
+//  - nothing on the run's own baseline touches it (then it is the end of a
+//    line set in a smaller size, not a mark);
+//  - no other glyph between the two baselines, or on the word's, sits over
+//    or under the run (a stacked fraction, limits over an operator, a small
+//    line above another).
+void settle_raised_marks(std::vector<TextChar>& chars) {
+    constexpr double kMarkMaxRatio = 0.8;    // mark size / word size
+    constexpr double kMarkMinShiftEm = 0.3;  // baseline shift, word em
+    constexpr double kMarkMaxShiftEm = 0.6;
+    constexpr double kMarkTouchEm = 0.5;     // gap to a neighbour, em
+    constexpr size_t kMarkMaxRun = 8;
+
+    std::vector<size_t> vis;
+    for (size_t i = 0; i < chars.size(); i++)
+        if (chars[i].rot == 0 && chars[i].unicode != ' ' && chars[i].unicode != 0xA0 &&
+            chars[i].font_size > 1)
+            vis.push_back(i);
+    if (vis.size() < 2) return;
+    std::sort(vis.begin(), vis.end(), [&](size_t a, size_t b) {
+        if (chars[a].y != chars[b].y) return chars[a].y > chars[b].y;
+        return chars[a].left < chars[b].left;
+    });
+    // max_w bounds the x window of the scans below; the rare glyph wider
+    // than two of its ems (a stretched rule, a broken metric) would widen
+    // every window to the page, so those few are checked on their own.
+    double max_fs = 0, max_w = 0;
+    std::vector<size_t> wide;
+    for (size_t i : vis) {
+        const TextChar& c = chars[i];
+        max_fs = std::max(max_fs, c.font_size);
+        if (c.right - c.left > 2 * c.font_size) wide.push_back(i);
+        else max_w = std::max(max_w, c.right - c.left);
+    }
+
+    // Glyphs whose baselines lie within [y - below, y + above] and whose
+    // left edge lies within [xlo, xhi], row by row: vis is sorted by row,
+    // then by x, so each row is cut to the x window by binary search rather
+    // than walked across the page (a table's rows are long). fn returns
+    // true to stop.
+    auto for_near = [&](double y, double below, double above, double xlo, double xhi,
+                        auto&& fn) {
+        auto it = std::lower_bound(vis.begin(), vis.end(), y + above,
+                                   [&](size_t i, double v) { return chars[i].y > v; });
+        auto hi = std::upper_bound(it, vis.end(), y - below,
+                                   [&](double v, size_t i) { return v > chars[i].y; });
+        while (it != hi) {
+            double row_y = chars[*it].y;
+            auto row_end = std::upper_bound(it, hi, row_y,
+                                            [&](double v, size_t i) { return v > chars[i].y; });
+            auto w = std::lower_bound(it, row_end, xlo,
+                                      [&](size_t i, double v) { return chars[i].left < v; });
+            for (; w != row_end && chars[*w].left <= xhi; ++w)
+                if (chars[*w].right - chars[*w].left <= 2 * chars[*w].font_size &&
+                    fn(chars[*w]))
+                    return;
+            it = row_end;
+        }
+        for (size_t i : wide)
+            if (chars[i].y <= y + above && chars[i].y >= y - below && fn(chars[i])) return;
+    };
+    // Each position's row (glyphs of one baseline) in vis: [row_lo, row_hi).
+    std::vector<uint32_t> row_lo(vis.size()), row_hi(vis.size());
+    for (size_t i = 0; i < vis.size();) {
+        size_t j = i + 1;
+        while (j < vis.size() && chars[vis[j]].y == chars[vis[i]].y) j++;
+        for (size_t k = i; k < j; k++) {
+            row_lo[k] = static_cast<uint32_t>(i);
+            row_hi[k] = static_cast<uint32_t>(j);
+        }
+        i = j;
+    }
+
+    // The word glyph `mark` (at position pos of vis) touches on its left
+    // (side < 0) or right. A word sits at least kMarkMinShiftEm off the
+    // mark's baseline, so with no other row within reach there is none.
+    auto touching = [&](const TextChar& mark, size_t pos, int side) -> const TextChar* {
+        double reach = std::min(kMarkMaxShiftEm * max_fs, mark.font_size);
+        bool row_above = row_lo[pos] > 0 && chars[vis[row_lo[pos] - 1]].y <= mark.y + reach;
+        bool row_below = row_hi[pos] < vis.size() && chars[vis[row_hi[pos]]].y >= mark.y - reach;
+        if (!row_above && !row_below && wide.empty()) return nullptr;
+        // Where a touching glyph's left edge can lie (the gap test below
+        // bounds it by the widest glyph and the largest size).
+        double xlo = side < 0 ? mark.left - kMarkTouchEm * max_fs - max_w
+                              : mark.right - 0.5 * max_w;
+        double xhi = side < 0 ? mark.left : mark.right + kMarkTouchEm * max_fs;
+        const TextChar* best = nullptr;
+        double best_gap = 1e18;
+        for_near(mark.y, reach, reach, xlo, xhi, [&](const TextChar& w) {
+            if (mark.font_size > kMarkMaxRatio * w.font_size) return false;
+            double shift = std::abs(mark.y - w.y);
+            if (shift < kMarkMinShiftEm * w.font_size || shift > kMarkMaxShiftEm * w.font_size ||
+                shift > mark.font_size)
+                return false;
+            double gap = side < 0 ? mark.left - w.right : w.left - mark.right;
+            if (gap < -0.5 * (w.right - w.left) || gap > kMarkTouchEm * w.font_size) return false;
+            if (std::abs(gap) < best_gap) {
+                best_gap = std::abs(gap);
+                best = &w;
+            }
+            return false;
+        });
+        return best;
+    };
+
+    std::vector<std::pair<size_t, double>> moves;
+    for (size_t a = 0; a < vis.size();) {
+        // A run: glyphs on one baseline, of one size, each touching the next.
+        const TextChar& first = chars[vis[a]];
+        double fs = first.font_size;
+        size_t b = a + 1;
+        while (b < vis.size()) {
+            const TextChar& p = chars[vis[b - 1]];
+            const TextChar& q = chars[vis[b]];
+            double gap = q.left - p.right;
+            if (std::abs(q.y - first.y) > 0.05 * fs ||
+                std::abs(q.font_size - fs) > 0.05 * fs || gap > kMarkTouchEm * fs ||
+                gap < -0.5 * (p.right - p.left))
+                break;
+            b++;
+        }
+        size_t run_a = a, run_b = b;
+        a = b;
+        if (run_b - run_a > kMarkMaxRun) continue;
+        const TextChar& last = chars[vis[run_b - 1]];
+        // Neighbours on the run's own baseline, another size or not touching
+        // each other: whatever touches the run there makes it part of a line.
+        bool in_line = false;
+        if (run_a > 0) {
+            const TextChar& l = chars[vis[run_a - 1]];
+            double gap = first.left - l.right;
+            in_line = std::abs(l.y - first.y) <= 0.05 * fs && gap <= kMarkTouchEm * fs &&
+                      gap >= -0.5 * (l.right - l.left);
+        }
+        if (!in_line && run_b < vis.size()) {
+            const TextChar& r = chars[vis[run_b]];
+            double gap = r.left - last.right;
+            in_line = std::abs(r.y - first.y) <= 0.05 * fs && gap <= kMarkTouchEm * fs &&
+                      gap >= -0.5 * (last.right - last.left);
+        }
+        if (in_line) continue;
+        const TextChar* word = touching(first, run_a, -1);
+        if (!word) word = touching(last, run_b - 1, +1);
+        if (!word) continue;
+        double run_left = first.left, run_right = last.right;
+        double wy = word->y, wfs = word->font_size;
+        bool covered = false;
+        for_near(wy, kMarkMaxShiftEm * wfs, kMarkMaxShiftEm * wfs, run_left - max_w, run_right,
+                 [&](const TextChar& w) {
+            if (std::abs(w.y - first.y) <= 0.05 * fs && w.font_size == fs &&
+                w.left >= run_left - 0.01 && w.right <= run_right + 0.01)
+                return false;  // the run itself
+            double overlap = std::min(run_right, w.right) - std::max(run_left, w.left);
+            covered = overlap > 0.5 * std::min(w.right - w.left, run_right - run_left);
+            return covered;
+        });
+        if (covered) continue;
+        for (size_t k = run_a; k < run_b; k++) moves.emplace_back(vis[k], wy);
+    }
+    for (const auto& [i, y] : moves) chars[i].y = y;
+}
+
 // Group chars that all share one writing direction into lines. Callers reach
 // this through chars_to_lines(), which rotates each non-upright direction into
 // this function's frame first.
 static std::vector<TextLine> lines_from_upright_chars(
-    const std::vector<TextChar>& chars, double* out_col_boundary) {
+    const std::vector<TextChar>& chars, double* out_col_boundary,
+    const std::vector<std::array<double, 4>>* ruled = nullptr) {
     if (chars.empty()) return {};
 
     // Sort by y (descending, top-first) then x (left-to-right)
@@ -2158,13 +3231,50 @@ static std::vector<TextLine> lines_from_upright_chars(
     double y_tol = median_fs * 0.4;
     if (y_tol < 2) y_tol = 2;
 
-    double col_boundary = detect_column_boundary(chars, median_fs, y_tol);
+    // A glyph inside a ruled table votes as the table's full width: the
+    // gaps between its columns are not gutters of the page, nor the gutter
+    // of a column band. A table across most of the page then covers the
+    // page centre, and one inside a column covers that column only, leaving
+    // the gutter beside it empty.
+    std::vector<TextChar> voted;
+    const std::vector<TextChar>* vote_chars = &chars;
+    if (ruled && !ruled->empty()) {
+        voted = chars;
+        for (auto& ch : voted) {
+            double cx = (ch.left + ch.right) / 2, cy = (ch.top + ch.bot) / 2;
+            for (const auto& b : *ruled)
+                if (cx >= b[0] - 2 && cx <= b[2] + 2 && cy >= b[1] - 2 && cy <= b[3] + 2) {
+                    ch.left = b[0];
+                    ch.right = b[2];
+                    break;
+                }
+        }
+        vote_chars = &voted;
+    }
+    double col_boundary = detect_column_boundary(*vote_chars, median_fs, y_tol);
     if (out_col_boundary) *out_col_boundary = col_boundary;
 
     std::sort(idx.begin(), idx.end(), [&](size_t a, size_t b) {
         if (std::abs(chars[a].y - chars[b].y) > y_tol) return chars[a].y > chars[b].y;
         return chars[a].x < chars[b].x;
     });
+    const std::vector<int> word_sep = explicit_word_spaces(chars);
+
+    // Physical rows, grouped as the loop below groups them, and the column
+    // bands among them.
+    std::vector<int> row_of(idx.size());
+    double row_top = 0;
+    for (size_t ii = 0, r = 0; ii < idx.size(); ii++) {
+        if (ii > 0 && std::abs(chars[idx[ii]].y - row_top) > y_tol) r++;
+        if (ii == 0 || row_of[ii - 1] != static_cast<int>(r)) row_top = chars[idx[ii]].y;
+        row_of[ii] = static_cast<int>(r);
+    }
+    const std::vector<BandCut> band_cut =
+        find_column_bands(*vote_chars, idx, row_of, median_fs, col_boundary,
+                          out_col_boundary != nullptr);
+    std::vector<double> band_split;
+    for (const auto& b : band_cut)
+        if (b.band >= static_cast<int>(band_split.size())) band_split.push_back(b.split);
 
     std::vector<TextLine> lines;
     double cur_y = chars[idx[0]].y;
@@ -2172,8 +3282,38 @@ static std::vector<TextLine> lines_from_upright_chars(
     double total_fs = 0;
     int fs_count = 0;
     double prev_right = -1e9;
+    double word_end = -1e9;      // right edge of the last non-space glyph
+    double reach = -1e9;         // right edge of everything placed so far
+    double hole = 0;             // widest empty stretch since word_end
+    bool first_gap_set = false;  // cur.first_gap measured
+    int prev_glyph = -1;         // index of the last non-space glyph placed
+    bool after_space = false;    // the last glyph placed was a space glyph
+    // Open bold run: byte start in cur.text, byte end after its last bold
+    // glyph, and whether it holds a letter. A bold run of only digits,
+    // punctuation or leader dots is not marked: Hangul word processors
+    // outline-stroke the number of a caption whose words come from a nameless
+    // Type 3 face, and marking the number alone ("그림 **1.1** ...") reads as
+    // emphasis the page does not have.
+    bool bold_open = false, bold_has_word = false;
+    uint32_t bold_start = 0, bold_end = 0;
+    auto close_bold = [&]() {
+        if (bold_open && bold_has_word && bold_end > bold_start)
+            cur.bold_spans.emplace_back(bold_start, bold_end);
+        bold_open = false;
+        bold_has_word = false;
+    };
+    auto is_word_cp = [](uint32_t u) {
+        if (u < 128) return std::isalpha(static_cast<unsigned char>(u)) != 0;
+        if (u >= 0xFF10 && u <= 0xFF19) return false;   // fullwidth digits
+        if (u >= 0x02B0 && u <= 0x036F) return false;   // spacing accents, combining marks
+        if (u >= 0x2000 && u <= 0x2BFF) return false;   // punctuation, arrows, symbols
+        if (u >= 0x3000 && u <= 0x303F) return false;   // CJK punctuation
+        if (u >= 0xFF00 && u <= 0xFF0F) return false;   // fullwidth punctuation
+        return u >= 0x00C0;
+    };
 
     auto flush = [&]() {
+        close_bold();
         if (cur.text.empty()) return;
         size_t end = cur.text.find_last_not_of(" \t");
         if (end != std::string::npos) cur.text.resize(end + 1);
@@ -2183,11 +3323,38 @@ static std::vector<TextLine> lines_from_upright_chars(
         total_fs = 0;
         fs_count = 0;
         prev_right = -1e9;
+        word_end = -1e9;
+        reach = -1e9;
+        hole = 0;
+        first_gap_set = false;
+        prev_glyph = -1;
+        after_space = false;
     };
 
     // Column-gutter gap threshold: large enough to skip word spaces (~0.15×fs)
-    // but small enough to catch tight body-text gutters (~1.2×fs).
+    // but small enough to catch tight body-text gutters (~1.2×fs). Journals
+    // set gutters narrower than that (11pt beside 10pt type), so on a page
+    // with a column boundary the gutter is also measured: the median gap
+    // across the boundary over the rows where it is wider than a word space
+    // (half the type size). The threshold comes down to 80% of it.
     double col_gap_thresh = std::max(median_fs * 1.2, 8.0);
+    if (col_boundary > 0) {
+        std::vector<double> gaps;
+        for (size_t i = 0; i < idx.size(); ) {
+            double row_y = chars[idx[i]].y, left = -1e18, right = 1e18;
+            for (; i < idx.size() && std::abs(chars[idx[i]].y - row_y) <= y_tol; i++) {
+                const auto& c = chars[idx[i]];
+                if (c.unicode == ' ' || c.unicode == 0xA0) continue;
+                if (c.left + c.right < 2 * col_boundary) left = std::max(left, (double)c.right);
+                else right = std::min(right, (double)c.left);
+            }
+            if (right - left >= median_fs * 0.5 && right - left < 1e17) gaps.push_back(right - left);
+        }
+        if (!gaps.empty()) {
+            std::nth_element(gaps.begin(), gaps.begin() + gaps.size() / 2, gaps.end());
+            col_gap_thresh = std::min(col_gap_thresh, gaps[gaps.size() / 2] * 0.8);
+        }
+    }
 
     // Peek-ahead helper: count distinct span clusters in the chars of the
     // current y-row that lie strictly to the right of col_boundary, starting
@@ -2217,6 +3384,19 @@ static std::vector<TextLine> lines_from_upright_chars(
             flush();
             cur_y = ch.y;
         }
+        // A row of a column band is cut at its gutter, which no glyph of
+        // the band crosses.
+        const BandCut& bc = band_cut[row_of[ii]];
+        if (bc.band >= 0 && !cur.text.empty() && word_end > -1e8 &&
+            ch.unicode != ' ' && ch.unicode != 0xA0 &&
+            word_end <= bc.split && ch.left >= bc.split) {
+            flush();
+            cur_y = ch.y;
+        }
+        if (cur.text.empty()) {
+            cur.band = bc.band;
+            cur.staggered = bc.staggered;
+        }
 
         // Split line at column boundary when a large gap crosses it.
         // Skip the split when the right side has multiple distinct cell
@@ -2225,12 +3405,26 @@ static std::vector<TextLine> lines_from_upright_chars(
         // (≥ 2×median_fs, ~20pt for 10pt body text) is always treated as a
         // page-gutter split, even when both sides have cell-like content,
         // so two tables sitting side-by-side at the same y get separated.
-        if (col_boundary > 0 && !cur.text.empty() && prev_right > -1e8) {
-            double gap = ch.left - prev_right;
-            if (gap > col_gap_thresh &&
-                prev_right < col_boundary && ch.left > col_boundary) {
+        // The gap is measured from the last glyph that is not a space: a
+        // space glyph the producer set after a column's last word reaches
+        // into the gutter and would hide it. A gap the spaces fill from end
+        // to end is text set wide ("요     약"), not a gutter: a gutter keeps
+        // an empty stretch wider than a word space somewhere across it.
+        if (col_boundary > 0 && !cur.text.empty() && word_end > -1e8 &&
+            ch.unicode != ' ' && ch.unicode != 0xA0) {
+            double gap = ch.left - word_end;
+            double empty = std::max(hole, ch.left - reach);
+            if (gap > col_gap_thresh && empty > median_fs * 0.3 &&
+                word_end < col_boundary && ch.left > col_boundary) {
                 bool gutter = gap > std::max(median_fs * 2.0, 18.0);
-                if (gutter || right_clusters(ii, cur_y) < 2) {
+                // Glyphs side by side on a row but far apart in the content
+                // stream belong to two text flows (a column each), however
+                // narrow the gap or cell-like the right side: a line of text,
+                // or a table row, is drawn glyph after glyph.
+                bool other_flow = prev_glyph >= 0 &&
+                    (static_cast<long>(idx[ii]) <= prev_glyph ||
+                     static_cast<long>(idx[ii]) - prev_glyph > 4);
+                if (gutter || other_flow || right_clusters(ii, cur_y) < 2) {
                     flush();
                     cur_y = ch.y;
                 }
@@ -2238,29 +3432,93 @@ static std::vector<TextLine> lines_from_upright_chars(
         }
 
         cur.y_center = ch.y;
-        if (ch.left < cur.x_left) cur.x_left = ch.left;
-        if (ch.right > cur.x_right) cur.x_right = ch.right;
+        // The line's extent starts at its first glyph, not at TextLine's
+        // defaults: a rotated run's frame (to_writing_frame) can lie wholly
+        // at negative x, where a default right edge of 0 would stretch the
+        // line to the frame origin.
+        if (cur.text.empty() || ch.left < cur.x_left) cur.x_left = ch.left;
+        if (cur.text.empty() || ch.right > cur.x_right) cur.x_right = ch.right;
 
-        // Detect word spacing using gap between this char's left and previous char's right
+        // Word spacing from the gap between this glyph and the previous one's
+        // advance end. Every gap from a fraction of an em up separates words,
+        // however wide: two runs on one baseline far apart (a running footer
+        // and its page number, a label and its value, a row of cells nobody
+        // detected as a table) are separate words too. There used to be an
+        // upper bound of 8 em here, which glued exactly those pairs
+        // ("Report 202499").
         if (!cur.text.empty() && ch.unicode != ' ' && ch.unicode != 0xA0 && prev_right > -1e8) {
             double gap = ch.left - prev_right;
-            // Use font-size-relative threshold for word spacing
             double word_gap = ch.font_size * 0.15;
             if (word_gap < 1) word_gap = 1;
-            if (gap > word_gap && gap < ch.font_size * 8 && cur.text.back() != ' ')
+            // A space the producer wrote in the stream between this glyph
+            // and the one just placed (explicit_word_spaces) separates them
+            // even when the space itself sits off the baseline and missed
+            // this line.
+            bool written = !after_space && word_sep[idx[ii]] >= 0 &&
+                           word_sep[idx[ii]] == prev_glyph;
+            if ((gap > word_gap || written) && cur.text.back() != ' ')
                 cur.text += ' ';
         }
 
-        if (ch.unicode != ' ' && ch.unicode != 0xA0) {
+        bool visible = ch.unicode != ' ' && ch.unicode != 0xA0;
+        if (visible) {
+            // First glyph of the second word: measure the gap back to the
+            // end of the first, whether a space glyph or geometry split them.
+            if (!first_gap_set && word_end > -1e8 &&
+                cur.text.back() == ' ') {
+                cur.first_gap = std::max(0.0, ch.left - word_end);
+                first_gap_set = true;
+            }
+            word_end = ch.right;
+            prev_glyph = static_cast<int>(idx[ii]);
             cur.is_bold = ch.is_bold;
             cur.is_italic = ch.is_italic;
             total_fs += ch.font_size;
             fs_count++;
+            if (ch.is_bold && !bold_open) {
+                bold_open = true;
+                bold_start = static_cast<uint32_t>(cur.text.size());
+            } else if (!ch.is_bold) {
+                close_bold();
+            }
         }
-        util::append_utf8(cur.text, ch.unicode);
+        // A no-break space is a word space in the line's text. Every other
+        // consumer of the glyph stream (cell text, column bins, word gaps
+        // above) already treats U+00A0 as a space; keeping the code point
+        // here made a line spell "면적 ha" where its table cell spells
+        // "면적 ha", so the capture check that drops table rows from the
+        // prose flow missed the line and the row was printed twice.
+        append_glyph_text(cur.text, ch.unicode == 0xA0 ? uint32_t(' ') : ch.unicode);
+        if (reach > -1e8) hole = std::max(hole, (double)ch.left - reach);
+        reach = std::max(reach, (double)ch.right);
+        if (ch.unicode != ' ' && ch.unicode != 0xA0) hole = 0;
+        if (visible && ch.is_bold) {
+            bold_end = static_cast<uint32_t>(cur.text.size());
+            if (is_word_cp(ch.unicode)) bold_has_word = true;
+        }
         prev_right = ch.right;
+        after_space = ch.unicode == ' ' || ch.unicode == 0xA0;
     }
     flush();
+
+    // Each band reads its left column, then its right column. Its lines are
+    // marked column-split so they are not joined back across the gutter.
+    for (size_t i = 0; i < lines.size();) {
+        int b = lines[i].band;
+        size_t j = i + 1;
+        while (j < lines.size() && b >= 0 && lines[j].band == b) j++;
+        if (b >= 0) {
+            double split = band_split[b];
+            std::stable_partition(lines.begin() + i, lines.begin() + j, [&](const TextLine& l) {
+                return (l.x_left + l.x_right) / 2.0 < split;
+            });
+            for (size_t k = i; k < j; k++) {
+                lines[k].is_column_split = true;
+                lines[k].band = b * 2 + ((lines[k].x_left + lines[k].x_right) / 2.0 < split ? 0 : 1);
+            }
+        }
+        i = j;
+    }
 
     if (col_boundary > 0)
         lines = reorder_column_lines(lines, col_boundary);
@@ -2269,7 +3527,8 @@ static std::vector<TextLine> lines_from_upright_chars(
 }
 
 std::vector<TextLine> chars_to_lines(const std::vector<TextChar>& chars,
-                                    double* out_col_boundary) {
+                                    double* out_col_boundary,
+                                    const std::vector<std::array<double, 4>>* ruled) {
     if (out_col_boundary) *out_col_boundary = 0;
     if (chars.empty()) return {};
 
@@ -2281,7 +3540,7 @@ std::vector<TextLine> chars_to_lines(const std::vector<TextChar>& chars,
     int directions = 0;
     for (bool p : present) directions += p ? 1 : 0;
     if (directions <= 1 && present[0])
-        return lines_from_upright_chars(chars, out_col_boundary);
+        return lines_from_upright_chars(chars, out_col_boundary, ruled);
 
     // Upright text first and unchanged — it drives the column boundary and
     // keeps the body's reading order. Rotated runs follow, each grouped in its
@@ -2292,42 +3551,18 @@ std::vector<TextLine> chars_to_lines(const std::vector<TextChar>& chars,
         upright.reserve(chars.size());
         for (auto& ch : chars)
             if (ch.rot == 0) upright.push_back(ch);
-        lines = lines_from_upright_chars(upright, out_col_boundary);
+        lines = lines_from_upright_chars(upright, out_col_boundary, ruled);
     }
 
-    const double kDegToRad = 3.14159265358979323846 / 180.0;
     for (int r = 1; r < 24; r++) {
         if (!present[r]) continue;
-        const double theta = r * 15.0 * kDegToRad;
-        const double cs = std::cos(theta), sn = std::sin(theta);
-        // Into the direction's own frame (rotate by -theta), and back out.
-        auto fwd = [&](double px, double py, double& ox, double& oy) {
-            ox = px * cs + py * sn;
-            oy = -px * sn + py * cs;
+        const int16_t rot = static_cast<int16_t>(r);
+        auto back = [&](double fx, double fy, double& px, double& py) {
+            from_writing_frame(rot, fx, fy, px, py);
         };
-        auto back = [&](double px, double py, double& ox, double& oy) {
-            ox = px * cs - py * sn;
-            oy = px * sn + py * cs;
-        };
-
         std::vector<TextChar> rot_chars;
-        for (auto& ch : chars) {
-            if (ch.rot != r) continue;
-            TextChar t = ch;
-            fwd(ch.x, ch.y, t.x, t.y);
-            // Rotating the page-space AABB is exact on the quarter turns that
-            // real documents use, and a slight over-estimate off them.
-            double bx[4] = {ch.left, ch.right, ch.left, ch.right};
-            double by[4] = {ch.top, ch.top, ch.bot, ch.bot};
-            double rx[4], ry[4];
-            for (int k = 0; k < 4; k++) fwd(bx[k], by[k], rx[k], ry[k]);
-            t.left = *std::min_element(rx, rx + 4);
-            t.right = *std::max_element(rx, rx + 4);
-            t.top = *std::max_element(ry, ry + 4);
-            t.bot = *std::min_element(ry, ry + 4);
-            t.rot = 0;
-            rot_chars.push_back(t);
-        }
+        for (auto& ch : chars)
+            if (ch.rot == r) rot_chars.push_back(to_writing_frame(ch));
 
         for (auto& ln : lines_from_upright_chars(rot_chars, nullptr)) {
             // Report the line where it sits on the page, not where it sat in
