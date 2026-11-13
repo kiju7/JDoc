@@ -1037,13 +1037,14 @@ std::string XlsParser::to_markdown(const ConvertOptions& opts) {
         // An Escher BLIP record declares a type rather than a filename, so
         // store_image settles the extension from the format. An image that
         // could not be written is not referenced.
+        // Without image extraction nothing is linked, as in every other
+        // parser, but a metafile's text is still part of the document.
         for (auto& img : images) {
-            const std::string filename = util::store_image(img, opts);
-            if (filename.empty()) continue;
-            if (opts.images)
+            if (opts.images) {
+                const std::string filename = util::store_image(img, opts);
+                if (filename.empty()) continue;
                 md += "![" + filename + "](" + opts.image_ref_prefix + filename + ")\n\n";
-            else
-                md += "![" + filename + "](" + filename + ")\n\n";
+            }
             if (!img.embedded_text.empty())
                 md += img.embedded_text + "\n\n";
         }

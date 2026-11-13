@@ -1639,6 +1639,17 @@ void test_xls_sst_continue() {
         assert_targets_exist(md, dir);
         std::filesystem::remove_all(dir);
     TEST_END
+
+    TEST(no_picture_link_without_image_extraction)
+        // As in every other parser: no extraction, no link to a file that
+        // was never written (an .xls inside a report converts this way).
+        jdoc::ConvertOptions opts;
+        opts.images = false;
+        auto md = jdoc::office_to_markdown("test/fixtures/xls/drawing_group_picture.xls",
+                                           opts);
+        ASSERT(md.find("picture sheet") != std::string::npos);
+        ASSERT(md.find("![") == std::string::npos);
+    TEST_END
 }
 
 // ── XLSB sparse-cell storage ────────────────────────────────
