@@ -171,17 +171,33 @@ inline std::string legacy_name_to_utf8(std::string&& name) {
     return is_valid_utf8(name) ? std::move(name) : cp949_string_to_utf8(name);
 }
 
-// Normalize plain-text bytes to UTF-8: already-valid UTF-8 (including pure
-// ASCII) is kept verbatim, anything else is decoded as CP949 — the encoding
-// legacy Korean .txt files and archive members use. Shared by the .txt reader
-// (path and in-memory) so plain text always leaves the library as UTF-8.
+// UTF-16 text by its byte-order mark (FF FE little-endian, FE FF big-endian)
+// decoded to UTF-8, the mark dropped; false when there is no mark. Notepad's
+// "Unicode" encoding is this, and it used to come out as U+FFFD and NULs.
+bool utf16_bom_to_utf8(const std::string& s, std::string& out);
+
+// Normalize plain-text bytes to UTF-8: UTF-16 with a byte-order mark is
+// decoded, a UTF-8 mark dropped, already-valid UTF-8 (including pure ASCII)
+// kept verbatim, anything else decoded as CP949 — the encoding legacy Korean
+// .txt files and archive members use. Shared by the .txt reader (path and
+// in-memory) so plain text always leaves the library as UTF-8.
 inline std::string plain_text_to_utf8(const std::string& s) {
+    std::string u16;
+    if (utf16_bom_to_utf8(s, u16)) return u16;
+    if (s.size() >= 3 && s.compare(0, 3, "\xEF\xBB\xBF") == 0) {
+        std::string rest = s.substr(3);
+        return is_valid_utf8(rest) ? rest : cp949_string_to_utf8(rest);
+    }
     return is_valid_utf8(s) ? s : cp949_string_to_utf8(s);
 }
 // rvalue overload: the .txt readers pass the whole-file buffer as a temporary
 // (ss.str() / std::string(data, size)); move it through the valid-UTF-8 fast
 // path instead of copying the entire document.
 inline std::string plain_text_to_utf8(std::string&& s) {
+    if (s.size() >= 2 &&
+        ((s[0] == '\xFF' && s[1] == '\xFE') || (s[0] == '\xFE' && s[1] == '\xFF')))
+        return plain_text_to_utf8(static_cast<const std::string&>(s));
+    if (s.size() >= 3 && s.compare(0, 3, "\xEF\xBB\xBF") == 0) s.erase(0, 3);
     return is_valid_utf8(s) ? std::move(s) : cp949_string_to_utf8(s);
 }
 

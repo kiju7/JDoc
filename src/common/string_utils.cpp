@@ -380,4 +380,25 @@ std::string charset_to_utf8(const std::string& bytes, const std::string& charset
     return is_valid_utf8(bytes) ? bytes : cp949_string_to_utf8(bytes);
 }
 
+bool utf16_bom_to_utf8(const std::string& s, std::string& out) {
+    if (s.size() < 2) return false;
+    const unsigned char b0 = static_cast<unsigned char>(s[0]);
+    const unsigned char b1 = static_cast<unsigned char>(s[1]);
+    const size_t n = (s.size() - 2) & ~size_t(1);
+    if (b0 == 0xFF && b1 == 0xFE) {
+        out = utf16le_to_utf8(s.data() + 2, n);
+        return true;
+    }
+    if (b0 == 0xFE && b1 == 0xFF) {
+        std::string le(n, '\0');
+        for (size_t i = 0; i + 1 < n; i += 2) {
+            le[i] = s[2 + i + 1];
+            le[i + 1] = s[2 + i];
+        }
+        out = utf16le_to_utf8(le.data(), le.size());
+        return true;
+    }
+    return false;
+}
+
 }} // namespace jdoc::util

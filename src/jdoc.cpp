@@ -45,6 +45,9 @@ void validate_memory_input(const void* data, size_t size) {
 // Rejects buffers with NUL bytes or invalid UTF-8 sequences.
 static bool is_likely_text_buf(const uint8_t* u, size_t n) {
     if (n == 0) return true; // empty is valid text
+    // UTF-16 with a byte-order mark: full of NULs, but text all the same.
+    if (n >= 2 && ((u[0] == 0xFF && u[1] == 0xFE) || (u[0] == 0xFE && u[1] == 0xFF)))
+        return true;
     if (n > 8192) n = 8192;
 
     for (size_t i = 0; i < n; ) {

@@ -2,6 +2,7 @@
 // License: MIT
 
 #include "jdoc/detect.h"
+#include "jdoc/jdoc.h"
 
 #include <cassert>
 #include <cstring>
@@ -229,6 +230,30 @@ void test_real_files(const std::string& root) {
     TEST_END
 }
 
+// Notepad's "Unicode" text is UTF-16 with a byte-order mark. It came out as
+// U+FFFD and NULs, and without an extension was not taken for text at all.
+static void test_utf16_text() {
+    std::cerr << "\nUTF-16 text:\n";
+    const std::string expect_utf8 = "\xEA\xB9\x80\xEA\xB8\xB8\xEB\x8F\x99 A1";  // 김길동 A1
+    auto le = std::string("\xFF\xFE", 2) + std::string("\x40\xAE\x38\xAE\xD9\xB3\x20\x00\x41\x00\x31\x00", 12);
+    auto be = std::string("\xFE\xFF", 2) + std::string("\xAE\x40\xAE\x38\xB3\xD9\x00\x20\x00\x41\x00\x31", 12);
+
+    TEST("utf16le_with_bom_decoded")
+        ASSERT(jdoc::convert(le.data(), le.size(), "a.txt") == expect_utf8);
+    TEST_END
+    TEST("utf16be_with_bom_decoded")
+        ASSERT(jdoc::convert(be.data(), be.size(), "a.txt") == expect_utf8);
+    TEST_END
+    TEST("utf16_without_extension_is_text")
+        ASSERT(detect_bytes(std::vector<unsigned char>(le.begin(), le.end())).format == "TXT");
+        ASSERT(jdoc::convert(le.data(), le.size(), "") == expect_utf8);
+    TEST_END
+    TEST("utf8_bom_dropped")
+        std::string b = "\xEF\xBB\xBFhello";
+        ASSERT(jdoc::convert(b.data(), b.size(), "a.txt") == "hello");
+    TEST_END
+}
+
 int main(int argc, char** argv) {
     // Fixtures resolve relative to the repo root (working dir set by ctest).
     std::string root = (argc > 1) ? argv[1] : ".";
@@ -238,6 +263,7 @@ int main(int argc, char** argv) {
     test_document_magic();
     test_cad_magic();
     test_real_files(root);
+    test_utf16_text();
 
     std::cerr << "\n" << tests_passed << " passed, " << tests_failed
               << " failed\n";
