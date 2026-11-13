@@ -65,16 +65,42 @@ bool ole_payload(const OleReader& ole, std::vector<char>& out, std::string& name
 }
 
 thread_local int g_depth = 0;
+thread_local int g_unnamed = 0;
 
-// Run one nested conversion: no images, the whole document, depth-bounded,
-// failures swallowed, surrounding blank lines trimmed.
+// The folder an embedded document's pictures go to, under the host's
+// image_dir: named after the object (BinData/BIN0001.OLE, ObjectPool/_123,
+// word/embeddings/oleObject1.bin), which is unique within its host, so the
+// page1_img0 names every document starts from cannot collide. An object with
+// no name gets a running number.
+std::string embedded_image_folder(const std::string& name) {
+    std::string out = "embedded_";
+    if (name.empty()) return out + "object" + std::to_string(++g_unnamed);
+    for (unsigned char c : name) {
+        bool ok = (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') ||
+                  (c >= 'a' && c <= 'z') || c == '.' || c == '-' || c >= 0x80;
+        out += ok ? static_cast<char>(c) : '_';
+    }
+    return out;
+}
+
+// Run one nested conversion: the whole document, depth-bounded, failures
+// swallowed, surrounding blank lines trimmed. Its pictures are extracted
+// when the host writes pictures to a folder — a picture pasted inside an
+// embedded report is as much a part of what the reader sees as its text —
+// into a subfolder of their own (see embedded_image_folder).
 template <class Fn>
-std::string nested(const ConvertOptions& opts, Fn&& fn) {
+std::string nested(const ConvertOptions& opts, const std::string& name, Fn&& fn) {
     int max_depth = opts.archive.max_depth;
     if (max_depth >= 0 && g_depth >= max_depth) return "";
     ConvertOptions o = opts;
-    o.images = false;
-    o.image_dir.clear();
+    if (o.images && !o.image_dir.empty()) {
+        const std::string folder = embedded_image_folder(name);
+        o.image_dir += "/" + folder;
+        o.image_ref_prefix += folder + "/";
+    } else {
+        o.images = false;
+        o.image_dir.clear();
+    }
     o.pages.clear();
     o.page_chunks = false;
     o.metadata = false;
@@ -116,7 +142,7 @@ std::string embedded_document_text(const uint8_t* data, size_t size,
             fmt != FileFormat::HWP && fmt != FileFormat::HWPX &&
             fmt != FileFormat::TXT)
             return "";
-        return nested(opts, [&](const ConvertOptions& o) {
+        return nested(opts, name_hint, [&](const ConvertOptions& o) {
             return convert_from_memory_as(fmt, data, size, name, o);
         });
     } catch (...) {
@@ -134,7 +160,7 @@ std::string embedded_storage_text(const OleReader& host, const std::string& stor
         if (ole_payload(*sub, bytes, name))
             return embedded_document_text(reinterpret_cast<const uint8_t*>(bytes.data()),
                                           bytes.size(), name, opts);
-        return nested(opts, [&](const ConvertOptions& o) {
+        return nested(opts, storage, [&](const ConvertOptions& o) {
             return office_storage_to_markdown(host, storage, o);
         });
     } catch (...) {
