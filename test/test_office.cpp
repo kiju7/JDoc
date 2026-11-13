@@ -1158,6 +1158,43 @@ void test_image_reference_matches_file() {
         ASSERT(image_targets(first) != image_targets(second));
         std::filesystem::remove_all(dir);
     TEST_END
+
+    // A workbook pasted into a report shows its pictures to the reader as
+    // much as its cells. They used to be dropped: the nested conversion ran
+    // with images off. Each embedded object gets a subfolder of its own, so
+    // its page1_img0 cannot overwrite the host's.
+    auto report = make_docx({"report body"},
+                            {{"word/media/image1.png", png_bytes()},
+                             {"word/embeddings/Book1.xlsx", make_media_xlsx()}});
+
+    TEST(embedded_document_pictures_extracted_into_own_folder)
+        std::string dir = temp_image_dir("embedded_pictures");
+        jdoc::ConvertOptions opts;
+        opts.min_image_size = 0;
+        opts.image_dir = dir;
+        auto md = jdoc::office_to_markdown_mem(
+            reinterpret_cast<const uint8_t*>(report.data()), report.size(),
+            "report.docx", opts);
+        ASSERT(md.find("report body") != std::string::npos);
+        bool nested = false;
+        for (const auto& t : image_targets(md)) {
+            ASSERT(std::filesystem::exists(std::filesystem::path(dir) / t));
+            if (t.find("embedded_Book1.xlsx/") == 0) nested = true;
+        }
+        ASSERT(nested);
+        std::filesystem::remove_all(dir);
+    TEST_END
+
+    TEST(embedded_document_pictures_not_linked_without_a_folder)
+        // In memory (no image_dir) the nested bytes have no way out, so
+        // nothing of the embedded document is linked.
+        jdoc::ConvertOptions opts;
+        opts.min_image_size = 0;
+        auto md = jdoc::office_to_markdown_mem(
+            reinterpret_cast<const uint8_t*>(report.data()), report.size(),
+            "report.docx", opts);
+        ASSERT(md.find("embedded_") == std::string::npos);
+    TEST_END
 }
 
 // ── Legacy .xls image extraction ─────────────────────────────
