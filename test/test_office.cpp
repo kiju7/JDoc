@@ -1424,6 +1424,103 @@ static std::string workbook_with_png_blip() {
 void test_xls_images() {
     std::cerr << "\nLegacy .xls images:\n";
 
+    TEST(hancom_cell_biff_dialect)
+        // Hancom Cell's BIFF8: every string UTF-16 under an 8-bit flag, a
+        // rich string's runs after its characters (flag bit 0), cell records
+        // with a 32-bit row, and the drawing group as one record whose length
+        // field does not hold its size. Each derailed the whole workbook.
+        auto u16s = [](const std::string& ascii) {
+            std::string o;
+            for (char c : ascii) { o.push_back(c); o.push_back('\0'); }
+            return o;
+        };
+        std::string wb;
+        put_u16(wb, 0x0809); put_u16(wb, 4); put_u16(wb, 0x0600); put_u16(wb, 0x0005);
+        put_u16(wb, 0x0085); put_u16(wb, 8 + 10);
+        put_u32(wb, 0); put_u16(wb, 0);
+        wb.push_back(5); wb.push_back(0); wb += u16s("cells");
+        // Drawing group: a 100-byte container under a 20-byte record length,
+        // after the two bytes Hancom puts first.
+        put_u16(wb, 0x00EB); put_u16(wb, 20);
+        wb += std::string("\x74\x00", 2);
+        put_u16(wb, 0x000F); put_u16(wb, 0xF000); put_u32(wb, 92);
+        wb += std::string(92, '\x55');
+        // SST: a plain string, then a rich one with its runs after the text.
+        std::string sst;
+        put_u32(sst, 2); put_u32(sst, 2);
+        put_u16(sst, 5); sst.push_back(0); sst += u16s("alpha");
+        put_u16(sst, 4); sst.push_back(1); sst += u16s("beta");
+        put_u16(sst, 1); put_u16(sst, 0); put_u16(sst, 0);
+        put_u16(wb, 0x00FC); put_u16(wb, static_cast<uint16_t>(sst.size())); wb += sst;
+        put_u16(wb, 0x000A); put_u16(wb, 0);
+        // Sheet: LABELSST and RK with 32-bit rows.
+        put_u16(wb, 0x0809); put_u16(wb, 4); put_u16(wb, 0x0600); put_u16(wb, 0x0010);
+        put_u16(wb, 0x00FD); put_u16(wb, 12);
+        put_u32(wb, 0); put_u16(wb, 0); put_u16(wb, 15); put_u32(wb, 0);
+        put_u16(wb, 0x00FD); put_u16(wb, 12);
+        put_u32(wb, 1); put_u16(wb, 0); put_u16(wb, 15); put_u32(wb, 1);
+        put_u16(wb, 0x027E); put_u16(wb, 12);
+        put_u32(wb, 1); put_u16(wb, 1); put_u16(wb, 15); put_u32(wb, (4321u << 2) | 2u);
+        put_u16(wb, 0x000A); put_u16(wb, 0);
+        auto book = make_ole_workbook(wb);
+        auto md = jdoc::office_to_markdown_mem(
+            reinterpret_cast<const uint8_t*>(book.data()), book.size(), "h.cell");
+        ASSERT(md.find("## cells") != std::string::npos);
+        ASSERT(md.find("| alpha |") != std::string::npos);
+        ASSERT(md.find("| beta | 4321 |") != std::string::npos);
+    TEST_END
+
+    TEST(excel_drawing_group_split_across_records_left_alone)
+        // Excel splits a large group over MSODRAWINGGROUP + CONTINUE records;
+        // its container length then exceeds the first record by design and
+        // must not be taken for Hancom's overrun (that pasted the record
+        // headers into the picture bytes).
+        std::string wb;
+        put_u16(wb, 0x0809); put_u16(wb, 4); put_u16(wb, 0x0600); put_u16(wb, 0x0005);
+        put_u16(wb, 0x0085); put_u16(wb, 8 + 5);
+        put_u32(wb, 0); put_u16(wb, 0); wb.push_back(5); wb.push_back(0); wb += "cells";
+        put_u16(wb, 0x00EB); put_u16(wb, 16);
+        put_u16(wb, 0x000F); put_u16(wb, 0xF000); put_u32(wb, 16);
+        wb += std::string(8, '\x11');
+        put_u16(wb, 0x003C); put_u16(wb, 8); wb += std::string(8, '\x22');
+        put_u16(wb, 0x000A); put_u16(wb, 0);
+        put_u16(wb, 0x0809); put_u16(wb, 4); put_u16(wb, 0x0600); put_u16(wb, 0x0010);
+        put_u16(wb, 0x0204); put_u16(wb, 9 + 2);
+        put_u16(wb, 0); put_u16(wb, 0); put_u16(wb, 0); put_u16(wb, 2); wb.push_back(0); wb += "ok";
+        put_u16(wb, 0x000A); put_u16(wb, 0);
+        auto book = make_ole_workbook(wb);
+        auto md = jdoc::office_to_markdown_mem(
+            reinterpret_cast<const uint8_t*>(book.data()), book.size(), "e.xls");
+        ASSERT(md.find("## cells") != std::string::npos);
+        ASSERT(md.find("| ok |") != std::string::npos);
+    TEST_END
+
+    TEST(hancom_utf16_sheet_name_flagged_8bit)
+        // Hancom Cell writes the sheet name as UTF-16 but flags it 8-bit; it
+        // came out as "t\0e\0" with NULs in the output.
+        std::string wb;
+        put_u16(wb, 0x0809); put_u16(wb, 4); put_u16(wb, 0x0600); put_u16(wb, 0x0005);
+        put_u16(wb, 0x0085); put_u16(wb, 8 + 8);
+        put_u32(wb, 0); put_u16(wb, 0);
+        wb.push_back(4);     // cch
+        wb.push_back(0);     // flagged 8-bit
+        wb += std::string("t\0e\0x\0t\0", 8);
+        put_u16(wb, 0x000A); put_u16(wb, 0);
+        // The sheet: one LABEL cell.
+        put_u16(wb, 0x0809); put_u16(wb, 4); put_u16(wb, 0x0600); put_u16(wb, 0x0010);
+        put_u16(wb, 0x0204); put_u16(wb, 9 + 10);   // its text UTF-16 too
+        put_u16(wb, 0); put_u16(wb, 0); put_u16(wb, 0); put_u16(wb, 5);
+        wb.push_back(0);
+        wb += std::string("h\0e\0l\0l\0o\0", 10);
+        put_u16(wb, 0x000A); put_u16(wb, 0);
+        auto book = make_ole_workbook(wb);
+        auto md = jdoc::office_to_markdown_mem(
+            reinterpret_cast<const uint8_t*>(book.data()), book.size(), "h.cell");
+        ASSERT(md.find("## text") != std::string::npos);
+        ASSERT(md.find("hello") != std::string::npos);
+        ASSERT(md.find('\0') == std::string::npos);
+    TEST_END
+
     TEST(blip_is_written_to_image_dir)
         // .xls used to emit an image reference without ever writing the file:
         // extract_images() ran, nothing called the writer.
