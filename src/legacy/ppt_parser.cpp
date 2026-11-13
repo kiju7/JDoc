@@ -243,6 +243,16 @@ static void collect_blip_refs(const char* data, size_t opt_data_start,
         out.push_back(static_cast<int>(fill_blip));
 }
 
+// A slide-number (or date) field is stored as the character '*' and drawn
+// by PowerPoint from the field record. On its own it is not text; a notes
+// page always carries one, which printed "> **Notes:** *" for every slide.
+static bool is_field_placeholder(const std::string& text) {
+    size_t b = text.find_first_not_of(" \t\r\n\v");
+    if (b == std::string::npos) return false;
+    size_t e = text.find_last_not_of(" \t\r\n\v");
+    return b == e && text[b] == '*';
+}
+
 static SlideText extract_slide_text(const char* data, size_t size,
                                      size_t container_start, uint32_t container_len) {
     SlideText result;
@@ -271,6 +281,7 @@ static SlideText extract_slide_text(const char* data, size_t size,
             text_type = util::read_u32_le(atom);
         } else if (hdr.rec_type == RT_TEXT_CHARS_ATOM) {
             std::string text = decode_text_chars(atom, hdr.rec_len);
+            if (is_field_placeholder(text)) text.clear();
             if (!text.empty()) {
                 if (text_type == 0) {
                     if (!result.title.empty()) result.title += " ";
@@ -283,6 +294,7 @@ static SlideText extract_slide_text(const char* data, size_t size,
             text_type = 0xFF;
         } else if (hdr.rec_type == RT_TEXT_BYTES_ATOM) {
             std::string text = decode_text_bytes(atom, hdr.rec_len);
+            if (is_field_placeholder(text)) text.clear();
             if (!text.empty()) {
                 if (text_type == 0) {
                     if (!result.title.empty()) result.title += " ";
@@ -556,11 +568,13 @@ static void for_each_line(std::string_view text, Fn&& fn) {
     }
 }
 
-std::string PptParser::slide_to_markdown(const Slide& slide) {
+std::string PptParser::slide_to_markdown(const Slide& slide, bool page_marker) {
     std::string out;
 
-    if (slide.number > 1) out += "\n";
-    out += "--- Page " + std::to_string(slide.number) + " ---\n\n";
+    if (page_marker) {
+        if (slide.number > 1) out += "\n";
+        out += "--- Page " + std::to_string(slide.number) + " ---\n\n";
+    }
 
     if (!slide.title.empty()) {
         out += "# " + slide.title + "\n\n";
@@ -789,7 +803,7 @@ std::vector<PageChunk> PptParser::to_chunks(const ConvertOptions& opts) {
 
         PageChunk chunk;
         chunk.page_number = slide.number;
-        std::string slide_md = slide_to_markdown(slide);
+        std::string slide_md = slide_to_markdown(slide, false);
 
         // Attach images to this slide by BLIP index
         for (int blip_idx : slide.blip_indices) {
