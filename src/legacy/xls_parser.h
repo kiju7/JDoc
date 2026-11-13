@@ -51,6 +51,12 @@ private:
 
     // Shared String Table.
     std::vector<std::string> sst_;
+    // Hancom Cell flags every string 8-bit and writes it as UTF-16; seen
+    // first in a BOUNDSHEET name, it then applies to every string.
+    bool hancom_wide_ = false;
+    // The Workbook (or Book) stream, rewritten into Excel's dialect where
+    // Hancom Cell writes its own (sets hancom_wide_).
+    std::vector<char> read_workbook_stream();
 
     // Parsed sheets.
     std::vector<Sheet> sheets_;
