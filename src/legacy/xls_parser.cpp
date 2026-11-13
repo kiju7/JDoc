@@ -503,7 +503,17 @@ void XlsParser::parse_workbook() {
                 uint8_t name_len = static_cast<uint8_t>(rec_data[6]);
                 uint8_t name_flags = static_cast<uint8_t>(rec_data[7]);
                 std::string sname;
-                if (name_flags & 0x01) {
+                // Hancom Cell flags the name as 8-bit but writes it as UTF-16:
+                // the record then holds exactly twice the characters, every
+                // high byte zero ("t\0e\0x\0t\0"). Read as 8-bit it came out
+                // as "t\0e\0", NULs and all.
+                bool wide = (name_flags & 0x01) != 0;
+                if (!wide && name_len > 0 && rec_size == 8 + size_t(name_len) * 2) {
+                    wide = true;
+                    for (size_t i = 0; i < name_len; ++i)
+                        if (rec_data[8 + 2 * i + 1] != 0) { wide = false; break; }
+                }
+                if (wide) {
                     size_t byte_len = std::min(size_t(name_len) * 2, size_t(rec_size - 8));
                     sname = util::utf16le_to_utf8(rec_data + 8, byte_len);
                 } else {

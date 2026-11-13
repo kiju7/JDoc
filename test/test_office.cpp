@@ -1288,6 +1288,32 @@ static std::string workbook_with_png_blip() {
 void test_xls_images() {
     std::cerr << "\nLegacy .xls images:\n";
 
+    TEST(hancom_utf16_sheet_name_flagged_8bit)
+        // Hancom Cell writes the sheet name as UTF-16 but flags it 8-bit; it
+        // came out as "t\0e\0" with NULs in the output.
+        std::string wb;
+        put_u16(wb, 0x0809); put_u16(wb, 4); put_u16(wb, 0x0600); put_u16(wb, 0x0005);
+        put_u16(wb, 0x0085); put_u16(wb, 8 + 8);
+        put_u32(wb, 0); put_u16(wb, 0);
+        wb.push_back(4);     // cch
+        wb.push_back(0);     // flagged 8-bit
+        wb += std::string("t\0e\0x\0t\0", 8);
+        put_u16(wb, 0x000A); put_u16(wb, 0);
+        // The sheet: one LABEL cell.
+        put_u16(wb, 0x0809); put_u16(wb, 4); put_u16(wb, 0x0600); put_u16(wb, 0x0010);
+        put_u16(wb, 0x0204); put_u16(wb, 9 + 5);
+        put_u16(wb, 0); put_u16(wb, 0); put_u16(wb, 0); put_u16(wb, 5);
+        wb.push_back(0);
+        wb += "hello";
+        put_u16(wb, 0x000A); put_u16(wb, 0);
+        auto book = make_ole_workbook(wb);
+        auto md = jdoc::office_to_markdown_mem(
+            reinterpret_cast<const uint8_t*>(book.data()), book.size(), "h.cell");
+        ASSERT(md.find("## text") != std::string::npos);
+        ASSERT(md.find("hello") != std::string::npos);
+        ASSERT(md.find('\0') == std::string::npos);
+    TEST_END
+
     TEST(blip_is_written_to_image_dir)
         // .xls used to emit an image reference without ever writing the file:
         // extract_images() ran, nothing called the writer.
