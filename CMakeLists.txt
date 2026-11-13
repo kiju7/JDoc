@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(jdoc VERSION 1.6.3 LANGUAGES CXX C)
+project(jdoc VERSION 1.7.0 LANGUAGES CXX C)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -310,7 +310,7 @@ target_include_directories(jdoc_shared PUBLIC include PRIVATE src)
 set_target_properties(jdoc_shared PROPERTIES
     OUTPUT_NAME "jdoc"
     VERSION ${PROJECT_VERSION}
-    SOVERSION 5
+    SOVERSION 6
 )
 
 
