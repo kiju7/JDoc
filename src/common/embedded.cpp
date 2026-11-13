@@ -1,5 +1,6 @@
 // License: MIT
 #include "common/embedded.h"
+#include "common/chart_text.h"
 #include "convert_internal.h"
 #include "legacy/ole_reader.h"
 
@@ -106,6 +107,12 @@ std::string embedded_document_text(const uint8_t* data, size_t size,
         if (is_cfb(data, size)) {
             OleReader ole(data, size);
             if (!ole.is_open()) return "";
+            // A Hancom chart object keeps the chart as DrawingML XML beside
+            // its binary VtChart contents.
+            if (ole.has_stream("OOXMLChartContents")) {
+                auto xml = ole.read_stream("OOXMLChartContents");
+                return drawingml_chart_text(xml.data(), xml.size());
+            }
             if (ole_payload(ole, inner, name)) {
                 data = reinterpret_cast<const uint8_t*>(inner.data());
                 size = inner.size();

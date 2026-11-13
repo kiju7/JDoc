@@ -12,6 +12,7 @@
 #include "xml_utils.h"
 #include "zip_reader.h"
 #include "common/embedded.h"
+#include "common/chart_text.h"
 #include <pugixml.hpp>
 #include <algorithm>
 #include <map>
@@ -48,6 +49,28 @@ static bool is_shape_element(const std::string& name) {
            name == "hp:textart"   || name == "hp:ole" ||
            name == "hp:video"     || name == "hp:chart" ||
            name == "hp:compose"   || name == "hp:dutmal";
+}
+
+// <hp:switch> offers an object in a newer form (<hp:case>: an OOXML chart)
+// with a fallback every reader knows (<hp:default>: the same chart as an OLE
+// object). The switch itself was not recognised, so such a chart vanished.
+// Take a case jdoc reads directly (a chart, from its Chart/ part), else the
+// fallback, else the first case.
+static pugi::xml_node first_element(pugi::xml_node n) {
+    for (auto c : n.children())
+        if (c.type() == pugi::node_element) return c;
+    return {};
+}
+
+static pugi::xml_node resolve_switch(pugi::xml_node item) {
+    if (std::string(item.name()) != "hp:switch") return item;
+    for (auto c : item.children("hp:case")) {
+        auto e = first_element(c);
+        if (e && std::string(e.name()) == "hp:chart") return e;
+    }
+    if (auto e = first_element(item.child("hp:default"))) return e;
+    if (auto e = first_element(item.child("hp:case"))) return e;
+    return item;
 }
 
 // Section XML nesting is file-controlled, so the recursive walkers below cap
@@ -429,7 +452,8 @@ private:
             // Track font size for body detection
             size_counts[font_height]++;
 
-            for (auto item : run.children()) {
+            for (auto run_item : run.children()) {
+                pugi::xml_node item = resolve_switch(run_item);
                 std::string in = item.name();
 
                 if (in == "hp:t") {
@@ -478,15 +502,30 @@ private:
                         para_text += "![" + saved.name + "](" +
                                      opts_.image_ref_prefix + ref + ")";
                     }
+                    std::string caption;
+                    append_caption(item, caption);
+                    if (!caption.empty()) {
+                        if (!para_text.empty()) {
+                            md += para_text + "\n\n";
+                            para_text.clear();
+                        }
+                        md += caption + "\n\n";
+                        para_has_content = true;
+                    }
                 }
                 else if (is_shape_element(in)) {
                     // Drawing object (글상자/도형): its <hp:drawText> body is a
                     // paragraph list of its own, unrelated to the run's text.
                     std::string shape_text;
-                    if (in == "hp:ole")
+                    if (in == "hp:ole") {
                         append_ole_text(item, shape_text, opts_.format);
-                    else
+                        append_caption(item, shape_text);
+                    } else if (in == "hp:chart") {
+                        append_chart_text(item, shape_text);
+                        append_caption(item, shape_text);
+                    } else {
                         collect_shape_text(item, shape_text, 0);
+                    }
                     shape_text = util::trim(shape_text);
                     if (!shape_text.empty()) {
                         // Flush preceding text so the shape reads as its own block
@@ -764,6 +803,9 @@ private:
     void flatten_table_text(pugi::xml_node tbl, std::string& out,
                             std::vector<pugi::xml_node>* cell_pics, int depth) {
         if (depth > kMaxShapeDepth) return;
+        // A table nested in a cell keeps its caption too.
+        append_caption(tbl, out, depth);
+        space_before(out);
         for (auto tr : tbl.children()) {
             if (std::string(tr.name()) != "hp:tr") continue;
             for (auto tc : tr.children()) {
@@ -784,6 +826,12 @@ private:
         if (depth > kMaxShapeDepth) return;
         if (std::string(shape.name()) == "hp:ole") {
             append_ole_text(shape, out);
+            append_caption(shape, out, depth);
+            return;
+        }
+        if (std::string(shape.name()) == "hp:chart") {
+            append_chart_text(shape, out);
+            append_caption(shape, out, depth);
             return;
         }
         for (auto child : shape.children()) {
@@ -795,8 +843,40 @@ private:
                 }
             } else if (is_shape_element(cn)) {
                 collect_shape_text(child, out, depth + 1);
+            } else if (cn == "hp:pic") {
+                append_caption(child, out, depth);
             }
         }
+        append_caption(shape, out, depth);
+    }
+
+    // The caption of a picture, drawing object, chart or OLE object
+    // (<hp:caption><hp:subList>). Only table captions used to be read, so
+    // "그림 1 촬영 박영수" under a photo was lost.
+    void append_caption(pugi::xml_node obj, std::string& out, int depth = 0) {
+        auto cap = obj.child("hp:caption");
+        if (!cap) return;
+        std::string text;
+        for (auto sub : cap.children())
+            if (std::string(sub.name()) == "hp:subList")
+                extract_sublist_text(sub, text, nullptr, depth + 1);
+        text = util::trim(text);
+        if (text.empty()) return;
+        if (!out.empty() && out.back() != '\n' && out.back() != ' ') out += "\n";
+        out += text;
+    }
+
+    // A chart's words (title, series and category names): the part its
+    // chartIDRef names (Chart/chart1.xml) is a DrawingML chart.
+    void append_chart_text(pugi::xml_node chart, std::string& out) {
+        std::string ref = chart.attribute("chartIDRef").as_string();
+        while (!ref.empty() && ref[0] == '/') ref.erase(0, 1);
+        if (ref.empty() || !zip_->has_entry(ref)) return;
+        auto xml = zip_->read_entry(ref);
+        std::string text = drawingml_chart_text(xml.data(), xml.size());
+        if (text.empty()) return;
+        if (!out.empty()) out += "\n";
+        out += text;
     }
 
     // An OLE object's own text (a spreadsheet or document pasted in): its
@@ -831,12 +911,15 @@ private:
             for (auto run : para.children()) {
                 std::string rname = run.name();
                 if (rname == "hp:run") {
-                    for (auto item : run.children()) {
+                    for (auto run_item : run.children()) {
+                        pugi::xml_node item = resolve_switch(run_item);
                         std::string iname = item.name();
                         if (iname == "hp:t") {
                             out += extract_text(item);
-                        } else if (iname == "hp:pic" && cell_pics) {
-                            cell_pics->push_back(item);
+                        } else if (iname == "hp:pic") {
+                            if (cell_pics) cell_pics->push_back(item);
+                            space_before(out);
+                            append_caption(item, out, depth);
                         } else if (iname == "hp:tbl") {
                             space_before(out);
                             flatten_table_text(item, out, cell_pics, depth + 1);
